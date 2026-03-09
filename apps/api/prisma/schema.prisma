@@ -1,0 +1,802 @@
+// ============================================================================
+// Voice AI SaaS Platform - Prisma Schema
+// Provider: PostgreSQL
+// ============================================================================
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["fullTextSearch", "postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  extensions = [pgcrypto]
+}
+
+// ============================================================================
+// ENUMS
+// ============================================================================
+
+enum TenantStatus {
+  ACTIVE
+  SUSPENDED
+  TRIAL
+  CANCELLED
+}
+
+enum TenantPlan {
+  FREE
+  STARTER
+  PROFESSIONAL
+  ENTERPRISE
+  CUSTOM
+}
+
+enum UserRole {
+  SUPER_ADMIN
+  TENANT_OWNER
+  ADMIN
+  MANAGER
+  SUPERVISOR
+  QA_AUDITOR
+  AGENT_OPERATOR
+  READONLY_ANALYST
+}
+
+enum MembershipRole {
+  OWNER
+  ADMIN
+  MANAGER
+  MEMBER
+  VIEWER
+}
+
+enum AgentType {
+  INBOUND
+  OUTBOUND
+  HYBRID
+  IVR
+  SURVEY
+  APPOINTMENT
+  COLLECTIONS
+  SUPPORT
+}
+
+enum Industry {
+  HEALTHCARE
+  FINANCE
+  INSURANCE
+  REAL_ESTATE
+  RETAIL
+  ECOMMERCE
+  HOSPITALITY
+  EDUCATION
+  TECHNOLOGY
+  AUTOMOTIVE
+  LEGAL
+  GOVERNMENT
+  TELECOMMUNICATIONS
+  ENERGY
+  LOGISTICS
+  OTHER
+}
+
+enum ConsentStatus {
+  OPTED_IN
+  OPTED_OUT
+  PENDING
+  UNKNOWN
+}
+
+enum CampaignStatus {
+  DRAFT
+  SCHEDULED
+  RUNNING
+  PAUSED
+  COMPLETED
+  CANCELLED
+  FAILED
+}
+
+enum CallDirection {
+  INBOUND
+  OUTBOUND
+}
+
+enum CallStatus {
+  QUEUED
+  RINGING
+  IN_PROGRESS
+  COMPLETED
+  FAILED
+  NO_ANSWER
+  BUSY
+  VOICEMAIL
+  CANCELLED
+  TRANSFERRED
+}
+
+enum DocumentStatus {
+  PENDING
+  PROCESSING
+  READY
+  FAILED
+  ARCHIVED
+}
+
+enum IntegrationStatus {
+  RUNNING
+  SUCCESS
+  FAILED
+  CANCELLED
+}
+
+enum UsageType {
+  CALL_MINUTES
+  API_CALLS
+  TRANSCRIPTION_MINUTES
+  TTS_CHARACTERS
+  LLM_TOKENS
+  STORAGE_GB
+  SMS_SENT
+  PHONE_NUMBERS
+}
+
+enum NotificationChannel {
+  IN_APP
+  EMAIL
+  SMS
+  WEBHOOK
+  SLACK
+}
+
+enum NotificationStatus {
+  PENDING
+  SENT
+  DELIVERED
+  FAILED
+  READ
+}
+
+// ============================================================================
+// MULTI-TENANT CORE
+// ============================================================================
+
+model Tenant {
+  id        String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name      String
+  slug      String       @unique
+  industry  String?
+  settings  Json         @default("{}")
+  branding  Json         @default("{}")
+  features  Json         @default("{}")
+  status    TenantStatus @default(TRIAL)
+  plan      TenantPlan   @default(FREE)
+  createdAt DateTime     @default(now())
+  updatedAt DateTime     @updatedAt
+
+  // Relations
+  users          User[]
+  memberships    Membership[]
+  agents         Agent[]
+  workflows      Workflow[]
+  contacts       Contact[]
+  accounts       Account[]
+  campaigns      Campaign[]
+  calls          Call[]
+  knowledgeBases KnowledgeBase[]
+  integrations   Integration[]
+  subscription   Subscription?
+  usageRecords   UsageRecord[]
+  auditLogs      AuditLog[]
+  notifications  Notification[]
+  phoneNumbers   PhoneNumber[]
+
+  @@index([slug])
+  @@index([status])
+  @@index([plan])
+  @@index([createdAt])
+  @@map("tenants")
+}
+
+model User {
+  id           String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  email        String
+  firstName    String
+  lastName     String
+  passwordHash String
+  phone        String?
+  role         UserRole  @default(READONLY_ANALYST)
+  tenantId     String    @db.Uuid
+  department   String?
+  avatar       String?
+  lastLoginAt  DateTime?
+  isActive     Boolean   @default(true)
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  // Relations
+  tenant      Tenant       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  memberships Membership[]
+  auditLogs   AuditLog[]
+  notifications Notification[]
+
+  @@unique([email, tenantId])
+  @@index([tenantId])
+  @@index([email])
+  @@index([tenantId, isActive])
+  @@index([tenantId, role])
+  @@map("users")
+}
+
+model Membership {
+  userId      String @db.Uuid
+  tenantId    String @db.Uuid
+  role        MembershipRole @default(MEMBER)
+  permissions Json   @default("{}")
+  department  String?
+
+  // Relations
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@id([userId, tenantId])
+  @@index([tenantId])
+  @@index([userId])
+  @@map("memberships")
+}
+
+// ============================================================================
+// AI AGENTS
+// ============================================================================
+
+model Agent {
+  id                    String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId              String    @db.Uuid
+  name                  String
+  description           String?
+  type                  AgentType @default(OUTBOUND)
+  industry              Industry  @default(OTHER)
+  voiceId               String?
+  language              String    @default("en-US")
+  personality           Json      @default("{}")
+  toneSettings          Json      @default("{}")
+  systemPrompt          String?   @db.Text
+  knowledgeBaseId       String?   @db.Uuid
+  escalationRules       Json      @default("[]")
+  complianceBlocks      Json      @default("[]")
+  callObjective         String?
+  successCriteria       String?
+  endCallConditions     Json      @default("[]")
+  humanTransferTriggers Json      @default("[]")
+  retryLogic            Json      @default("{}")
+  timeRules             Json      @default("{}")
+  isActive              Boolean   @default(true)
+  version               Int       @default(1)
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+
+  // Relations
+  tenant        Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  knowledgeBase KnowledgeBase? @relation(fields: [knowledgeBaseId], references: [id], onDelete: SetNull)
+  versions      AgentVersion[]
+  campaigns     Campaign[]
+  calls         Call[]
+  phoneNumbers  PhoneNumber[]
+
+  @@index([tenantId])
+  @@index([tenantId, isActive])
+  @@index([tenantId, type])
+  @@index([tenantId, industry])
+  @@index([knowledgeBaseId])
+  @@map("agents")
+}
+
+model AgentVersion {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  agentId   String   @db.Uuid
+  version   Int
+  config    Json
+  createdBy String?  @db.Uuid
+  createdAt DateTime @default(now())
+
+  // Relations
+  agent Agent @relation(fields: [agentId], references: [id], onDelete: Cascade)
+
+  @@unique([agentId, version])
+  @@index([agentId])
+  @@map("agent_versions")
+}
+
+// ============================================================================
+// WORKFLOWS
+// ============================================================================
+
+model Workflow {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId    String   @db.Uuid
+  name        String
+  description String?
+  nodes       Json     @default("[]")
+  edges       Json     @default("[]")
+  variables   Json     @default("{}")
+  version     Int      @default(1)
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  // Relations
+  tenant    Tenant            @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  versions  WorkflowVersion[]
+  campaigns Campaign[]
+
+  @@index([tenantId])
+  @@index([tenantId, isActive])
+  @@map("workflows")
+}
+
+model WorkflowVersion {
+  id         String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  workflowId String   @db.Uuid
+  version    Int
+  definition Json
+  createdBy  String?  @db.Uuid
+  createdAt  DateTime @default(now())
+
+  // Relations
+  workflow Workflow @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+
+  @@unique([workflowId, version])
+  @@index([workflowId])
+  @@map("workflow_versions")
+}
+
+// ============================================================================
+// CONTACTS / CRM
+// ============================================================================
+
+model Contact {
+  id                 String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId           String        @db.Uuid
+  firstName          String?
+  lastName           String?
+  email              String?
+  phone              String?
+  company            String?
+  title              String?
+  tags               String[]      @default([])
+  segment            String?
+  consentStatus      ConsentStatus @default(UNKNOWN)
+  dncStatus          Boolean       @default(false)
+  languagePreference String?
+  preferredCallTime  String?
+  timezone           String?
+  customFields       Json          @default("{}")
+  accountId          String?       @db.Uuid
+  createdAt          DateTime      @default(now())
+  updatedAt          DateTime      @updatedAt
+
+  // Relations
+  tenant  Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  account Account?      @relation(fields: [accountId], references: [id], onDelete: SetNull)
+  notes   ContactNote[]
+  calls   Call[]
+
+  @@index([tenantId])
+  @@index([tenantId, email])
+  @@index([tenantId, phone])
+  @@index([tenantId, segment])
+  @@index([tenantId, consentStatus])
+  @@index([tenantId, dncStatus])
+  @@index([tenantId, tags], type: Gin)
+  @@index([accountId])
+  @@map("contacts")
+}
+
+model Account {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId  String   @db.Uuid
+  name      String
+  industry  String?
+  website   String?
+  metadata  Json     @default("{}")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relations
+  tenant   Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  contacts Contact[]
+
+  @@index([tenantId])
+  @@index([tenantId, name])
+  @@map("accounts")
+}
+
+model ContactNote {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  contactId String   @db.Uuid
+  content   String   @db.Text
+  createdBy String?  @db.Uuid
+  createdAt DateTime @default(now())
+
+  // Relations
+  contact Contact @relation(fields: [contactId], references: [id], onDelete: Cascade)
+
+  @@index([contactId])
+  @@map("contact_notes")
+}
+
+// ============================================================================
+// CAMPAIGNS
+// ============================================================================
+
+model Campaign {
+  id                String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId          String         @db.Uuid
+  name              String
+  description       String?
+  status            CampaignStatus @default(DRAFT)
+  agentId           String         @db.Uuid
+  workflowId        String?        @db.Uuid
+  contactListFilter Json           @default("{}")
+  retryPolicy       Json           @default("{}")
+  callWindowRules   Json           @default("{}")
+  maxAttempts       Int            @default(3)
+  concurrency       Int            @default(1)
+  priority          Int            @default(0)
+  scheduledAt       DateTime?
+  startedAt         DateTime?
+  completedAt       DateTime?
+  metrics           Json           @default("{}")
+  createdBy         String?        @db.Uuid
+  createdAt         DateTime       @default(now())
+  updatedAt         DateTime       @updatedAt
+
+  // Relations
+  tenant   Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  agent    Agent     @relation(fields: [agentId], references: [id], onDelete: Restrict)
+  workflow Workflow? @relation(fields: [workflowId], references: [id], onDelete: SetNull)
+  calls    Call[]
+
+  @@index([tenantId])
+  @@index([tenantId, status])
+  @@index([tenantId, agentId])
+  @@index([status])
+  @@index([scheduledAt])
+  @@map("campaigns")
+}
+
+// ============================================================================
+// CALLS
+// ============================================================================
+
+model Call {
+  id                   String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId             String        @db.Uuid
+  campaignId           String?       @db.Uuid
+  agentId              String        @db.Uuid
+  contactId            String?       @db.Uuid
+  direction            CallDirection
+  status               CallStatus    @default(QUEUED)
+  telephonyProvider    String?
+  telephonyCallId      String?
+  phoneFrom            String?
+  phoneTo              String?
+  startedAt            DateTime?
+  answeredAt           DateTime?
+  endedAt              DateTime?
+  duration             Int?
+  recordingUrl         String?
+  recordingStorageKey  String?
+  summary              String?       @db.Text
+  sentiment            String?
+  outcome              String?
+  outcomeDetails       Json?
+  complianceChecklist  Json?
+  knowledgeSourcesUsed String[]      @default([])
+  latencyStats         Json?
+  costBreakdown        Json?
+  humanHandoffStatus   String?
+  metadata             Json          @default("{}")
+  createdAt            DateTime      @default(now())
+
+  // Relations
+  tenant     Tenant          @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  campaign   Campaign?       @relation(fields: [campaignId], references: [id], onDelete: SetNull)
+  agent      Agent           @relation(fields: [agentId], references: [id], onDelete: Restrict)
+  contact    Contact?        @relation(fields: [contactId], references: [id], onDelete: SetNull)
+  transcript CallTranscript?
+  events     CallEvent[]
+  recordings CallRecording[]
+
+  @@index([tenantId])
+  @@index([tenantId, status])
+  @@index([tenantId, agentId])
+  @@index([tenantId, campaignId])
+  @@index([tenantId, contactId])
+  @@index([tenantId, direction])
+  @@index([tenantId, createdAt])
+  @@index([tenantId, outcome])
+  @@index([telephonyCallId])
+  @@index([campaignId, status])
+  @@index([startedAt])
+  @@map("calls")
+}
+
+model CallTranscript {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  callId    String   @unique @db.Uuid
+  segments  Json     @default("[]") // Array of {role, text, timestamp, sentiment}
+  fullText  String?  @db.Text
+  createdAt DateTime @default(now())
+
+  // Relations
+  call Call @relation(fields: [callId], references: [id], onDelete: Cascade)
+
+  @@index([callId])
+  @@map("call_transcripts")
+}
+
+model CallEvent {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  callId    String   @db.Uuid
+  type      String
+  payload   Json     @default("{}")
+  timestamp DateTime @default(now())
+
+  // Relations
+  call Call @relation(fields: [callId], references: [id], onDelete: Cascade)
+
+  @@index([callId])
+  @@index([callId, type])
+  @@index([callId, timestamp])
+  @@map("call_events")
+}
+
+model CallRecording {
+  id         String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  callId     String   @db.Uuid
+  storageKey String
+  url        String?
+  duration   Int?
+  format     String?
+  sizeBytes  Int?
+  createdAt  DateTime @default(now())
+
+  // Relations
+  call Call @relation(fields: [callId], references: [id], onDelete: Cascade)
+
+  @@index([callId])
+  @@map("call_recordings")
+}
+
+// ============================================================================
+// KNOWLEDGE BASE
+// ============================================================================
+
+model KnowledgeBase {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId    String   @db.Uuid
+  name        String
+  description String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  // Relations
+  tenant    Tenant              @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  documents KnowledgeDocument[]
+  agents    Agent[]
+
+  @@index([tenantId])
+  @@map("knowledge_bases")
+}
+
+model KnowledgeDocument {
+  id              String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  knowledgeBaseId String         @db.Uuid
+  name            String
+  type            String
+  sourceUrl       String?
+  storageKey      String?
+  chunkCount      Int            @default(0)
+  status          DocumentStatus @default(PENDING)
+  metadata        Json           @default("{}")
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+
+  // Relations
+  knowledgeBase KnowledgeBase @relation(fields: [knowledgeBaseId], references: [id], onDelete: Cascade)
+
+  @@index([knowledgeBaseId])
+  @@index([knowledgeBaseId, status])
+  @@map("knowledge_documents")
+}
+
+// ============================================================================
+// INTEGRATIONS
+// ============================================================================
+
+model Integration {
+  id            String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId      String    @db.Uuid
+  type          String
+  provider      String
+  name          String
+  config        Json      @default("{}") /// @encrypted
+  credentials   Json      @default("{}") /// @encrypted
+  fieldMappings Json      @default("{}")
+  webhookUrl    String?
+  isActive      Boolean   @default(true)
+  lastSyncAt    DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  // Relations
+  tenant Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  runs   IntegrationRun[]
+
+  @@index([tenantId])
+  @@index([tenantId, type])
+  @@index([tenantId, provider])
+  @@index([tenantId, isActive])
+  @@map("integrations")
+}
+
+model IntegrationRun {
+  id            String            @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  integrationId String            @db.Uuid
+  status        IntegrationStatus @default(RUNNING)
+  payload       Json?
+  result        Json?
+  error         String?           @db.Text
+  startedAt     DateTime          @default(now())
+  completedAt   DateTime?
+
+  // Relations
+  integration Integration @relation(fields: [integrationId], references: [id], onDelete: Cascade)
+
+  @@index([integrationId])
+  @@index([integrationId, status])
+  @@map("integration_runs")
+}
+
+// ============================================================================
+// BILLING
+// ============================================================================
+
+model Subscription {
+  id                   String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId             String   @unique @db.Uuid
+  plan                 String
+  status               String
+  stripeCustomerId     String?
+  stripeSubscriptionId String?
+  currentPeriodStart   DateTime?
+  currentPeriodEnd     DateTime?
+  seats                Int      @default(1)
+  features             Json     @default("{}")
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  // Relations
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([stripeCustomerId])
+  @@index([stripeSubscriptionId])
+  @@index([status])
+  @@map("subscriptions")
+}
+
+model UsageRecord {
+  id          String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId    String    @db.Uuid
+  type        UsageType
+  quantity    Float
+  unit        String
+  cost        Float     @default(0)
+  metadata    Json      @default("{}")
+  periodStart DateTime
+  periodEnd   DateTime
+  createdAt   DateTime  @default(now())
+
+  // Relations
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([tenantId, type])
+  @@index([tenantId, periodStart, periodEnd])
+  @@index([tenantId, type, periodStart])
+  @@map("usage_records")
+}
+
+// ============================================================================
+// SYSTEM
+// ============================================================================
+
+model AuditLog {
+  id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId     String?  @db.Uuid
+  userId       String?  @db.Uuid
+  action       String
+  resourceType String
+  resourceId   String?
+  oldValue     Json?
+  newValue     Json?
+  ipAddress    String?
+  userAgent    String?
+  createdAt    DateTime @default(now())
+
+  // Relations
+  tenant Tenant? @relation(fields: [tenantId], references: [id], onDelete: SetNull)
+  user   User?   @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([tenantId])
+  @@index([tenantId, action])
+  @@index([tenantId, resourceType])
+  @@index([tenantId, resourceType, resourceId])
+  @@index([userId])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
+
+model Notification {
+  id        String             @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId  String             @db.Uuid
+  userId    String?            @db.Uuid
+  type      String
+  title     String
+  body      String?            @db.Text
+  channel   NotificationChannel @default(IN_APP)
+  status    NotificationStatus  @default(PENDING)
+  metadata  Json               @default("{}")
+  readAt    DateTime?
+  createdAt DateTime           @default(now())
+
+  // Relations
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  user   User?  @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([tenantId])
+  @@index([userId])
+  @@index([tenantId, userId, status])
+  @@index([tenantId, channel])
+  @@index([createdAt])
+  @@map("notifications")
+}
+
+model FeatureFlag {
+  id              String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name            String   @unique
+  description     String?
+  isEnabled       Boolean  @default(false)
+  tenantOverrides Json     @default("{}")
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([name])
+  @@index([isEnabled])
+  @@map("feature_flags")
+}
+
+model PhoneNumber {
+  id              String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId        String   @db.Uuid
+  number          String   @unique
+  provider        String
+  capabilities    Json     @default("{}")
+  isActive        Boolean  @default(true)
+  assignedAgentId String?  @db.Uuid
+  metadata        Json     @default("{}")
+  createdAt       DateTime @default(now())
+
+  // Relations
+  tenant        Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  assignedAgent Agent? @relation(fields: [assignedAgentId], references: [id], onDelete: SetNull)
+
+  @@index([tenantId])
+  @@index([tenantId, isActive])
+  @@index([number])
+  @@index([assignedAgentId])
+  @@map("phone_numbers")
+}

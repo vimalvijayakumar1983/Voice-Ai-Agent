@@ -1,0 +1,47 @@
+# ============================================================
+# Multi-stage Dockerfile for NestJS API
+# ============================================================
+
+# ---------- Stage 1: Base ----------
+FROM node:20-alpine AS base
+RUN apk add --no-cache libc6-compat
+RUN corepack enable && corepack prepare pnpm@9.15.4 --activate
+WORKDIR /app
+
+# ---------- Stage 2: Pruned monorepo ----------
+FROM base AS pruner
+RUN pnpm add -g turbo@^2.3.0
+COPY . .
+RUN turbo prune @voice-ai/api --docker
+
+# ---------- Stage 3: Install dependencies ----------
+FROM base AS installer
+COPY --from=pruner /app/out/json/ .
+COPY --from=pruner /app/out/pnpm-lock.yaml ./pnpm-lock.yaml
+RUN pnpm install --frozen-lockfile
+
+# ---------- Stage 4: Build ----------
+FROM base AS builder
+COPY --from=installer /app/ .
+COPY --from=pruner /app/out/full/ .
+RUN pnpm turbo run build --filter=@voice-ai/api
+
+# ---------- Stage 5: Production ----------
+FROM node:20-alpine AS runner
+RUN apk add --no-cache libc6-compat dumb-init
+RUN corepack enable && corepack prepare pnpm@9.15.4 --activate
+
+ENV NODE_ENV=production
+WORKDIR /app
+
+RUN addgroup --system --gid 1001 nestjs && \
+    adduser --system --uid 1001 nestjs
+
+COPY --from=builder --chown=nestjs:nestjs /app/ .
+
+USER nestjs
+
+EXPOSE 4000
+
+ENTRYPOINT ["dumb-init", "--"]
+CMD ["node", "apps/api/dist/main.js"]
