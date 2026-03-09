@@ -640,3 +640,479 @@ export interface CallAnalytics {
   callsByHour: { hour: number; count: number }[];
   topAgents: { agentId: string; agentName: string; calls: number; successRate: number }[];
 }
+
+// ============================================================
+// Phase 2: Campaign Execution & Call Orchestration
+// ============================================================
+
+export enum CampaignContactStatus {
+  PENDING = 'PENDING',
+  QUEUED = 'QUEUED',
+  CALLING = 'CALLING',
+  COMPLETED = 'COMPLETED',
+  FAILED = 'FAILED',
+  SKIPPED = 'SKIPPED',
+  RETRY = 'RETRY',
+}
+
+export enum PacingMode {
+  PREDICTIVE = 'PREDICTIVE',
+  PROGRESSIVE = 'PROGRESSIVE',
+  PREVIEW = 'PREVIEW',
+  POWER = 'POWER',
+}
+
+export interface CampaignExecutionConfig {
+  pacingMode: PacingMode;
+  maxConcurrentCalls: number;
+  callsPerMinute: number;
+  maxRetries: number;
+  retryDelayMinutes: number;
+  callingWindowStart: string;
+  callingWindowEnd: string;
+  respectTimezones: boolean;
+  abandonRateTarget: number;
+}
+
+export interface LiveCallData {
+  callId: string;
+  contactName: string;
+  phoneNumber: string;
+  agentName: string;
+  duration: number;
+  status: CallStatus;
+  sentiment: 'positive' | 'neutral' | 'negative';
+  currentTranscript: TranscriptSegment[];
+}
+
+export interface TranscriptSegment {
+  role: 'agent' | 'human';
+  text: string;
+  timestamp: number;
+  sentiment?: 'positive' | 'neutral' | 'negative';
+  confidence?: number;
+}
+
+export interface CallOrchestratorEvent {
+  type: 'call:started' | 'call:ringing' | 'call:answered' | 'call:transcript' | 'call:ended' | 'call:error' | 'call:handoff';
+  callId: string;
+  tenantId: string;
+  data: Record<string, unknown>;
+  timestamp: string;
+}
+
+export interface AudioPipelineMetrics {
+  sttLatencyMs: number;
+  llmLatencyMs: number;
+  ttsLatencyMs: number;
+  totalLatencyMs: number;
+  audioBufferMs: number;
+}
+
+// ============================================================
+// Phase 3: Knowledge Base RAG
+// ============================================================
+
+export enum ChunkStrategy {
+  FIXED_SIZE = 'FIXED_SIZE',
+  SENTENCE = 'SENTENCE',
+  SEMANTIC = 'SEMANTIC',
+  PARAGRAPH = 'PARAGRAPH',
+}
+
+export interface DocumentChunkData {
+  id: string;
+  documentId: string;
+  content: string;
+  chunkIndex: number;
+  tokenCount: number;
+  metadata: Record<string, unknown>;
+}
+
+export interface RAGQueryResult {
+  query: string;
+  results: RAGRetrievedChunk[];
+  answer: string;
+  sources: RAGSource[];
+  confidence: number;
+  tokensUsed: number;
+}
+
+export interface RAGRetrievedChunk {
+  chunkId: string;
+  documentId: string;
+  documentName: string;
+  content: string;
+  score: number;
+  metadata: Record<string, unknown>;
+}
+
+export interface RAGSource {
+  documentId: string;
+  documentName: string;
+  chunkIds: string[];
+  relevanceScore: number;
+}
+
+export interface KnowledgeBaseStats {
+  id: string;
+  name: string;
+  documentCount: number;
+  chunkCount: number;
+  totalTokens: number;
+  lastUpdated: string;
+}
+
+// ============================================================
+// Phase 3: CRM Integration
+// ============================================================
+
+export enum CrmProvider {
+  SALESFORCE = 'SALESFORCE',
+  HUBSPOT = 'HUBSPOT',
+}
+
+export enum SyncDirection {
+  INBOUND = 'INBOUND',
+  OUTBOUND = 'OUTBOUND',
+  BIDIRECTIONAL = 'BIDIRECTIONAL',
+}
+
+export interface CrmFieldMapping {
+  sourceField: string;
+  targetField: string;
+  direction: SyncDirection;
+  transform?: string;
+  isRequired: boolean;
+  defaultValue?: string;
+}
+
+export interface CrmSyncStatus {
+  integrationId: string;
+  provider: CrmProvider;
+  status: 'idle' | 'syncing' | 'success' | 'failed';
+  lastSyncAt?: string;
+  syncedRecords: number;
+  failedRecords: number;
+  errors: string[];
+}
+
+export interface CrmContact {
+  externalId: string;
+  firstName: string;
+  lastName: string;
+  email?: string;
+  phone?: string;
+  company?: string;
+  title?: string;
+  customFields: Record<string, unknown>;
+}
+
+// ============================================================
+// Phase 3: Billing
+// ============================================================
+
+export enum BillingPlan {
+  FREE = 'FREE',
+  STARTER = 'STARTER',
+  PROFESSIONAL = 'PROFESSIONAL',
+  ENTERPRISE = 'ENTERPRISE',
+}
+
+export enum UsageDimension {
+  CALL_MINUTES = 'CALL_MINUTES',
+  API_CALLS = 'API_CALLS',
+  TRANSCRIPTION_MINUTES = 'TRANSCRIPTION_MINUTES',
+  TTS_CHARACTERS = 'TTS_CHARACTERS',
+  LLM_TOKENS = 'LLM_TOKENS',
+  STORAGE_GB = 'STORAGE_GB',
+}
+
+export interface PlanDetails {
+  id: string;
+  name: BillingPlan;
+  displayName: string;
+  monthlyPrice: number;
+  annualPrice: number;
+  features: PlanFeatures;
+  limits: PlanLimits;
+}
+
+export interface PlanFeatures {
+  maxAgents: number;
+  maxCallsPerMonth: number;
+  maxConcurrentCalls: number;
+  maxContacts: number;
+  maxUsers: number;
+  maxKnowledgeBases: number;
+  maxStorageGb: number;
+  includesCallMinutes: number;
+  includesTranscription: boolean;
+  includesCrmIntegration: boolean;
+  includesAbTesting: boolean;
+  includesAdvancedAnalytics: boolean;
+  includesCustomWorkflows: boolean;
+}
+
+export interface PlanLimits {
+  callMinutes: number;
+  apiCalls: number;
+  transcriptionMinutes: number;
+  ttsCharacters: number;
+  llmTokens: number;
+  storageGb: number;
+}
+
+export interface UsageSummary {
+  dimension: UsageDimension;
+  used: number;
+  limit: number;
+  percentage: number;
+  unit: string;
+  cost: number;
+}
+
+export interface BillingOverview {
+  plan: PlanDetails;
+  subscription: {
+    status: string;
+    currentPeriodStart: string;
+    currentPeriodEnd: string;
+    cancelAtPeriodEnd: boolean;
+  };
+  usage: UsageSummary[];
+  estimatedCost: number;
+}
+
+// ============================================================
+// Phase 4: A/B Testing
+// ============================================================
+
+export enum ExperimentStatus {
+  DRAFT = 'DRAFT',
+  RUNNING = 'RUNNING',
+  PAUSED = 'PAUSED',
+  COMPLETED = 'COMPLETED',
+  CANCELLED = 'CANCELLED',
+}
+
+export interface ABExperiment {
+  id: string;
+  tenantId: string;
+  name: string;
+  description?: string;
+  agentId: string;
+  status: ExperimentStatus;
+  trafficSplit: 'equal' | 'percentage' | 'stratified';
+  minSampleSize: number;
+  confidenceLevel: number;
+  primaryMetric: 'success_rate' | 'avg_duration' | 'sentiment' | 'conversion';
+  variants: ABVariant[];
+  startedAt?: string;
+  completedAt?: string;
+  winnerId?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ABVariant {
+  id: string;
+  experimentId: string;
+  name: string;
+  description?: string;
+  systemPrompt: string;
+  trafficPercent: number;
+  isControl: boolean;
+  metrics: ABVariantMetrics;
+}
+
+export interface ABVariantMetrics {
+  totalCalls: number;
+  successfulCalls: number;
+  failedCalls: number;
+  totalDuration: number;
+  avgDuration: number;
+  avgSentiment: number;
+  conversions: number;
+  successRate: number;
+  conversionRate: number;
+}
+
+export interface ABTestResults {
+  experimentId: string;
+  status: ExperimentStatus;
+  totalSamples: number;
+  isStatisticallySignificant: boolean;
+  pValue: number;
+  confidenceLevel: number;
+  variants: ABVariantResults[];
+  recommendation: string;
+  winnerId?: string;
+}
+
+export interface ABVariantResults {
+  variantId: string;
+  name: string;
+  isControl: boolean;
+  metrics: ABVariantMetrics;
+  confidenceInterval: { lower: number; upper: number };
+  relativeImprovement?: number;
+}
+
+// ============================================================
+// Phase 4: Advanced Analytics
+// ============================================================
+
+export interface AnalyticsOverview {
+  kpis: {
+    totalCalls: number;
+    activeCalls: number;
+    successRate: number;
+    avgDuration: number;
+    avgSentiment: number;
+    totalCost: number;
+    callsToday: number;
+    callsTrend: number;
+  };
+  callVolumeTrend: TimeSeriesData[];
+  outcomeDistribution: { name: string; value: number }[];
+  topPerformingAgents: AgentPerformance[];
+}
+
+export interface TimeSeriesData {
+  timestamp: string;
+  value: number;
+  label?: string;
+}
+
+export interface AgentPerformance {
+  agentId: string;
+  agentName: string;
+  totalCalls: number;
+  successRate: number;
+  avgDuration: number;
+  avgSentiment: number;
+  score: number;
+}
+
+export interface CampaignFunnel {
+  campaignId: string;
+  campaignName: string;
+  stages: FunnelStage[];
+}
+
+export interface FunnelStage {
+  name: string;
+  count: number;
+  percentage: number;
+  conversionFromPrevious: number;
+}
+
+export interface SentimentHeatmapData {
+  dayOfWeek: number;
+  hour: number;
+  avgSentiment: number;
+  callCount: number;
+}
+
+export interface CostBreakdown {
+  period: string;
+  telephony: number;
+  stt: number;
+  tts: number;
+  llm: number;
+  storage: number;
+  total: number;
+}
+
+export interface ReportConfig {
+  type: 'CALL_SUMMARY' | 'CAMPAIGN_PERFORMANCE' | 'AGENT_SCORECARD' | 'COMPLIANCE_AUDIT' | 'USAGE_REPORT' | 'COST_ANALYSIS';
+  dateRange: { start: string; end: string };
+  format: 'pdf' | 'csv' | 'xlsx';
+  filters?: Record<string, unknown>;
+}
+
+// ============================================================
+// Phase 4: Workflow Builder
+// ============================================================
+
+export enum ExtendedWorkflowNodeType {
+  GREETING = 'GREETING',
+  CONSENT_CAPTURE = 'CONSENT_CAPTURE',
+  VERIFICATION = 'VERIFICATION',
+  QUALIFICATION = 'QUALIFICATION',
+  INFO_CAPTURE = 'INFO_CAPTURE',
+  LOOKUP = 'LOOKUP',
+  SUMMARIZE = 'SUMMARIZE',
+  OFFER_OPTIONS = 'OFFER_OPTIONS',
+  BOOK_APPOINTMENT = 'BOOK_APPOINTMENT',
+  COLLECT_PAYMENT = 'COLLECT_PAYMENT',
+  ESCALATE_HUMAN = 'ESCALATE_HUMAN',
+  SEND_MESSAGE = 'SEND_MESSAGE',
+  END_CALL = 'END_CALL',
+  RETRY_LATER = 'RETRY_LATER',
+  MARK_UNREACHABLE = 'MARK_UNREACHABLE',
+  DNC_OPTOUT = 'DNC_OPTOUT',
+  DISPUTE = 'DISPUTE',
+  COMPLAINT = 'COMPLAINT',
+  CONDITIONAL = 'CONDITIONAL',
+  WAIT = 'WAIT',
+  API_CALL = 'API_CALL',
+  SET_VARIABLE = 'SET_VARIABLE',
+  KNOWLEDGE_QUERY = 'KNOWLEDGE_QUERY',
+  SENTIMENT_CHECK = 'SENTIMENT_CHECK',
+  LOOP = 'LOOP',
+  DELAY = 'DELAY',
+}
+
+export interface WorkflowNodeConfig {
+  nodeType: string;
+  prompt?: string;
+  variables?: string[];
+  conditions?: WorkflowCondition[];
+  apiConfig?: {
+    url: string;
+    method: string;
+    headers: Record<string, string>;
+    body?: string;
+    responseMapping?: Record<string, string>;
+  };
+  messageConfig?: {
+    channel: 'sms' | 'email';
+    template: string;
+  };
+  transferConfig?: {
+    targetNumber?: string;
+    targetQueue?: string;
+    warmTransfer: boolean;
+  };
+  knowledgeBaseId?: string;
+  maxWaitSeconds?: number;
+  retryDelayMinutes?: number;
+}
+
+export interface WorkflowCondition {
+  id: string;
+  variable: string;
+  operator: 'equals' | 'not_equals' | 'contains' | 'greater_than' | 'less_than' | 'is_empty' | 'is_not_empty' | 'matches_regex';
+  value: string;
+  targetNodeId: string;
+}
+
+export interface WorkflowSimulationStep {
+  nodeId: string;
+  nodeType: string;
+  input: string;
+  output: string;
+  variables: Record<string, unknown>;
+  duration: number;
+  nextNodeId?: string;
+}
+
+export interface WorkflowSimulationResult {
+  workflowId: string;
+  steps: WorkflowSimulationStep[];
+  totalDuration: number;
+  outcome: string;
+  variables: Record<string, unknown>;
+}

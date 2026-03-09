@@ -18,6 +18,7 @@ import { BillingModule } from './modules/billing/billing.module';
 import { NotificationsModule } from './modules/notifications/notifications.module';
 import { AdminModule } from './modules/admin/admin.module';
 import { AuditModule } from './modules/audit/audit.module';
+import { ABTestingModule } from './modules/ab-testing/ab-testing.module';
 import { PrismaService } from './common/services/prisma.service';
 import { RedisService } from './common/services/redis.service';
 
@@ -56,6 +57,7 @@ import { RedisService } from './common/services/redis.service';
     NotificationsModule,
     AdminModule,
     AuditModule,
+    ABTestingModule,
   ],
   providers: [PrismaService, RedisService],
   exports: [PrismaService, RedisService],

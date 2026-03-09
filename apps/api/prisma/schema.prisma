@@ -11,7 +11,7 @@ generator client {
 datasource db {
   provider   = "postgresql"
   url        = env("DATABASE_URL")
-  extensions = [pgcrypto]
+  extensions = [pgcrypto, pgvector(map: "vector")]
 }
 
 // ============================================================================
@@ -157,6 +157,51 @@ enum NotificationStatus {
   DELIVERED
   FAILED
   READ
+}
+
+enum ExperimentStatus {
+  DRAFT
+  RUNNING
+  PAUSED
+  COMPLETED
+  CANCELLED
+}
+
+enum SyncDirection {
+  INBOUND
+  OUTBOUND
+  BIDIRECTIONAL
+}
+
+enum SyncStatus {
+  IDLE
+  SYNCING
+  SUCCESS
+  FAILED
+}
+
+enum ReportStatus {
+  PENDING
+  GENERATING
+  READY
+  FAILED
+  EXPIRED
+}
+
+enum ReportType {
+  CALL_SUMMARY
+  CAMPAIGN_PERFORMANCE
+  AGENT_SCORECARD
+  COMPLIANCE_AUDIT
+  USAGE_REPORT
+  COST_ANALYSIS
+}
+
+enum ChunkStrategy {
+  FIXED_SIZE
+  SENTENCE
+  SEMANTIC
+  PARAGRAPH
 }
 
 // ============================================================================
@@ -600,13 +645,18 @@ model KnowledgeDocument {
   sourceUrl       String?
   storageKey      String?
   chunkCount      Int            @default(0)
+  chunkStrategy   ChunkStrategy  @default(SENTENCE)
+  chunkSize       Int            @default(512)
+  chunkOverlap    Int            @default(50)
   status          DocumentStatus @default(PENDING)
+  processingError String?        @db.Text
   metadata        Json           @default("{}")
   createdAt       DateTime       @default(now())
   updatedAt       DateTime       @updatedAt
 
   // Relations
-  knowledgeBase KnowledgeBase @relation(fields: [knowledgeBaseId], references: [id], onDelete: Cascade)
+  knowledgeBase KnowledgeBase   @relation(fields: [knowledgeBaseId], references: [id], onDelete: Cascade)
+  chunks        DocumentChunk[]
 
   @@index([knowledgeBaseId])
   @@index([knowledgeBaseId, status])
@@ -799,4 +849,323 @@ model PhoneNumber {
   @@index([number])
   @@index([assignedAgentId])
   @@map("phone_numbers")
+}
+
+// ============================================================================
+// PHASE 2: CAMPAIGN EXECUTION & CALL ORCHESTRATION
+// ============================================================================
+
+model CampaignContact {
+  id           String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  campaignId   String    @db.Uuid
+  contactId    String    @db.Uuid
+  tenantId     String    @db.Uuid
+  status       String    @default("pending") // pending, queued, calling, completed, failed, skipped, retry
+  attempts     Int       @default(0)
+  maxAttempts  Int       @default(3)
+  lastCallId   String?   @db.Uuid
+  lastCalledAt DateTime?
+  nextRetryAt  DateTime?
+  outcome      String?
+  error        String?
+  metadata     Json      @default("{}")
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  @@unique([campaignId, contactId])
+  @@index([campaignId, status])
+  @@index([campaignId, nextRetryAt])
+  @@index([tenantId])
+  @@map("campaign_contacts")
+}
+
+model CallSession {
+  id                String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  callId            String   @unique @db.Uuid
+  tenantId          String   @db.Uuid
+  agentId           String   @db.Uuid
+  workflowId        String?  @db.Uuid
+  currentNodeId     String?
+  workflowState     Json     @default("{}")
+  conversationState Json     @default("[]")
+  variables         Json     @default("{}")
+  sttProvider       String?
+  ttsProvider       String?
+  llmProvider       String?
+  isActive          Boolean  @default(true)
+  startedAt         DateTime @default(now())
+  endedAt           DateTime?
+
+  @@index([callId])
+  @@index([tenantId, isActive])
+  @@map("call_sessions")
+}
+
+// ============================================================================
+// PHASE 3: KNOWLEDGE BASE RAG (Vector Embeddings)
+// ============================================================================
+
+model DocumentChunk {
+  id              String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  documentId      String   @db.Uuid
+  knowledgeBaseId String   @db.Uuid
+  tenantId        String   @db.Uuid
+  content         String   @db.Text
+  chunkIndex      Int
+  tokenCount      Int      @default(0)
+  embedding       Unsupported("vector(1536)")?
+  metadata        Json     @default("{}")
+  createdAt       DateTime @default(now())
+
+  // Relations
+  document KnowledgeDocument @relation(fields: [documentId], references: [id], onDelete: Cascade)
+
+  @@index([documentId])
+  @@index([knowledgeBaseId])
+  @@index([tenantId, knowledgeBaseId])
+  @@map("document_chunks")
+}
+
+// ============================================================================
+// PHASE 3: CRM SYNC
+// ============================================================================
+
+model CrmSync {
+  id             String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  integrationId  String        @db.Uuid
+  tenantId       String        @db.Uuid
+  direction      SyncDirection @default(BIDIRECTIONAL)
+  status         SyncStatus    @default(IDLE)
+  fieldMappings  Json          @default("[]")
+  lastSyncAt     DateTime?
+  lastSyncCursor String?
+  syncedRecords  Int           @default(0)
+  failedRecords  Int           @default(0)
+  errorLog       Json          @default("[]")
+  config         Json          @default("{}")
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  @@index([integrationId])
+  @@index([tenantId])
+  @@index([tenantId, status])
+  @@map("crm_syncs")
+}
+
+model CrmFieldMapping {
+  id            String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  integrationId String @db.Uuid
+  tenantId      String @db.Uuid
+  sourceField   String
+  targetField   String
+  direction     SyncDirection @default(BIDIRECTIONAL)
+  transform     String?       // e.g., "uppercase", "phone_e164", "date_iso"
+  isRequired    Boolean       @default(false)
+  defaultValue  String?
+
+  @@unique([integrationId, sourceField, targetField])
+  @@index([integrationId])
+  @@index([tenantId])
+  @@map("crm_field_mappings")
+}
+
+// ============================================================================
+// PHASE 3: STRIPE BILLING (Enhanced)
+// ============================================================================
+
+model Invoice {
+  id               String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId         String    @db.Uuid
+  stripeInvoiceId  String?   @unique
+  amount           Float
+  currency         String    @default("usd")
+  status           String    @default("draft") // draft, open, paid, void, uncollectible
+  pdfUrl           String?
+  hostedUrl        String?
+  periodStart      DateTime?
+  periodEnd        DateTime?
+  dueDate          DateTime?
+  paidAt           DateTime?
+  metadata         Json      @default("{}")
+  createdAt        DateTime  @default(now())
+
+  // Relations
+  lineItems InvoiceLineItem[]
+
+  @@index([tenantId])
+  @@index([tenantId, status])
+  @@index([stripeInvoiceId])
+  @@map("invoices")
+}
+
+model InvoiceLineItem {
+  id          String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  invoiceId   String @db.Uuid
+  description String
+  quantity    Float
+  unitAmount  Float
+  amount      Float
+  usageType   String?
+  metadata    Json   @default("{}")
+
+  // Relations
+  invoice Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+
+  @@index([invoiceId])
+  @@map("invoice_line_items")
+}
+
+model Plan {
+  id                    String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name                  String  @unique
+  displayName           String
+  description           String?
+  stripePriceId         String? @unique
+  monthlyPrice          Float   @default(0)
+  annualPrice           Float   @default(0)
+  maxAgents             Int     @default(1)
+  maxCallsPerMonth      Int     @default(100)
+  maxConcurrentCalls    Int     @default(1)
+  maxContacts           Int     @default(500)
+  maxUsers              Int     @default(2)
+  maxKnowledgeBases     Int     @default(1)
+  maxStorageGb          Float   @default(1)
+  includesCallMinutes   Int     @default(60)
+  includesTranscription Boolean @default(false)
+  includesCrmIntegration Boolean @default(false)
+  includesAbTesting     Boolean @default(false)
+  includesAdvancedAnalytics Boolean @default(false)
+  includesCustomWorkflows Boolean @default(false)
+  features              Json    @default("{}")
+  isActive              Boolean @default(true)
+  sortOrder             Int     @default(0)
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+
+  @@index([isActive])
+  @@index([name])
+  @@map("plans")
+}
+
+// ============================================================================
+// PHASE 4: A/B TESTING
+// ============================================================================
+
+model ABExperiment {
+  id              String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId        String           @db.Uuid
+  name            String
+  description     String?
+  agentId         String           @db.Uuid
+  status          ExperimentStatus @default(DRAFT)
+  trafficSplit    String           @default("equal") // equal, percentage, stratified
+  minSampleSize   Int              @default(100)
+  confidenceLevel Float            @default(0.95)
+  primaryMetric   String           @default("success_rate") // success_rate, avg_duration, sentiment, conversion
+  startedAt       DateTime?
+  completedAt     DateTime?
+  winnerId        String?          @db.Uuid
+  createdBy       String?          @db.Uuid
+  metadata        Json             @default("{}")
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+
+  // Relations
+  variants ABVariant[]
+
+  @@index([tenantId])
+  @@index([tenantId, status])
+  @@index([tenantId, agentId])
+  @@map("ab_experiments")
+}
+
+model ABVariant {
+  id              String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  experimentId    String  @db.Uuid
+  name            String
+  description     String?
+  systemPrompt    String  @db.Text
+  trafficPercent  Float   @default(50)
+  isControl       Boolean @default(false)
+  metadata        Json    @default("{}")
+
+  // Aggregated metrics
+  totalCalls      Int     @default(0)
+  successfulCalls Int     @default(0)
+  failedCalls     Int     @default(0)
+  totalDuration   Int     @default(0)
+  avgSentiment    Float   @default(0)
+  conversions     Int     @default(0)
+
+  // Relations
+  experiment ABExperiment @relation(fields: [experimentId], references: [id], onDelete: Cascade)
+
+  @@index([experimentId])
+  @@map("ab_variants")
+}
+
+// ============================================================================
+// PHASE 4: ANALYTICS REPORTS
+// ============================================================================
+
+model AnalyticsReport {
+  id         String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId   String       @db.Uuid
+  type       ReportType
+  name       String
+  status     ReportStatus @default(PENDING)
+  parameters Json         @default("{}")
+  storageKey String?
+  fileUrl    String?
+  fileSize   Int?
+  format     String       @default("pdf") // pdf, csv, xlsx
+  createdBy  String?      @db.Uuid
+  startedAt  DateTime?
+  completedAt DateTime?
+  expiresAt  DateTime?
+  createdAt  DateTime     @default(now())
+
+  @@index([tenantId])
+  @@index([tenantId, type])
+  @@index([tenantId, status])
+  @@index([createdAt])
+  @@map("analytics_reports")
+}
+
+model AnalyticsSnapshot {
+  id         String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId   String   @db.Uuid
+  period     String   // hourly, daily, weekly, monthly
+  periodKey  String   // e.g., "2026-03-09", "2026-03-09T14"
+  metrics    Json     @default("{}")
+  createdAt  DateTime @default(now())
+
+  @@unique([tenantId, period, periodKey])
+  @@index([tenantId, period])
+  @@index([tenantId, periodKey])
+  @@map("analytics_snapshots")
+}
+
+// ============================================================================
+// PHASE 4: WORKFLOW EXECUTION STATE
+// ============================================================================
+
+model WorkflowExecution {
+  id            String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  workflowId    String    @db.Uuid
+  callId        String?   @db.Uuid
+  tenantId      String    @db.Uuid
+  status        String    @default("running") // running, completed, failed, paused
+  currentNodeId String?
+  variables     Json      @default("{}")
+  executionLog  Json      @default("[]")
+  startedAt     DateTime  @default(now())
+  completedAt   DateTime?
+  error         String?   @db.Text
+
+  @@index([workflowId])
+  @@index([callId])
+  @@index([tenantId])
+  @@index([tenantId, status])
+  @@map("workflow_executions")
 }
