@@ -1,9 +1,9 @@
 [build]
-builder = "DOCKERFILE"
-dockerfilePath = "Dockerfile.api"
+builder = "NIXPACKS"
+buildCommand = "cd apps/api && npm install -g pnpm@9.15.4 && pnpm install --frozen-lockfile && npx prisma generate && pnpm run build"
 
 [deploy]
-startCommand = "node dist/main.js"
+startCommand = "cd apps/api && node dist/main.js"
 healthcheckPath = "/api/v1/health"
 healthcheckTimeout = 120
 numReplicas = 1
