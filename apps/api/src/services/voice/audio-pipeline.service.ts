@@ -81,7 +81,7 @@ export class AudioPipelineService extends EventEmitter {
     private readonly llmService: LLMService,
   ) {
     super();
-    this.defaultSilenceTimeoutMs = this.configService.get<number>('PIPELINE_SILENCE_TIMEOUT_MS', 2000);
+    this.defaultSilenceTimeoutMs = this.configService.get<number>('PIPELINE_SILENCE_TIMEOUT_MS', 800);
     this.defaultMaxCallDurationMs = this.configService.get<number>('PIPELINE_MAX_CALL_DURATION_MS', 1800000);
   }
 
@@ -130,7 +130,7 @@ export class AudioPipelineService extends EventEmitter {
 
     this.sessions.set(callId, session);
 
-    // Set up STT streaming session
+    // Set up STT streaming session (optimized for lowest latency)
     const sttSession = this.deepgramSTT.createStream(callId, {
       language: config.language || 'en',
       encoding: config.encoding || 'linear16',
@@ -138,9 +138,9 @@ export class AudioPipelineService extends EventEmitter {
       interimResults: true,
       punctuate: true,
       vadEvents: true,
-      endpointing: 300,
-      utteranceEndMs: 1000,
-      smartFormat: true,
+      endpointing: 150,
+      utteranceEndMs: 500,
+      smartFormat: false,
     });
 
     session.sttSession = sttSession;
@@ -381,11 +381,11 @@ export class AudioPipelineService extends EventEmitter {
     let fullResponse = '';
 
     try {
-      // Create TTS session for streaming response audio
+      // Create TTS session for streaming response audio (max latency optimization)
       const ttsSession = this.elevenLabsTTS.createStream(`tts-${callId}-${Date.now()}`, {
         voiceId: session.config.voice,
         outputFormat: 'pcm_16000',
-        optimizeStreamingLatency: 3,
+        optimizeStreamingLatency: 4,
       });
 
       session.ttsSession = ttsSession;
@@ -398,7 +398,7 @@ export class AudioPipelineService extends EventEmitter {
         }
       });
 
-      // Stream LLM response with sentence-level TTS
+      // Stream LLM response with clause-level TTS for lowest latency
       let sentenceBuffer = '';
       const ttsStartTime = Date.now();
 
@@ -406,9 +406,9 @@ export class AudioPipelineService extends EventEmitter {
         session.conversationHistory,
         {
           temperature: session.config.temperature || 0.7,
-          maxTokens: 512,
+          maxTokens: 150,
           provider: session.config.llmProvider as any,
-          model: session.config.llmModel,
+          model: session.config.llmModel || 'claude-haiku-4-5-20251001',
         },
         (chunk: string) => {
           if (!llmFirstChunkTime) {
@@ -420,14 +420,14 @@ export class AudioPipelineService extends EventEmitter {
           fullResponse += chunk;
           sentenceBuffer += chunk;
 
-          // Send complete sentences to TTS for streaming synthesis
-          const sentenceEnd = sentenceBuffer.search(/[.!?]\s/);
-          if (sentenceEnd !== -1) {
-            const sentence = sentenceBuffer.slice(0, sentenceEnd + 1).trim();
-            sentenceBuffer = sentenceBuffer.slice(sentenceEnd + 2);
+          // Send at clause boundaries (commas, semicolons, colons, dashes) for faster first audio
+          const clauseEnd = sentenceBuffer.search(/[.!?;:,\u2014]\s/);
+          if (clauseEnd !== -1) {
+            const clause = sentenceBuffer.slice(0, clauseEnd + 1).trim();
+            sentenceBuffer = sentenceBuffer.slice(clauseEnd + 2);
 
-            if (sentence && session.state === PipelineState.SPEAKING) {
-              ttsSession.sendText(sentence + ' ');
+            if (clause && session.state === PipelineState.SPEAKING) {
+              ttsSession.sendText(clause + ' ');
             }
           }
         },

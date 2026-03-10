@@ -23,7 +23,7 @@ export class AnthropicProvider implements ILLMProvider {
     });
     this.defaultModel = this.configService.get<string>(
       'ANTHROPIC_MODEL',
-      'claude-sonnet-4-20250514',
+      'claude-haiku-4-5-20251001',
     );
   }
 

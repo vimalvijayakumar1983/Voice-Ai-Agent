@@ -402,7 +402,7 @@ export class ElevenLabsTTSSession extends EventEmitter {
             use_speaker_boost: this.options.useSpeakerBoost ?? true,
           },
           generation_config: {
-            chunk_length_schedule: [120, 160, 250, 290],
+            chunk_length_schedule: [50, 90, 120, 150],
           },
         }));
       }
