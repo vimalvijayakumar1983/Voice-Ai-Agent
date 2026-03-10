@@ -117,4 +117,16 @@ export class AgentsController {
   ) {
     return this.agentsService.testAgent(tenantId, id, input);
   }
+
+  @Post(':id/demo-call')
+  @Roles(Role.TENANT_OWNER, Role.TENANT_ADMIN, Role.MANAGER)
+  @ApiOperation({ summary: 'Trigger a demo call to test agent voice and behavior' })
+  async demoCall(
+    @CurrentTenant() tenantId: string,
+    @CurrentUser() user: JwtPayload,
+    @Param('id') id: string,
+    @Body() body: { toNumber: string; fromNumber?: string },
+  ) {
+    return this.agentsService.initiateDemoCall(tenantId, user.sub, id, body.toNumber, body.fromNumber);
+  }
 }

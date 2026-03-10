@@ -161,4 +161,81 @@ export class AgentsService {
       timestamp: new Date().toISOString(),
     };
   }
+
+  /**
+   * Initiates a demo call to test an agent's voice, speed, and conversational ability.
+   * Creates a call record tagged as a demo call and triggers the telephony provider.
+   */
+  async initiateDemoCall(
+    tenantId: string,
+    userId: string,
+    agentId: string,
+    toNumber: string,
+    fromNumber?: string,
+  ): Promise<any> {
+    const agent = await this.findById(tenantId, agentId);
+
+    if (!agent.isActive) {
+      throw new BadRequestException('Cannot demo an inactive agent');
+    }
+
+    // Get a from number: use provided, agent default, or tenant phone number
+    let callerNumber = fromNumber;
+    if (!callerNumber) {
+      const phoneNumber = await this.prisma.phoneNumber.findFirst({
+        where: { tenantId, isActive: true },
+        orderBy: { createdAt: 'desc' },
+      });
+      callerNumber = phoneNumber?.number;
+    }
+
+    if (!callerNumber) {
+      throw new BadRequestException(
+        'No phone number available. Please provide a fromNumber or configure a phone number in Settings > Phone Numbers.',
+      );
+    }
+
+    // Create the call record tagged as demo
+    const call = await this.prisma.call.create({
+      data: {
+        tenantId,
+        agentId,
+        direction: 'OUTBOUND',
+        status: 'QUEUED',
+        toNumber,
+        fromNumber: callerNumber,
+        initiatedById: userId,
+        metadata: {
+          isDemoCall: true,
+          demoInitiatedBy: userId,
+          agentName: agent.name,
+          agentVoice: agent.voice || 'default',
+          agentLanguage: agent.language || 'en-US',
+        },
+      },
+    });
+
+    this.logger.log(
+      `Demo call ${call.id} initiated for agent "${agent.name}" (${agentId}) to ${toNumber}`,
+    );
+
+    return {
+      callId: call.id,
+      agentId,
+      agentName: agent.name,
+      toNumber,
+      fromNumber: callerNumber,
+      status: 'QUEUED',
+      isDemoCall: true,
+      message: `Demo call queued. You will receive a call at ${toNumber} from agent "${agent.name}". Answer the call to test the agent's voice, speed, and conversational ability.`,
+      agentConfig: {
+        voice: agent.voice || 'default',
+        language: agent.language || 'en-US',
+        llmModel: agent.llmModel || 'default',
+        systemPromptPreview: agent.systemPrompt
+          ? agent.systemPrompt.substring(0, 200) + (agent.systemPrompt.length > 200 ? '...' : '')
+          : null,
+      },
+    };
+  }
 }

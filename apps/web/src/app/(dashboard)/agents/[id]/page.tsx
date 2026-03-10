@@ -1,10 +1,12 @@
 'use client';
 
+import { useState } from 'react';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { KpiCard } from '@/components/dashboard/kpi-card';
+import { DemoCallDialog } from '@/components/agents/demo-call-dialog';
 import {
   Phone,
   PhoneCall,
@@ -18,6 +20,8 @@ import {
 } from 'lucide-react';
 
 export default function AgentDetailPage({ params }: { params: { id: string } }) {
+  const [demoCallOpen, setDemoCallOpen] = useState(false);
+
   return (
     <div className="space-y-6">
       {/* Agent header */}
@@ -37,6 +41,10 @@ export default function AgentDetailPage({ params }: { params: { id: string } }) 
           </div>
         </div>
         <div className="flex items-center gap-2">
+          <Button variant="default" size="sm" onClick={() => setDemoCallOpen(true)}>
+            <PhoneCall className="mr-2 h-4 w-4" />
+            Demo Call
+          </Button>
           <Button variant="outline" size="sm">
             <Pause className="mr-2 h-4 w-4" />
             Pause
@@ -45,12 +53,22 @@ export default function AgentDetailPage({ params }: { params: { id: string } }) 
             <Copy className="mr-2 h-4 w-4" />
             Duplicate
           </Button>
-          <Button size="sm">
+          <Button variant="outline" size="sm">
             <Settings className="mr-2 h-4 w-4" />
             Edit
           </Button>
         </div>
       </div>
+
+      {/* Demo Call Dialog */}
+      <DemoCallDialog
+        open={demoCallOpen}
+        onOpenChange={setDemoCallOpen}
+        agentId={params.id}
+        agentName="Sales Outreach Pro"
+        agentVoice="Nova (Female, American)"
+        agentLanguage="English (US)"
+      />
 
       {/* KPI row */}
       <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">

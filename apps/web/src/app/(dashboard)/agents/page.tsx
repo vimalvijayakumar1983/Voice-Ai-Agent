@@ -13,6 +13,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
+import { DemoCallDialog } from '@/components/agents/demo-call-dialog';
 
 const mockAgents = [
   { id: '1', name: 'Sales Outreach Pro', type: 'outbound-sales', industry: 'Technology', status: 'active' as const, callCount: 12450, successRate: 68, language: 'English (US)' },
@@ -26,6 +27,7 @@ const mockAgents = [
 export default function AgentsPage() {
   const [search, setSearch] = useState('');
   const [typeFilter, setTypeFilter] = useState('all');
+  const [demoCallAgent, setDemoCallAgent] = useState<{ id: string; name: string } | null>(null);
 
   const filtered = mockAgents.filter((agent) => {
     const matchesSearch = agent.name.toLowerCase().includes(search.toLowerCase());
@@ -79,7 +81,11 @@ export default function AgentsPage() {
 
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
         {filtered.map((agent) => (
-          <AgentCard key={agent.id} {...agent} />
+          <AgentCard
+            key={agent.id}
+            {...agent}
+            onDemoCall={(agentId, agentName) => setDemoCallAgent({ id: agentId, name: agentName })}
+          />
         ))}
       </div>
 
@@ -90,6 +96,16 @@ export default function AgentsPage() {
             Try adjusting your search or filters
           </p>
         </div>
+      )}
+
+      {/* Demo Call Dialog */}
+      {demoCallAgent && (
+        <DemoCallDialog
+          open={!!demoCallAgent}
+          onOpenChange={(open) => !open && setDemoCallAgent(null)}
+          agentId={demoCallAgent.id}
+          agentName={demoCallAgent.name}
+        />
       )}
     </div>
   );

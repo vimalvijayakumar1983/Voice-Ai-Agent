@@ -3,7 +3,7 @@
 import { Card, CardContent } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Avatar, AvatarFallback } from '@/components/ui/avatar';
-import { Bot, Phone, BarChart3, MoreVertical } from 'lucide-react';
+import { Bot, Phone, PhoneCall, BarChart3, MoreVertical } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import {
   DropdownMenu,
@@ -22,6 +22,7 @@ interface AgentCardProps {
   callCount: number;
   successRate: number;
   language: string;
+  onDemoCall?: (agentId: string, agentName: string) => void;
 }
 
 const statusVariant: Record<string, 'success' | 'secondary' | 'warning'> = {
@@ -49,6 +50,7 @@ export function AgentCard({
   callCount,
   successRate,
   language,
+  onDemoCall,
 }: AgentCardProps) {
   return (
     <Link href={`/agents/${id}`}>
@@ -75,6 +77,12 @@ export function AgentCard({
                   </Button>
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="end">
+                  {status === 'active' && (
+                    <DropdownMenuItem onClick={(e) => { e.preventDefault(); onDemoCall?.(id, name); }}>
+                      <PhoneCall className="mr-2 h-4 w-4" />
+                      Demo Call
+                    </DropdownMenuItem>
+                  )}
                   <DropdownMenuItem>Edit</DropdownMenuItem>
                   <DropdownMenuItem>Duplicate</DropdownMenuItem>
                   <DropdownMenuItem>View Calls</DropdownMenuItem>
