@@ -1,6 +1,6 @@
 {
-  "buildCommand": "cd ../.. && npx turbo run build --filter=@voice-ai/web",
-  "outputDirectory": "apps/web/.next",
+  "buildCommand": "next build",
+  "outputDirectory": ".next",
   "framework": "nextjs",
   "installCommand": "pnpm install"
 }
