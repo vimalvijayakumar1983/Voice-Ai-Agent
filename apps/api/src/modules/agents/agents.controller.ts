@@ -125,8 +125,10 @@ export class AgentsController {
     @CurrentTenant() tenantId: string,
     @CurrentUser() user: JwtPayload,
     @Param('id') id: string,
-    @Body() body: { toNumber: string; fromNumber?: string },
+    @Body() body: { toNumber: string; fromNumber?: string; voice?: string; language?: string },
   ) {
-    return this.agentsService.initiateDemoCall(tenantId, user.sub, id, body.toNumber, body.fromNumber);
+    return this.agentsService.initiateDemoCall(
+      tenantId, user.sub, id, body.toNumber, body.fromNumber, body.voice, body.language,
+    );
   }
 }

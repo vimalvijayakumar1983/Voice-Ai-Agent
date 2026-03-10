@@ -172,12 +172,18 @@ export class AgentsService {
     agentId: string,
     toNumber: string,
     fromNumber?: string,
+    voice?: string,
+    language?: string,
   ): Promise<any> {
     const agent = await this.findById(tenantId, agentId);
 
     if (!agent.isActive) {
       throw new BadRequestException('Cannot demo an inactive agent');
     }
+
+    // Use overrides from the demo call dialog, or fall back to agent defaults
+    const callVoice = voice || agent.voice || 'nova';
+    const callLanguage = language || agent.language || 'en-US';
 
     // Get a from number: use provided, agent default, or tenant phone number
     let callerNumber = fromNumber;
@@ -195,7 +201,7 @@ export class AgentsService {
       );
     }
 
-    // Create the call record tagged as demo
+    // Create the call record tagged as demo with voice/language overrides
     const call = await this.prisma.call.create({
       data: {
         tenantId,
@@ -209,14 +215,14 @@ export class AgentsService {
           isDemoCall: true,
           demoInitiatedBy: userId,
           agentName: agent.name,
-          agentVoice: agent.voice || 'default',
-          agentLanguage: agent.language || 'en-US',
+          voice: callVoice,
+          language: callLanguage,
         },
       },
     });
 
     this.logger.log(
-      `Demo call ${call.id} initiated for agent "${agent.name}" (${agentId}) to ${toNumber}`,
+      `Demo call ${call.id} initiated for agent "${agent.name}" (${agentId}) to ${toNumber} [voice=${callVoice}, lang=${callLanguage}]`,
     );
 
     return {
@@ -229,8 +235,8 @@ export class AgentsService {
       isDemoCall: true,
       message: `Demo call queued. You will receive a call at ${toNumber} from agent "${agent.name}". Answer the call to test the agent's voice, speed, and conversational ability.`,
       agentConfig: {
-        voice: agent.voice || 'default',
-        language: agent.language || 'en-US',
+        voice: callVoice,
+        language: callLanguage,
         llmModel: agent.llmModel || 'default',
         systemPromptPreview: agent.systemPrompt
           ? agent.systemPrompt.substring(0, 200) + (agent.systemPrompt.length > 200 ? '...' : '')

@@ -12,9 +12,53 @@ import {
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
-import { Badge } from '@/components/ui/badge';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
 import { Phone, PhoneCall, Loader2, CheckCircle2, AlertCircle } from 'lucide-react';
 import api from '@/lib/api';
+
+const VOICE_OPTIONS = [
+  { value: 'nova', label: 'Nova (Female, American)' },
+  { value: 'alloy', label: 'Alloy (Female, Neutral)' },
+  { value: 'echo', label: 'Echo (Male, American)' },
+  { value: 'fable', label: 'Fable (Male, British)' },
+  { value: 'onyx', label: 'Onyx (Male, Deep)' },
+  { value: 'shimmer', label: 'Shimmer (Female, Warm)' },
+  { value: 'rachel', label: 'Rachel (Female, Calm)' },
+  { value: 'adam', label: 'Adam (Male, Deep)' },
+  { value: 'antoni', label: 'Antoni (Male, Warm)' },
+  { value: 'bella', label: 'Bella (Female, Soft)' },
+  { value: 'domi', label: 'Domi (Female, Assertive)' },
+  { value: 'elli', label: 'Elli (Female, Young)' },
+  { value: 'josh', label: 'Josh (Male, Mature)' },
+  { value: 'sam', label: 'Sam (Male, Energetic)' },
+] as const;
+
+const LANGUAGE_OPTIONS = [
+  { value: 'en-US', label: 'English (US)' },
+  { value: 'en-GB', label: 'English (UK)' },
+  { value: 'ar', label: 'Arabic (عربي)' },
+  { value: 'ar-AE', label: 'Arabic - UAE (عربي إماراتي)' },
+  { value: 'ar-SA', label: 'Arabic - Saudi (عربي سعودي)' },
+  { value: 'hi', label: 'Hindi (हिन्दी)' },
+  { value: 'ur', label: 'Urdu (اردو)' },
+  { value: 'ml', label: 'Malayalam (മലയാളം)' },
+  { value: 'ta', label: 'Tamil (தமிழ்)' },
+  { value: 'tl', label: 'Tagalog (Filipino)' },
+  { value: 'fr', label: 'French (Français)' },
+  { value: 'es', label: 'Spanish (Español)' },
+  { value: 'de', label: 'German (Deutsch)' },
+  { value: 'pt', label: 'Portuguese (Português)' },
+  { value: 'zh', label: 'Chinese (中文)' },
+  { value: 'ja', label: 'Japanese (日本語)' },
+  { value: 'ko', label: 'Korean (한국어)' },
+  { value: 'ru', label: 'Russian (Русский)' },
+] as const;
 
 interface DemoCallDialogProps {
   open: boolean;
@@ -37,6 +81,8 @@ export function DemoCallDialog({
 }: DemoCallDialogProps) {
   const [phoneNumber, setPhoneNumber] = useState('');
   const [fromNumber, setFromNumber] = useState('');
+  const [selectedVoice, setSelectedVoice] = useState(agentVoice || 'nova');
+  const [selectedLanguage, setSelectedLanguage] = useState(agentLanguage || 'en-US');
   const [callState, setCallState] = useState<CallState>('idle');
   const [result, setResult] = useState<any>(null);
   const [error, setError] = useState('');
@@ -52,6 +98,8 @@ export function DemoCallDialog({
       const response = await api.post(`/api/v1/agents/${agentId}/demo-call`, {
         toNumber: phoneNumber.trim(),
         fromNumber: fromNumber.trim() || undefined,
+        voice: selectedVoice,
+        language: selectedLanguage,
       });
       setResult(response.data);
       setCallState('success');
@@ -86,17 +134,37 @@ export function DemoCallDialog({
 
         {callState === 'idle' && (
           <div className="space-y-4">
-            {/* Agent info */}
-            <div className="flex items-center gap-2 rounded-md bg-muted/50 p-3 text-sm">
-              <div className="flex-1 space-y-1">
-                <div className="flex items-center gap-2">
-                  <span className="text-muted-foreground">Voice:</span>
-                  <Badge variant="outline">{agentVoice || 'Default'}</Badge>
-                </div>
-                <div className="flex items-center gap-2">
-                  <span className="text-muted-foreground">Language:</span>
-                  <Badge variant="outline">{agentLanguage || 'en-US'}</Badge>
-                </div>
+            {/* Voice & Language selectors */}
+            <div className="grid grid-cols-2 gap-3">
+              <div className="space-y-2">
+                <Label htmlFor="voice">Voice</Label>
+                <Select value={selectedVoice} onValueChange={setSelectedVoice}>
+                  <SelectTrigger id="voice">
+                    <SelectValue placeholder="Select voice" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {VOICE_OPTIONS.map((voice) => (
+                      <SelectItem key={voice.value} value={voice.value}>
+                        {voice.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="language">Language</Label>
+                <Select value={selectedLanguage} onValueChange={setSelectedLanguage}>
+                  <SelectTrigger id="language">
+                    <SelectValue placeholder="Select language" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {LANGUAGE_OPTIONS.map((lang) => (
+                      <SelectItem key={lang.value} value={lang.value}>
+                        {lang.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
               </div>
             </div>
 
@@ -106,12 +174,12 @@ export function DemoCallDialog({
               <Input
                 id="phone"
                 type="tel"
-                placeholder="+1 (555) 123-4567"
+                placeholder="+971 50 123 4567"
                 value={phoneNumber}
                 onChange={(e) => setPhoneNumber(e.target.value)}
               />
               <p className="text-xs text-muted-foreground">
-                Include country code (e.g. +1 for US, +91 for India)
+                Include country code (e.g. +971 for UAE, +1 for US, +91 for India)
               </p>
             </div>
 
@@ -151,6 +219,8 @@ export function DemoCallDialog({
               <p>Call ID: <code className="text-xs">{result.callId}</code></p>
               <p>To: {result.toNumber}</p>
               <p>From: {result.fromNumber}</p>
+              <p>Voice: {VOICE_OPTIONS.find((v) => v.value === selectedVoice)?.label || selectedVoice}</p>
+              <p>Language: {LANGUAGE_OPTIONS.find((l) => l.value === selectedLanguage)?.label || selectedLanguage}</p>
             </div>
           </div>
         )}
