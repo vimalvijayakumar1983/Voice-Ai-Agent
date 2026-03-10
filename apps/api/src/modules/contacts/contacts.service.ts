@@ -84,12 +84,18 @@ export class ContactsService {
       return existing;
     }
 
+    const { jobTitle, notes, preferredLanguage, ...contactData } = dto as any;
     return this.prisma.contact.create({
       data: {
-        ...dto,
+        ...contactData,
         tenantId,
         tags: dto.tags || [],
-        customFields: dto.customFields || {},
+        customFields: (dto.customFields || {}) as any,
+        metadata: {
+          ...(jobTitle ? { jobTitle } : {}),
+          ...(notes ? { notes } : {}),
+          ...(preferredLanguage ? { preferredLanguage } : {}),
+        },
       },
     });
   }

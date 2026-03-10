@@ -188,16 +188,16 @@ export class CallProcessor {
         data: {
           outcome: outcome.disposition,
           sentiment: analysis.sentiment,
-          recordingKey,
+          recordingStorageKey: recordingKey,
           metadata: {
             summary: analysis.summary,
             sentimentScore: analysis.sentimentScore,
             keyTopics: analysis.keyTopics,
             outcome: outcome.disposition,
             outcomeDetails: outcome.details,
-            pipelineMetrics: data.metrics,
+            pipelineMetrics: data.metrics || {},
             recordingKey,
-          },
+          } as any,
         },
       });
 

@@ -4,8 +4,8 @@ import { SwaggerModule, DocumentBuilder } from '@nestjs/swagger';
 import { AppModule } from './app.module';
 import { HttpExceptionFilter } from './common/filters/http-exception.filter';
 import { TransformInterceptor } from './common/interceptors/transform.interceptor';
-import * as helmet from 'helmet';
-import * as compression from 'compression';
+import helmet from 'helmet';
+import compression from 'compression';
 import { WinstonModule } from 'nest-winston';
 import * as winston from 'winston';
 

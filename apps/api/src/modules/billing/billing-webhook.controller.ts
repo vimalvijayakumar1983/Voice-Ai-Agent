@@ -420,9 +420,9 @@ export class BillingWebhookController {
         data: {
           tenantId,
           action: `billing:invoice:${eventType}`,
-          entityType: 'invoice',
-          entityId: details.invoiceId as string || 'unknown',
-          metadata: details as any,
+          resourceType: 'invoice',
+          resourceId: details.invoiceId as string || 'unknown',
+          details: details as any,
         },
       });
     } catch (error) {

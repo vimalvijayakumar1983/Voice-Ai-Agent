@@ -5,7 +5,7 @@ import {
   ForbiddenException,
   Logger,
 } from '@nestjs/common';
-import * as bcrypt from 'bcrypt';
+import * as bcrypt from 'bcryptjs';
 import { PrismaService } from '../../common/services/prisma.service';
 import { CreateUserDto, UpdateUserDto, InviteUserDto } from './dto/create-user.dto';
 import { PaginationQuery, PaginatedResponse } from '../../common/dto/pagination.dto';
@@ -72,8 +72,8 @@ export class UsersService {
   }
 
   async create(tenantId: string, dto: CreateUserDto): Promise<any> {
-    const existing = await this.prisma.user.findUnique({
-      where: { email: dto.email },
+    const existing = await this.prisma.user.findFirst({
+      where: { email: dto.email, tenantId },
     });
 
     if (existing) throw new ConflictException('Email already registered');
@@ -86,7 +86,7 @@ export class UsersService {
         passwordHash: hashedPassword,
         firstName: dto.firstName,
         lastName: dto.lastName,
-        role: dto.role || 'AGENT',
+        role: (dto.role || 'AGENT_OPERATOR') as any,
         phone: dto.phone || null,
         tenantId,
         isActive: true,
@@ -110,7 +110,7 @@ export class UsersService {
 
     return this.prisma.user.update({
       where: { id },
-      data: dto,
+      data: dto as any,
       select: {
         id: true,
         email: true,
@@ -133,14 +133,14 @@ export class UsersService {
 
     return this.prisma.user.update({
       where: { id },
-      data: { role },
+      data: { role: role as any },
       select: { id: true, email: true, role: true },
     });
   }
 
   async inviteUser(tenantId: string, dto: InviteUserDto): Promise<any> {
-    const existing = await this.prisma.user.findUnique({
-      where: { email: dto.email },
+    const existing = await this.prisma.user.findFirst({
+      where: { email: dto.email, tenantId },
     });
 
     if (existing) throw new ConflictException('Email already registered');
@@ -154,7 +154,7 @@ export class UsersService {
         passwordHash: hashedPassword,
         firstName: dto.firstName || '',
         lastName: dto.lastName || '',
-        role: dto.role,
+        role: dto.role as any,
         tenantId,
         isActive: true,
       },

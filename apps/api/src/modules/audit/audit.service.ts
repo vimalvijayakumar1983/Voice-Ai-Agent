@@ -29,7 +29,7 @@ export class AuditService {
 
     if (filters?.userId) where.userId = filters.userId;
     if (filters?.action) where.action = { contains: filters.action, mode: 'insensitive' };
-    if (filters?.resource) where.resource = { contains: filters.resource, mode: 'insensitive' };
+    if (filters?.resource) where.resourceType = { contains: filters.resource, mode: 'insensitive' };
     if (filters?.dateFrom) where.createdAt = { gte: new Date(filters.dateFrom) };
     if (filters?.dateTo) {
       where.createdAt = {
@@ -61,6 +61,13 @@ export class AuditService {
     ipAddress: string;
     userAgent: string | null;
   }): Promise<any> {
-    return this.prisma.auditLog.create({ data });
+    const { resource, details, ...rest } = data;
+    return this.prisma.auditLog.create({
+      data: {
+        ...rest,
+        resourceType: resource,
+        details: details as any,
+      },
+    });
   }
 }

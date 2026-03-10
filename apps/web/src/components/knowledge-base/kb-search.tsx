@@ -287,12 +287,15 @@ export function KBSearch({
                     </Button>
                   )}
 
-                  {result.metadata?.fileName && (
-                    <div className="flex items-center gap-1 text-xs text-muted-foreground">
-                      <FileText className="h-3 w-3" />
-                      <span>{result.metadata.fileName as string}</span>
-                    </div>
-                  )}
+                  {(() => {
+                    const meta = result.metadata as Record<string, unknown> | undefined;
+                    return meta?.fileName ? (
+                      <div className="flex items-center gap-1 text-xs text-muted-foreground">
+                        <FileText className="h-3 w-3" />
+                        <span>{String(meta.fileName)}</span>
+                      </div>
+                    ) : null;
+                  })()}
                 </div>
               );
             })}

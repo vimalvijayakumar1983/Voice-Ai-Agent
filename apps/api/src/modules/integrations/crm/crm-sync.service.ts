@@ -115,16 +115,12 @@ export class CRMSyncService {
         },
       } as any,
       update: {
-        status: 'ACTIVE',
+        isActive: true,
         credentials: {
           accessToken: tokens.accessToken,
           refreshToken: tokens.refreshToken,
           expiresAt: tokens.expiresAt?.toISOString(),
           instanceUrl: tokens.instanceUrl,
-        } as any,
-        metadata: {
-          connectedAt: new Date().toISOString(),
-          tokenType: tokens.tokenType,
         } as any,
       },
       create: {
@@ -132,7 +128,7 @@ export class CRMSyncService {
         provider,
         type: 'crm',
         name: `${provider} CRM`,
-        status: 'ACTIVE',
+        isActive: true,
         config: {
           syncDirection: SyncDirection.BIDIRECTIONAL,
           conflictResolution: ConflictResolution.NEWEST_WINS,
@@ -143,10 +139,6 @@ export class CRMSyncService {
           refreshToken: tokens.refreshToken,
           expiresAt: tokens.expiresAt?.toISOString(),
           instanceUrl: tokens.instanceUrl,
-        } as any,
-        metadata: {
-          connectedAt: new Date().toISOString(),
-          tokenType: tokens.tokenType,
         } as any,
       },
     });
@@ -314,9 +306,10 @@ export class CRMSyncService {
       offset += contacts.length;
 
       for (const crmContact of contacts) {
+        let existing: any = null;
         try {
           // Find existing contact by externalId or email
-          const existing = await this.prisma.contact.findFirst({
+          existing = await this.prisma.contact.findFirst({
             where: {
               tenantId,
               OR: [
@@ -705,9 +698,9 @@ export class CRMSyncService {
         data: {
           tenantId,
           action: 'crm_sync',
-          entityType: 'integration',
-          entityId: integrationId,
-          metadata: result as any,
+          resourceType: 'integration',
+          resourceId: integrationId,
+          details: result as any,
         },
       });
     } catch (error) {

@@ -63,16 +63,21 @@ export class KnowledgeBaseService {
         description: dto.description,
         type: dto.type || 'general',
         tenantId,
-        metadata: dto.metadata || {},
+        metadata: (dto.metadata || {}) as any,
       },
     });
   }
 
   async update(tenantId: string, id: string, dto: Partial<CreateKnowledgeBaseDto>): Promise<any> {
     await this.findById(tenantId, id);
+    const updateData: Record<string, unknown> = {};
+    if (dto.name !== undefined) updateData.name = dto.name;
+    if (dto.description !== undefined) updateData.description = dto.description;
+    if (dto.type !== undefined) updateData.type = dto.type;
+    if (dto.metadata) updateData.metadata = dto.metadata as any;
     return this.prisma.knowledgeBase.update({
       where: { id },
-      data: dto,
+      data: updateData,
     });
   }
 
@@ -88,15 +93,14 @@ export class KnowledgeBaseService {
   ): Promise<any> {
     await this.findById(tenantId, kbId);
 
-    const document = await this.prisma.kbDocument.create({
+    const document = await this.prisma.knowledgeDocument.create({
       data: {
         knowledgeBaseId: kbId,
-        fileName: dto.fileName,
-        contentType: dto.contentType,
-        fileKey: dto.fileKey,
+        name: dto.fileName,
+        type: dto.contentType,
+        storageKey: dto.fileKey,
         status: 'PENDING',
-        tenantId,
-        metadata: dto.metadata || {},
+        metadata: (dto.metadata || {}) as any,
       },
     });
 
@@ -122,7 +126,7 @@ export class KnowledgeBaseService {
 
     // In production, this would perform vector similarity search
     // For now, do a basic text search
-    const results = await this.prisma.kbChunk.findMany({
+    const results = await this.prisma.documentChunk.findMany({
       where: {
         knowledgeBaseId: kbId,
         content: { contains: queryText, mode: 'insensitive' },

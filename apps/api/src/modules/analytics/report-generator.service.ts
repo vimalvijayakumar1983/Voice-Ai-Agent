@@ -318,7 +318,7 @@ export class ReportGeneratorService {
 
     // HTML/PDF format
     return this.generateHtmlReport('Call Summary Report', record, [
-      { title: 'Overview', content: this.metricsToHtml(metrics) },
+      { title: 'Overview', content: this.metricsToHtml(metrics as unknown as Record<string, unknown>) },
       {
         title: 'Call Details',
         content: this.tableToHtml(

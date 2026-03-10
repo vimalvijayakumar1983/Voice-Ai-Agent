@@ -46,18 +46,19 @@ export class AgentsService {
   }
 
   async create(tenantId: string, userId: string, dto: CreateAgentDto): Promise<any> {
+    const { escalationRules, complianceBlocks, successCriteria, tools, metadata, ...rest } = dto as any;
     const agent = await this.prisma.agent.create({
       data: {
-        ...dto,
+        ...rest,
         tenantId,
         createdById: userId,
         version: 1,
         isActive: true,
-        escalationRules: dto.escalationRules ? JSON.parse(JSON.stringify(dto.escalationRules)) : [],
-        complianceBlocks: dto.complianceBlocks ? JSON.parse(JSON.stringify(dto.complianceBlocks)) : [],
-        successCriteria: dto.successCriteria || [],
-        tools: dto.tools ? JSON.parse(JSON.stringify(dto.tools)) : [],
-        metadata: dto.metadata || {},
+        escalationRules: escalationRules ? JSON.parse(JSON.stringify(escalationRules)) : [],
+        complianceBlocks: complianceBlocks ? JSON.parse(JSON.stringify(complianceBlocks)) : [],
+        successCriteria: successCriteria || null,
+        tools: tools ? JSON.parse(JSON.stringify(tools)) : [],
+        metadata: metadata || {},
       },
     });
 

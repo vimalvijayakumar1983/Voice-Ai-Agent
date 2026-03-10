@@ -85,16 +85,15 @@ export class CampaignsService {
         status: CampaignStatus.DRAFT,
         agentId: dto.agentId,
         tenantId,
-        createdById: userId,
+        createdBy: userId,
         contactListIds: dto.contactListIds || [],
         scheduledStartAt: dto.scheduledStartAt ? new Date(dto.scheduledStartAt) : null,
-        scheduledEndAt: dto.scheduledEndAt ? new Date(dto.scheduledEndAt) : null,
         maxConcurrentCalls: dto.maxConcurrentCalls || 5,
         callsPerHour: dto.callsPerHour || 100,
         callingHours: dto.callingHours ? JSON.parse(JSON.stringify(dto.callingHours)) : {},
         maxRetries: dto.maxRetries || 2,
         retryDelayMinutes: dto.retryDelayMinutes || 60,
-        metadata: dto.metadata || {},
+        metadata: (dto.metadata || {}) as any,
       },
     });
   }
@@ -111,7 +110,6 @@ export class CampaignsService {
       updateData.callingHours = JSON.parse(JSON.stringify(dto.callingHours));
     }
     if (dto.scheduledStartAt) updateData.scheduledStartAt = new Date(dto.scheduledStartAt);
-    if (dto.scheduledEndAt) updateData.scheduledEndAt = new Date(dto.scheduledEndAt);
 
     return this.prisma.campaign.update({ where: { id }, data: updateData });
   }

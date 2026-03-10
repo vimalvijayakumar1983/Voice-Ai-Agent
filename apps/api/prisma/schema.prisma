@@ -209,17 +209,20 @@ enum ChunkStrategy {
 // ============================================================================
 
 model Tenant {
-  id        String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  name      String
-  slug      String       @unique
-  industry  String?
-  settings  Json         @default("{}")
-  branding  Json         @default("{}")
-  features  Json         @default("{}")
-  status    TenantStatus @default(TRIAL)
-  plan      TenantPlan   @default(FREE)
-  createdAt DateTime     @default(now())
-  updatedAt DateTime     @updatedAt
+  id          String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name        String
+  slug        String       @unique
+  industry    String?
+  description String?
+  settings    Json         @default("{}")
+  branding    Json         @default("{}")
+  features    Json         @default("{}")
+  status      TenantStatus @default(TRIAL)
+  plan        TenantPlan   @default(FREE)
+  isActive    Boolean      @default(true)
+  metadata    Json         @default("{}")  @map("tenant_metadata")
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
 
   // Relations
   users          User[]
@@ -317,7 +320,9 @@ model Agent {
   humanTransferTriggers Json      @default("[]")
   retryLogic            Json      @default("{}")
   timeRules             Json      @default("{}")
+  config                Json      @default("{}")
   isActive              Boolean   @default(true)
+  createdById           String?   @db.Uuid
   version               Int       @default(1)
   createdAt             DateTime  @default(now())
   updatedAt             DateTime  @updatedAt
@@ -341,6 +346,7 @@ model Agent {
 model AgentVersion {
   id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   agentId   String   @db.Uuid
+  tenantId  String?  @db.Uuid
   version   Int
   config    Json
   createdBy String?  @db.Uuid
@@ -351,6 +357,7 @@ model AgentVersion {
 
   @@unique([agentId, version])
   @@index([agentId])
+  @@index([tenantId])
   @@map("agent_versions")
 }
 
@@ -363,11 +370,14 @@ model Workflow {
   tenantId    String   @db.Uuid
   name        String
   description String?
+  agentId     String?  @db.Uuid
   nodes       Json     @default("[]")
   edges       Json     @default("[]")
   variables   Json     @default("{}")
+  metadata    Json     @default("{}")
   version     Int      @default(1)
   isActive    Boolean  @default(true)
+  createdById String?  @db.Uuid
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
@@ -378,14 +388,17 @@ model Workflow {
 
   @@index([tenantId])
   @@index([tenantId, isActive])
+  @@index([agentId])
   @@map("workflows")
 }
 
 model WorkflowVersion {
   id         String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   workflowId String   @db.Uuid
+  tenantId   String?  @db.Uuid
   version    Int
   definition Json
+  config     Json?
   createdBy  String?  @db.Uuid
   createdAt  DateTime @default(now())
 
@@ -394,6 +407,7 @@ model WorkflowVersion {
 
   @@unique([workflowId, version])
   @@index([workflowId])
+  @@index([tenantId])
   @@map("workflow_versions")
 }
 
@@ -418,7 +432,12 @@ model Contact {
   preferredCallTime  String?
   timezone           String?
   customFields       Json          @default("{}")
+  externalId         String?
+  metadata           Json          @default("{}")
+  doNotContact       Boolean       @default(false)
+  source             String?
   accountId          String?       @db.Uuid
+  lastContactedAt    DateTime?
   createdAt          DateTime      @default(now())
   updatedAt          DateTime      @updatedAt
 
@@ -434,7 +453,9 @@ model Contact {
   @@index([tenantId, segment])
   @@index([tenantId, consentStatus])
   @@index([tenantId, dncStatus])
-  @@index([tenantId, tags], type: Gin)
+  @@index([tenantId, source])
+  @@index([tenantId, externalId])
+  @@index([tags], type: Gin)
   @@index([accountId])
   @@map("contacts")
 }
@@ -477,26 +498,35 @@ model ContactNote {
 // ============================================================================
 
 model Campaign {
-  id                String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  tenantId          String         @db.Uuid
-  name              String
-  description       String?
-  status            CampaignStatus @default(DRAFT)
-  agentId           String         @db.Uuid
-  workflowId        String?        @db.Uuid
-  contactListFilter Json           @default("{}")
-  retryPolicy       Json           @default("{}")
-  callWindowRules   Json           @default("{}")
-  maxAttempts       Int            @default(3)
-  concurrency       Int            @default(1)
-  priority          Int            @default(0)
-  scheduledAt       DateTime?
-  startedAt         DateTime?
-  completedAt       DateTime?
-  metrics           Json           @default("{}")
-  createdBy         String?        @db.Uuid
-  createdAt         DateTime       @default(now())
-  updatedAt         DateTime       @updatedAt
+  id                 String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId           String         @db.Uuid
+  name               String
+  description        String?
+  type               String?
+  status             CampaignStatus @default(DRAFT)
+  agentId            String         @db.Uuid
+  workflowId         String?        @db.Uuid
+  contactListFilter  Json           @default("{}")
+  contactListIds     String[]       @default([])
+  retryPolicy        Json           @default("{}")
+  callWindowRules    Json           @default("{}")
+  callingHours       Json?
+  maxAttempts        Int            @default(3)
+  maxConcurrentCalls Int?
+  callsPerHour       Int?
+  maxRetries         Int?
+  retryDelayMinutes  Int?
+  concurrency        Int            @default(1)
+  priority           Int            @default(0)
+  scheduledAt        DateTime?
+  scheduledStartAt   DateTime?
+  startedAt          DateTime?
+  completedAt        DateTime?
+  metrics            Json           @default("{}")
+  metadata           Json           @default("{}")
+  createdBy          String?        @db.Uuid
+  createdAt          DateTime       @default(now())
+  updatedAt          DateTime       @updatedAt
 
   // Relations
   tenant   Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
@@ -509,6 +539,7 @@ model Campaign {
   @@index([tenantId, agentId])
   @@index([status])
   @@index([scheduledAt])
+  @@index([type])
   @@map("campaigns")
 }
 
@@ -528,10 +559,16 @@ model Call {
   telephonyCallId      String?
   phoneFrom            String?
   phoneTo              String?
+  toNumber             String?
+  fromNumber           String?
+  externalCallId       String?
+  initiatedById        String?     @db.Uuid
   startedAt            DateTime?
   answeredAt           DateTime?
   endedAt              DateTime?
   duration             Int?
+  durationSeconds      Int?
+  sentimentScore       Float?
   recordingUrl         String?
   recordingStorageKey  String?
   summary              String?       @db.Text
@@ -573,7 +610,9 @@ model CallTranscript {
   id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   callId    String   @unique @db.Uuid
   segments  Json     @default("[]") // Array of {role, text, timestamp, sentiment}
+  entries   Json     @default("[]") // Array of {speaker, text, timestamp}
   fullText  String?  @db.Text
+  wordCount Int?
   createdAt DateTime @default(now())
 
   // Relations
@@ -625,13 +664,17 @@ model KnowledgeBase {
   tenantId    String   @db.Uuid
   name        String
   description String?
+  type        String?
+  metadata    Json     @default("{}")
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
   // Relations
-  tenant    Tenant              @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  documents KnowledgeDocument[]
-  agents    Agent[]
+  tenant      Tenant              @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  documents   KnowledgeDocument[]
+  agents      Agent[]
+  kbDocuments KbDocument[]
+  kbChunks    KbChunk[]
 
   @@index([tenantId])
   @@map("knowledge_bases")
@@ -673,6 +716,7 @@ model Integration {
   type          String
   provider      String
   name          String
+  status        String?
   config        Json      @default("{}") /// @encrypted
   credentials   Json      @default("{}") /// @encrypted
   fieldMappings Json      @default("{}")
@@ -718,7 +762,8 @@ model IntegrationRun {
 model Subscription {
   id                   String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   tenantId             String   @unique @db.Uuid
-  plan                 String
+  planName             String   @map("plan")
+  planId               String?  @db.Uuid
   status               String
   stripeCustomerId     String?
   stripeSubscriptionId String?
@@ -731,10 +776,12 @@ model Subscription {
 
   // Relations
   tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  plan   Plan?  @relation(fields: [planId], references: [id], onDelete: SetNull)
 
   @@index([stripeCustomerId])
   @@index([stripeSubscriptionId])
   @@index([status])
+  @@index([planId])
   @@map("subscriptions")
 }
 
@@ -769,8 +816,11 @@ model AuditLog {
   tenantId     String?  @db.Uuid
   userId       String?  @db.Uuid
   action       String
+  resource     String?
   resourceType String
   resourceId   String?
+  entityType   String?
+  details      Json?
   oldValue     Json?
   newValue     Json?
   ipAddress    String?
@@ -1042,6 +1092,9 @@ model Plan {
   createdAt             DateTime @default(now())
   updatedAt             DateTime @updatedAt
 
+  // Relations
+  subscriptions Subscription[]
+
   @@index([isActive])
   @@index([name])
   @@map("plans")
@@ -1168,4 +1221,74 @@ model WorkflowExecution {
   @@index([tenantId])
   @@index([tenantId, status])
   @@map("workflow_executions")
+}
+
+// ============================================================================
+// KNOWLEDGE BASE: KbDocument & KbChunk (used by document-processor & vector-store)
+// ============================================================================
+
+model KbDocument {
+  id              String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  knowledgeBaseId String   @db.Uuid
+  tenantId        String   @db.Uuid
+  fileName        String
+  contentType     String?
+  fileKey         String?
+  status          String   @default("PENDING")
+  metadata        Json     @default("{}")
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  // Relations
+  knowledgeBase KnowledgeBase @relation(fields: [knowledgeBaseId], references: [id], onDelete: Cascade)
+  chunks        KbChunk[]
+
+  @@index([knowledgeBaseId])
+  @@index([tenantId])
+  @@index([knowledgeBaseId, status])
+  @@map("kb_documents")
+}
+
+model KbChunk {
+  id              String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  knowledgeBaseId String   @db.Uuid
+  documentId      String   @db.Uuid
+  tenantId        String   @db.Uuid
+  content         String   @db.Text
+  chunkIndex      Int
+  embedding       Unsupported("vector(1536)")?
+  metadata        Json     @default("{}")
+  createdAt       DateTime @default(now())
+
+  // Relations
+  knowledgeBase KnowledgeBase @relation(fields: [knowledgeBaseId], references: [id], onDelete: Cascade)
+  document      KbDocument    @relation(fields: [documentId], references: [id], onDelete: Cascade)
+
+  @@index([knowledgeBaseId])
+  @@index([documentId])
+  @@index([tenantId])
+  @@index([tenantId, knowledgeBaseId])
+  @@map("kb_chunks")
+}
+
+// ============================================================================
+// NOTIFICATION PREFERENCES
+// ============================================================================
+
+model NotificationPreference {
+  id              String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId          String   @db.Uuid
+  tenantId        String   @db.Uuid
+  emailEnabled    Boolean  @default(true)
+  inAppEnabled    Boolean  @default(true)
+  webhookEnabled  Boolean  @default(false)
+  emailDigest     String   @default("DAILY")
+  mutedTypes      String[] @default([])
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@unique([userId, tenantId])
+  @@index([userId])
+  @@index([tenantId])
+  @@map("notification_preferences")
 }

@@ -54,7 +54,7 @@ export class WorkflowsService {
         createdById: userId,
         version: 1,
         isActive: dto.isActive ?? true,
-        metadata: dto.metadata || {},
+        metadata: (dto.metadata || {}) as any,
       },
     });
   }
@@ -95,9 +95,9 @@ export class WorkflowsService {
 
     const versionRecord = await this.prisma.workflowVersion.create({
       data: {
-        workflowId: id,
+        workflow: { connect: { id } },
         version: workflow.version,
-        config: JSON.parse(JSON.stringify(workflow)),
+        definition: JSON.parse(JSON.stringify(workflow)),
         tenantId,
       },
     });

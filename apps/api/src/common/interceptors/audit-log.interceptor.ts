@@ -81,7 +81,14 @@ export class AuditLogInterceptor implements NestInterceptor {
     ipAddress: string;
     userAgent: string | null;
   }): Promise<void> {
-    await this.prisma.auditLog.create({ data });
+    const { resource, details, ...rest } = data;
+    await this.prisma.auditLog.create({
+      data: {
+        ...rest,
+        resourceType: resource,
+        details: details as any,
+      },
+    });
   }
 
   private sanitizeBody(body: Record<string, unknown>): Record<string, unknown> {

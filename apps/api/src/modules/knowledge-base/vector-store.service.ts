@@ -377,30 +377,38 @@ export class VectorStoreService {
     chunkIndex: number,
     metadata: Record<string, unknown>,
   ): Promise<string> {
-    const chunk = await this.prisma.kbChunk.create({
+    // Create the chunk without the embedding (Unsupported type in Prisma)
+    const chunk = await this.prisma.documentChunk.create({
       data: {
         knowledgeBaseId,
         documentId,
         content,
         chunkIndex,
-        embedding,
-        metadata,
+        metadata: metadata as any,
         tenantId,
       },
     });
+
+    // Store the embedding via raw SQL (pgvector Unsupported type)
+    const vectorStr = `[${embedding.join(',')}]`;
+    await this.prisma.$executeRawUnsafe(
+      `UPDATE "DocumentChunk" SET embedding = $1::vector WHERE id = $2`,
+      vectorStr,
+      chunk.id,
+    );
 
     return chunk.id;
   }
 
   async deleteEmbeddingsByDocument(documentId: string): Promise<number> {
-    const result = await this.prisma.kbChunk.deleteMany({
+    const result = await this.prisma.documentChunk.deleteMany({
       where: { documentId },
     });
     return result.count;
   }
 
   async deleteEmbeddingsByKnowledgeBase(knowledgeBaseId: string): Promise<number> {
-    const result = await this.prisma.kbChunk.deleteMany({
+    const result = await this.prisma.documentChunk.deleteMany({
       where: { knowledgeBaseId },
     });
     return result.count;

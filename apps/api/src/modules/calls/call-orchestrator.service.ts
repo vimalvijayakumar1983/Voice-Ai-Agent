@@ -553,7 +553,7 @@ export class CallOrchestratorService {
     });
 
     const settings = (tenant?.settings as Record<string, unknown>) || {};
-    if (settings.requireConsent && contact.consentStatus !== 'GRANTED') {
+    if (settings.requireConsent && contact.consentStatus !== 'OPTED_IN') {
       throw new Error(`Contact ${contactId} has not granted consent (status: ${contact.consentStatus})`);
     }
   }

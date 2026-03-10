@@ -117,8 +117,8 @@ export class CampaignSchedulerService implements OnModuleInit {
         scheduledStartAt: { lte: now },
         // Don't start if end time has already passed
         OR: [
-          { scheduledEndAt: null },
-          { scheduledEndAt: { gt: now } },
+          { completedAt: null },
+          { completedAt: { gt: now } },
         ],
       },
       select: {

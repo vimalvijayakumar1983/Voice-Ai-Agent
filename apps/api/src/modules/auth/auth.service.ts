@@ -7,7 +7,7 @@ import {
 } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
-import * as bcrypt from 'bcrypt';
+import * as bcrypt from 'bcryptjs';
 import { PrismaService } from '../../common/services/prisma.service';
 import { RedisService } from '../../common/services/redis.service';
 import { RegisterDto } from './dto/register.dto';
@@ -132,7 +132,7 @@ export class AuthService {
   }
 
   async validateUser(email: string, password: string): Promise<any> {
-    const user = await this.prisma.user.findUnique({
+    const user = await this.prisma.user.findFirst({
       where: { email },
     });
 

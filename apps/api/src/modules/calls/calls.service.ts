@@ -106,7 +106,7 @@ export class CallsService {
         toNumber: dto.toNumber,
         fromNumber: dto.fromNumber || null,
         initiatedById: userId,
-        metadata: dto.metadata || {},
+        metadata: (dto.metadata || {}) as any,
       },
     });
 

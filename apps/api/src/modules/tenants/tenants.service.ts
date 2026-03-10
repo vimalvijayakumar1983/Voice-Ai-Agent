@@ -56,9 +56,7 @@ export class TenantsService {
         slug,
         industry: dto.industry || 'OTHER',
         description: dto.description,
-        website: dto.website,
-        logoUrl: dto.logoUrl,
-        settings: {},
+        settings: {} as any,
       },
     });
   }
@@ -79,7 +77,7 @@ export class TenantsService {
     return this.prisma.tenant.update({
       where: { id },
       data: {
-        settings: { ...currentSettings, ...dto },
+        settings: { ...currentSettings, ...dto } as any,
       },
     });
   }
@@ -88,7 +86,7 @@ export class TenantsService {
     await this.findById(id);
     await this.prisma.tenant.update({
       where: { id },
-      data: { isActive: false },
+      data: { status: 'SUSPENDED' as const },
     });
     this.logger.log(`Tenant ${id} deactivated`);
   }

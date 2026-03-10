@@ -89,7 +89,7 @@ export function SentimentHeatmap() {
     }
 
     let max = 0;
-    for (const cell of gridMap.values()) {
+    for (const cell of Array.from(gridMap.values())) {
       if (cell.count > max) max = cell.count;
     }
 

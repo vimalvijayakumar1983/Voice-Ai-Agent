@@ -116,7 +116,7 @@ export class UsageMeteringService {
     );
 
     // Check usage limits
-    await this.checkUsageLimits(tenantId, dimension, newValue);
+    await this.checkUsageLimits(tenantId, dimension, parseFloat(newValue as unknown as string));
   }
 
   // ---------- Enforce Usage Limits ----------

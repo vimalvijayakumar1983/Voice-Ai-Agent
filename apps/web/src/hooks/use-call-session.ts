@@ -193,8 +193,8 @@ export function useCallSession(
         }
 
         const entry: TranscriptEntry = {
-          id: `t-${++entryIdCounter.current}`,
           ...transcript,
+          id: `t-${++entryIdCounter.current}`,
         };
 
         return {

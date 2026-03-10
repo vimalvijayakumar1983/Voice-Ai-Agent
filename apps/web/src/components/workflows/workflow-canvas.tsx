@@ -173,8 +173,8 @@ export function WorkflowCanvas() {
           position: n.position!,
           data: n.data as any,
           selected: n.selected,
-          width: n.width,
-          height: n.height,
+          width: n.width ?? undefined,
+          height: n.height ?? undefined,
         })),
       );
 

@@ -114,18 +114,18 @@ export class DocumentProcessorService {
       await this.reportProgress(documentId, 'parsing', 0, 'Downloading document...');
 
       // 2. Parse document
-      const document = await this.prisma.kbDocument.findUnique({
+      const document = await this.prisma.knowledgeDocument.findUnique({
         where: { id: documentId },
       });
       if (!document) {
         throw new Error(`Document ${documentId} not found`);
       }
 
-      const rawContent = await this.downloadAndParse(fileKey, document.contentType);
+      const rawContent = await this.downloadAndParse(fileKey, document.type);
       await this.reportProgress(documentId, 'parsing', 20, 'Document parsed successfully');
 
       // 3. Extract metadata
-      const docMetadata = this.extractMetadata(rawContent, document.fileName);
+      const docMetadata = this.extractMetadata(rawContent, document.name);
 
       // 4. Chunk the document
       await this.reportProgress(documentId, 'chunking', 30, 'Splitting into chunks...');
@@ -133,7 +133,7 @@ export class DocumentProcessorService {
         documentId,
         knowledgeBaseId,
         tenantId,
-        fileName: document.fileName,
+        fileName: document.name,
         chunkIndex: 0,
         startOffset: 0,
         endOffset: 0,
@@ -185,7 +185,7 @@ export class DocumentProcessorService {
       await this.storeChunksAndEmbeddings(embeddedChunks);
 
       // 7. Update document metadata and status
-      await this.prisma.kbDocument.update({
+      await this.prisma.knowledgeDocument.update({
         where: { id: documentId },
         data: {
           status: 'READY',
@@ -249,7 +249,7 @@ export class DocumentProcessorService {
   }
 
   async deleteDocumentEmbeddings(documentId: string): Promise<number> {
-    const result = await this.prisma.kbChunk.deleteMany({
+    const result = await this.prisma.documentChunk.deleteMany({
       where: { documentId },
     });
 
@@ -692,15 +692,14 @@ export class DocumentProcessorService {
 
       await this.prisma.$transaction(
         batch.map(({ chunk, vector }) =>
-          this.prisma.kbChunk.create({
+          this.prisma.documentChunk.create({
             data: {
-              knowledgeBaseId: chunk.metadata.knowledgeBaseId,
-              documentId: chunk.metadata.documentId,
+              knowledgeBaseId: chunk.metadata.knowledgeBaseId as string,
+              documentId: chunk.metadata.documentId as string,
               content: chunk.content,
               chunkIndex: chunk.index,
-              embedding: vector,
               metadata: chunk.metadata as any,
-              tenantId: chunk.metadata.tenantId,
+              tenantId: chunk.metadata.tenantId as string,
             },
           }),
         ),
@@ -709,9 +708,9 @@ export class DocumentProcessorService {
   }
 
   private async updateDocumentStatus(documentId: string, status: string): Promise<void> {
-    await this.prisma.kbDocument.update({
+    await this.prisma.knowledgeDocument.update({
       where: { id: documentId },
-      data: { status },
+      data: { status: status as any },
     });
   }
 

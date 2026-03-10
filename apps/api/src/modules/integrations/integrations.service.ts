@@ -70,7 +70,7 @@ export class IntegrationsService {
         name: dto.name,
         type: dto.type,
         provider: dto.provider,
-        config: dto.config,
+        config: dto.config as any,
         credentials: dto.credentials ? JSON.parse(JSON.stringify(dto.credentials)) : {},
         tenantId,
         isActive: dto.isActive ?? true,
