@@ -109,7 +109,7 @@ export class VectorStoreService {
     params.push(minScore);
     params.push(topK);
 
-    const results = await this.prisma.$queryRawUnsafe<any[]>(query, ...params);
+    const results = await (this.prisma.$queryRawUnsafe as Function)(query, ...params) as any[];
 
     return results.map((row) => ({
       id: row.id,
@@ -198,10 +198,10 @@ export class VectorStoreService {
 
       params.push(fetchK);
 
-      fullTextResults = await this.prisma.$queryRawUnsafe<Array<{ id: string; rank: number }>>(
+      fullTextResults = await (this.prisma.$queryRawUnsafe as Function)(
         ftQuery,
         ...params,
-      );
+      ) as Array<{ id: string; rank: number }>;
     }
 
     // 3. Combine scores

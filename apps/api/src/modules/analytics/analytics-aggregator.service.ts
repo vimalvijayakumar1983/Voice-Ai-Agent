@@ -369,7 +369,7 @@ export class AnalyticsAggregatorService {
       .map((s) => ({
         campaignId: s.campaignId!,
         campaignName: campaignNameMap.get(s.campaignId!) || 'Unknown',
-        rate: s._count.id > 0 ? ((successByCampaign.get(s.campaignId) || 0) / s._count.id) * 100 : 0,
+        rate: s._count.id > 0 ? (Number(successByCampaign.get(s.campaignId) || 0) / s._count.id) * 100 : 0,
         total: s._count.id,
       }));
 
