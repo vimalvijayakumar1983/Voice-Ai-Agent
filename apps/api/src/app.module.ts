@@ -20,6 +20,7 @@ import { AdminModule } from './modules/admin/admin.module';
 import { AuditModule } from './modules/audit/audit.module';
 import { HealthModule } from './modules/health/health.module';
 import { AbTestingModule } from './modules/ab-testing/ab-testing.module';
+import { TelephonyModule } from './services/telephony/telephony.module';
 import { PrismaService } from './common/services/prisma.service';
 import { RedisService } from './common/services/redis.service';
 import { getRedisConnection } from './common/utils/parse-redis-url';
@@ -56,6 +57,7 @@ import { getRedisConnection } from './common/utils/parse-redis-url';
     AdminModule,
     AuditModule,
     AbTestingModule,
+    TelephonyModule,
     HealthModule,
   ],
   providers: [PrismaService, RedisService],
