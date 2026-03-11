@@ -11,7 +11,7 @@ generator client {
 datasource db {
   provider   = "postgresql"
   url        = env("DATABASE_URL")
-  extensions = [pgcrypto, pgvector(map: "vector")]
+  extensions = [pgcrypto]
 }
 
 // ============================================================================
@@ -963,7 +963,7 @@ model DocumentChunk {
   content         String   @db.Text
   chunkIndex      Int
   tokenCount      Int      @default(0)
-  embedding       Unsupported("vector(1536)")?
+  embedding       Json?
   metadata        Json     @default("{}")
   createdAt       DateTime @default(now())
 
@@ -1256,7 +1256,7 @@ model KbChunk {
   tenantId        String   @db.Uuid
   content         String   @db.Text
   chunkIndex      Int
-  embedding       Unsupported("vector(1536)")?
+  embedding       Json?
   metadata        Json     @default("{}")
   createdAt       DateTime @default(now())
 

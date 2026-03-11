@@ -1,8 +1,6 @@
 -- CreateExtension
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
--- CreateExtension
-CREATE EXTENSION IF NOT EXISTS "vector";
 
 -- CreateEnum
 CREATE TYPE "TenantStatus" AS ENUM ('ACTIVE', 'SUSPENDED', 'TRIAL', 'CANCELLED');
@@ -585,7 +583,7 @@ CREATE TABLE "document_chunks" (
     "content" TEXT NOT NULL,
     "chunkIndex" INTEGER NOT NULL,
     "tokenCount" INTEGER NOT NULL DEFAULT 0,
-    "embedding" vector(1536),
+    "embedding" JSONB,
     "metadata" JSONB NOT NULL DEFAULT '{}',
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
@@ -809,7 +807,7 @@ CREATE TABLE "kb_chunks" (
     "tenantId" UUID NOT NULL,
     "content" TEXT NOT NULL,
     "chunkIndex" INTEGER NOT NULL,
-    "embedding" vector(1536),
+    "embedding" JSONB,
     "metadata" JSONB NOT NULL DEFAULT '{}',
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
