@@ -1,5 +1,5 @@
 {
-  "buildCommand": "cd apps/web && next build",
+  "buildCommand": "pnpm --filter @voice-ai/web build",
   "outputDirectory": "apps/web/.next",
   "framework": "nextjs",
   "installCommand": "pnpm install"
