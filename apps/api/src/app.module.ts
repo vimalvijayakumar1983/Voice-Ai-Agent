@@ -22,6 +22,7 @@ import { HealthModule } from './modules/health/health.module';
 import { AbTestingModule } from './modules/ab-testing/ab-testing.module';
 import { PrismaService } from './common/services/prisma.service';
 import { RedisService } from './common/services/redis.service';
+import { getRedisConnection } from './common/utils/parse-redis-url';
 
 @Module({
   imports: [
@@ -36,11 +37,7 @@ import { RedisService } from './common/services/redis.service';
       },
     ]),
     BullModule.forRoot({
-      connection: {
-        host: process.env.REDIS_HOST || 'localhost',
-        port: parseInt(process.env.REDIS_PORT || '6379', 10),
-        password: process.env.REDIS_PASSWORD || undefined,
-      },
+      connection: getRedisConnection(),
     }),
     ScheduleModule.forRoot(),
     AuthModule,

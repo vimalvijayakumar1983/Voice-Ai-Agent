@@ -1,6 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Worker, Job } from 'bullmq';
+import { getRedisConnection } from '../../../common/utils/parse-redis-url';
 import { PrismaService } from '../../../common/services/prisma.service';
 import { RedisService } from '../../../common/services/redis.service';
 import { S3Service } from '../../../common/services/s3.service';
@@ -51,21 +52,13 @@ export class CallProcessor {
   }
 
   private initializeWorker(): void {
-    const redisHost = this.configService.get<string>('REDIS_HOST', 'localhost');
-    const redisPort = this.configService.get<number>('REDIS_PORT', 6379);
-    const redisPassword = this.configService.get<string>('REDIS_PASSWORD', '') || undefined;
-
     this.worker = new Worker(
       'call-processing',
       async (job: Job<CallJobData>) => {
         return this.processJob(job);
       },
       {
-        connection: {
-          host: redisHost,
-          port: redisPort,
-          password: redisPassword,
-        },
+        connection: getRedisConnection(this.configService),
         concurrency: 20,
         limiter: {
           max: 100,

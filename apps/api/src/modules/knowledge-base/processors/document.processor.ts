@@ -1,6 +1,7 @@
 import { Logger } from '@nestjs/common';
 import { Worker, Job } from 'bullmq';
 import { ConfigService } from '@nestjs/config';
+import { getRedisConnection } from '../../../common/utils/parse-redis-url';
 import { DocumentProcessorService, ChunkingConfig } from '../document-processor.service';
 import { VectorStoreService } from '../vector-store.service';
 import { RAGEngineService } from '../rag-engine.service';
@@ -50,11 +51,7 @@ export class DocumentProcessor {
   ) {}
 
   async start(): Promise<void> {
-    const connection = {
-      host: this.configService.get<string>('REDIS_HOST', 'localhost'),
-      port: this.configService.get<number>('REDIS_PORT', 6379),
-      password: this.configService.get<string>('REDIS_PASSWORD', '') || undefined,
-    };
+    const connection = getRedisConnection(this.configService);
 
     this.worker = new Worker(
       'kb-processing',

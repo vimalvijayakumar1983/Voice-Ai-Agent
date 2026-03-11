@@ -1,6 +1,7 @@
 import { Logger } from '@nestjs/common';
 import { Worker, Job } from 'bullmq';
 import { ConfigService } from '@nestjs/config';
+import { getRedisConnection } from '../../../common/utils/parse-redis-url';
 import { CRMSyncService } from '../crm/crm-sync.service';
 import { RedisService } from '../../../common/services/redis.service';
 import { CRMProvider, SyncOptions } from '../crm/crm.interface';
@@ -65,11 +66,7 @@ export class CRMSyncProcessor {
   ) {}
 
   async start(): Promise<void> {
-    const connection = {
-      host: this.configService.get<string>('REDIS_HOST', 'localhost'),
-      port: this.configService.get<number>('REDIS_PORT', 6379),
-      password: this.configService.get<string>('REDIS_PASSWORD', '') || undefined,
-    };
+    const connection = getRedisConnection(this.configService);
 
     this.worker = new Worker(
       'crm-sync',
