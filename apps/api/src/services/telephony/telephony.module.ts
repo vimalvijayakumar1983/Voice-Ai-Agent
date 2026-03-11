@@ -7,7 +7,9 @@ import { TwilioMediaStreamProvider } from './providers/twilio-media-stream.provi
 import { PlivoProvider } from './providers/plivo.provider';
 import { SIPTrunkProvider } from './providers/sip-trunk.provider';
 import { VonageVoiceProvider } from './providers/vonage-voice.provider';
+import { VonageAudioStreamGateway } from './providers/vonage-audio-stream.gateway';
 import { RedisService } from '../../common/services/redis.service';
+import { ConfigService } from '@nestjs/config';
 
 @Module({
   controllers: [TelephonyWebhookController],
@@ -17,6 +19,13 @@ import { RedisService } from '../../common/services/redis.service';
     PlivoProvider,
     SIPTrunkProvider,
     VonageVoiceProvider,
+    {
+      provide: VonageAudioStreamGateway,
+      useFactory: (configService: ConfigService) => {
+        return new VonageAudioStreamGateway(configService);
+      },
+      inject: [ConfigService],
+    },
     TelephonyFactory,
     TelephonyService,
     RedisService,
@@ -25,6 +34,7 @@ import { RedisService } from '../../common/services/redis.service';
     TelephonyFactory,
     TelephonyService,
     VonageVoiceProvider,
+    VonageAudioStreamGateway,
     TwilioProvider,
     TwilioMediaStreamProvider,
   ],

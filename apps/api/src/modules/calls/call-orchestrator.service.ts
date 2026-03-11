@@ -7,6 +7,7 @@ import { S3Service } from '../../common/services/s3.service';
 import { TelephonyService } from '../../services/telephony/telephony.service';
 import { AudioPipelineService, PipelineState } from '../../services/voice/audio-pipeline.service';
 import { TwilioMediaStreamProvider } from '../../services/telephony/providers/twilio-media-stream.provider';
+import { VonageAudioStreamGateway } from '../../services/telephony/providers/vonage-audio-stream.gateway';
 import { LLMService } from '../../services/llm/llm.service';
 import { LLMMessage } from '../../services/llm/llm.interface';
 import { CallStatus } from './dto/call.dto';
@@ -40,6 +41,7 @@ export interface CallSession {
   language: string;
   isRecording: boolean;
   recordingChunks: Buffer[];
+  provider: 'twilio' | 'vonage' | string;
   metadata: Record<string, unknown>;
 }
 
@@ -60,6 +62,8 @@ export class CallOrchestratorService {
   private readonly activeSessions = new Map<string, CallSession>();
   private readonly apiBaseUrl: string;
 
+  private readonly defaultProvider: string;
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly redisService: RedisService,
@@ -69,10 +73,13 @@ export class CallOrchestratorService {
     private readonly telephonyService: TelephonyService,
     private readonly audioPipeline: AudioPipelineService,
     private readonly twilioMediaStream: TwilioMediaStreamProvider,
+    private readonly vonageAudioStream: VonageAudioStreamGateway,
     private readonly llmService: LLMService,
   ) {
     this.apiBaseUrl = this.configService.get<string>('API_BASE_URL', 'https://api.example.com');
+    this.defaultProvider = this.configService.get<string>('TELEPHONY_PROVIDER', 'twilio');
     this.setupPipelineListeners();
+    this.setupVonageListeners();
   }
 
   /**
@@ -107,6 +114,9 @@ export class CallOrchestratorService {
       await this.checkCompliance(tenantId, params.contactId);
     }
 
+    // Determine telephony provider
+    const provider = (agentConfig.telephonyProvider as string) || this.defaultProvider;
+
     // Create the call session
     const session: CallSession = {
       callId,
@@ -123,6 +133,7 @@ export class CallOrchestratorService {
       language: (agentConfig.language as string) || 'en-US',
       isRecording: (agentConfig.enableRecording as boolean) !== false,
       recordingChunks: [],
+      provider,
       metadata: {
         contactId: params.contactId,
         campaignId: params.campaignId,
@@ -133,20 +144,23 @@ export class CallOrchestratorService {
 
     this.activeSessions.set(callId, session);
 
+    // Build provider-specific webhook URLs
+    const webhookUrls = this.getProviderWebhookUrls(provider);
+
     // Initiate the telephony call
     try {
       const callResult = await this.telephonyService.makeCall({
         to: params.toNumber,
         from: params.fromNumber,
-        callbackUrl: `${this.apiBaseUrl}/api/v1/telephony/twilio/voice`,
-        statusCallbackUrl: `${this.apiBaseUrl}/api/v1/telephony/twilio/status`,
+        callbackUrl: webhookUrls.callbackUrl,
+        statusCallbackUrl: webhookUrls.statusCallbackUrl,
         record: session.isRecording,
         metadata: {
           callId,
           tenantId,
           agentId,
         },
-      });
+      }, provider as any);
 
       session.callSid = callResult.callSid;
 
@@ -456,18 +470,24 @@ export class CallOrchestratorService {
 
   /**
    * Sends synthesized audio back to the telephony provider.
+   * Routes to the correct provider based on the call session.
    */
   private sendAudioToTelephony(callId: string, pcmAudio: Buffer): void {
     const session = this.activeSessions.get(callId);
-    if (!session?.streamSid) return;
+    if (!session) return;
 
-    const mediaMessage = this.twilioMediaStream.createMediaMessage(session.streamSid, pcmAudio);
-
-    // Emit the media message for the WebSocket handler to send
-    this.emitCallEvent(callId, 'media:outgoing', {
-      message: mediaMessage,
-      streamSid: session.streamSid,
-    });
+    if (session.provider === 'vonage') {
+      // Vonage: send raw L16 PCM directly over WebSocket
+      this.vonageAudioStream.sendAudio(session.callSid, pcmAudio);
+    } else {
+      // Twilio: encode as mulaw and send as JSON media message
+      if (!session.streamSid) return;
+      const mediaMessage = this.twilioMediaStream.createMediaMessage(session.streamSid, pcmAudio);
+      this.emitCallEvent(callId, 'media:outgoing', {
+        message: mediaMessage,
+        streamSid: session.streamSid,
+      });
+    }
   }
 
   /**
@@ -475,13 +495,21 @@ export class CallOrchestratorService {
    */
   private handleBargeInEvent(callId: string): void {
     const session = this.activeSessions.get(callId);
-    if (!session?.streamSid) return;
+    if (!session) return;
 
-    const clearMessage = this.twilioMediaStream.createClearMessage(session.streamSid);
-    this.emitCallEvent(callId, 'media:clear', {
-      message: clearMessage,
-      streamSid: session.streamSid,
-    });
+    if (session.provider === 'vonage') {
+      // Vonage WebSocket doesn't have a clear mechanism —
+      // barge-in is handled by simply stopping TTS output and
+      // starting to process new speech input
+      this.logger.debug(`Barge-in for Vonage call ${callId} — stopping TTS output`);
+    } else {
+      if (!session.streamSid) return;
+      const clearMessage = this.twilioMediaStream.createClearMessage(session.streamSid);
+      this.emitCallEvent(callId, 'media:clear', {
+        message: clearMessage,
+        streamSid: session.streamSid,
+      });
+    }
   }
 
   /**
@@ -556,6 +584,165 @@ export class CallOrchestratorService {
     if (settings.requireConsent && contact.consentStatus !== 'OPTED_IN') {
       throw new Error(`Contact ${contactId} has not granted consent (status: ${contact.consentStatus})`);
     }
+  }
+
+  /**
+   * Sets up event listeners for the Vonage audio stream gateway.
+   * Bridges Vonage WebSocket events into the call orchestrator pipeline.
+   */
+  private setupVonageListeners(): void {
+    this.vonageAudioStream.on('stream:start', (data: {
+      callUuid: string;
+      agentId: string;
+      tenantId: string;
+    }) => {
+      // Find session by callSid (which is the Vonage callUuid)
+      const session = this.getSessionByCallSid(data.callUuid);
+      if (session) {
+        this.handleCallAnswered(session.callId, data.callUuid);
+      } else {
+        // Inbound call — create session from Redis metadata
+        this.handleVonageInboundCall(data);
+      }
+    });
+
+    this.vonageAudioStream.on('stream:audio', (data: {
+      callUuid: string;
+      pcmAudio: Buffer;
+    }) => {
+      const session = this.getSessionByCallSid(data.callUuid);
+      if (session) {
+        this.handleIncomingAudio(session.callId, data.pcmAudio);
+      }
+    });
+
+    this.vonageAudioStream.on('stream:stop', (data: {
+      callUuid: string;
+    }) => {
+      const session = this.getSessionByCallSid(data.callUuid);
+      if (session) {
+        this.endCall(session.callId, 'vonage_stream_ended');
+      }
+    });
+  }
+
+  /**
+   * Handles an inbound Vonage call when the WebSocket connects.
+   * Looks up call metadata from Redis and creates a session.
+   */
+  private async handleVonageInboundCall(data: {
+    callUuid: string;
+    agentId: string;
+    tenantId: string;
+  }): Promise<void> {
+    const { callUuid, agentId, tenantId } = data;
+
+    // Try to get call metadata stored by the answer webhook
+    const callMeta = await this.redisService.getJson<{
+      callUuid: string;
+      from: string;
+      to: string;
+      agentId: string;
+      tenantId: string;
+    }>(`call:incoming:vonage:${callUuid}`);
+
+    const effectiveAgentId = agentId || callMeta?.agentId || '';
+    const effectiveTenantId = tenantId || callMeta?.tenantId || '';
+
+    if (!effectiveAgentId) {
+      this.logger.warn(`No agentId for inbound Vonage call ${callUuid}, ignoring`);
+      return;
+    }
+
+    // Load agent
+    const agent = await this.prisma.agent.findFirst({
+      where: { id: effectiveAgentId, tenantId: effectiveTenantId, isActive: true },
+    });
+
+    if (!agent) {
+      this.logger.warn(`Agent ${effectiveAgentId} not found for Vonage call ${callUuid}`);
+      return;
+    }
+
+    const agentConfig = (agent.config as Record<string, unknown>) || {};
+
+    // Create a call record
+    const call = await this.prisma.call.create({
+      data: {
+        tenantId: effectiveTenantId,
+        agentId: effectiveAgentId,
+        direction: 'INBOUND',
+        fromNumber: callMeta?.from || '',
+        toNumber: callMeta?.to || '',
+        externalCallId: callUuid,
+        status: CallStatus.IN_PROGRESS,
+        answeredAt: new Date(),
+      },
+    });
+
+    const session: CallSession = {
+      callId: call.id,
+      tenantId: effectiveTenantId,
+      agentId: effectiveAgentId,
+      callSid: callUuid,
+      streamSid: callUuid,
+      phase: CallPhase.ANSWERED,
+      conversationHistory: [],
+      startedAt: new Date(),
+      answeredAt: new Date(),
+      systemPrompt: (agentConfig.systemPrompt as string) || agent.description || '',
+      voice: (agentConfig.voice as string) || 'default',
+      language: (agentConfig.language as string) || 'en-US',
+      isRecording: (agentConfig.enableRecording as boolean) !== false,
+      recordingChunks: [],
+      provider: 'vonage',
+      metadata: {
+        fromNumber: callMeta?.from,
+        toNumber: callMeta?.to,
+        inbound: true,
+      },
+    };
+
+    this.activeSessions.set(call.id, session);
+    await this.storeSessionInRedis(session);
+
+    this.logger.log(`Vonage inbound call ${callUuid} mapped to session ${call.id}`);
+
+    // Start the audio pipeline
+    await this.audioPipeline.startSession({
+      callId: call.id,
+      tenantId: effectiveTenantId,
+      agentId: effectiveAgentId,
+      systemPrompt: session.systemPrompt,
+      voice: session.voice,
+      language: session.language,
+      bargeInEnabled: true,
+      silenceTimeoutMs: 15000,
+      maxCallDurationMs: 1800000,
+    });
+
+    this.audioPipeline.setStreamSid(call.id, callUuid);
+  }
+
+  /**
+   * Returns provider-specific webhook URLs for outbound calls.
+   */
+  private getProviderWebhookUrls(provider: string): {
+    callbackUrl: string;
+    statusCallbackUrl: string;
+  } {
+    if (provider === 'vonage') {
+      return {
+        callbackUrl: `${this.apiBaseUrl}/api/v1/telephony/vonage/answer`,
+        statusCallbackUrl: `${this.apiBaseUrl}/api/v1/telephony/vonage/event`,
+      };
+    }
+
+    // Default: Twilio
+    return {
+      callbackUrl: `${this.apiBaseUrl}/api/v1/telephony/twilio/voice`,
+      statusCallbackUrl: `${this.apiBaseUrl}/api/v1/telephony/twilio/status`,
+    };
   }
 
   /**

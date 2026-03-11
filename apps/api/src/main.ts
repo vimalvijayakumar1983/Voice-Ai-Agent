@@ -4,6 +4,7 @@ import { SwaggerModule, DocumentBuilder } from '@nestjs/swagger';
 import { AppModule } from './app.module';
 import { HttpExceptionFilter } from './common/filters/http-exception.filter';
 import { TransformInterceptor } from './common/interceptors/transform.interceptor';
+import { VonageAudioStreamGateway } from './services/telephony/providers/vonage-audio-stream.gateway';
 import helmet from 'helmet';
 import compression from 'compression';
 import { WinstonModule } from 'nest-winston';
@@ -91,6 +92,11 @@ async function bootstrap() {
 
   const document = SwaggerModule.createDocument(app, swaggerConfig);
   SwaggerModule.setup('api/docs', app, document);
+
+  // Attach Vonage WebSocket audio stream gateway to the HTTP server
+  const vonageGateway = app.get(VonageAudioStreamGateway);
+  const httpServer = app.getHttpServer();
+  vonageGateway.attachToServer(httpServer);
 
   const port = process.env.PORT || 4000;
   await app.listen(port);
