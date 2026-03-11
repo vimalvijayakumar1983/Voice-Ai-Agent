@@ -1,6 +1,6 @@
 [build]
 builder = "NIXPACKS"
-buildCommand = "cd apps/api && pnpm install --frozen-lockfile && npx prisma generate && pnpm run build"
+buildCommand = "cd apps/api && npx prisma generate && pnpm run build"
 
 [deploy]
 startCommand = "cd apps/api && node dist/main.js"
