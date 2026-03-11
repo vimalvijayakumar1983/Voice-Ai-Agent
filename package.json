@@ -29,7 +29,7 @@
     "docker:up": "docker compose up -d",
     "docker:down": "docker compose down",
     "docker:reset": "docker compose down -v && docker compose up -d",
-    "prepare": "husky"
+    "prepare": "husky || true"
   },
   "devDependencies": {
     "@changesets/cli": "^2.27.0",

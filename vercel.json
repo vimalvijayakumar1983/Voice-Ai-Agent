@@ -2,11 +2,5 @@
   "buildCommand": "cd apps/web && next build",
   "outputDirectory": "apps/web/.next",
   "framework": "nextjs",
-  "installCommand": "pnpm install",
-  "rewrites": [
-    {
-      "source": "/api/:path*",
-      "destination": "https://voice-ai-agent-production-cd7e.up.railway.app/api/:path*"
-    }
-  ]
+  "installCommand": "pnpm install"
 }
