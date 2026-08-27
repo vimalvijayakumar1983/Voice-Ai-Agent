@@ -61,6 +61,33 @@ npm ci
 npm run dev
 ```
 
+## Railway deployment
+
+Deploy this isolated monorepo as five Railway services:
+
+| Service | Source/root | Config file | Public domain |
+| --- | --- | --- | --- |
+| `api` | GitHub, `/backend` | `/backend/railway.toml` | Yes |
+| `worker` | GitHub, `/backend` | `/backend/railway.worker.toml` | No |
+| `frontend` | GitHub, `/frontend` | `/frontend/railway.toml` | Yes |
+| `Postgres` | Railway database | Managed | No |
+| `Redis` | Railway database | Managed | No |
+
+Set these service variables with Railway references where shown:
+
+| Service | Variable | Value |
+| --- | --- | --- |
+| API + worker | `DATABASE_URL` | `${{Postgres.DATABASE_URL}}` |
+| API + worker | `REDIS_URL` | `${{Redis.REDIS_URL}}` |
+| API | `CORS_ORIGINS` | `https://${{frontend.RAILWAY_PUBLIC_DOMAIN}}` |
+| API | `BASE_URL` | `https://${{api.RAILWAY_PUBLIC_DOMAIN}}` |
+| Frontend | `NEXT_PUBLIC_API_URL` | `https://${{api.RAILWAY_PUBLIC_DOMAIN}}` |
+| API | `SECRET_KEY` | A generated, sealed production secret |
+| API + worker | `SMALLEST_API_KEY` | A sealed Smallest.ai API key |
+| API | `SMALLEST_WEBHOOK_SECRET` | A generated, sealed webhook signing secret |
+
+Use the production branch for all three GitHub services. The API config runs `alembic upgrade head` before traffic switches, both web services use Railway's dynamic `PORT`, and the frontend build embeds the API's public HTTPS URL. Generate public Railway domains for `api` and `frontend`, then configure the Smallest.ai webhook as `https://YOUR_API_DOMAIN/api/v1/webhooks/smallest`.
+
 ## Smallest.ai configuration
 
 All provider credentials belong in the backend environment only:

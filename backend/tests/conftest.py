@@ -8,6 +8,7 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.ext.compiler import compiles
+from sqlalchemy.pool import StaticPool
 
 from app.core.database import Base, get_db
 from app.core.security import create_access_token, hash_password
@@ -15,7 +16,7 @@ from app.main import app
 from app.models.tenant import Tenant
 from app.models.user import User
 
-TEST_DATABASE_URL = "sqlite+aiosqlite:///./test.db"
+TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
 
 
 @compiles(JSONB, "sqlite")
@@ -23,7 +24,11 @@ def compile_jsonb_for_sqlite(_type, _compiler, **_kwargs):
     return "JSON"
 
 
-engine = create_async_engine(TEST_DATABASE_URL, echo=False)
+engine = create_async_engine(
+    TEST_DATABASE_URL,
+    echo=False,
+    poolclass=StaticPool,
+)
 test_session_factory = async_sessionmaker(engine, expire_on_commit=False)
 
 
