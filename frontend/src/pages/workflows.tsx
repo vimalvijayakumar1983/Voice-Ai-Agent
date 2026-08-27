@@ -1,9 +1,9 @@
 import { useEffect, useState } from 'react';
 import Layout from '@/components/Layout';
-import { api } from '@/lib/api';
+import { api, CallWorkflow } from '@/lib/api';
 
 export default function Workflows() {
-  const [workflows, setWorkflows] = useState<any[]>([]);
+  const [workflows, setWorkflows] = useState<CallWorkflow[]>([]);
 
   useEffect(() => { api.listWorkflows().then(setWorkflows).catch(() => {}); }, []);
 

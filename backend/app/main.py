@@ -22,7 +22,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Voice AI Agent Platform",
     description="Enterprise-grade Voice AI Agent SaaS Platform",
-    version="0.1.0",
+    version="0.2.0",
     docs_url="/docs" if settings.app_debug else None,
     redoc_url="/redoc" if settings.app_debug else None,
     lifespan=lifespan,
@@ -43,4 +43,8 @@ app.include_router(api_router)
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "version": "0.1.0"}
+    return {
+        "status": "healthy",
+        "version": "0.2.0",
+        "providers": {"smallest": bool(settings.smallest_api_key)},
+    }

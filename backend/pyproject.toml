@@ -15,8 +15,10 @@ dependencies = [
     "alembic>=1.13.0",
     "pydantic>=2.6.0",
     "pydantic-settings>=2.1.0",
+    "email-validator>=2.1.0",
     "python-jose[cryptography]>=3.3.0",
     "passlib[bcrypt]>=1.7.4",
+    "bcrypt>=4.0,<4.1",
     "python-multipart>=0.0.9",
     "httpx>=0.27.0",
     "celery[redis]>=5.3.6",
@@ -27,6 +29,7 @@ dependencies = [
     "stripe>=8.0.0",
     "tenacity>=8.2.0",
     "structlog>=24.1.0",
+    "aiosqlite>=0.20.0",
 ]
 
 [project.optional-dependencies]
@@ -43,6 +46,10 @@ dev = [
 [tool.ruff]
 target-version = "py311"
 line-length = 100
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+exclude = ["migrations*", "tests*"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W", "UP"]

@@ -20,8 +20,8 @@ export default function Login() {
         await api.login(form.email, form.password);
       }
       router.push('/');
-    } catch (err: any) {
-      setError(err.message);
+    } catch (error: unknown) {
+      setError(error instanceof Error ? error.message : 'Authentication failed.');
     }
   };
 

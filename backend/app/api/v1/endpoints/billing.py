@@ -1,9 +1,9 @@
 """Billing and usage endpoints."""
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import func, select, and_
+from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
@@ -26,9 +26,7 @@ async def get_subscription(
     db: AsyncSession = Depends(get_db),
 ):
     result = await db.execute(
-        select(TenantSubscription).where(
-            TenantSubscription.tenant_id == current_user.tenant_id
-        )
+        select(TenantSubscription).where(TenantSubscription.tenant_id == current_user.tenant_id)
     )
     sub = result.scalar_one_or_none()
     if not sub:
@@ -42,8 +40,8 @@ async def get_usage(
     db: AsyncSession = Depends(get_db),
     days: int = Query(30, ge=1, le=365),
 ):
-    since = datetime.now(timezone.utc) - timedelta(days=days)
-    now = datetime.now(timezone.utc)
+    since = datetime.now(UTC) - timedelta(days=days)
+    now = datetime.now(UTC)
 
     result = await db.execute(
         select(

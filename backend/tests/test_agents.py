@@ -18,7 +18,9 @@ async def test_create_agent(client: AsyncClient, auth_headers):
     assert response.status_code == 201
     data = response.json()
     assert data["name"] == "Sales Agent"
-    assert data["model_provider"] == "openai"
+    assert data["model_provider"] == "smallest"
+    assert data["voice_provider"] == "smallest"
+    assert data["sync_status"] == "local_only"
 
 
 @pytest.mark.asyncio

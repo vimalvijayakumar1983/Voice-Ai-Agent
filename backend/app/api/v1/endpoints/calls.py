@@ -1,10 +1,10 @@
 """Call management endpoints - logs, transcripts, summaries, and outbound calls."""
 
-from datetime import datetime
+from datetime import UTC, datetime
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import and_, func, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
@@ -12,14 +12,15 @@ from app.core.database import get_db
 from app.middleware.tenant import CurrentUser, get_current_user
 from app.models.agent import Agent
 from app.models.call import Call, CallSummary, CallTranscript
+from app.providers.smallest import SmallestAIError, get_smallest_client
 from app.schemas.call import (
     CallOutbound,
     CallResponse,
     CallSummaryResponse,
     CallTranscriptResponse,
 )
-from app.telephony.twilio_provider import get_telephony_provider
 from app.telephony.base import CallRequest
+from app.telephony.twilio_provider import get_telephony_provider
 
 router = APIRouter(prefix="/calls", tags=["Calls"])
 
@@ -87,9 +88,18 @@ async def initiate_outbound_call(
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found")
 
-    from_number = data.from_number or settings.twilio_default_from_number
-    if not from_number:
-        raise HTTPException(status_code=400, detail="No from_number provided and no default configured")
+    is_smallest = agent.voice_provider == "smallest"
+    from_number = data.from_number or (
+        settings.smallest_default_from_number
+        if is_smallest
+        else settings.twilio_default_from_number
+    )
+    if not from_number and not is_smallest:
+        raise HTTPException(
+            status_code=400,
+            detail="No from_number provided and no default configured",
+        )
+    from_number = from_number or "provider-managed"
 
     # Create call record
     call = Call(
@@ -99,30 +109,45 @@ async def initiate_outbound_call(
         status="initiated",
         from_number=from_number,
         to_number=data.to_number,
-        metadata=data.context,
+        provider="smallest" if is_smallest else "twilio",
+        call_metadata=data.context,
     )
     db.add(call)
     await db.flush()
 
-    # Initiate via telephony provider
-    provider = get_telephony_provider()
-    webhook_url = f"{settings.base_url}/api/v1/webhooks/twilio/voice/{call.id}"
-    status_url = f"{settings.base_url}/api/v1/webhooks/twilio/status/{call.id}"
-
     try:
-        result = await provider.make_call(
-            CallRequest(
-                to_number=data.to_number,
-                from_number=from_number,
-                webhook_url=webhook_url,
-                status_callback_url=status_url,
+        if is_smallest:
+            if not agent.provider_agent_id:
+                raise SmallestAIError(
+                    "Provision this agent on Smallest.ai before placing a call.",
+                    status_code=409,
+                )
+            conversation_id = await get_smallest_client().start_outbound_call(
+                agent_id=agent.provider_agent_id,
+                phone_number=data.to_number,
+                variables=data.context,
+                from_product_id=data.from_product_id,
+                version_id=data.version_id,
             )
-        )
-        call.provider_call_sid = result.provider_call_sid
+            call.provider_call_sid = conversation_id
+        else:
+            provider = get_telephony_provider()
+            webhook_url = f"{settings.base_url}/api/v1/webhooks/twilio/voice/{call.id}"
+            status_url = f"{settings.base_url}/api/v1/webhooks/twilio/status/{call.id}"
+            provider_result = await provider.make_call(
+                CallRequest(
+                    to_number=data.to_number,
+                    from_number=from_number,
+                    webhook_url=webhook_url,
+                    status_callback_url=status_url,
+                )
+            )
+            call.provider_call_sid = provider_result.provider_call_sid
         call.status = "ringing"
+        call.started_at = datetime.now(UTC)
     except Exception as e:
         call.status = "failed"
-        call.metadata = {**(call.metadata or {}), "error": str(e)}
+        call.call_metadata = {**(call.call_metadata or {}), "error": str(e)}
 
     await db.flush()
     return CallResponse.model_validate(call)

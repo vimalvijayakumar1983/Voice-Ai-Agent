@@ -1,7 +1,7 @@
 from datetime import datetime
 from uuid import UUID
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 
 
 class CallResponse(BaseModel):
@@ -31,7 +31,17 @@ class CallOutbound(BaseModel):
     agent_id: UUID
     to_number: str
     from_number: str | None = None
-    context: dict | None = None  # extra context for the AI
+    context: dict[str, str | int | float | bool] = Field(default_factory=dict)
+    from_product_id: str | None = None
+    version_id: str | None = None
+
+    @field_validator("to_number")
+    @classmethod
+    def validate_e164(cls, value: str) -> str:
+        digits = value[1:] if value.startswith("+") else ""
+        if not digits.isdigit() or not 8 <= len(digits) <= 15:
+            raise ValueError("Phone number must be in E.164 format, for example +971501234567")
+        return value
 
 
 class CallTranscriptResponse(BaseModel):

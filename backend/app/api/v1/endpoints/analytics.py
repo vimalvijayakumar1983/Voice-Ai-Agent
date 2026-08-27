@@ -1,15 +1,15 @@
 """Analytics endpoints."""
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import func, select, and_, case, cast, Date
+from sqlalchemy import Date, and_, cast, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.middleware.tenant import CurrentUser, get_current_user
-from app.models.call import Call
 from app.models.agent import Agent
+from app.models.call import Call
 from app.models.campaign import Campaign
 from app.schemas.analytics import (
     AgentPerformance,
@@ -27,7 +27,7 @@ async def get_overview(
     db: AsyncSession = Depends(get_db),
     days: int = Query(30, ge=1, le=365),
 ):
-    since = datetime.now(timezone.utc) - timedelta(days=days)
+    since = datetime.now(UTC) - timedelta(days=days)
     base = and_(Call.tenant_id == current_user.tenant_id, Call.created_at >= since)
 
     # Aggregate stats
@@ -77,9 +77,9 @@ async def get_timeseries(
     current_user: CurrentUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
     days: int = Query(30, ge=1, le=365),
-    period: str = Query("day", regex="^(day|week|month)$"),
+    period: str = Query("day", pattern="^(day|week|month)$"),
 ):
-    since = datetime.now(timezone.utc) - timedelta(days=days)
+    since = datetime.now(UTC) - timedelta(days=days)
     base = and_(Call.tenant_id == current_user.tenant_id, Call.created_at >= since)
 
     date_col = cast(Call.created_at, Date)
@@ -108,7 +108,7 @@ async def get_agent_performance(
     db: AsyncSession = Depends(get_db),
     days: int = Query(30, ge=1, le=365),
 ):
-    since = datetime.now(timezone.utc) - timedelta(days=days)
+    since = datetime.now(UTC) - timedelta(days=days)
 
     result = await db.execute(
         select(
@@ -145,9 +145,10 @@ async def get_campaign_analytics(
     db: AsyncSession = Depends(get_db),
 ):
     result = await db.execute(
-        select(Campaign).where(Campaign.tenant_id == current_user.tenant_id).order_by(
-            Campaign.created_at.desc()
-        ).limit(20)
+        select(Campaign)
+        .where(Campaign.tenant_id == current_user.tenant_id)
+        .order_by(Campaign.created_at.desc())
+        .limit(20)
     )
 
     analytics = []

@@ -1,7 +1,7 @@
 import uuid
 
-from sqlalchemy import ForeignKey, String, Boolean, Text, Integer
-from sqlalchemy.dialects.postgresql import UUID, JSONB
+from sqlalchemy import Boolean, ForeignKey, Integer, String, Text
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import TenantScopedModel
@@ -23,7 +23,9 @@ class Workflow(TenantScopedModel):
     config: Mapped[dict | None] = mapped_column(JSONB)
 
     # Relationships
-    nodes = relationship("WorkflowNode", back_populates="workflow", lazy="selectin", order_by="WorkflowNode.position")
+    nodes = relationship(
+        "WorkflowNode", back_populates="workflow", lazy="selectin", order_by="WorkflowNode.position"
+    )
 
 
 class WorkflowNode(TenantScopedModel):

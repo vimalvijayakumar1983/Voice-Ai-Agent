@@ -5,7 +5,7 @@ import uuid
 
 import structlog
 from celery import shared_task
-from sqlalchemy import select, and_
+from sqlalchemy import select
 
 from app.core.config import settings
 
@@ -29,11 +29,11 @@ def run_campaign(self, campaign_id: str, tenant_id: str):
 
 async def _run_campaign_async(campaign_id: str, tenant_id: str):
     from app.core.database import async_session_factory
-    from app.models.campaign import Campaign, CampaignContact
     from app.models.call import Call
+    from app.models.campaign import Campaign, CampaignContact
     from app.models.compliance import DncEntry
-    from app.telephony.twilio_provider import get_telephony_provider
     from app.telephony.base import CallRequest
+    from app.telephony.twilio_provider import get_telephony_provider
 
     campaign_uuid = uuid.UUID(campaign_id)
     tenant_uuid = uuid.UUID(tenant_id)
@@ -87,7 +87,7 @@ async def _run_campaign_async(campaign_id: str, tenant_id: str):
                 status="initiated",
                 from_number=settings.twilio_default_from_number,
                 to_number=contact.phone_number,
-                metadata=contact.context_data,
+                call_metadata=contact.context_data,
             )
             db.add(call)
             await db.flush()

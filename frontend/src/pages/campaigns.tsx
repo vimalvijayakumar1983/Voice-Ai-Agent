@@ -1,10 +1,10 @@
 import { useEffect, useState } from 'react';
 import Layout from '@/components/Layout';
-import { api } from '@/lib/api';
+import { api, Campaign, VoiceAgent } from '@/lib/api';
 
 export default function Campaigns() {
-  const [campaigns, setCampaigns] = useState<any[]>([]);
-  const [agents, setAgents] = useState<any[]>([]);
+  const [campaigns, setCampaigns] = useState<Campaign[]>([]);
+  const [agents, setAgents] = useState<VoiceAgent[]>([]);
   const [showCreate, setShowCreate] = useState(false);
   const [form, setForm] = useState({
     name: '', agent_id: '', max_concurrent_calls: 5, calling_hours_start: '09:00', calling_hours_end: '17:00',
@@ -23,7 +23,9 @@ export default function Campaigns() {
       await api.createCampaign(form);
       setShowCreate(false);
       load();
-    } catch (err: any) { alert(err.message); }
+    } catch (error: unknown) {
+      alert(error instanceof Error ? error.message : 'Could not create the campaign.');
+    }
   };
 
   const statusColor: Record<string, string> = {

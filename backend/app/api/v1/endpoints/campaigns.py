@@ -31,7 +31,9 @@ async def list_campaigns(
     query = select(Campaign).where(Campaign.tenant_id == current_user.tenant_id)
     if status_filter:
         query = query.where(Campaign.status == status_filter)
-    query = query.order_by(Campaign.created_at.desc()).offset((page - 1) * page_size).limit(page_size)
+    query = (
+        query.order_by(Campaign.created_at.desc()).offset((page - 1) * page_size).limit(page_size)
+    )
 
     result = await db.execute(query)
     return [CampaignResponse.model_validate(c) for c in result.scalars().all()]
@@ -133,7 +135,9 @@ async def start_campaign(
         raise HTTPException(status_code=404, detail="Campaign not found")
 
     if campaign.status not in ("draft", "paused"):
-        raise HTTPException(status_code=400, detail=f"Cannot start campaign in '{campaign.status}' status")
+        raise HTTPException(
+            status_code=400, detail=f"Cannot start campaign in '{campaign.status}' status"
+        )
 
     campaign.status = "running"
     await db.flush()

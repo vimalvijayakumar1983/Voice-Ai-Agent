@@ -36,10 +36,12 @@ class ConversationEngine:
         messages = [{"role": "system", "content": system_prompt}]
 
         if knowledge_context:
-            messages.append({
-                "role": "system",
-                "content": f"Relevant knowledge base context:\n{knowledge_context}",
-            })
+            messages.append(
+                {
+                    "role": "system",
+                    "content": f"Relevant knowledge base context:\n{knowledge_context}",
+                }
+            )
 
         messages.extend(conversation_history)
 
@@ -62,9 +64,7 @@ class ConversationEngine:
 
         return content, tokens_used
 
-    async def generate_call_summary(
-        self, transcript_text: str, model: str = "gpt-4o"
-    ) -> dict:
+    async def generate_call_summary(self, transcript_text: str, model: str = "gpt-4o") -> dict:
         """Generate a structured summary from a call transcript."""
         system_prompt = """Analyze this call transcript and return a JSON object with:
 - "summary": A concise 2-3 sentence summary of the call

@@ -1,8 +1,8 @@
 """Twilio telephony provider implementation."""
 
 import structlog
-from twilio.rest import Client
 from twilio.request_validator import RequestValidator
+from twilio.rest import Client
 
 from app.core.config import settings
 from app.telephony.base import (
@@ -50,7 +50,7 @@ class TwilioProvider(TelephonyProvider):
     def generate_greeting(self, message: str, voice: str) -> TwiMLResponse:
         return TwiMLResponse(
             xml=f'<?xml version="1.0" encoding="UTF-8"?>'
-            f"<Response><Say voice=\"{voice}\">{message}</Say></Response>"
+            f'<Response><Say voice="{voice}">{message}</Say></Response>'
         )
 
     def generate_gather(
@@ -70,7 +70,7 @@ class TwilioProvider(TelephonyProvider):
         return TwiMLResponse(
             xml=f'<?xml version="1.0" encoding="UTF-8"?>'
             f"<Response>"
-            f"<Connect><Stream url=\"{websocket_url}\" /></Connect>"
+            f'<Connect><Stream url="{websocket_url}" /></Connect>'
             f"</Response>"
         )
 

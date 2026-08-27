@@ -2,6 +2,7 @@
 
 import asyncio
 import uuid
+from datetime import UTC
 
 import structlog
 from celery import shared_task
@@ -29,7 +30,7 @@ def fire_webhook_event(self, tenant_id: str, event_type: str, payload: dict):
 
 
 async def _fire_webhook_async(tenant_id: str, event_type: str, payload: dict):
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     import httpx
     from sqlalchemy import select
@@ -79,14 +80,14 @@ async def _fire_webhook_async(tenant_id: str, event_type: str, payload: dict):
                         json={
                             "event": event_type,
                             "data": payload,
-                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                            "timestamp": datetime.now(UTC).isoformat(),
                         },
                         headers={"Content-Type": "application/json"},
                     )
                     response.raise_for_status()
 
                 event.status = "sent"
-                event.delivered_at = datetime.now(timezone.utc)
+                event.delivered_at = datetime.now(UTC)
                 event.attempts += 1
 
             except Exception as e:

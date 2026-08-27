@@ -13,7 +13,9 @@ export default function Compliance() {
     try {
       const result = await api.checkDnc(checkNumber);
       setCheckResult(result);
-    } catch (err: any) { alert(err.message); }
+    } catch (error: unknown) {
+      alert(error instanceof Error ? error.message : 'Could not check the DNC list.');
+    }
   };
 
   const handleAdd = async (e: React.FormEvent) => {
@@ -23,7 +25,9 @@ export default function Compliance() {
       setAddNumber('');
       setAddReason('');
       alert('Number added to DNC list');
-    } catch (err: any) { alert(err.message); }
+    } catch (error: unknown) {
+      alert(error instanceof Error ? error.message : 'Could not update the DNC list.');
+    }
   };
 
   return (

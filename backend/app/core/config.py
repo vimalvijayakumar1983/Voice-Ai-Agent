@@ -26,6 +26,13 @@ class Settings(BaseSettings):
     twilio_auth_token: str = ""
     twilio_default_from_number: str = ""
 
+    # Smallest.ai Atoms
+    smallest_api_key: str = ""
+    smallest_base_url: str = "https://api.smallest.ai/atoms/v1"
+    smallest_webhook_secret: str = ""
+    smallest_default_from_number: str = ""
+    smallest_request_timeout_seconds: float = 30.0
+
     # AI Providers
     openai_api_key: str = ""
     anthropic_api_key: str = ""

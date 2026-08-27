@@ -1,7 +1,8 @@
 import uuid
+from datetime import datetime
 
-from sqlalchemy import ForeignKey, String, Boolean, Text, Float, Integer
-from sqlalchemy.dialects.postgresql import UUID, JSONB
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import TenantScopedModel
@@ -19,23 +20,32 @@ class Agent(TenantScopedModel):
 
     # AI Configuration
     system_prompt: Mapped[str] = mapped_column(Text, nullable=False)
-    model_provider: Mapped[str] = mapped_column(String(50), default="openai")  # openai, anthropic
-    model_name: Mapped[str] = mapped_column(String(100), default="gpt-4o")
+    model_provider: Mapped[str] = mapped_column(String(50), default="smallest")
+    model_name: Mapped[str] = mapped_column(String(100), default="electron")
     temperature: Mapped[float] = mapped_column(Float, default=0.7)
     max_tokens: Mapped[int] = mapped_column(Integer, default=500)
 
     # Voice Configuration
-    voice_provider: Mapped[str] = mapped_column(String(50), default="twilio")
-    voice_id: Mapped[str] = mapped_column(String(100), default="en-US-Standard-A")
-    language: Mapped[str] = mapped_column(String(10), default="en-US")
+    voice_provider: Mapped[str] = mapped_column(String(50), default="smallest")
+    voice_id: Mapped[str] = mapped_column(String(100), default="")
+    language: Mapped[str] = mapped_column(String(10), default="en")
     speech_rate: Mapped[float] = mapped_column(Float, default=1.0)
+
+    # Smallest.ai provider state. Secrets are never stored on the agent.
+    provider_agent_id: Mapped[str | None] = mapped_column(String(100), unique=True, index=True)
+    provider_branch_id: Mapped[str | None] = mapped_column(String(100))
+    provider_revision_id: Mapped[str | None] = mapped_column(String(100))
+    provider_config: Mapped[dict | None] = mapped_column(JSONB)
+    sync_status: Mapped[str] = mapped_column(String(30), default="local_only")
+    last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    timezone: Mapped[str] = mapped_column(String(64), default="Asia/Dubai")
 
     # Behavior
     greeting_message: Mapped[str | None] = mapped_column(Text)
     fallback_message: Mapped[str | None] = mapped_column(Text)
     max_call_duration_seconds: Mapped[int] = mapped_column(Integer, default=600)
     transfer_number: Mapped[str | None] = mapped_column(String(20))
-    metadata: Mapped[dict | None] = mapped_column(JSONB)
+    agent_metadata: Mapped[dict | None] = mapped_column("metadata", JSONB)
 
     # Relationships
     tenant = relationship("Tenant", back_populates="agents")

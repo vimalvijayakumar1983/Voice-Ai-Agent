@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
+import { PhoneOutgoing, Plus, X } from 'lucide-react';
 import Layout from '@/components/Layout';
-import { api } from '@/lib/api';
+import { api, CallRecord, VoiceAgent } from '@/lib/api';
 
 function statusBadge(status: string) {
   const map: Record<string, string> = {
@@ -15,29 +16,54 @@ function statusBadge(status: string) {
 }
 
 export default function Calls() {
-  const [calls, setCalls] = useState<any[]>([]);
+  const [calls, setCalls] = useState<CallRecord[]>([]);
   const [loading, setLoading] = useState(true);
-  const [selectedCall, setSelectedCall] = useState<any>(null);
+  const [selectedCall, setSelectedCall] = useState<CallRecord | null>(null);
+  const [agents, setAgents] = useState<VoiceAgent[]>([]);
+  const [showDialer, setShowDialer] = useState(false);
+  const [dialing, setDialing] = useState(false);
+  const [dialForm, setDialForm] = useState({ agent_id: '', to_number: '' });
 
   useEffect(() => {
     api.listCalls().then(setCalls).catch(() => {}).finally(() => setLoading(false));
+    api.listAgents().then(setAgents).catch(() => {});
   }, []);
+
+  const initiateCall = async (event: React.FormEvent) => {
+    event.preventDefault();
+    setDialing(true);
+    try {
+      const call = await api.initiateCall(dialForm);
+      setCalls((current) => [call, ...current]);
+      setDialForm({ agent_id: '', to_number: '' });
+      setShowDialer(false);
+    } catch (error) {
+      alert(error instanceof Error ? error.message : 'Could not start the call.');
+    } finally {
+      setDialing(false);
+    }
+  };
 
   return (
     <Layout>
       <div className="page-header">
-        <h1>Call Logs</h1>
+        <div><span className="page-kicker">Monitor & improve</span><h1>Conversations</h1><p className="page-subtitle">Place controlled outbound calls and review every transcript, outcome, and recording.</p></div>
         <div style={{ display: 'flex', gap: 8 }}>
           <select className="btn btn-secondary" onChange={(e) => {
-            const params = e.target.value ? { direction: e.target.value } : {};
+            const params: Record<string, string> = e.target.value
+              ? { direction: e.target.value }
+              : {};
             api.listCalls(params).then(setCalls);
           }}>
             <option value="">All Directions</option>
             <option value="inbound">Inbound</option>
             <option value="outbound">Outbound</option>
           </select>
+          <button className="btn btn-primary" onClick={() => setShowDialer((visible) => !visible)}>{showDialer ? <X size={14} /> : <Plus size={14} />}{showDialer ? 'Close' : 'New call'}</button>
         </div>
       </div>
+
+      {showDialer && <form className="card" style={{ marginBottom: 18 }} onSubmit={initiateCall}><div className="card-title"><div><h3>Start a Smallest.ai outbound call</h3><p>Numbers must use E.164 format. The provider conversation ID will be stored automatically.</p></div><PhoneOutgoing size={18} color="var(--accent)" /></div><div className="form-grid"><div className="form-group"><label>Agent</label><select required value={dialForm.agent_id} onChange={(event) => setDialForm({ ...dialForm, agent_id: event.target.value })}><option value="">Select a provisioned agent</option>{agents.filter((agent) => agent.provider_agent_id).map((agent) => <option value={agent.id} key={agent.id}>{agent.name}</option>)}</select></div><div className="form-group"><label>Customer phone</label><input required value={dialForm.to_number} placeholder="+971501234567" onChange={(event) => setDialForm({ ...dialForm, to_number: event.target.value })} /></div></div><button className="btn btn-primary" disabled={dialing}>{dialing ? 'Starting…' : 'Start outbound call'}</button></form>}
 
       {loading ? (
         <p style={{ color: 'var(--text-secondary)' }}>Loading calls...</p>

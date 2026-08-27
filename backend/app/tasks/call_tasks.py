@@ -2,6 +2,7 @@
 
 import asyncio
 import uuid
+from datetime import UTC
 
 import structlog
 from celery import shared_task
@@ -24,7 +25,7 @@ def process_completed_call(self, call_id: str, tenant_id: str):
 
 
 async def _process_completed_call_async(call_id: str, tenant_id: str):
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     from sqlalchemy import select
 
@@ -51,9 +52,7 @@ async def _process_completed_call_async(call_id: str, tenant_id: str):
             try:
                 from app.ai.conversation import conversation_engine
 
-                summary_data = await conversation_engine.generate_call_summary(
-                    transcript.full_text
-                )
+                summary_data = await conversation_engine.generate_call_summary(transcript.full_text)
 
                 summary = CallSummary(
                     tenant_id=tenant_uuid,
@@ -74,7 +73,7 @@ async def _process_completed_call_async(call_id: str, tenant_id: str):
 
         # Record usage
         if call.duration_seconds and call.duration_seconds > 0:
-            now = datetime.now(timezone.utc)
+            now = datetime.now(UTC)
             usage = UsageRecord(
                 tenant_id=tenant_uuid,
                 call_id=call_uuid,

@@ -1,12 +1,13 @@
 """Test configuration and fixtures."""
 
 import asyncio
-import uuid
 from collections.abc import AsyncGenerator
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.compiler import compiles
 
 from app.core.database import Base, get_db
 from app.core.security import create_access_token, hash_password
@@ -15,6 +16,12 @@ from app.models.tenant import Tenant
 from app.models.user import User
 
 TEST_DATABASE_URL = "sqlite+aiosqlite:///./test.db"
+
+
+@compiles(JSONB, "sqlite")
+def compile_jsonb_for_sqlite(_type, _compiler, **_kwargs):
+    return "JSON"
+
 
 engine = create_async_engine(TEST_DATABASE_URL, echo=False)
 test_session_factory = async_sessionmaker(engine, expire_on_commit=False)
@@ -59,7 +66,8 @@ async def db() -> AsyncGenerator[AsyncSession, None]:
 async def tenant(db: AsyncSession) -> Tenant:
     tenant = Tenant(name="Test Corp", slug="test-corp")
     db.add(tenant)
-    await db.flush()
+    await db.commit()
+    await db.refresh(tenant)
     return tenant
 
 
@@ -73,7 +81,8 @@ async def user(db: AsyncSession, tenant: Tenant) -> User:
         role="owner",
     )
     db.add(user)
-    await db.flush()
+    await db.commit()
+    await db.refresh(user)
     return user
 
 

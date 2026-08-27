@@ -1,7 +1,7 @@
 """Authentication and user management endpoints."""
 
 import secrets
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
@@ -84,7 +84,7 @@ async def login(data: UserLogin, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=403, detail="Account disabled")
 
     # Update last login
-    user.last_login = datetime.now(timezone.utc)
+    user.last_login = datetime.now(UTC)
 
     return TokenResponse(
         access_token=create_access_token(user.id, user.tenant_id, user.role),

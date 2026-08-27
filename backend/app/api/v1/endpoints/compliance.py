@@ -1,5 +1,6 @@
 """Compliance endpoints - DNC, consent management."""
 
+from datetime import UTC
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -121,7 +122,7 @@ async def create_consent_record(
     current_user: CurrentUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     record = ConsentRecord(
         tenant_id=current_user.tenant_id,
@@ -129,8 +130,8 @@ async def create_consent_record(
         consent_type=data.consent_type,
         status=data.status,
         evidence=data.evidence,
-        granted_at=datetime.now(timezone.utc) if data.status == "granted" else None,
-        revoked_at=datetime.now(timezone.utc) if data.status == "revoked" else None,
+        granted_at=datetime.now(UTC) if data.status == "granted" else None,
+        revoked_at=datetime.now(UTC) if data.status == "revoked" else None,
     )
     db.add(record)
     await db.flush()
