@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
@@ -60,11 +61,16 @@ class SmallestAIClient:
         base_url: str | None = None,
         timeout: float | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
+        waves_base_url: str | None = None,
     ):
         self.api_key = api_key if api_key is not None else settings.smallest_api_key
         self.base_url = (base_url or settings.smallest_base_url).rstrip("/")
         self.timeout = timeout or settings.smallest_request_timeout_seconds
         self.transport = transport
+        parsed_base_url = urlsplit(self.base_url)
+        self.waves_base_url = waves_base_url or (
+            f"{parsed_base_url.scheme}://{parsed_base_url.netloc}/waves/v1"
+        )
 
     @property
     def is_configured(self) -> bool:
@@ -77,6 +83,7 @@ class SmallestAIClient:
         *,
         json: dict[str, Any] | None = None,
         params: dict[str, Any] | None = None,
+        base_url: str | None = None,
     ) -> dict[str, Any]:
         if not self.api_key:
             raise SmallestAIError(
@@ -85,7 +92,7 @@ class SmallestAIClient:
             )
 
         async with httpx.AsyncClient(
-            base_url=self.base_url,
+            base_url=base_url or self.base_url,
             timeout=self.timeout,
             transport=self.transport,
             headers={
@@ -126,6 +133,20 @@ class SmallestAIClient:
             raise SmallestAIError("Smallest.ai returned an unexpected response.")
         return payload
 
+    async def list_voices(self) -> list[dict[str, Any]]:
+        response = await self._request(
+            "GET",
+            "/lightning-v3.1/get_voices",
+            base_url=self.waves_base_url,
+        )
+        voices = response.get("voices") or response.get("data") or []
+        return voices if isinstance(voices, list) else []
+
+    async def list_voice_clones(self) -> list[dict[str, Any]]:
+        response = await self._request("GET", "/voice-cloning", base_url=self.waves_base_url)
+        voices = response.get("data") or response.get("voices") or []
+        return voices if isinstance(voices, list) else []
+
     async def create_agent(
         self,
         *,
@@ -164,14 +185,25 @@ class SmallestAIClient:
         first_message: str | None,
         slm_model: str,
         language: str,
+        supported_languages: list[str] | None,
         timezone: str,
         voice_id: str | None = None,
         speech_rate: float = 1.0,
     ) -> dict[str, Any]:
+        resolved_languages = list(dict.fromkeys(supported_languages or [language]))
+        if language not in resolved_languages:
+            raise SmallestAIError(
+                "Primary language must be included in supported languages.", status_code=422
+            )
+        if "ta" in resolved_languages and len(resolved_languages) > 1:
+            raise SmallestAIError(
+                "Tamil cannot be combined with other supported languages.", status_code=422
+            )
+
         payload: dict[str, Any] = {
             "globalPrompt": global_prompt,
             "slmModel": slm_model,
-            "language": {"default": language, "supported": [language]},
+            "language": {"default": language, "supported": resolved_languages},
             "timezone": _timezone_config(timezone),
             "allowInterruptions": True,
         }

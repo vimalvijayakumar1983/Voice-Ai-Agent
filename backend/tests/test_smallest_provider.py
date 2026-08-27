@@ -96,6 +96,7 @@ async def test_versioned_draft_contains_runtime_configuration():
         first_message="Welcome.",
         slm_model="electron",
         language="en",
+        supported_languages=["en", "hi"],
         timezone="Asia/Dubai",
         voice_id="nyah",
         speech_rate=1.1,
@@ -103,7 +104,7 @@ async def test_versioned_draft_contains_runtime_configuration():
 
     assert captured["globalPrompt"] == "Be concise and helpful."
     assert captured["slmModel"] == "electron"
-    assert captured["language"] == {"default": "en", "supported": ["en"]}
+    assert captured["language"] == {"default": "en", "supported": ["en", "hi"]}
     assert captured["synthesizer"]["voiceConfig"]["voiceId"] == "nyah"
     assert captured["timezone"] == {
         "label": "(GMT+4:00) Asia/Dubai",
@@ -126,7 +127,54 @@ async def test_versioned_draft_rejects_unknown_timezone_before_request():
             first_message="Welcome.",
             slm_model="electron",
             language="en",
+            supported_languages=["en"],
             timezone="Not/A_Timezone",
+        )
+
+    assert error.value.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_waves_catalog_and_voice_clones_use_current_endpoints():
+    paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        if request.url.path.endswith("/get_voices"):
+            return httpx.Response(200, json={"voices": [{"voiceId": "emily"}]})
+        return httpx.Response(200, json={"data": [{"voiceId": "my_clone"}]})
+
+    client = SmallestAIClient(
+        api_key="sk_test",
+        base_url="https://api.smallest.ai/atoms/v1",
+        transport=httpx.MockTransport(handler),
+    )
+
+    voices = await client.list_voices()
+    clones = await client.list_voice_clones()
+
+    assert voices == [{"voiceId": "emily"}]
+    assert clones == [{"voiceId": "my_clone"}]
+    assert paths == [
+        "/waves/v1/lightning-v3.1/get_voices",
+        "/waves/v1/voice-cloning",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_versioned_draft_rejects_tamil_in_multilingual_agent():
+    client = SmallestAIClient(api_key="sk_test")
+
+    with pytest.raises(SmallestAIError) as error:
+        await client.update_agent_draft(
+            agent_id="agent_123",
+            branch_id="branch_123",
+            global_prompt="Be concise and helpful.",
+            first_message="Welcome.",
+            slm_model="electron",
+            language="ta",
+            supported_languages=["ta", "en"],
+            timezone="Asia/Kolkata",
         )
 
     assert error.value.status_code == 422

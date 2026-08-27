@@ -11,6 +11,7 @@ export interface VoiceAgent {
   voice_provider: string;
   voice_id: string;
   language: string;
+  supported_languages: string[];
   speech_rate: number;
   temperature: number;
   greeting_message: string | null;
@@ -29,6 +30,45 @@ export interface ProviderStatus {
   configured: boolean;
   webhook_configured: boolean;
   base_url: string;
+}
+
+export interface VoiceCatalogItem {
+  id: string;
+  name: string;
+  languages: string[];
+  accent: string | null;
+  gender: string | null;
+  age: string | null;
+  use_cases: string[];
+  source: 'catalog' | 'cloned';
+}
+
+export interface LanguageCatalogItem {
+  code: string;
+  name: string;
+}
+
+export interface AgentTemplate {
+  id: string;
+  name: string;
+  category: string;
+  description: string;
+  system_prompt: string;
+  greeting_message: string;
+  default_language: string;
+  supported_languages: string[];
+  voice_id: string;
+  speech_rate: number;
+  temperature: number;
+  timezone: string;
+}
+
+export interface AgentProviderCatalog {
+  provider: 'smallest';
+  voice_model: string;
+  voices: VoiceCatalogItem[];
+  languages: LanguageCatalogItem[];
+  templates: AgentTemplate[];
 }
 
 export interface BrowserSession {
@@ -278,6 +318,10 @@ class ApiClient {
 
   async getProviderStatus() {
     return this.request<ProviderStatus>('/api/v1/agents/provider/status');
+  }
+
+  async getAgentProviderCatalog() {
+    return this.request<AgentProviderCatalog>('/api/v1/agents/provider/catalog');
   }
 
   async provisionSmallestAgent(id: string) {

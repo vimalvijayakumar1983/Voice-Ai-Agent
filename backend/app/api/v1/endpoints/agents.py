@@ -1,5 +1,6 @@
 """Agent builder endpoints - CRUD for AI voice agents."""
 
+import asyncio
 from datetime import UTC, datetime
 from uuid import UUID
 
@@ -14,6 +15,7 @@ from app.models.agent import Agent, KnowledgeBase
 from app.providers.smallest import SmallestAIError, get_smallest_client
 from app.schemas.agent import (
     AgentCreate,
+    AgentProviderCatalog,
     AgentResponse,
     AgentUpdate,
     KnowledgeBaseCreate,
@@ -21,6 +23,7 @@ from app.schemas.agent import (
     SmallestSessionRequest,
     SmallestSessionResponse,
 )
+from app.services.agent_catalog import AGENT_TEMPLATES, language_catalog, normalize_voices
 
 router = APIRouter(prefix="/agents", tags=["Agents"])
 
@@ -31,6 +34,7 @@ SMALLEST_SYNC_FIELDS = {
     "model_name",
     "voice_id",
     "language",
+    "supported_languages",
     "speech_rate",
     "timezone",
 }
@@ -85,6 +89,35 @@ async def get_provider_status(
     }
 
 
+@router.get("/provider/catalog", response_model=AgentProviderCatalog)
+async def get_provider_catalog(
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """Return the current Waves voice catalog and local agent templates."""
+    client = get_smallest_client()
+    provider_voices, cloned_voices = await asyncio.gather(
+        client.list_voices(),
+        client.list_voice_clones(),
+        return_exceptions=True,
+    )
+    if isinstance(provider_voices, SmallestAIError):
+        raise HTTPException(
+            status_code=provider_voices.status_code, detail=str(provider_voices)
+        ) from provider_voices
+    if isinstance(provider_voices, Exception):
+        raise HTTPException(status_code=502, detail="Could not load the Smallest.ai voice catalog")
+
+    # Some plans do not expose voice cloning. The public catalog is still useful
+    # in that case, so omit clones rather than failing the whole editor.
+    clones = cloned_voices if isinstance(cloned_voices, list) else []
+    voices = normalize_voices(provider_voices, clones)
+    return AgentProviderCatalog(
+        voices=voices,
+        languages=language_catalog(voices),
+        templates=AGENT_TEMPLATES,
+    )
+
+
 @router.post("/{agent_id}/smallest/provision", response_model=AgentResponse)
 async def provision_smallest_agent(
     agent_id: UUID,
@@ -121,6 +154,7 @@ async def provision_smallest_agent(
             first_message=agent.greeting_message,
             slm_model=agent.model_name,
             language=agent.language,
+            supported_languages=agent.supported_languages,
             timezone=agent.timezone,
             voice_id=agent.voice_id,
             speech_rate=agent.speech_rate,
@@ -168,6 +202,7 @@ async def sync_smallest_agent(
             first_message=agent.greeting_message,
             slm_model=agent.model_name,
             language=agent.language,
+            supported_languages=agent.supported_languages,
             timezone=agent.timezone,
             voice_id=agent.voice_id,
             speech_rate=agent.speech_rate,
@@ -250,6 +285,19 @@ async def update_agent(
         raise HTTPException(status_code=404, detail="Agent not found")
 
     changes = data.model_dump(exclude_unset=True)
+    language = changes.get("language", agent.language)
+    supported_languages = changes.get("supported_languages", agent.supported_languages)
+    if language not in supported_languages:
+        raise HTTPException(
+            status_code=422,
+            detail="Primary language must be included in supported languages",
+        )
+    if "ta" in supported_languages and len(supported_languages) > 1:
+        raise HTTPException(
+            status_code=422,
+            detail="Tamil cannot be combined with other supported languages",
+        )
+
     for key, value in changes.items():
         setattr(agent, key, value)
 
