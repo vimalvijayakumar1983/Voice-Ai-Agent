@@ -105,4 +105,28 @@ async def test_versioned_draft_contains_runtime_configuration():
     assert captured["slmModel"] == "electron"
     assert captured["language"] == {"default": "en", "supported": ["en"]}
     assert captured["synthesizer"]["voiceConfig"]["voiceId"] == "nyah"
-    assert captured["timezone"] == "Asia/Dubai"
+    assert captured["timezone"] == {
+        "label": "(GMT+4:00) Asia/Dubai",
+        "offset": 4,
+    }
+
+
+@pytest.mark.asyncio
+async def test_versioned_draft_rejects_unknown_timezone_before_request():
+    client = SmallestAIClient(
+        api_key="sk_test",
+        transport=httpx.MockTransport(lambda _request: httpx.Response(200, json={})),
+    )
+
+    with pytest.raises(SmallestAIError) as error:
+        await client.update_agent_draft(
+            agent_id="agent_123",
+            branch_id="branch_123",
+            global_prompt="Be concise and helpful.",
+            first_message="Welcome.",
+            slm_model="electron",
+            language="en",
+            timezone="Not/A_Timezone",
+        )
+
+    assert error.value.status_code == 422

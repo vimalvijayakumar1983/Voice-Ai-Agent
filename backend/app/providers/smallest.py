@@ -7,7 +7,9 @@ is never exposed to a browser or stored on an agent record.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 import structlog
@@ -15,6 +17,23 @@ import structlog
 from app.core.config import settings
 
 logger = structlog.get_logger()
+
+
+def _timezone_config(timezone_name: str) -> dict[str, str | int | float]:
+    """Translate an IANA zone into the object currently accepted by Atoms."""
+    try:
+        offset = datetime.now(ZoneInfo(timezone_name)).utcoffset()
+    except ZoneInfoNotFoundError as exc:
+        raise SmallestAIError(f"Unknown IANA timezone: {timezone_name}", status_code=422) from exc
+
+    total_minutes = int((offset.total_seconds() if offset else 0) / 60)
+    sign = "+" if total_minutes >= 0 else "-"
+    hours, minutes = divmod(abs(total_minutes), 60)
+    offset_hours = total_minutes / 60
+    return {
+        "label": f"(GMT{sign}{hours}:{minutes:02d}) {timezone_name}",
+        "offset": int(offset_hours) if offset_hours.is_integer() else offset_hours,
+    }
 
 
 class SmallestAIError(RuntimeError):
@@ -153,7 +172,7 @@ class SmallestAIClient:
             "globalPrompt": global_prompt,
             "slmModel": slm_model,
             "language": {"default": language, "supported": [language]},
-            "timezone": timezone,
+            "timezone": _timezone_config(timezone),
             "allowInterruptions": True,
         }
         if first_message is not None:

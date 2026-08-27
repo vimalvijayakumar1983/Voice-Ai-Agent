@@ -30,6 +30,7 @@ dependencies = [
     "tenacity>=8.2.0",
     "structlog>=24.1.0",
     "aiosqlite>=0.20.0",
+    "tzdata>=2025.2",
 ]
 
 [project.optional-dependencies]
