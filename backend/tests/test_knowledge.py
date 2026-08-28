@@ -98,6 +98,35 @@ def test_reconcile_matches_completed_url_returned_as_knowledge_item():
     assert knowledge.indexed_source_count == 1
 
 
+def test_reconcile_matches_smallest_completed_scrape_batch():
+    source = _url_source()
+    knowledge = _knowledge(source)
+    now = datetime.now(UTC)
+
+    _reconcile_provider_sources(
+        knowledge,
+        scraped=[
+            {
+                "_id": "provider-scrape-batch-1",
+                "knowledgeBaseId": "provider-kb-1",
+                "hostUrl": "https://www.aesmc.com/",
+                "scrapedUrls": ["https://www.aesmc.com/"],
+                "processingStatus": "completed",
+                "totalUrls": 1,
+            }
+        ],
+        items=[],
+        provider_knowledge_base={"_id": "provider-kb-1"},
+        now=now,
+    )
+
+    assert source.status == "indexed"
+    assert source.provider_item_id == "provider-scrape-batch-1"
+    assert source.last_synced_at == now
+    assert knowledge.sync_status == "ready"
+    assert knowledge.indexed_source_count == 1
+
+
 def test_reconcile_uses_completed_knowledge_base_as_safe_fallback():
     source = _url_source()
     knowledge = _knowledge(source)

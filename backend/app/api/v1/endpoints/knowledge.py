@@ -200,6 +200,7 @@ def _provider_item_urls(item: dict) -> list[object]:
         value
         for value in (
             item.get("url"),
+            item.get("hostUrl"),
             item.get("location"),
             item.get("sourceUrl"),
             item.get("sourceURL"),
@@ -214,6 +215,36 @@ def _provider_item_urls(item: dict) -> list[object]:
         )
         if value
     ]
+
+
+def _expand_scraped_provider_items(scraped: list[dict]) -> list[dict]:
+    """Expand Smallest scrape batches into URL-shaped provider records.
+
+    Smallest returns ``scraped-urls`` as crawl batches.  The batch carries the
+    authoritative ``processingStatus`` and ``hostUrl`` while any individual
+    URLs live under ``scrapedUrls``.  Preserve the batch and synthesize child
+    records that inherit its status so both response variants reconcile.
+    """
+    expanded: list[dict] = []
+    for batch in scraped:
+        expanded.append(batch)
+        nested = batch.get("scrapedUrls")
+        if not isinstance(nested, list):
+            continue
+        for value in nested:
+            child = dict(value) if isinstance(value, dict) else {"url": value}
+            if not child.get("processingStatus") and not child.get("status"):
+                if batch.get("processingStatus"):
+                    child["processingStatus"] = batch["processingStatus"]
+                elif batch.get("status"):
+                    child["status"] = batch["status"]
+            if not child.get("_id") and not child.get("id"):
+                if batch.get("_id"):
+                    child["_id"] = batch["_id"]
+                elif batch.get("id"):
+                    child["id"] = batch["id"]
+            expanded.append(child)
+    return expanded
 
 
 def _provider_file_name(item: dict) -> str:
@@ -231,7 +262,7 @@ def _reconcile_provider_sources(
     provider_knowledge_base: dict,
     now: datetime,
 ) -> None:
-    provider_items = [*scraped, *items]
+    provider_items = [*_expand_scraped_provider_items(scraped), *items]
     items_by_id = {
         str(item.get("_id") or item.get("id")): item
         for item in provider_items
