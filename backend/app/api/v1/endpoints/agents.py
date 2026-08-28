@@ -245,6 +245,21 @@ def _publish_reconciliation_is_current(agent: Agent, operation_id: str | None) -
     return operation_id is None or current_id == operation_id
 
 
+def _provider_publish_label(label: str, operation_id: str) -> str:
+    """Build a provider-safe, bounded label that still identifies this operation."""
+    punctuation = {" ", ".", ",", "-", "(", ")"}
+    normalized = "".join(
+        character
+        if (character.isascii() and character.isalnum()) or character in punctuation
+        else "-"
+        for character in label
+    )
+    normalized = " ".join(normalized.split()).strip(" .,-()") or "VAV"
+    suffix = f"-{operation_id[:8]}"
+    base = normalized[: 40 - len(suffix)].rstrip(" .,-()") or "VAV"
+    return f"{base}{suffix}"
+
+
 def _lease_active(operation: dict) -> bool:
     raw_expiry = operation.get("lease_expires_at")
     if not isinstance(raw_expiry, str):
@@ -1001,7 +1016,7 @@ async def _publish_smallest_agent(
 ) -> Agent:
     """Update a draft, publish once, then reconcile the resulting revision."""
     operation_id = str(uuid4())
-    operation_label = f"{label} [{operation_id}]"
+    operation_label = _provider_publish_label(label, operation_id)
     now = datetime.now(UTC)
     agent = await _tenant_agent(db, agent_id, tenant_id, for_update=True)
     provider_agent_id = agent.provider_agent_id
