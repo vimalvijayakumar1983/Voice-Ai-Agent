@@ -7,7 +7,6 @@ import {
   AudioWaveform,
   Bot,
   BookOpenCheck,
-  ShoppingBag,
   ChevronDown,
   CreditCard,
   FlaskConical,
@@ -37,7 +36,6 @@ const navigation = [
       { href: '/playground', label: 'Playground', icon: FlaskConical },
       { href: '/calls', label: 'Conversations', icon: PhoneCall },
       { href: '/workflows', label: 'Workflows', icon: Workflow },
-      { href: '/commerce', label: 'Commerce', icon: ShoppingBag },
     ],
   },
   {

@@ -168,45 +168,6 @@ export interface BrowserSession {
   sample_rate: number;
 }
 
-export interface CommerceAction {
-  id: string;
-  session_id: string;
-  action_type: string;
-  status: string;
-  request_summary: Record<string, unknown>;
-  result_summary: Record<string, unknown>;
-  error_message: string | null;
-  duration_ms: number | null;
-  created_at: string;
-}
-
-export interface CommerceSession {
-  id: string;
-  agent_id: string | null;
-  channel: 'web_voice' | 'phone' | 'operator';
-  status: 'active' | 'checkout_ready' | 'awaiting_confirmation' | 'confirmed' | 'submitting' | 'completed' | 'failed' | 'expired';
-  currency: string;
-  cart_snapshot: Record<string, unknown>;
-  browser_checkpoint: Record<string, unknown>;
-  payment_method: 'cod' | 'store_pickup' | 'hosted_card' | null;
-  confirmed_at: string | null;
-  order_reference: string | null;
-  checkout_url: string | null;
-  last_error: string | null;
-  expires_at: string;
-  created_at: string;
-  updated_at: string;
-  actions: CommerceAction[];
-}
-
-export interface CommerceProviderStatus {
-  provider: 'fepy_browser';
-  enabled: boolean;
-  order_submission_enabled: boolean;
-  shop_origin: string;
-  execution_mode: 'local_chromium' | 'disabled';
-}
-
 export type WorkspaceRole = 'owner' | 'admin' | 'member' | 'viewer';
 
 export interface CurrentUser {
@@ -1226,58 +1187,6 @@ class ApiClient {
 
   async deleteKnowledgeBase(id: string) {
     return this.request<void>(`/api/v1/knowledge/${id}`, { method: 'DELETE' });
-  }
-
-  // Browser Commerce
-  async getCommerceStatus() {
-    return this.request<CommerceProviderStatus>('/api/v1/commerce/status');
-  }
-
-  async listCommerceSessions() {
-    return this.request<CommerceSession[]>('/api/v1/commerce/sessions');
-  }
-
-  async createCommerceSession(agentId?: string) {
-    return this.request<CommerceSession>('/api/v1/commerce/sessions', {
-      method: 'POST',
-      body: JSON.stringify({ channel: 'web_voice', agent_id: agentId || null }),
-    });
-  }
-
-  async searchCommerce(sessionId: string, query: string) {
-    return this.request<CommerceSession>(`/api/v1/commerce/sessions/${sessionId}/search`, {
-      method: 'POST',
-      headers: { 'Idempotency-Key': createIdempotencyKey() },
-      body: JSON.stringify({ query, limit: 6 }),
-    });
-  }
-
-  async inspectCommerceProduct(sessionId: string, productPath: string) {
-    return this.request<CommerceSession>(`/api/v1/commerce/sessions/${sessionId}/product`, {
-      method: 'POST',
-      headers: { 'Idempotency-Key': createIdempotencyKey() },
-      body: JSON.stringify({ product_path: productPath }),
-    });
-  }
-
-  async addCommerceCartItem(sessionId: string, productPath: string, quantity = 1) {
-    return this.request<CommerceSession>(`/api/v1/commerce/sessions/${sessionId}/cart/items`, {
-      method: 'POST',
-      headers: { 'Idempotency-Key': createIdempotencyKey() },
-      body: JSON.stringify({ product_path: productPath, quantity }),
-    });
-  }
-
-  async prepareCommerceCheckout(sessionId: string, data: Record<string, unknown>) {
-    return this.request<CommerceSession>(`/api/v1/commerce/sessions/${sessionId}/checkout`, {
-      method: 'POST', body: JSON.stringify(data),
-    });
-  }
-
-  async confirmCommerceOrder(sessionId: string) {
-    return this.request<CommerceSession>(`/api/v1/commerce/sessions/${sessionId}/confirm`, {
-      method: 'POST', body: JSON.stringify({ confirmation_text: 'Confirm order' }),
-    });
   }
 
   // Calls

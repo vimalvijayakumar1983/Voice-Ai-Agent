@@ -2,13 +2,12 @@ FROM python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    HOME=/home/app
+    PIP_DISABLE_PIP_VERSION_CHECK=1
 
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential chromium fonts-liberation libpq-dev \
+    build-essential libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml ./
@@ -18,9 +17,8 @@ RUN pip install --no-cache-dir .
 COPY migrations ./migrations
 COPY alembic.ini ./
 
-RUN addgroup --system app && adduser --system --ingroup app --home /home/app app \
-    && mkdir -p /home/app/.config \
-    && chown -R app:app /app /home/app
+RUN addgroup --system app && adduser --system --ingroup app app \
+    && chown -R app:app /app
 
 USER app
 

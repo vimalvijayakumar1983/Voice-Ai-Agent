@@ -69,14 +69,6 @@ class Settings(BaseSettings):
     smallest_webhook_id: str = ""
     smallest_request_timeout_seconds: float = 30.0
 
-    # FEPY browser commerce. Navigation is hard-allowlisted to this origin.
-    fepy_commerce_enabled: bool = True
-    fepy_allow_order_submission: bool = False
-    fepy_shop_origin: str = "https://www.fepy.com"
-    fepy_search_origin: str = "https://search.fepy.com"
-    fepy_browser_timeout_seconds: int = Field(default=25, ge=5, le=60)
-    chromium_executable_path: str = "/usr/bin/chromium"
-
     # AI Providers
     openai_api_key: str = ""
     anthropic_api_key: str = ""
