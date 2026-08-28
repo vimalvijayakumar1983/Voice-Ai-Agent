@@ -180,6 +180,7 @@ All provider credentials belong in the backend environment only:
 | --- | --- |
 | `SMALLEST_API_KEY` | Server-to-server Atoms API authentication |
 | `SMALLEST_BASE_URL` | Atoms API base URL; defaults to the production v1 endpoint |
+| `SMALLEST_WAVES_BASE_URL` | Waves API base URL; kept independent from Atoms overrides |
 | `SMALLEST_WEBHOOK_ID` | Provider webhook resource attached to every provisioned agent |
 | `SMALLEST_WEBHOOK_SECRET` | HMAC-SHA256 verification secret for lifecycle events |
 | `SMALLEST_REQUEST_TIMEOUT_SECONDS` | Provider request timeout |

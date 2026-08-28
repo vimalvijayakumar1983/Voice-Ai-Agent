@@ -189,6 +189,20 @@ async def test_provider_auth_failures_are_not_exposed_as_application_auth_failur
 
 
 @pytest.mark.asyncio
+async def test_provider_string_detail_is_preserved_for_safe_diagnostics():
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(422, json={"detail": "Unsupported catalog route"})
+
+    client = SmallestAIClient(api_key="sk_test", transport=httpx.MockTransport(handler))
+
+    with pytest.raises(SmallestAIError) as error:
+        await client.list_voices()
+
+    assert error.value.status_code == 422
+    assert str(error.value) == "Unsupported catalog route"
+
+
+@pytest.mark.asyncio
 async def test_versioned_draft_contains_runtime_configuration():
     captured: dict = {}
 
@@ -277,17 +291,18 @@ async def test_versioned_draft_rejects_unknown_timezone_before_request():
 
 @pytest.mark.asyncio
 async def test_waves_catalog_and_voice_clones_use_current_endpoints():
-    paths: list[str] = []
+    requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        paths.append(request.url.path)
+        requests.append(request)
         if request.url.path.endswith("/get_voices"):
             return httpx.Response(200, json={"voices": [{"voiceId": "emily"}]})
         return httpx.Response(200, json={"data": [{"voiceId": "my_clone"}]})
 
     client = SmallestAIClient(
         api_key="sk_test",
-        base_url="https://api.smallest.ai/atoms/v1",
+        base_url="https://atoms-gateway.example.com/v1",
+        waves_base_url="https://api.smallest.ai/waves/v1",
         transport=httpx.MockTransport(handler),
     )
 
@@ -296,10 +311,12 @@ async def test_waves_catalog_and_voice_clones_use_current_endpoints():
 
     assert voices == [{"voiceId": "emily"}]
     assert clones == [{"voiceId": "my_clone"}]
-    assert paths == [
+    assert [request.url.path for request in requests] == [
         "/waves/v1/lightning-v3.1/get_voices",
         "/waves/v1/voice-cloning",
     ]
+    assert {request.url.host for request in requests} == {"api.smallest.ai"}
+    assert all("content-type" not in request.headers for request in requests)
 
 
 @pytest.mark.asyncio

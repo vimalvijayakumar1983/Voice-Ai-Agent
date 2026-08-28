@@ -40,6 +40,16 @@ def test_valid_production_configuration_passes_startup_gate():
     assert settings.app_env == "production"
 
 
+def test_smallest_waves_base_url_is_independent_from_atoms_base_url():
+    settings = Settings(
+        smallest_base_url="https://atoms-gateway.example.com/v1",
+        _env_file=None,
+    )
+
+    assert settings.smallest_base_url == "https://atoms-gateway.example.com/v1"
+    assert settings.smallest_waves_base_url == "https://api.smallest.ai/waves/v1"
+
+
 @pytest.mark.parametrize("app_env", [None, "prodution"])
 def test_railway_production_marker_is_authoritative(monkeypatch, app_env):
     for name, value in PRODUCTION_SETTINGS.items():

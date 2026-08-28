@@ -9,7 +9,7 @@ from __future__ import annotations
 import json as jsonlib
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
@@ -134,10 +134,7 @@ class SmallestAIClient:
         self.base_url = (base_url or settings.smallest_base_url).rstrip("/")
         self.timeout = timeout or settings.smallest_request_timeout_seconds
         self.transport = transport
-        parsed_base_url = urlsplit(self.base_url)
-        self.waves_base_url = waves_base_url or (
-            f"{parsed_base_url.scheme}://{parsed_base_url.netloc}/waves/v1"
-        )
+        self.waves_base_url = (waves_base_url or settings.smallest_waves_base_url).rstrip("/")
 
     @property
     def is_configured(self) -> bool:
@@ -166,7 +163,6 @@ class SmallestAIClient:
             headers={
                 "Authorization": f"Bearer {self.api_key}",
                 "Accept": "application/json",
-                "Content-Type": "application/json",
             },
         ) as client:
             try:
@@ -196,7 +192,11 @@ class SmallestAIClient:
             )
             message = "Smallest.ai rejected the request."
             if isinstance(details, dict):
-                message = str(details.get("message") or details.get("error") or message)
+                provider_message = (
+                    details.get("message") or details.get("error") or details.get("detail")
+                )
+                if isinstance(provider_message, str) and provider_message.strip():
+                    message = provider_message.strip()[:500]
             public_status_code = response.status_code
             if response.status_code in {401, 403}:
                 # These credentials belong to our server, not the signed-in

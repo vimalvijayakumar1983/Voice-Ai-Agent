@@ -65,6 +65,10 @@ class Settings(BaseSettings):
     # Smallest.ai Atoms
     smallest_api_key: str = ""
     smallest_base_url: str = "https://api.smallest.ai/atoms/v1"
+    # Waves is a separate provider surface. Do not derive this URL from an
+    # Atoms override: private gateways and legacy Atoms hosts do not
+    # necessarily expose the public voice catalog at the same origin.
+    smallest_waves_base_url: str = "https://api.smallest.ai/waves/v1"
     smallest_webhook_secret: str = ""
     smallest_webhook_id: str = ""
     smallest_request_timeout_seconds: float = 30.0
