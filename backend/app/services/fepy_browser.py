@@ -41,11 +41,19 @@ class FepyBrowser:
 
         async with self._semaphore:
             async with async_playwright() as playwright:
-                browser = await playwright.chromium.launch(
-                    executable_path=settings.chromium_executable_path or None,
-                    headless=True,
-                    args=["--no-sandbox", "--disable-dev-shm-usage"],
-                )
+                try:
+                    browser = await playwright.chromium.launch(
+                        executable_path=settings.chromium_executable_path or None,
+                        headless=True,
+                        args=[
+                            "--no-sandbox",
+                            "--disable-dev-shm-usage",
+                            "--disable-crash-reporter",
+                            "--disable-breakpad",
+                        ],
+                    )
+                except Exception as exc:
+                    raise FepyBrowserError("Browser session could not start") from exc
                 context = await browser.new_context(
                     storage_state=storage_state,
                     locale="en-AE",

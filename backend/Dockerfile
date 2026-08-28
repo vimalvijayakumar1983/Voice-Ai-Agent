@@ -2,7 +2,8 @@ FROM python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    HOME=/home/app
 
 WORKDIR /app
 
@@ -17,8 +18,9 @@ RUN pip install --no-cache-dir .
 COPY migrations ./migrations
 COPY alembic.ini ./
 
-RUN addgroup --system app && adduser --system --ingroup app app \
-    && chown -R app:app /app
+RUN addgroup --system app && adduser --system --ingroup app --home /home/app app \
+    && mkdir -p /home/app/.config \
+    && chown -R app:app /app /home/app
 
 USER app
 
