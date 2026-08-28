@@ -5,13 +5,13 @@ from unittest.mock import AsyncMock
 from uuid import UUID
 
 import pytest
-from httpx import AsyncClient
+from httpx import AsyncClient, MockTransport, Request, Response
 from sqlalchemy import event, select
 
 from app.api.v1.endpoints import agents as agents_endpoint
 from app.api.v1.endpoints import calls as calls_endpoint
 from app.models.agent import Agent
-from app.providers.smallest import BrowserSession, SmallestAIError
+from app.providers.smallest import BrowserSession, SmallestAIClient, SmallestAIError
 from app.tasks.call_tasks import reconcile_call_dispatch, reconcile_direct_call_terminal
 from tests.conftest import engine as test_engine
 from tests.conftest import test_session_factory as session_factory
@@ -221,6 +221,32 @@ async def test_catalog_includes_public_voices_languages_and_templates_without_pr
     assert len(payload["templates"]) == 5
     assert payload["templates"][0]["id"] == "receptionist"
     assert fake.clone_catalog_calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider_status", [401, 403])
+async def test_catalog_does_not_expose_provider_auth_as_application_auth(
+    provider_status: int,
+    client: AsyncClient,
+    auth_headers,
+    monkeypatch,
+):
+    def handler(_request: Request) -> Response:
+        return Response(provider_status, json={"message": "raw provider auth failure"})
+
+    provider = SmallestAIClient(
+        api_key="sk_invalid",
+        transport=MockTransport(handler),
+    )
+    monkeypatch.setattr(agents_endpoint, "get_smallest_client", lambda: provider)
+
+    response = await client.get("/api/v1/agents/provider/catalog", headers=auth_headers)
+
+    assert response.status_code == 502
+    assert response.json()["detail"] == (
+        "Smallest.ai rejected the configured server credentials or permissions."
+    )
+    assert "raw provider auth failure" not in response.text
 
 
 @pytest.mark.asyncio

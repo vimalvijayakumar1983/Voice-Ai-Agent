@@ -28,10 +28,27 @@ from app.models.campaign import (
 from app.models.compliance import DncEntry
 from app.models.user import User
 from app.models.workflow import Workflow
+from app.providers.smallest import SmallestAIError
 from app.services.campaign_lifecycle import sync_campaign_call_lifecycle
 from app.tasks import call_tasks, campaign_tasks
 from tests.conftest import engine as test_engine
 from tests.conftest import test_session_factory as session_factory
+
+
+def test_provider_auth_normalization_preserves_definitive_campaign_classification():
+    provider_auth_error = SmallestAIError(
+        "Smallest.ai rejected the configured server credentials or permissions.",
+        status_code=502,
+        upstream_status_code=401,
+    )
+
+    assert campaign_tasks._is_definitive_provider_rejection(provider_auth_error) is True
+    assert (
+        campaign_tasks._is_definitive_provider_rejection(
+            SmallestAIError("Smallest.ai failed", status_code=502)
+        )
+        is False
+    )
 
 
 async def _seed_campaign(

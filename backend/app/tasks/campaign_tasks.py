@@ -1320,7 +1320,9 @@ async def _call_provider_with_final_guard(
 def _is_definitive_provider_rejection(exc: Exception) -> bool:
     if isinstance(exc, DefinitiveDispatchError):
         return True
-    status_code = getattr(exc, "status_code", None)
+    status_code = getattr(exc, "upstream_status_code", None)
+    if status_code is None:
+        status_code = getattr(exc, "status_code", None)
     if status_code is None:
         status_code = getattr(exc, "status", None)
     return isinstance(status_code, int) and 400 <= status_code < 500 and status_code != 408

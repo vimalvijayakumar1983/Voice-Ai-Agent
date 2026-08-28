@@ -45,11 +45,15 @@ class SmallestAIError(RuntimeError):
         message: str,
         *,
         status_code: int = 502,
+        upstream_status_code: int | None = None,
         details: Any = None,
         ambiguous: bool = False,
     ):
         super().__init__(message)
         self.status_code = status_code
+        # Keep the provider's raw status for internal dispatch classification
+        # while exposing only an application-safe status to API clients.
+        self.upstream_status_code = upstream_status_code
         self.details = details
         # A timeout/connection loss after a mutating request may mean Smallest
         # accepted the operation even though we never received its response.
@@ -141,9 +145,18 @@ class SmallestAIClient:
             message = "Smallest.ai rejected the request."
             if isinstance(details, dict):
                 message = str(details.get("message") or details.get("error") or message)
+            public_status_code = response.status_code
+            if response.status_code in {401, 403}:
+                # These credentials belong to our server, not the signed-in
+                # operator. Never surface a provider authentication status as
+                # an application authentication failure: the frontend treats
+                # our own 401 as a signal to rotate or clear the user session.
+                public_status_code = 502
+                message = "Smallest.ai rejected the configured server credentials or permissions."
             raise SmallestAIError(
                 message,
-                status_code=response.status_code,
+                status_code=public_status_code,
+                upstream_status_code=response.status_code,
                 details=details,
                 ambiguous=mutation and (response.status_code == 408 or response.status_code >= 500),
             )

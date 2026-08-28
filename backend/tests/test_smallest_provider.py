@@ -81,6 +81,27 @@ async def test_missing_api_key_is_a_service_configuration_error():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("provider_status", [401, 403])
+async def test_provider_auth_failures_are_not_exposed_as_application_auth_failures(
+    provider_status: int,
+):
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(provider_status, json={"message": "provider auth failed"})
+
+    client = SmallestAIClient(api_key="sk_test", transport=httpx.MockTransport(handler))
+
+    with pytest.raises(SmallestAIError) as error:
+        await client.create_agent(name="Provider auth boundary")
+
+    assert error.value.status_code == 502
+    assert error.value.upstream_status_code == provider_status
+    assert str(error.value) == (
+        "Smallest.ai rejected the configured server credentials or permissions."
+    )
+    assert error.value.ambiguous is False
+
+
+@pytest.mark.asyncio
 async def test_versioned_draft_contains_runtime_configuration():
     captured: dict = {}
 
