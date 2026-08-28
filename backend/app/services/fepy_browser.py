@@ -9,8 +9,11 @@ from typing import Any
 from urllib.parse import urljoin, urlsplit
 
 import httpx
+import structlog
 
 from app.core.config import settings
+
+logger = structlog.get_logger()
 
 
 class FepyBrowserError(RuntimeError):
@@ -161,7 +164,7 @@ class FepyBrowser:
     async def inspect_product(self, product_path: str) -> dict[str, Any]:
         try:
             async with self._page() as (page, _context):
-                await page.goto(self._url(product_path), wait_until="domcontentloaded")
+                await page.goto(self._url(product_path), wait_until="commit")
                 self._assert_loaded_origin(page)
                 await page.locator("h1").first.wait_for(state="visible")
                 result = await page.evaluate(
@@ -188,7 +191,7 @@ class FepyBrowser:
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         try:
             async with self._page(storage_state) as (page, context):
-                await page.goto(self._url("/shop/cart"), wait_until="domcontentloaded")
+                await page.goto(self._url("/shop/cart"), wait_until="commit")
                 self._assert_loaded_origin(page)
                 await page.locator("body").wait_for(state="visible")
                 before_snapshot = await self._cart_snapshot(
@@ -196,7 +199,7 @@ class FepyBrowser:
                     expected_product_path=product_path,
                 )
                 before_quantity = before_snapshot["verified_quantity"] or 0
-                await page.goto(self._url(product_path), wait_until="domcontentloaded")
+                await page.goto(self._url(product_path), wait_until="commit")
                 self._assert_loaded_origin(page)
                 await page.locator("h1").first.wait_for(state="visible")
                 quantity_input, add_button = await self._main_purchase_controls(page)
@@ -210,7 +213,7 @@ class FepyBrowser:
                 await add_button.scroll_into_view_if_needed()
                 await add_button.click()
                 await page.wait_for_timeout(1200)
-                await page.goto(self._url("/shop/cart"), wait_until="domcontentloaded")
+                await page.goto(self._url("/shop/cart"), wait_until="commit")
                 self._assert_loaded_origin(page)
                 await page.locator("body").wait_for(state="visible")
                 await page.wait_for_timeout(500)
@@ -226,6 +229,11 @@ class FepyBrowser:
         except FepyBrowserError:
             raise
         except Exception as exc:
+            logger.warning(
+                "fepy_cart_controls_failed",
+                error_type=type(exc).__name__,
+                error=str(exc)[:500],
+            )
             raise FepyBrowserError("FEPY cart controls are temporarily unavailable") from exc
 
     async def review_cart(
@@ -233,13 +241,18 @@ class FepyBrowser:
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         try:
             async with self._page(storage_state) as (page, context):
-                await page.goto(self._url("/shop/cart"), wait_until="domcontentloaded")
+                await page.goto(self._url("/shop/cart"), wait_until="commit")
                 self._assert_loaded_origin(page)
                 await page.wait_for_timeout(500)
                 return await self._cart_snapshot(page), await context.storage_state()
         except FepyBrowserError:
             raise
         except Exception as exc:
+            logger.warning(
+                "fepy_cart_page_failed",
+                error_type=type(exc).__name__,
+                error=str(exc)[:500],
+            )
             raise FepyBrowserError("FEPY cart page is temporarily unavailable") from exc
 
     async def _cart_snapshot(

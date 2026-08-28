@@ -199,6 +199,7 @@ async def test_add_to_cart_verifies_main_control_mutation_and_cart_page():
             self.visited = []
 
         async def goto(self, url, **_kwargs):
+            assert _kwargs == {"wait_until": "commit"}
             self.url = url
             self.visited.append(url)
 
