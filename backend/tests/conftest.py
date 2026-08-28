@@ -10,7 +10,7 @@ from sqlalchemy import event
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.ext.compiler import compiles
-from sqlalchemy.pool import StaticPool
+from sqlalchemy.pool import NullPool, StaticPool
 
 from app.core.database import Base, get_db
 from app.core.security import create_access_token, hash_password
@@ -40,7 +40,11 @@ if TEST_DATABASE_URL.startswith("sqlite"):
         cursor.close()
 
 else:
-    engine = create_async_engine(TEST_DATABASE_URL, echo=False, pool_pre_ping=True)
+    # pytest-asyncio creates isolated event loops for tests. asyncpg connections
+    # are loop-bound, so a pooled connection from an earlier test cannot safely
+    # be reused by a later loop. Real application engines remain pooled; only
+    # the PostgreSQL test engine uses fresh connections per checkout.
+    engine = create_async_engine(TEST_DATABASE_URL, echo=False, poolclass=NullPool)
 test_session_factory = async_sessionmaker(engine, expire_on_commit=False)
 
 
