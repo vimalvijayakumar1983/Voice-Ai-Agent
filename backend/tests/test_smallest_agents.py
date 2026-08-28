@@ -182,6 +182,22 @@ def _full_agent_editor_payload(agent: dict) -> dict:
     return {field: agent[field] for field in fields}
 
 
+def test_provider_publish_label_is_bounded_and_provider_safe():
+    operation_id = "12345678-1234-1234-1234-123456789abc"
+
+    label = agents_endpoint._provider_publish_label(
+        "VAV Voice AI initial release [Dubai] / production",
+        operation_id,
+    )
+
+    assert len(label) <= 40
+    assert label.endswith("-12345678")
+    assert all(
+        (character.isascii() and character.isalnum()) or character in {" ", ".", ",", "-", "(", ")"}
+        for character in label
+    )
+
+
 async def _provision_editor_regression_agent(
     client: AsyncClient,
     auth_headers: dict,
@@ -251,7 +267,7 @@ async def test_provision_sync_and_mint_browser_session(
     assert fake.knowledge_binding_lookup_calls == 1
     assert fake.webhook_calls == 1
     first_operation = provisioned.json()["provider_config"]["publish"]
-    assert first_operation["id"] in first_operation["label"]
+    assert first_operation["id"][:8] in first_operation["label"]
     assert fake.publish_labels == [first_operation["label"]]
 
     duplicate_provision = await client.post(
