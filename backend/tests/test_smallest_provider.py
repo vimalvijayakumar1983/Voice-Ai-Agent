@@ -82,6 +82,32 @@ async def test_knowledge_base_url_ingestion_contract():
 
 
 @pytest.mark.asyncio
+async def test_get_knowledge_base_contract():
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "status": True,
+                "data": {"_id": "kb_123", "processingStatus": "completed"},
+            },
+        )
+
+    client = SmallestAIClient(
+        api_key="sk_test",
+        base_url="https://api.smallest.ai/atoms/v1",
+        transport=httpx.MockTransport(handler),
+    )
+
+    knowledge_base = await client.get_knowledge_base("kb_123")
+
+    assert requests[0].url.path == "/atoms/v1/knowledgebase/kb_123"
+    assert knowledge_base["processingStatus"] == "completed"
+
+
+@pytest.mark.asyncio
 async def test_knowledge_base_description_is_normalized_to_provider_limit():
     requests: list[httpx.Request] = []
 

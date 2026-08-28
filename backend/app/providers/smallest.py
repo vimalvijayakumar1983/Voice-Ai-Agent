@@ -512,6 +512,13 @@ class SmallestAIClient:
             json={"name": name, "description": _provider_knowledge_description(description)},
         )
 
+    async def get_knowledge_base(self, knowledge_base_id: str) -> dict[str, Any]:
+        response = await self._request("GET", f"/knowledgebase/{quote(knowledge_base_id, safe='')}")
+        data = response.get("data")
+        if not isinstance(data, dict):
+            raise SmallestAIError("Smallest.ai returned an invalid knowledge base response.")
+        return data
+
     async def delete_knowledge_base(self, knowledge_base_id: str) -> None:
         await self._request("DELETE", f"/knowledgebase/{quote(knowledge_base_id, safe='')}")
 

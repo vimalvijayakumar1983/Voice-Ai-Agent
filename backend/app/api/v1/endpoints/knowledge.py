@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from pathlib import PurePath
+from urllib.parse import urlsplit, urlunsplit
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
@@ -30,6 +31,16 @@ from app.services.audit import record_audit_event
 
 router = APIRouter(prefix="/knowledge", tags=["Knowledge Studio"])
 MAX_KNOWLEDGE_PDF_BYTES = 8 * 1024 * 1024
+PROVIDER_INDEXED_STATUSES = {
+    "complete",
+    "completed",
+    "indexed",
+    "processed",
+    "ready",
+    "success",
+    "succeeded",
+}
+PROVIDER_FAILED_STATUSES = {"error", "failed", "failure"}
 
 
 def _provider_error(exc: SmallestAIError) -> HTTPException:
@@ -146,6 +157,111 @@ def _recount(kb: KnowledgeBase) -> None:
         kb.sync_status = "error"
     elif any(source.status in {"pending", "processing"} for source in kb.sources):
         kb.sync_status = "processing"
+
+
+def _provider_source_status(item: dict | None) -> str:
+    if not item:
+        return "processing"
+    value = str(item.get("processingStatus") or item.get("status") or "processing")
+    normalized = value.strip().lower().replace("-", "_").replace(" ", "_")
+    if normalized in PROVIDER_INDEXED_STATUSES:
+        return "indexed"
+    if normalized in PROVIDER_FAILED_STATUSES:
+        return "failed"
+    return "processing"
+
+
+def _provider_url_key(value: object) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    parsed = urlsplit(raw)
+    if not parsed.scheme or not parsed.netloc:
+        return raw.rstrip("/")
+    scheme = parsed.scheme.lower()
+    host = (parsed.hostname or "").lower()
+    try:
+        port = parsed.port
+    except ValueError:
+        return raw.rstrip("/")
+    default_port = 80 if scheme == "http" else 443
+    netloc = host if port in {None, default_port} else f"{host}:{port}"
+    path = parsed.path or "/"
+    if path != "/":
+        path = path.rstrip("/") or "/"
+    return urlunsplit((scheme, netloc, path, parsed.query, ""))
+
+
+def _provider_item_url(item: dict) -> object:
+    metadata = item.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    return (
+        item.get("url") or item.get("location") or metadata.get("url") or metadata.get("sourceUrl")
+    )
+
+
+def _provider_file_name(item: dict) -> str:
+    metadata = item.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    return str(item.get("fileName") or metadata.get("fileName") or "")
+
+
+def _reconcile_provider_sources(
+    kb: KnowledgeBase,
+    *,
+    scraped: list[dict],
+    items: list[dict],
+    provider_knowledge_base: dict,
+    now: datetime,
+) -> None:
+    provider_items = [*scraped, *items]
+    items_by_id = {
+        str(item.get("_id") or item.get("id")): item
+        for item in provider_items
+        if item.get("_id") or item.get("id")
+    }
+    urls_by_location = {
+        key: item for item in scraped if (key := _provider_url_key(_provider_item_url(item)))
+    }
+    files_by_name = {name: item for item in items if (name := _provider_file_name(item))}
+    overall_status = _provider_source_status(provider_knowledge_base)
+
+    for source in kb.sources:
+        item = None
+        if source.provider_item_id:
+            item = items_by_id.get(source.provider_item_id)
+        if item is None and source.location:
+            item = urls_by_location.get(_provider_url_key(source.location))
+        if item is None and source.source_type == "file":
+            item = files_by_name.get(source.name)
+
+        if item is not None:
+            source.status = _provider_source_status(item)
+            source.provider_item_id = str(item.get("_id") or item.get("id") or "") or None
+            source.last_synced_at = now
+            source.error_message = None
+            if source.status == "failed":
+                source.error_message = str(
+                    item.get("error") or item.get("errorMessage") or "Provider processing failed"
+                )
+            continue
+
+        # Smallest.ai's knowledge-base status is authoritative for the whole
+        # ingestion job. Its per-source endpoint may normalize a URL or omit a
+        # completed item, so a completed base safely closes any remaining
+        # provider-backed URL/file source instead of leaving it stuck forever.
+        if (
+            overall_status == "indexed"
+            and source.source_type in {"url", "file", "website", "sitemap"}
+            and source.status in {"pending", "processing"}
+        ):
+            source.status = "indexed"
+            source.error_message = None
+            source.last_synced_at = now
+
+    _recount(kb)
 
 
 @router.get("", response_model=list[KnowledgeBaseResponse])
@@ -418,30 +534,20 @@ async def refresh_knowledge_base(
         return _knowledge_response(kb)
     client = get_smallest_client()
     try:
+        provider_knowledge_base = await client.get_knowledge_base(kb.provider_knowledge_base_id)
         scraped = await client.list_scraped_knowledge_urls(kb.provider_knowledge_base_id)
         items = await client.list_knowledge_items(kb.provider_knowledge_base_id)
     except SmallestAIError as exc:
         await _mark_provider_error(db, kb, exc)
         raise _provider_error(exc) from exc
-    urls_by_location = {str(item.get("url")): item for item in scraped}
-    files_by_name = {str(item.get("fileName")): item for item in items if item.get("fileName")}
     now = datetime.now(UTC)
-    for source in kb.sources:
-        item = urls_by_location.get(source.location or "") or files_by_name.get(source.name)
-        if not item:
-            continue
-        provider_status = str(item.get("status") or item.get("processingStatus") or "processing")
-        source.status = {
-            "completed": "indexed",
-            "indexed": "indexed",
-            "failed": "failed",
-            "error": "failed",
-        }.get(provider_status.lower(), "processing")
-        source.provider_item_id = str(item.get("_id") or item.get("id") or "") or None
-        source.last_synced_at = now
-        if source.status == "failed":
-            source.error_message = str(item.get("error") or "Provider processing failed")
-    _recount(kb)
+    _reconcile_provider_sources(
+        kb,
+        scraped=scraped,
+        items=items,
+        provider_knowledge_base=provider_knowledge_base,
+        now=now,
+    )
     kb.last_synced_at = now
     await db.flush()
     await record_audit_event(
