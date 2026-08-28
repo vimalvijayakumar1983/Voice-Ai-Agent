@@ -13,6 +13,7 @@ import {
   X,
 } from 'lucide-react';
 import Layout from '@/components/Layout';
+import { isAgentCallReady } from '@/lib/agent-readiness.cjs';
 import {
   api,
   Campaign,
@@ -297,12 +298,7 @@ export default function Campaigns() {
 
   const canMutateCampaigns = Boolean(currentUser && currentUser.role !== 'viewer');
   const canReconcileAttempts = currentUser?.role === 'owner' || currentUser?.role === 'admin';
-  const provisionedAgents = agents.filter((agent) => (
-    agent.is_active
-    && agent.provider_agent_id
-    && agent.provider_revision_id
-    && agent.last_synced_at
-  ));
+  const provisionedAgents = agents.filter(isAgentCallReady);
   const agentNames = new Map(agents.map((agent) => [agent.id, agent.name]));
   const contactLineCount = form.contacts.split(/\r?\n/).filter((line) => line.trim()).length;
   const timezoneOptions = COMMON_TIMEZONES.some((option) => option.value === browserTimezone)

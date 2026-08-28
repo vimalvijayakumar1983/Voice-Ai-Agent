@@ -311,6 +311,29 @@ class SmallestAIClient:
             )
         return {**result, "state": state}
 
+    async def get_open_branch_draft(
+        self,
+        *,
+        agent_id: str,
+        branch_id: str,
+    ) -> dict[str, Any] | None:
+        """Return the currently open draft, or ``None`` when none exists."""
+        try:
+            response = await self._request(
+                "GET",
+                f"/agent/{agent_id}/branches/{branch_id}/draft",
+            )
+        except SmallestAIError as exc:
+            if exc.upstream_status_code == 404:
+                return None
+            raise
+
+        data = response.get("data")
+        draft = data.get("latest") if isinstance(data, dict) else None
+        if not isinstance(draft, dict):
+            raise SmallestAIError("Smallest.ai returned an invalid open draft.")
+        return draft
+
     async def get_latest_branch_revision(
         self,
         *,

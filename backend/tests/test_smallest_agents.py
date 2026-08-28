@@ -26,6 +26,7 @@ class FakeSmallestClient:
     outbound_payloads: list[dict] = field(default_factory=list)
     clone_catalog_calls: int = 0
     publish_calls: int = 0
+    publish_labels: list[str] = field(default_factory=list)
     webhook_calls: int = 0
     publish_state: str = "committed"
     revision_status: str = "published"
@@ -72,18 +73,26 @@ class FakeSmallestClient:
             }
         ]
 
-    async def publish_draft(self, **_kwargs):
+    async def publish_draft(self, **kwargs):
         self.publish_calls += 1
+        self.publish_labels.append(kwargs["label"])
         return {"state": self.publish_state}
 
     async def get_latest_branch_revision(self, **_kwargs):
         if self.publish_calls == 0:
             return {"_id": "revision_122"}
-        return {"_id": f"revision_{122 + self.publish_calls}"}
+        return {
+            "_id": f"revision_{122 + self.publish_calls}",
+            "label": self.publish_labels[-1],
+        }
+
+    async def get_open_branch_draft(self, **_kwargs):
+        return None
 
     async def get_branch_revision(self, **kwargs):
         return {
             "_id": kwargs["revision_id"],
+            "label": self.publish_labels[-1],
             "status": self.revision_status,
             "securityCheck": {"status": self.security_status},
         }
@@ -133,6 +142,9 @@ async def test_provision_sync_and_mint_browser_session(
     assert provisioned.json()["sync_status"] == "synced"
     assert fake.draft_calls[0]["supported_languages"] == ["en", "hi"]
     assert fake.webhook_calls == 1
+    first_operation = provisioned.json()["provider_config"]["publish"]
+    assert first_operation["id"] in first_operation["label"]
+    assert fake.publish_labels == [first_operation["label"]]
 
     duplicate_provision = await client.post(
         f"/api/v1/agents/{agent_id}/smallest/provision", headers=auth_headers
@@ -334,14 +346,160 @@ async def test_scanning_publish_is_reconciled_without_republishing(
 
 
 @pytest.mark.asyncio
+async def test_open_draft_publish_state_transitions_from_scanning_to_actionable_error(
+    client: AsyncClient,
+    auth_headers,
+    monkeypatch,
+):
+    class PendingDraftClient(FakeSmallestClient):
+        pending_state = "active"
+
+        async def get_latest_branch_revision(self, **_kwargs):
+            return {"_id": "revision_122"}
+
+        async def get_open_branch_draft(self, **_kwargs):
+            return {"pendingPublish": {"state": self.pending_state}}
+
+    fake = PendingDraftClient(publish_state="scanning")
+    monkeypatch.setattr(agents_endpoint, "get_smallest_client", lambda: fake)
+    created = await client.post(
+        "/api/v1/agents",
+        headers=auth_headers,
+        json={"name": "Draft scan", "system_prompt": "Track the provider scan safely."},
+    )
+    agent_id = created.json()["id"]
+
+    scanning = await client.post(
+        f"/api/v1/agents/{agent_id}/smallest/provision",
+        headers=auth_headers,
+    )
+
+    assert scanning.status_code == 200
+    assert scanning.json()["sync_status"] == "provider_scanning"
+    assert scanning.json()["provider_config"]["publish"]["provider_state"] == "active"
+    assert fake.publish_calls == 1
+
+    fake.pending_state = "errored"
+    failed = await client.post(
+        f"/api/v1/agents/{agent_id}/smallest/sync",
+        headers=auth_headers,
+    )
+
+    assert failed.status_code == 200
+    assert failed.json()["sync_status"] == "error"
+    operation = failed.json()["provider_config"]["publish"]
+    assert operation["phase"] == "publish_failed"
+    assert operation["provider_state"] == "errored"
+    assert "correct the issue" in operation["last_error"]
+    assert fake.publish_calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("revision_state", "security_state", "expected_phase"),
+    [
+        ("error", "passed", "publish_failed"),
+        ("errored", "passed", "publish_failed"),
+        ("published", "error", "security_failed"),
+        ("published", "errored", "security_failed"),
+    ],
+)
+async def test_committed_revision_error_states_are_normalized_as_publish_failures(
+    revision_state: str,
+    security_state: str,
+    expected_phase: str,
+    client: AsyncClient,
+    auth_headers,
+    monkeypatch,
+):
+    fake = FakeSmallestClient(
+        revision_status=revision_state,
+        security_status=security_state,
+    )
+    monkeypatch.setattr(agents_endpoint, "get_smallest_client", lambda: fake)
+    created = await client.post(
+        "/api/v1/agents",
+        headers=auth_headers,
+        json={"name": "Failed revision", "system_prompt": "Surface provider failures safely."},
+    )
+
+    provisioned = await client.post(
+        f"/api/v1/agents/{created.json()['id']}/smallest/provision",
+        headers=auth_headers,
+    )
+
+    assert provisioned.status_code == 200
+    assert provisioned.json()["sync_status"] == "error"
+    operation = provisioned.json()["provider_config"]["publish"]
+    assert operation["phase"] == expected_phase
+    assert f"revision state: {revision_state}" in operation["last_error"]
+    assert f"security state: {security_state}" in operation["last_error"]
+    assert "correct the issue" in operation["last_error"]
+    assert fake.publish_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_does_not_accept_newer_revision_with_conflicting_label(
+    client: AsyncClient,
+    auth_headers,
+    monkeypatch,
+):
+    class OutOfBandRevisionClient(FakeSmallestClient):
+        async def get_latest_branch_revision(self, **_kwargs):
+            if self.publish_calls == 0:
+                return {"_id": "revision_122", "label": "Previous release"}
+            return {"_id": "revision_999", "label": "Manual console release"}
+
+        async def get_branch_revision(self, **kwargs):
+            return {
+                "_id": kwargs["revision_id"],
+                "label": "Manual console release",
+                "status": "published",
+                "securityCheck": {"status": "passed"},
+            }
+
+    fake = OutOfBandRevisionClient()
+    monkeypatch.setattr(agents_endpoint, "get_smallest_client", lambda: fake)
+    created = await client.post(
+        "/api/v1/agents",
+        headers=auth_headers,
+        json={"name": "Label guard", "system_prompt": "Reject unrelated provider revisions."},
+    )
+    agent_id = created.json()["id"]
+
+    provisioned = await client.post(
+        f"/api/v1/agents/{agent_id}/smallest/provision",
+        headers=auth_headers,
+    )
+
+    assert provisioned.status_code == 200
+    assert provisioned.json()["sync_status"] == "publish_unknown"
+    assert provisioned.json()["provider_revision_id"] is None
+    operation = provisioned.json()["provider_config"]["publish"]
+    assert operation["phase"] == "revision_label_mismatch"
+    assert operation["observed_revision_id"] == "revision_999"
+    assert operation["observed_revision_label"] == "Manual console release"
+    assert fake.publish_calls == 1
+
+    checked_again = await client.post(
+        f"/api/v1/agents/{agent_id}/smallest/sync",
+        headers=auth_headers,
+    )
+    assert checked_again.status_code == 200
+    assert checked_again.json()["sync_status"] == "publish_unknown"
+    assert fake.publish_calls == 1
+
+
+@pytest.mark.asyncio
 async def test_ambiguous_publish_is_reconciled_without_a_second_publish(
     client: AsyncClient,
     auth_headers,
     monkeypatch,
 ):
     class AmbiguousPublishClient(FakeSmallestClient):
-        async def publish_draft(self, **_kwargs):
+        async def publish_draft(self, **kwargs):
             self.publish_calls += 1
+            self.publish_labels.append(kwargs["label"])
             raise SmallestAIError(
                 "Connection ended after publish",
                 status_code=504,
@@ -472,8 +630,9 @@ async def test_owner_can_confirm_an_ambiguous_publish_created_no_revision(
     monkeypatch,
 ):
     class NoRevisionAmbiguousPublishClient(FakeSmallestClient):
-        async def publish_draft(self, **_kwargs):
+        async def publish_draft(self, **kwargs):
             self.publish_calls += 1
+            self.publish_labels.append(kwargs["label"])
             raise SmallestAIError("Publish response was lost", status_code=504, ambiguous=True)
 
         async def get_latest_branch_revision(self, **_kwargs):
@@ -511,6 +670,68 @@ async def test_owner_can_confirm_an_ambiguous_publish_created_no_revision(
         json={"system_prompt": "The confirmed absent publish is editable again."},
     )
     assert editable.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_confirm_publish_absent_refuses_every_reported_pending_publish(
+    client: AsyncClient,
+    auth_headers,
+    monkeypatch,
+):
+    class PendingAmbiguousPublishClient(FakeSmallestClient):
+        pending_publish: dict | None = {"state": "active"}
+
+        async def publish_draft(self, **kwargs):
+            self.publish_calls += 1
+            self.publish_labels.append(kwargs["label"])
+            raise SmallestAIError("Publish response was lost", status_code=504, ambiguous=True)
+
+        async def get_latest_branch_revision(self, **_kwargs):
+            return {"_id": "revision_122"}
+
+        async def get_open_branch_draft(self, **_kwargs):
+            return {"pendingPublish": self.pending_publish}
+
+    fake = PendingAmbiguousPublishClient()
+    monkeypatch.setattr(agents_endpoint, "get_smallest_client", lambda: fake)
+    created = await client.post(
+        "/api/v1/agents",
+        headers=auth_headers,
+        json={"name": "Pending publish", "system_prompt": "Never abandon pending work."},
+    )
+    agent_id = created.json()["id"]
+    provisioned = await client.post(
+        f"/api/v1/agents/{agent_id}/smallest/provision",
+        headers=auth_headers,
+    )
+    assert provisioned.status_code == 504
+
+    resolution = {
+        "action": "confirm_publish_absent",
+        "confirmation": "I CONFIRM NO NEW REVISION EXISTS",
+    }
+    for pending_publish in ({"state": "active"}, {"state": "failed"}, {}):
+        fake.pending_publish = pending_publish
+        refused = await client.post(
+            f"/api/v1/agents/{agent_id}/smallest/resolve",
+            headers=auth_headers,
+            json=resolution,
+        )
+        assert refused.status_code == 409
+        assert "pending publish" in refused.json()["detail"]
+
+    persisted = await client.get(f"/api/v1/agents/{agent_id}", headers=auth_headers)
+    assert persisted.json()["sync_status"] == "publish_unknown"
+
+    fake.pending_publish = None
+    resolved = await client.post(
+        f"/api/v1/agents/{agent_id}/smallest/resolve",
+        headers=auth_headers,
+        json=resolution,
+    )
+    assert resolved.status_code == 200
+    assert resolved.json()["sync_status"] == "dirty"
+    assert fake.publish_calls == 1
 
 
 @pytest.mark.asyncio

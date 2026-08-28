@@ -258,6 +258,50 @@ async def test_revision_lifecycle_and_webhook_subscription_contracts():
 
 
 @pytest.mark.asyncio
+async def test_open_branch_draft_returns_latest_and_treats_404_as_absent():
+    paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        if "/agent_missing/" in request.url.path:
+            return httpx.Response(404, json={"message": "No open draft"})
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "latest": {
+                        "_id": "draft_9",
+                        "status": "draft",
+                        "pendingPublish": {"state": "active"},
+                    }
+                }
+            },
+        )
+
+    client = SmallestAIClient(api_key="sk_test", transport=httpx.MockTransport(handler))
+
+    draft = await client.get_open_branch_draft(
+        agent_id="agent_123",
+        branch_id="branch_123",
+    )
+    missing = await client.get_open_branch_draft(
+        agent_id="agent_missing",
+        branch_id="branch_123",
+    )
+
+    assert draft == {
+        "_id": "draft_9",
+        "status": "draft",
+        "pendingPublish": {"state": "active"},
+    }
+    assert missing is None
+    assert paths == [
+        "/atoms/v1/agent/agent_123/branches/branch_123/draft",
+        "/atoms/v1/agent/agent_missing/branches/branch_123/draft",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_mutating_timeout_is_marked_as_ambiguous():
     def handler(_request: httpx.Request) -> httpx.Response:
         raise httpx.ReadTimeout("timed out")

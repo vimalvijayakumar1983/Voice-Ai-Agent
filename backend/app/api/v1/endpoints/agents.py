@@ -59,6 +59,12 @@ UNRESOLVED_PROVIDER_STATES = frozenset(
     }
 )
 RECONCILABLE_PUBLISH_STATES = frozenset({"publishing", "provider_scanning", "publish_unknown"})
+PROVIDER_ACTIVE_STATES = frozenset(
+    {"active", "pending", "queued", "running", "scanning", "processing", "in_progress"}
+)
+PROVIDER_FAILED_STATES = frozenset(
+    {"failed", "error", "errored", "rejected", "blocked", "cancelled", "canceled"}
+)
 PROVIDER_OPERATION_LEASE = timedelta(minutes=2)
 TERMINAL_CALL_STATUSES = frozenset(
     {"completed", "failed", "busy", "no_answer", "canceled", "cancelled"}
@@ -147,6 +153,41 @@ def _revision_lifecycle(revision: dict) -> tuple[str, str]:
     else:
         security_status = str(security or "unknown").lower()
     return revision_status, security_status
+
+
+def _pending_publish_state(draft: dict | None) -> str | None:
+    pending_publish = _pending_publish_value(draft)
+    if not isinstance(pending_publish, dict):
+        return None
+    state = pending_publish.get("state") or pending_publish.get("status")
+    return str(state).strip().lower() if state else None
+
+
+def _pending_publish_value(draft: dict | None):
+    if not isinstance(draft, dict):
+        return None
+    if "pendingPublish" in draft:
+        return draft["pendingPublish"]
+    return draft.get("pending_publish")
+
+
+def _pending_publish_is_authoritatively_absent(draft: dict | None) -> bool:
+    if draft is None:
+        return True
+    if not isinstance(draft, dict):
+        return False
+    if "pendingPublish" in draft:
+        return draft["pendingPublish"] is None
+    if "pending_publish" in draft:
+        return draft["pending_publish"] is None
+    return False
+
+
+def _revision_label(revision: dict | None) -> str | None:
+    if not isinstance(revision, dict):
+        return None
+    label = revision.get("label")
+    return str(label) if label is not None else None
 
 
 def _publish_kwargs(agent: Agent, voice_model: str | None) -> dict:
@@ -374,16 +415,57 @@ async def _reconcile_smallest_publish(
         return agent
 
     if latest_revision_id is None or latest_revision_id == baseline_revision_id:
+        try:
+            draft = await client.get_open_branch_draft(
+                agent_id=provider_agent_id,
+                branch_id=branch_id,
+            )
+        except SmallestAIError as exc:
+            agent = await _tenant_agent(db, agent_id, tenant_id, for_update=True)
+            if not _publish_reconciliation_is_current(agent, operation_id):
+                return agent
+            if agent.sync_status == "publishing":
+                agent.sync_status = "publish_unknown"
+            _set_provider_operation(
+                agent,
+                "publish",
+                phase=agent.sync_status,
+                lease_expires_at=None,
+                last_error=str(exc),
+                last_checked_at=datetime.now(UTC).isoformat(),
+            )
+            await db.commit()
+            raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+        pending_state = _pending_publish_state(draft)
         agent = await _tenant_agent(db, agent_id, tenant_id, for_update=True)
         if not _publish_reconciliation_is_current(agent, operation_id):
             return agent
-        if agent.sync_status == "publishing":
+        if pending_state in PROVIDER_ACTIVE_STATES:
+            agent.sync_status = "provider_scanning"
+            phase = "provider_scanning"
+            last_error = None
+        elif pending_state in PROVIDER_FAILED_STATES:
+            agent.sync_status = "error"
+            phase = "publish_failed"
+            last_error = (
+                f"Smallest.ai draft publish failed with state '{pending_state}'. "
+                "Review the provider draft and security result, correct the issue, then sync again."
+            )
+        else:
             agent.sync_status = "publish_unknown"
+            phase = "publish_unknown"
+            last_error = (
+                "Smallest.ai reports no active draft publish and no matching committed revision. "
+                "Confirm the provider outcome before retrying."
+            )
         _set_provider_operation(
             agent,
             "publish",
-            phase=agent.sync_status,
+            phase=phase,
             lease_expires_at=None,
+            provider_state=pending_state,
+            last_error=last_error,
             last_checked_at=datetime.now(UTC).isoformat(),
         )
         await db.commit()
@@ -399,35 +481,82 @@ async def _reconcile_smallest_publish(
         agent = await _tenant_agent(db, agent_id, tenant_id, for_update=True)
         if not _publish_reconciliation_is_current(agent, operation_id):
             return agent
-        agent.provider_revision_id = latest_revision_id
-        agent.sync_status = "provider_scanning"
-        _set_provider_operation(
-            agent,
-            "publish",
-            phase="provider_scanning",
-            lease_expires_at=None,
-            last_error=str(exc),
-            last_checked_at=datetime.now(UTC).isoformat(),
-        )
+        expected_label = operation.get("label")
+        summary_label = _revision_label(latest)
+        if isinstance(expected_label, str) and expected_label and summary_label != expected_label:
+            agent.sync_status = "publish_unknown"
+            _set_provider_operation(
+                agent,
+                "publish",
+                phase="revision_label_mismatch",
+                lease_expires_at=None,
+                observed_revision_id=latest_revision_id,
+                observed_revision_label=summary_label,
+                last_error=(
+                    "The newest Smallest.ai revision is missing this operation's exact label. "
+                    "Confirm the provider revision before retrying."
+                ),
+                last_checked_at=datetime.now(UTC).isoformat(),
+            )
+        else:
+            agent.provider_revision_id = latest_revision_id
+            agent.sync_status = "provider_scanning"
+            _set_provider_operation(
+                agent,
+                "publish",
+                phase="provider_scanning",
+                lease_expires_at=None,
+                last_error=str(exc),
+                last_checked_at=datetime.now(UTC).isoformat(),
+            )
         await db.commit()
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
 
+    expected_label = operation.get("label")
+    actual_label = _revision_label(revision) or _revision_label(latest)
+    if isinstance(expected_label, str) and expected_label and actual_label != expected_label:
+        agent = await _tenant_agent(db, agent_id, tenant_id, for_update=True)
+        if not _publish_reconciliation_is_current(agent, operation_id):
+            return agent
+        agent.sync_status = "publish_unknown"
+        _set_provider_operation(
+            agent,
+            "publish",
+            phase="revision_label_mismatch",
+            lease_expires_at=None,
+            observed_revision_id=latest_revision_id,
+            observed_revision_label=actual_label,
+            last_error=(
+                "The newest Smallest.ai revision is missing this operation's exact label. "
+                "Confirm the provider revision before retrying."
+            ),
+            last_checked_at=datetime.now(UTC).isoformat(),
+        )
+        await db.commit()
+        return agent
+
     revision_status, security_status = _revision_lifecycle(revision)
-    failed_states = {"failed", "rejected", "blocked", "cancelled", "canceled"}
     agent = await _tenant_agent(db, agent_id, tenant_id, for_update=True)
     if not _publish_reconciliation_is_current(agent, operation_id):
         return agent
     agent.provider_revision_id = latest_revision_id
-    if revision_status in failed_states or security_status in failed_states:
+    if revision_status in PROVIDER_FAILED_STATES or security_status in PROVIDER_FAILED_STATES:
         agent.sync_status = "error"
-        phase = "security_failed" if security_status in failed_states else "publish_failed"
+        phase = "security_failed" if security_status in PROVIDER_FAILED_STATES else "publish_failed"
+        last_error = (
+            "Smallest.ai rejected the revision "
+            f"(revision state: {revision_status}; security state: {security_status}). "
+            "Review the provider revision and security result, correct the issue, then sync again."
+        )
     elif revision_status == "published" and security_status == "passed":
         agent.sync_status = "synced"
         agent.last_synced_at = datetime.now(UTC)
         phase = "complete"
+        last_error = None
     else:
         agent.sync_status = "provider_scanning"
         phase = "provider_scanning"
+        last_error = None
     _set_provider_operation(
         agent,
         "publish",
@@ -436,7 +565,7 @@ async def _reconcile_smallest_publish(
         revision_id=latest_revision_id,
         revision_status=revision_status,
         security_status=security_status,
-        last_error=None,
+        last_error=last_error,
         last_checked_at=datetime.now(UTC).isoformat(),
     )
     await db.commit()
@@ -454,6 +583,7 @@ async def _publish_smallest_agent(
 ) -> Agent:
     """Update a draft, publish once, then reconcile the resulting revision."""
     operation_id = str(uuid4())
+    operation_label = f"{label} [{operation_id}]"
     now = datetime.now(UTC)
     agent = await _tenant_agent(db, agent_id, tenant_id, for_update=True)
     agent.sync_status = "publishing"
@@ -465,7 +595,7 @@ async def _publish_smallest_agent(
         "publish",
         id=operation_id,
         phase="branch_lookup",
-        label=label,
+        label=operation_label,
         started_at=now.isoformat(),
         lease_expires_at=(now + PROVIDER_OPERATION_LEASE).isoformat(),
     )
@@ -559,7 +689,7 @@ async def _publish_smallest_agent(
         publish = await client.publish_draft(
             agent_id=provider_agent_id,
             branch_id=branch_id,
-            label=label,
+            label=operation_label,
         )
     except SmallestAIError as exc:
         await _mark_publish_failure(
@@ -917,6 +1047,31 @@ async def resolve_smallest_provider_operation(
             raise HTTPException(
                 status_code=409,
                 detail="A new provider revision exists; use Check status instead of abandoning it",
+            )
+        try:
+            draft = await client.get_open_branch_draft(
+                agent_id=provider_agent_id,
+                branch_id=branch_id,
+            )
+            latest_after_draft = await client.get_latest_branch_revision(
+                agent_id=provider_agent_id,
+                branch_id=branch_id,
+            )
+        except SmallestAIError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+        if _revision_id(latest_after_draft) != baseline_revision_id:
+            raise HTTPException(
+                status_code=409,
+                detail="A new provider revision exists; use Check status instead of abandoning it",
+            )
+        if not _pending_publish_is_authoritatively_absent(draft):
+            pending_state = _pending_publish_state(draft) or "unknown"
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Smallest.ai still reports a pending publish "
+                    f"(state: {pending_state}); use Check status instead of abandoning it"
+                ),
             )
         agent = await _tenant_agent(db, agent_id, current_user.tenant_id, for_update=True)
         if (

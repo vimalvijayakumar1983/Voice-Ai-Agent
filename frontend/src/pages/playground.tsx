@@ -12,6 +12,7 @@ import {
   Volume2,
 } from 'lucide-react';
 import Layout from '@/components/Layout';
+import { agentTestReadinessMessage, isAgentCallReady } from '@/lib/agent-readiness.cjs';
 import { api, VoiceAgent } from '@/lib/api';
 import type { AtomsAgent } from '@smallest-ai/agent-sdk';
 
@@ -40,10 +41,14 @@ export default function Playground() {
   useEffect(() => () => agentRef.current?.disconnect(), []);
 
   const selected = useMemo(() => agents.find((agent) => agent.id === selectedId), [agents, selectedId]);
+  const selectedReady = isAgentCallReady(selected);
   const active = ['connecting', 'listening', 'speaking'].includes(state);
 
   const startSession = async () => {
-    if (!selected?.provider_agent_id) return;
+    if (!selected || !isAgentCallReady(selected)) {
+      setError(selected ? agentTestReadinessMessage(selected) : 'Select a voice agent before testing.');
+      return;
+    }
     setState('connecting');
     setError('');
     setTranscript([]);
@@ -98,21 +103,21 @@ export default function Playground() {
       <div className="playground-layout">
         <section className="card playground-config">
           <div className="card-title"><div><h3>Test configuration</h3><p>Choose an agent and optional call context.</p></div><FlaskConical size={17} color="var(--accent)" /></div>
-          <div className="form-group"><label>Voice agent</label><select value={selectedId} disabled={active} onChange={(event) => setSelectedId(event.target.value)}><option value="">Select an agent</option>{agents.map((agent) => <option value={agent.id} key={agent.id}>{agent.name}{agent.provider_agent_id ? '' : ' — local only'}</option>)}</select></div>
-          {selected && <div className="provider-alert"><Bot size={15} /><div><strong>{selected.name}</strong><br />{selected.provider_agent_id ? `Smallest.ai · ${selected.language.toUpperCase()} · ${selected.model_name}` : 'Provision this local draft before testing.'}</div></div>}
+          <div className="form-group"><label>Voice agent</label><select value={selectedId} disabled={active} onChange={(event) => setSelectedId(event.target.value)}><option value="">Select an agent</option>{agents.map((agent) => <option value={agent.id} key={agent.id}>{agent.name}{isAgentCallReady(agent) ? '' : ' — not ready'}</option>)}</select></div>
+          {selected && <div className="provider-alert"><Bot size={15} /><div><strong>{selected.name}</strong><br />{selectedReady ? `Smallest.ai · ${selected.language.toUpperCase()} · ${selected.model_name}` : agentTestReadinessMessage(selected)}</div></div>}
           <div className="form-group"><label>Pre-call variables <span>JSON, scalar values only</span></label><textarea value={variablesText} disabled={active} onChange={(event) => setVariablesText(event.target.value)} /><p className="form-hint">These values fill matching prompt variables only for this test call.</p></div>
           <div className="card" style={{ background: 'var(--bg-muted)', boxShadow: 'none' }}><div className="activity-list"><div className="activity-item"><div className="activity-icon"><Mic size={14} /></div><div><strong>Microphone permission</strong><p>Requested only after Start test</p></div></div><div className="activity-item"><div className="activity-icon"><Volume2 size={14} /></div><div><strong>Live audio output</strong><p>24 kHz streaming playback</p></div></div><div className="activity-item"><div className="activity-icon"><MessageSquareText size={14} /></div><div><strong>Transcript events</strong><p>Settled turn-by-turn in this session</p></div></div></div></div>
         </section>
 
         <section className="card voice-stage">
           <div className="voice-stage-header"><div><h3>{selected?.name || 'Select an agent'}</h3><p>Smallest.ai Atoms browser session</p></div><span className={`badge ${active ? 'badge-success' : 'badge-neutral'}`}>{state}</span></div>
-          <div className="voice-orb-wrap"><div><div className={`voice-orb ${state === 'listening' || state === 'speaking' ? 'listening' : ''}`} /><div className="session-status" style={{ marginTop: 28 }}><strong>{sessionLabel(state)}</strong><span>{state === 'idle' ? 'Start a private test conversation' : state === 'speaking' ? 'Agent audio is streaming' : state === 'listening' ? 'Speak naturally — interruption is supported' : 'Review the session transcript below'}</span></div></div></div>
+          <div className="voice-orb-wrap"><div><div className={`voice-orb ${state === 'listening' || state === 'speaking' ? 'listening' : ''}`} /><div className="session-status" style={{ marginTop: 28 }}><strong>{sessionLabel(state)}</strong><span>{state === 'idle' ? (selectedReady ? 'Start a private test conversation' : selected ? agentTestReadinessMessage(selected) : 'Select a voice agent to begin') : state === 'speaking' ? 'Agent audio is streaming' : state === 'listening' ? 'Speak naturally — interruption is supported' : 'Review the session transcript below'}</span></div></div></div>
           <div className="transcript-panel">
             {transcript.length === 0 ? <div className="transcript-empty"><div><MessageSquareText size={20} style={{ marginBottom: 8 }} /><br />Live transcript will appear here after the first turn.</div></div> : transcript.map((turn, index) => <div className={`transcript-turn ${turn.role}`} key={`${turn.role}-${index}`}><small>{turn.role}</small>{turn.text}</div>)}
           </div>
           {error && <div className="provider-alert badge-danger" style={{ marginTop: 12 }}>{error}</div>}
           <div className="call-controls">
-            {!active ? <button className="call-button" disabled={!selected?.provider_agent_id} onClick={startSession}><Play size={15} /> Start test</button> : <><button className="icon-button" style={{ background: 'rgba(255,255,255,.09)', borderColor: 'rgba(255,255,255,.12)', color: 'white' }} onClick={toggleMute} aria-label={muted ? 'Unmute' : 'Mute'}>{muted ? <MicOff size={17} /> : <Mic size={17} />}</button><button className="call-button end" onClick={endSession}><PhoneOff size={15} /> End call</button></>}
+            {!active ? <button className="call-button" disabled={!selectedReady} title={selectedReady ? undefined : selected ? agentTestReadinessMessage(selected) : 'Select a voice agent before testing.'} onClick={startSession}><Play size={15} /> Start test</button> : <><button className="icon-button" style={{ background: 'rgba(255,255,255,.09)', borderColor: 'rgba(255,255,255,.12)', color: 'white' }} onClick={toggleMute} aria-label={muted ? 'Unmute' : 'Mute'}>{muted ? <MicOff size={17} /> : <Mic size={17} />}</button><button className="call-button end" onClick={endSession}><PhoneOff size={15} /> End call</button></>}
           </div>
         </section>
       </div>

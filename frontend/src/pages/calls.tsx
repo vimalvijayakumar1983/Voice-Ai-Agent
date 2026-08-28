@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { FileText, ListChecks, PhoneOutgoing, Plus, X } from 'lucide-react';
 import Layout from '@/components/Layout';
+import { isAgentCallReady } from '@/lib/agent-readiness.cjs';
 import {
   api,
   CallRecord,
@@ -262,7 +263,7 @@ export default function Calls() {
                 onChange={(event) => updateDialField('agent_id', event.target.value)}
               >
                 <option value="">Select a provisioned agent</option>
-                {agents.filter((agent) => agent.provider_agent_id).map((agent) => (
+                {agents.filter(isAgentCallReady).map((agent) => (
                   <option value={agent.id} key={agent.id}>{agent.name}</option>
                 ))}
               </select>

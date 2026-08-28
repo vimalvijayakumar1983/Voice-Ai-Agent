@@ -16,6 +16,7 @@ import {
 } from 'lucide-react';
 import AgentEditor, { AgentEditorValues, defaultAgentValues } from '@/components/AgentEditor';
 import Layout from '@/components/Layout';
+import { agentTestReadinessMessage, isAgentCallReady, providerActionNotice } from '@/lib/agent-readiness.cjs';
 import { api, AgentProviderCatalog, ProviderStatus, VoiceAgent } from '@/lib/api';
 
 export default function Agents() {
@@ -25,7 +26,7 @@ export default function Agents() {
   const [showCreate, setShowCreate] = useState(false);
   const [editingAgentId, setEditingAgentId] = useState<string | null>(null);
   const [working, setWorking] = useState<string | null>(null);
-  const [notice, setNotice] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+  const [notice, setNotice] = useState<{ type: 'success' | 'info' | 'error'; text: string } | null>(null);
 
   useEffect(() => {
     let active = true;
@@ -94,11 +95,14 @@ export default function Agents() {
         ? await api.provisionSmallestAgent(agent.id)
         : await api.syncSmallestAgent(agent.id);
       setAgents((current) => current.map((item) => item.id === updated.id ? updated : item));
-      setNotice({
-        type: 'success',
-        text: providerActionNotice(agent.name, action, updated.sync_status),
-      });
+      setNotice(providerActionNotice(agent.name, action, updated.sync_status));
     } catch (error) {
+      try {
+        const refreshed = await api.getAgent(agent.id);
+        setAgents((current) => current.map((item) => item.id === refreshed.id ? refreshed : item));
+      } catch {
+        // Preserve the original provider error when a best-effort state refresh also fails.
+      }
       setNotice({
         type: 'error',
         text: error instanceof Error ? error.message : 'Provider action failed.',
@@ -263,10 +267,10 @@ export default function Agents() {
                 {agent.sync_status === 'publish_unknown' && (
                   <button className="btn btn-secondary btn-sm" disabled={working === `resolve-${agent.id}`} onClick={() => resolveProviderOperation(agent)}><RefreshCw size={12} /> Resolve unknown</button>
                 )}
-                {agent.last_synced_at ? (
+                {isAgentCallReady(agent) ? (
                   <Link href={`/playground?agent=${agent.id}`} className="btn btn-secondary btn-sm"><FlaskConical size={12} /> Test</Link>
                 ) : (
-                  <button className="btn btn-secondary btn-sm" disabled><FlaskConical size={12} /> Test</button>
+                  <button className="btn btn-secondary btn-sm" disabled title={agentTestReadinessMessage(agent)}><FlaskConical size={12} /> Test</button>
                 )}
                 <button className="btn btn-ghost btn-sm" disabled={Boolean(agent.provider_agent_id) || providerOperationUnresolved(agent.sync_status) || working === `delete-${agent.id}`} onClick={() => removeAgent(agent)} aria-label={`Delete ${agent.name}`} title={agent.provider_agent_id ? 'Provisioned agents must be archived with their provider resource.' : undefined}><Trash2 size={12} /></button>
               </div>
@@ -320,20 +324,4 @@ function providerActionLabel(status: VoiceAgent['sync_status']) {
   if (status === 'synced') return 'In sync';
   if (['publishing', 'provider_scanning', 'publish_unknown'].includes(status)) return 'Check status';
   return 'Publish';
-}
-
-function providerActionNotice(
-  name: string,
-  action: 'provision' | 'sync',
-  status: VoiceAgent['sync_status'],
-) {
-  if (status === 'provider_scanning' || status === 'publish_unknown') {
-    return `${name} is awaiting Smallest.ai revision and security checks. Use Check status before retrying.`;
-  }
-  if (status === 'dirty') {
-    return `${name}'s interrupted provider update is safe to publish again.`;
-  }
-  return action === 'provision'
-    ? `${name} is provisioned and published on Smallest.ai.`
-    : `${name} has been verified through the Smallest.ai versioning workflow.`;
 }
