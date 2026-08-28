@@ -267,7 +267,10 @@ async def test_versioned_draft_contains_runtime_configuration():
     }
     assert captured["synthesizer"]["voiceConfig"]["voiceId"] == "nyah"
     assert captured["synthesizer"]["voiceConfig"]["model"] == "waves_lightning_v3_1"
-    assert captured["timezone"] == "Asia/Dubai"
+    assert captured["timezone"] == {
+        "label": "(GMT+4:00) Asia/Dubai",
+        "offset": 4.0,
+    }
     assert captured["sessionTimeoutConfig"] == {"timeoutTimeInSecs": 600}
     assert captured["globalKnowledgeBaseId"] == "kb_123"
 
@@ -317,6 +320,32 @@ async def test_versioned_draft_rejects_unknown_timezone_before_request():
         )
 
     assert error.value.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_versioned_draft_serializes_fractional_timezone_offset():
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content))
+        return httpx.Response(200, json={"status": True, "data": {"status": "draft"}})
+
+    client = SmallestAIClient(api_key="sk_test", transport=httpx.MockTransport(handler))
+    await client.update_agent_draft(
+        agent_id="agent_123",
+        branch_id="branch_123",
+        global_prompt="Be concise and helpful.",
+        first_message="Welcome.",
+        slm_model="electron",
+        language="en",
+        supported_languages=["en"],
+        timezone="Asia/Kathmandu",
+    )
+
+    assert captured["timezone"] == {
+        "label": "(GMT+5:45) Asia/Kathmandu",
+        "offset": 5.75,
+    }
 
 
 @pytest.mark.asyncio
