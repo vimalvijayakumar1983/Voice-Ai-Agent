@@ -14,7 +14,11 @@ from app.middleware.tenant import CurrentUser, get_current_user, require_role
 from app.models.agent import Agent, AgentKnowledgeBinding, KnowledgeBase
 from app.models.call import Call
 from app.models.campaign import Campaign, CampaignContactAttempt
-from app.providers.smallest import SmallestAIError, get_smallest_client
+from app.providers.smallest import (
+    SmallestAIError,
+    get_smallest_client,
+    resolve_active_knowledge_base_id,
+)
 from app.schemas.agent import (
     AgentCreate,
     AgentProviderCatalog,
@@ -215,6 +219,21 @@ def _publish_operation(agent: Agent) -> dict:
     config = agent.provider_config or {}
     operation = config.get("publish") if isinstance(config, dict) else None
     return operation if isinstance(operation, dict) else {}
+
+
+def _provider_config_mismatch_pending(agent: Agent) -> bool:
+    """Return whether Sync must verify a provider-side correction without publishing."""
+    return (
+        agent.sync_status == "error"
+        and _publish_operation(agent).get("phase") == "provider_config_mismatch"
+    )
+
+
+def _provider_config_recovery_is_current(agent: Agent, operation_id: str) -> bool:
+    return (
+        _provider_config_mismatch_pending(agent)
+        and _publish_operation(agent).get("id") == operation_id
+    )
 
 
 def _provision_operation(agent: Agent) -> dict:
@@ -510,6 +529,42 @@ def _first_present(mapping: dict, *keys: str):
     return _MISSING
 
 
+def _resolved_system_prompt(provider_agent: dict, resolved: dict):
+    """Select the prompt that is authoritative for the provider workflow type."""
+    raw_workflow_type = _first_present(provider_agent, "workflowType", "workflow_type")
+    if raw_workflow_type is _MISSING:
+        raw_workflow_type = _first_present(resolved, "workflowType", "workflow_type")
+    workflow_type = (
+        raw_workflow_type.strip().lower().replace("-", "_")
+        if isinstance(raw_workflow_type, str)
+        else None
+    )
+
+    prompt = _first_present(resolved, "prompt")
+    global_prompt = _first_present(resolved, "globalPrompt")
+    nested_prompt = _MISSING
+    for configuration in (resolved, provider_agent):
+        single_prompt = configuration.get("singlePromptConfig")
+        if isinstance(single_prompt, dict) and "prompt" in single_prompt:
+            nested_prompt = single_prompt["prompt"]
+            break
+
+    if workflow_type == "single_prompt":
+        return next(
+            (value for value in (prompt, nested_prompt, global_prompt) if value is not _MISSING),
+            _MISSING,
+        )
+    if workflow_type == "workflow_graph":
+        return global_prompt
+
+    candidates = [
+        value for value in (prompt, nested_prompt, global_prompt) if value is not _MISSING
+    ]
+    if not candidates or any(value != candidates[0] for value in candidates[1:]):
+        return _MISSING
+    return candidates[0]
+
+
 def _provider_configuration_mismatches(
     provider_agent: dict,
     expected: dict,
@@ -527,7 +582,7 @@ def _provider_configuration_mismatches(
 
     compare(
         "system_prompt",
-        _first_present(resolved, "globalPrompt", "prompt"),
+        _resolved_system_prompt(provider_agent, resolved),
         expected["global_prompt"],
     )
     compare(
@@ -606,19 +661,41 @@ def _provider_configuration_mismatches(
         expected["max_call_duration_seconds"],
     )
     if "global_knowledge_base_id" in expected:
-        actual_knowledge_base_id = _first_present(
-            provider_agent,
-            "globalKnowledgeBaseId",
-            "global_knowledge_base_id",
-        )
-        if actual_knowledge_base_id is _MISSING and expected["global_knowledge_base_id"] is None:
-            actual_knowledge_base_id = None
-        compare(
-            "global_knowledge_base_id",
-            actual_knowledge_base_id,
-            expected["global_knowledge_base_id"],
-        )
+        try:
+            actual_knowledge_base_id = resolve_active_knowledge_base_id(provider_agent)
+        except SmallestAIError:
+            mismatches.append("global_knowledge_base_id")
+        else:
+            compare(
+                "global_knowledge_base_id",
+                actual_knowledge_base_id,
+                expected["global_knowledge_base_id"],
+            )
     return mismatches
+
+
+def _provider_configuration_mismatch_sets(
+    published_provider_agent: dict,
+    active_provider_agent: dict,
+    expected_configuration: dict,
+) -> tuple[list[str], list[str], list[str]]:
+    published_mismatches = _provider_configuration_mismatches(
+        published_provider_agent,
+        expected_configuration,
+    )
+    if published_provider_agent.get("_configSource") != "version":
+        published_mismatches.append("configuration_source")
+    active_mismatches = _provider_configuration_mismatches(
+        active_provider_agent,
+        expected_configuration,
+    )
+    if active_provider_agent.get("_configSource") != "active":
+        active_mismatches.append("configuration_source")
+    return (
+        sorted({*published_mismatches, *active_mismatches}),
+        published_mismatches,
+        active_mismatches,
+    )
 
 
 async def _mark_publish_failure(
@@ -937,20 +1014,14 @@ async def _reconcile_smallest_publish(
                 )
                 await db.commit()
                 raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
-            published_configuration_mismatches = _provider_configuration_mismatches(
+            (
+                configuration_mismatches,
+                published_configuration_mismatches,
+                active_configuration_mismatches,
+            ) = _provider_configuration_mismatch_sets(
                 published_provider_agent,
-                expected_configuration,
-            )
-            if published_provider_agent.get("_configSource") != "version":
-                published_configuration_mismatches.append("configuration_source")
-            active_configuration_mismatches = _provider_configuration_mismatches(
                 active_provider_agent,
                 expected_configuration,
-            )
-            if active_provider_agent.get("_configSource") != "active":
-                active_configuration_mismatches.append("configuration_source")
-            configuration_mismatches = sorted(
-                {*published_configuration_mismatches, *active_configuration_mismatches}
             )
 
     agent = await _tenant_agent(db, agent_id, tenant_id, for_update=True)
@@ -1003,6 +1074,230 @@ async def _reconcile_smallest_publish(
         active_configuration_mismatches=active_configuration_mismatches,
         last_error=last_error,
         last_checked_at=datetime.now(UTC).isoformat(),
+    )
+    await db.commit()
+    return agent
+
+
+async def _reconcile_smallest_config_mismatch(
+    db: AsyncSession,
+    *,
+    agent_id: UUID,
+    tenant_id: UUID,
+    actor_user_id: UUID,
+    client,
+) -> Agent:
+    """Verify a provider-side correction using reads only; never publish here."""
+    agent = await _tenant_agent(db, agent_id, tenant_id, for_update=True)
+    if not _provider_config_mismatch_pending(agent):
+        return agent
+    if not agent.provider_agent_id or not agent.provider_branch_id:
+        raise HTTPException(status_code=409, detail="Provider mapping is incomplete")
+
+    operation = _publish_operation(agent)
+    operation_id = operation.get("id")
+    original_revision_id = operation.get("revision_id")
+    original_label = operation.get("label")
+    baseline_known = "baseline_revision_id" in operation
+    baseline_revision_id = operation.get("baseline_revision_id")
+    if not all(
+        isinstance(value, str) and value
+        for value in (operation_id, original_revision_id, original_label)
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Provider verification history is incomplete; support review is required",
+        )
+    if not baseline_known or (
+        baseline_revision_id is not None
+        and (not isinstance(baseline_revision_id, str) or not baseline_revision_id)
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Provider baseline history is incomplete; support review is required",
+        )
+    if "global_knowledge_base_id" not in operation:
+        raise HTTPException(
+            status_code=409,
+            detail="Provider knowledge-binding history is incomplete",
+        )
+    expected_knowledge_base_id = operation["global_knowledge_base_id"]
+    if expected_knowledge_base_id is not None and (
+        not isinstance(expected_knowledge_base_id, str) or not expected_knowledge_base_id.strip()
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Provider knowledge-binding history is invalid",
+        )
+    if agent.provider_revision_id != original_revision_id:
+        raise HTTPException(
+            status_code=409,
+            detail="Provider revision history changed before correction verification",
+        )
+    voice = _stored_voice_resolution(agent)
+    if voice is None:
+        raise HTTPException(
+            status_code=409, detail="Stored provider voice resolution is incomplete"
+        )
+
+    provider_agent_id = agent.provider_agent_id
+    branch_id = agent.provider_branch_id
+    expected_configuration = _publish_kwargs(agent, voice)
+    expected_configuration["global_knowledge_base_id"] = expected_knowledge_base_id
+    await db.commit()
+
+    observed_revision_id: str | None = None
+    observed_revision_label: str | None = None
+    try:
+        latest = await client.get_latest_branch_revision(
+            agent_id=provider_agent_id,
+            branch_id=branch_id,
+        )
+        observed_revision_id = _revision_id(latest)
+        observed_revision_label = _revision_label(latest)
+        if not observed_revision_id or not observed_revision_label:
+            raise SmallestAIError("Smallest.ai returned an incomplete correction revision.")
+        if observed_revision_id == baseline_revision_id:
+            raise SmallestAIError(
+                "Smallest.ai returned the pre-publish baseline revision.",
+                status_code=409,
+            )
+        if (
+            observed_revision_id == original_revision_id
+            and observed_revision_label != original_label
+        ):
+            raise SmallestAIError(
+                "Smallest.ai changed the original revision label during correction verification.",
+                status_code=409,
+            )
+        revision = await client.get_branch_revision(
+            agent_id=provider_agent_id,
+            branch_id=branch_id,
+            revision_id=observed_revision_id,
+        )
+        if _revision_id(revision) != observed_revision_id:
+            raise SmallestAIError(
+                "Smallest.ai returned conflicting correction revision details.",
+                status_code=409,
+            )
+        detailed_revision_label = _revision_label(revision)
+        if detailed_revision_label and detailed_revision_label != observed_revision_label:
+            raise SmallestAIError(
+                "Smallest.ai returned conflicting correction revision labels.",
+                status_code=409,
+            )
+        revision_status, security_status = _revision_lifecycle(revision)
+        configuration_mismatches: list[str] = []
+        published_configuration_mismatches: list[str] = []
+        active_configuration_mismatches: list[str] = []
+        if revision_status == "published" and security_status == "passed":
+            published_provider_agent = await client.get_agent(
+                provider_agent_id,
+                version_id=observed_revision_id,
+            )
+            active_provider_agent = await client.get_agent(provider_agent_id)
+            (
+                configuration_mismatches,
+                published_configuration_mismatches,
+                active_configuration_mismatches,
+            ) = _provider_configuration_mismatch_sets(
+                published_provider_agent,
+                active_provider_agent,
+                expected_configuration,
+            )
+    except SmallestAIError as exc:
+        agent = await _tenant_agent(db, agent_id, tenant_id, for_update=True)
+        if _provider_config_recovery_is_current(agent, operation_id):
+            _set_provider_operation(
+                agent,
+                "publish",
+                phase="provider_config_mismatch",
+                reconciliation_mode="configuration_recovery",
+                observed_revision_id=observed_revision_id,
+                observed_revision_label=observed_revision_label,
+                recovery_last_error=str(exc),
+                last_checked_at=datetime.now(UTC).isoformat(),
+            )
+            await db.commit()
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+    agent = await _tenant_agent(db, agent_id, tenant_id, for_update=True)
+    if not _provider_config_recovery_is_current(agent, operation_id):
+        return agent
+
+    now = datetime.now(UTC)
+    success = (
+        revision_status == "published"
+        and security_status == "passed"
+        and not configuration_mismatches
+    )
+    if success:
+        agent.provider_revision_id = observed_revision_id
+        agent.sync_status = "synced"
+        agent.last_synced_at = now
+        binding = await db.scalar(
+            select(AgentKnowledgeBinding).where(
+                AgentKnowledgeBinding.agent_id == agent.id,
+                AgentKnowledgeBinding.tenant_id == tenant_id,
+            )
+        )
+        if binding:
+            binding.sync_status = "synced"
+            binding.last_synced_at = now
+        await record_audit_event(
+            db,
+            tenant_id=tenant_id,
+            actor_user_id=actor_user_id,
+            action="agent.provider_configuration_reconciled",
+            resource_type="agent",
+            resource_id=str(agent.id),
+            details={
+                "previous_revision_id": original_revision_id,
+                "previous_revision_label": original_label,
+                "reconciled_revision_id": observed_revision_id,
+                "reconciled_revision_label": observed_revision_label,
+                "mode": "read_only_configuration_recovery",
+            },
+        )
+        phase = "complete"
+        last_error = None
+    else:
+        phase = "provider_config_mismatch"
+        if revision_status in PROVIDER_FAILED_STATES or security_status in PROVIDER_FAILED_STATES:
+            last_error = (
+                "Smallest.ai rejected the provider-side correction "
+                f"(revision state: {revision_status}; security state: {security_status})."
+            )
+        elif revision_status != "published" or security_status != "passed":
+            last_error = (
+                "Smallest.ai has not finished publishing and approving the corrected revision."
+            )
+        else:
+            last_error = (
+                "Smallest.ai's corrected revision still differs from the requested configuration. "
+                "Mismatched fields: " + ", ".join(configuration_mismatches)
+            )
+
+    _set_provider_operation(
+        agent,
+        "publish",
+        phase=phase,
+        reconciliation_mode="configuration_recovery",
+        previous_revision_id=original_revision_id,
+        previous_revision_label=original_label,
+        revision_id=observed_revision_id if success else original_revision_id,
+        revision_status=revision_status,
+        security_status=security_status,
+        observed_revision_id=observed_revision_id,
+        observed_revision_label=observed_revision_label,
+        reconciled_revision_id=observed_revision_id if success else None,
+        reconciled_revision_label=observed_revision_label if success else None,
+        configuration_mismatches=configuration_mismatches,
+        published_configuration_mismatches=published_configuration_mismatches,
+        active_configuration_mismatches=active_configuration_mismatches,
+        recovery_last_error=None,
+        last_error=last_error,
+        last_checked_at=now.isoformat(),
     )
     await db.commit()
     return agent
@@ -1513,7 +1808,7 @@ async def sync_smallest_agent(
     current_user: CurrentUser = Depends(require_role("owner", "admin")),
     db: AsyncSession = Depends(get_db),
 ):
-    """Publish a dirty draft, or reconcile an unresolved provider revision."""
+    """Publish a dirty draft, or read-only verify an unresolved provider result."""
     agent = await _tenant_agent(db, agent_id, current_user.tenant_id, for_update=True)
     if _expire_stale_provisioning(agent):
         await db.commit()
@@ -1529,6 +1824,15 @@ async def sync_smallest_agent(
         raise HTTPException(status_code=409, detail="Agent is already in sync")
 
     client = get_smallest_client()
+    if _provider_config_mismatch_pending(agent):
+        agent = await _reconcile_smallest_config_mismatch(
+            db,
+            agent_id=agent_id,
+            tenant_id=current_user.tenant_id,
+            actor_user_id=current_user.id,
+            client=client,
+        )
+        return AgentResponse.model_validate(agent)
     if agent.sync_status in RECONCILABLE_PUBLISH_STATES:
         agent = await _reconcile_smallest_publish(
             db,

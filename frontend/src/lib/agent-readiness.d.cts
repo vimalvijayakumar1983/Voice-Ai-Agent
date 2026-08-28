@@ -4,6 +4,11 @@ export interface AgentReadiness {
   provider_agent_id: string | null;
   provider_revision_id: string | null;
   last_synced_at: string | null;
+  provider_config?: {
+    publish?: {
+      phase?: string;
+    };
+  } | null;
 }
 
 export type TestReadyAgent<T extends AgentReadiness> = T & {
@@ -19,8 +24,15 @@ export function isAgentCallReady<T extends AgentReadiness>(
 
 export function agentTestReadinessMessage(agent: AgentReadiness | null | undefined): string;
 
+export function isProviderConfigCorrection(
+  agent: AgentReadiness | null | undefined,
+): boolean;
+
+export function providerActionLabel(agent: AgentReadiness): string;
+
 export function providerActionNotice(
   name: string,
   action: 'provision' | 'sync',
   status: string,
+  reconciliationOnly?: boolean,
 ): { type: 'success' | 'info' | 'error'; text: string };

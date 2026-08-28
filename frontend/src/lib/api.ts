@@ -46,6 +46,11 @@ export interface VoiceAgent {
   provider_agent_id: string | null;
   provider_branch_id: string | null;
   provider_revision_id: string | null;
+  provider_config: {
+    publish?: {
+      phase?: string;
+    };
+  } | null;
   sync_status:
     | 'local_only'
     | 'dirty'

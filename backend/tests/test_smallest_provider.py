@@ -260,6 +260,170 @@ async def test_active_agent_knowledge_binding_is_read_from_provider_config():
 
 
 @pytest.mark.asyncio
+async def test_active_agent_knowledge_binding_is_read_from_enabled_search_tool():
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "status": True,
+                "data": {
+                    "_resolvedConfig": {
+                        "tools": [
+                            {
+                                "type": "knowledge_base_search",
+                                "enabled": True,
+                                "knowledgeBaseId": "kb_123",
+                            }
+                        ]
+                    }
+                },
+            },
+        )
+
+    client = SmallestAIClient(api_key="sk_test", transport=httpx.MockTransport(handler))
+
+    assert await client.get_agent_knowledge_base_id("agent_123") == "kb_123"
+
+
+@pytest.mark.asyncio
+async def test_disabled_knowledge_tool_overrides_stale_global_binding():
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "status": True,
+                "data": {
+                    "globalKnowledgeBaseId": "kb_stale",
+                    "tools": [
+                        {
+                            "type": "knowledge_base_search",
+                            "enabled": True,
+                            "knowledgeBaseId": "kb_stale",
+                        }
+                    ],
+                    "_resolvedConfig": {
+                        "tools": [
+                            {
+                                "type": "knowledge_base_search",
+                                "enabled": False,
+                                "knowledgeBaseId": "kb_stale",
+                            }
+                        ]
+                    },
+                },
+            },
+        )
+
+    client = SmallestAIClient(api_key="sk_test", transport=httpx.MockTransport(handler))
+
+    assert await client.get_agent_knowledge_base_id("agent_123") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "runtime_tools",
+    [[], [{"type": "webhook", "enabled": True}]],
+)
+async def test_authoritative_runtime_tools_do_not_fall_back_to_stale_global_binding(
+    runtime_tools,
+):
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "status": True,
+                "data": {
+                    "globalKnowledgeBaseId": "kb_stale",
+                    "_resolvedConfig": {"tools": runtime_tools},
+                },
+            },
+        )
+
+    client = SmallestAIClient(api_key="sk_test", transport=httpx.MockTransport(handler))
+
+    assert await client.get_agent_knowledge_base_id("agent_123") is None
+
+
+@pytest.mark.asyncio
+async def test_enabled_knowledge_tool_overrides_conflicting_legacy_binding():
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "status": True,
+                "data": {
+                    "globalKnowledgeBaseId": "kb_stale",
+                    "_resolvedConfig": {
+                        "tools": [
+                            {
+                                "type": "knowledge_base_search",
+                                "enabled": True,
+                                "knowledgeBaseId": "kb_active",
+                            }
+                        ]
+                    },
+                },
+            },
+        )
+
+    client = SmallestAIClient(api_key="sk_test", transport=httpx.MockTransport(handler))
+
+    assert await client.get_agent_knowledge_base_id("agent_123") == "kb_active"
+
+
+@pytest.mark.asyncio
+async def test_multiple_enabled_knowledge_tools_are_rejected():
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "status": True,
+                "data": {
+                    "_resolvedConfig": {
+                        "tools": [
+                            {
+                                "type": "knowledge_base_search",
+                                "enabled": True,
+                                "knowledgeBaseId": "kb_one",
+                            },
+                            {
+                                "type": "knowledge_base_search",
+                                "enabled": True,
+                                "knowledgeBaseId": "kb_two",
+                            },
+                        ]
+                    }
+                },
+            },
+        )
+
+    client = SmallestAIClient(api_key="sk_test", transport=httpx.MockTransport(handler))
+
+    with pytest.raises(SmallestAIError, match="multiple active knowledge-base bindings"):
+        await client.get_agent_knowledge_base_id("agent_123")
+
+
+@pytest.mark.asyncio
+async def test_conflicting_legacy_knowledge_bindings_are_rejected():
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "status": True,
+                "data": {
+                    "globalKnowledgeBaseId": "kb_one",
+                    "_resolvedConfig": {"globalKnowledgeBaseId": "kb_two"},
+                },
+            },
+        )
+
+    client = SmallestAIClient(api_key="sk_test", transport=httpx.MockTransport(handler))
+
+    with pytest.raises(SmallestAIError, match="multiple active knowledge-base bindings"):
+        await client.get_agent_knowledge_base_id("agent_123")
+
+
+@pytest.mark.asyncio
 async def test_versioned_draft_contains_runtime_configuration():
     captured: dict = {}
 

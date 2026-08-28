@@ -23,7 +23,36 @@ function agentTestReadinessMessage(agent) {
   return 'Publish and verify this agent before testing.';
 }
 
-function providerActionNotice(name, action, status) {
+function isProviderConfigCorrection(agent) {
+  return Boolean(
+    agent
+      && agent.sync_status === 'error'
+      && agent.provider_config?.publish?.phase === 'provider_config_mismatch',
+  );
+}
+
+function providerActionLabel(agent) {
+  if (agent?.sync_status === 'synced') return 'In sync';
+  if (isProviderConfigCorrection(agent)) return 'Verify correction';
+  if (['publishing', 'provider_scanning', 'publish_unknown'].includes(agent?.sync_status)) {
+    return 'Check status';
+  }
+  return 'Publish';
+}
+
+function providerActionNotice(name, action, status, reconciliationOnly = false) {
+  if (reconciliationOnly && status === 'synced') {
+    return {
+      type: 'success',
+      text: `${name}'s Smallest.ai correction was verified without a VAV publish.`,
+    };
+  }
+  if (reconciliationOnly && status === 'error') {
+    return {
+      type: 'error',
+      text: `${name}'s Smallest.ai correction could not be verified; no VAV publish was attempted.`,
+    };
+  }
   if (status === 'error') {
     return {
       type: 'error',
@@ -70,6 +99,8 @@ function providerActionNotice(name, action, status) {
 
 module.exports = {
   agentTestReadinessMessage,
+  isProviderConfigCorrection,
   isAgentCallReady,
+  providerActionLabel,
   providerActionNotice,
 };

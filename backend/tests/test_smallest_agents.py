@@ -10,7 +10,7 @@ from sqlalchemy import event, select
 
 from app.api.v1.endpoints import agents as agents_endpoint
 from app.api.v1.endpoints import calls as calls_endpoint
-from app.models.agent import Agent
+from app.models.agent import Agent, AgentKnowledgeBinding, KnowledgeBase
 from app.providers.smallest import BrowserSession, SmallestAIClient, SmallestAIError
 from app.services.agent_catalog_cache import public_agent_catalog_cache
 from app.tasks.call_tasks import reconcile_call_dispatch, reconcile_direct_call_terminal
@@ -1817,9 +1817,11 @@ async def test_published_revision_must_also_match_active_runtime_configuration(
     monkeypatch,
 ):
     class StaleActiveProviderClient(FakeSmallestClient):
+        active_caught_up = False
+
         async def get_agent(self, agent_id, **kwargs):
             provider_agent = await super().get_agent(agent_id, **kwargs)
-            if not kwargs.get("version_id"):
+            if not kwargs.get("version_id") and not self.active_caught_up:
                 provider_agent["_resolvedConfig"]["firstMessage"] = "Stale active greeting"
             return provider_agent
 
@@ -1846,6 +1848,209 @@ async def test_published_revision_must_also_match_active_runtime_configuration(
     assert operation["published_configuration_mismatches"] == []
     assert operation["active_configuration_mismatches"] == ["greeting_message"]
     assert operation["configuration_mismatches"] == ["greeting_message"]
+
+    mutation_counts = (
+        fake.webhook_calls,
+        len(fake.draft_calls),
+        fake.publish_calls,
+        fake.voice_catalog_calls,
+    )
+    fake.active_caught_up = True
+    recovered = await client.post(
+        f"/api/v1/agents/{created.json()['id']}/smallest/sync",
+        headers=auth_headers,
+    )
+
+    assert recovered.status_code == 200
+    assert recovered.json()["sync_status"] == "synced"
+    assert recovered.json()["provider_revision_id"] == response.json()["provider_revision_id"]
+    assert recovered.json()["provider_config"]["publish"]["phase"] == "complete"
+    assert (
+        fake.webhook_calls,
+        len(fake.draft_calls),
+        fake.publish_calls,
+        fake.voice_catalog_calls,
+    ) == mutation_counts
+
+
+def test_prompt_verification_respects_provider_workflow_type():
+    resolved = {
+        "prompt": "Canonical single prompt",
+        "globalPrompt": "Workflow graph prompt",
+    }
+
+    assert (
+        agents_endpoint._resolved_system_prompt(
+            {"workflowType": "single_prompt"},
+            resolved,
+        )
+        == "Canonical single prompt"
+    )
+    assert (
+        agents_endpoint._resolved_system_prompt(
+            {"workflowType": "workflow_graph"},
+            resolved,
+        )
+        == "Workflow graph prompt"
+    )
+    assert agents_endpoint._resolved_system_prompt({}, resolved) is agents_endpoint._MISSING
+
+
+@pytest.mark.asyncio
+async def test_provider_config_mismatch_accepts_manual_kb_fix_without_republishing(
+    client: AsyncClient,
+    auth_headers,
+    db,
+    monkeypatch,
+):
+    class ManualKnowledgeFixClient(FakeSmallestClient):
+        manual_revision = False
+        manual_fixed = False
+
+        async def set_agent_webhook_subscriptions(self, **kwargs):
+            if self.manual_revision:
+                raise AssertionError("configuration recovery must not update webhooks")
+            return await super().set_agent_webhook_subscriptions(**kwargs)
+
+        async def update_agent_draft(self, **kwargs):
+            if self.manual_revision:
+                raise AssertionError("configuration recovery must not update a draft")
+            return await super().update_agent_draft(**kwargs)
+
+        async def publish_draft(self, **kwargs):
+            if self.manual_revision:
+                raise AssertionError("configuration recovery must not publish")
+            return await super().publish_draft(**kwargs)
+
+        async def get_latest_branch_revision(self, **kwargs):
+            if self.manual_revision:
+                return {"_id": "revision_124", "label": "Manual knowledge correction"}
+            return await super().get_latest_branch_revision(**kwargs)
+
+        async def get_branch_revision(self, **kwargs):
+            if self.manual_revision:
+                return {
+                    "_id": kwargs["revision_id"],
+                    "label": "Manual knowledge correction",
+                    "status": "published",
+                    "securityCheck": {"status": "passed"},
+                }
+            return await super().get_branch_revision(**kwargs)
+
+        async def get_agent(self, agent_id, **kwargs):
+            provider_agent = await super().get_agent(agent_id, **kwargs)
+            draft = self.draft_calls[-1]
+            provider_agent["workflowType"] = "single_prompt"
+            provider_agent["_resolvedConfig"]["globalPrompt"] = "Obsolete legacy prompt"
+            provider_agent["_resolvedConfig"]["prompt"] = draft["global_prompt"]
+            if self.manual_fixed:
+                provider_agent["_resolvedConfig"]["tools"] = [
+                    {
+                        "type": "knowledge_base_search",
+                        "enabled": True,
+                        "knowledgeBaseId": "provider_kb_123",
+                    }
+                ]
+            return provider_agent
+
+    fake = ManualKnowledgeFixClient()
+    monkeypatch.setattr(agents_endpoint, "get_smallest_client", lambda: fake)
+    created = await client.post(
+        "/api/v1/agents",
+        headers=auth_headers,
+        json={
+            "name": "Manual KB recovery",
+            "system_prompt": "Use the approved knowledge base for every answer.",
+        },
+    )
+    agent_id = UUID(created.json()["id"])
+    agent = await db.scalar(select(Agent).where(Agent.id == agent_id))
+    knowledge_base = KnowledgeBase(
+        tenant_id=agent.tenant_id,
+        name="Approved provider knowledge",
+        provider_knowledge_base_id="provider_kb_123",
+        sync_status="ready",
+        approval_status="approved",
+    )
+    db.add(knowledge_base)
+    await db.flush()
+    binding = AgentKnowledgeBinding(
+        tenant_id=agent.tenant_id,
+        agent_id=agent.id,
+        knowledge_base_id=knowledge_base.id,
+        sync_status="pending",
+    )
+    db.add(binding)
+    await db.commit()
+
+    first_publish = await client.post(
+        f"/api/v1/agents/{agent_id}/smallest/provision",
+        headers=auth_headers,
+    )
+
+    assert first_publish.status_code == 200
+    assert first_publish.json()["sync_status"] == "error"
+    first_operation = first_publish.json()["provider_config"]["publish"]
+    assert first_operation["phase"] == "provider_config_mismatch"
+    assert first_operation["configuration_mismatches"] == ["global_knowledge_base_id"]
+    operation_id = first_operation["id"]
+    mutation_counts = (
+        fake.webhook_calls,
+        len(fake.draft_calls),
+        fake.publish_calls,
+        fake.voice_catalog_calls,
+    )
+
+    fake.manual_revision = True
+    still_stale = await client.post(
+        f"/api/v1/agents/{agent_id}/smallest/sync",
+        headers=auth_headers,
+    )
+
+    assert still_stale.status_code == 200
+    assert still_stale.json()["sync_status"] == "error"
+    assert still_stale.json()["provider_revision_id"] == "revision_123"
+    stale_operation = still_stale.json()["provider_config"]["publish"]
+    assert stale_operation["phase"] == "provider_config_mismatch"
+    assert stale_operation["active_configuration_mismatches"] == ["global_knowledge_base_id"]
+    assert (
+        fake.webhook_calls,
+        len(fake.draft_calls),
+        fake.publish_calls,
+        fake.voice_catalog_calls,
+    ) == mutation_counts
+
+    fake.manual_fixed = True
+    recovered = await client.post(
+        f"/api/v1/agents/{agent_id}/smallest/sync",
+        headers=auth_headers,
+    )
+
+    assert recovered.status_code == 200
+    assert recovered.json()["sync_status"] == "synced"
+    assert recovered.json()["provider_revision_id"] == "revision_124"
+    assert recovered.json()["last_synced_at"] is not None
+    recovered_operation = recovered.json()["provider_config"]["publish"]
+    assert recovered_operation["id"] == operation_id
+    assert recovered_operation["phase"] == "complete"
+    assert recovered_operation["reconciled_revision_id"] == "revision_124"
+    assert recovered_operation["reconciled_revision_label"] == "Manual knowledge correction"
+    assert recovered_operation["configuration_mismatches"] == []
+    assert recovered_operation["published_configuration_mismatches"] == []
+    assert recovered_operation["active_configuration_mismatches"] == []
+    persisted_binding = await db.scalar(
+        select(AgentKnowledgeBinding)
+        .where(AgentKnowledgeBinding.agent_id == agent_id)
+        .execution_options(populate_existing=True)
+    )
+    assert persisted_binding.sync_status == "synced"
+    assert persisted_binding.last_synced_at is not None
+    assert (
+        fake.webhook_calls,
+        len(fake.draft_calls),
+        fake.publish_calls,
+        fake.voice_catalog_calls,
+    ) == mutation_counts
 
 
 @pytest.mark.asyncio

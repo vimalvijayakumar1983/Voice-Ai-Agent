@@ -3,7 +3,13 @@ import assert from 'node:assert/strict';
 
 import readiness from '../src/lib/agent-readiness.cjs';
 
-const { agentTestReadinessMessage, isAgentCallReady, providerActionNotice } = readiness;
+const {
+  agentTestReadinessMessage,
+  isAgentCallReady,
+  isProviderConfigCorrection,
+  providerActionLabel,
+  providerActionNotice,
+} = readiness;
 
 const readyAgent = {
   is_active: true,
@@ -66,4 +72,41 @@ test('provider notices never report incomplete or failed states as success', () 
   ]) {
     assert.equal(providerActionNotice('Agent', 'sync', status).type, 'info', status);
   }
+});
+
+test('only configuration mismatches use the reconciliation-only action', () => {
+  const recoverable = {
+    ...readyAgent,
+    sync_status: 'error',
+    provider_config: { publish: { phase: 'provider_config_mismatch' } },
+  };
+
+  assert.equal(isProviderConfigCorrection(recoverable), true);
+  assert.equal(providerActionLabel(recoverable), 'Verify correction');
+  assert.deepEqual(providerActionNotice('Agent', 'sync', 'synced', true), {
+    type: 'success',
+    text: "Agent's Smallest.ai correction was verified without a VAV publish.",
+  });
+  assert.deepEqual(providerActionNotice('Agent', 'sync', 'error', true), {
+    type: 'error',
+    text: "Agent's Smallest.ai correction could not be verified; no VAV publish was attempted.",
+  });
+  assert.equal(
+    isProviderConfigCorrection({
+      ...recoverable,
+      provider_config: { publish: { phase: 'security_failed' } },
+    }),
+    false,
+  );
+  assert.equal(
+    providerActionLabel({
+      ...recoverable,
+      provider_config: { publish: { phase: 'security_failed' } },
+    }),
+    'Publish',
+  );
+  assert.equal(
+    providerActionLabel({ ...readyAgent, sync_status: 'provider_scanning' }),
+    'Check status',
+  );
 });

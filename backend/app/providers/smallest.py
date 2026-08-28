@@ -153,6 +153,56 @@ class SmallestAIError(RuntimeError):
         self.ambiguous = ambiguous
 
 
+def resolve_active_knowledge_base_id(provider_agent: dict[str, Any]) -> str | None:
+    """Resolve the active KB, preferring the runtime tool state over legacy fields."""
+    resolved = provider_agent.get("_resolvedConfig")
+    configurations = [provider_agent]
+    if isinstance(resolved, dict):
+        configurations.insert(0, resolved)
+
+    tool_configuration: dict[str, Any] | None = None
+    if isinstance(resolved, dict) and "tools" in resolved:
+        tool_configuration = resolved
+    elif "tools" in provider_agent:
+        tool_configuration = provider_agent
+
+    knowledge_tools: list[dict[str, Any]] = []
+    if tool_configuration is not None:
+        tools = tool_configuration["tools"]
+        if not isinstance(tools, list):
+            raise SmallestAIError("Smallest.ai returned an invalid knowledge-base tool list.")
+        for tool in tools:
+            if not isinstance(tool, dict):
+                raise SmallestAIError("Smallest.ai returned an invalid knowledge-base tool.")
+            if tool.get("type") == "knowledge_base_search":
+                knowledge_tools.append(tool)
+
+    knowledge_base_ids: set[str] = set()
+    if tool_configuration is not None:
+        for tool in knowledge_tools:
+            if tool.get("enabled") is not True:
+                continue
+            value = tool.get("knowledgeBaseId") or tool.get("knowledge_base_id")
+            if not isinstance(value, str) or not value.strip():
+                raise SmallestAIError("Smallest.ai returned an invalid knowledge-base tool.")
+            knowledge_base_ids.add(value)
+    else:
+        for configuration in configurations:
+            for key in ("globalKnowledgeBaseId", "global_knowledge_base_id"):
+                if key not in configuration:
+                    continue
+                value = configuration[key]
+                if value is None or value == "":
+                    continue
+                if not isinstance(value, str) or not value.strip():
+                    raise SmallestAIError("Smallest.ai returned an invalid knowledge-base binding.")
+                knowledge_base_ids.add(value)
+
+    if len(knowledge_base_ids) > 1:
+        raise SmallestAIError("Smallest.ai returned multiple active knowledge-base bindings.")
+    return next(iter(knowledge_base_ids), None)
+
+
 @dataclass(frozen=True)
 class BrowserSession:
     access_token: str
@@ -598,21 +648,7 @@ class SmallestAIClient:
     async def get_agent_knowledge_base_id(self, agent_id: str) -> str | None:
         """Return the active provider KB binding without confusing absence with an empty ID."""
         provider_agent = await self.get_agent(agent_id)
-        resolved = provider_agent.get("_resolvedConfig")
-        configurations = [provider_agent]
-        if isinstance(resolved, dict):
-            configurations.append(resolved)
-        for configuration in configurations:
-            for key in ("globalKnowledgeBaseId", "global_knowledge_base_id"):
-                if key not in configuration:
-                    continue
-                value = configuration[key]
-                if value is None or value == "":
-                    return None
-                if isinstance(value, str):
-                    return value
-                raise SmallestAIError("Smallest.ai returned an invalid knowledge-base binding.")
-        return None
+        return resolve_active_knowledge_base_id(provider_agent)
 
     async def get_default_branch_id(self, agent_id: str) -> str:
         response = await self._request("GET", f"/agent/{agent_id}/branches")

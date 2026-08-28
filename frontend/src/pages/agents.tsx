@@ -21,7 +21,13 @@ import {
 import AgentEditor, { AgentEditorValues, defaultAgentValues } from '@/components/AgentEditor';
 import { agentEditorPatch, agentUpdateNotice } from '@/components/agent-editor-diff.cjs';
 import Layout from '@/components/Layout';
-import { agentTestReadinessMessage, isAgentCallReady, providerActionNotice } from '@/lib/agent-readiness.cjs';
+import {
+  agentTestReadinessMessage,
+  isAgentCallReady,
+  isProviderConfigCorrection,
+  providerActionLabel,
+  providerActionNotice,
+} from '@/lib/agent-readiness.cjs';
 import { api, AgentProviderCatalog, ProviderStatus, VoiceAgent } from '@/lib/api';
 
 type AgentLoadErrors = Partial<Record<'agents' | 'provider' | 'catalog', string>>;
@@ -174,12 +180,13 @@ export default function Agents() {
   const runAgentAction = async (agent: VoiceAgent, action: 'provision' | 'sync') => {
     setWorking(`${action}-${agent.id}`);
     setNotice(null);
+    const correctionVerification = action === 'sync' && isProviderConfigCorrection(agent);
     try {
       const updated = action === 'provision'
         ? await api.provisionSmallestAgent(agent.id)
         : await api.syncSmallestAgent(agent.id);
       setAgents((current) => current.map((item) => item.id === updated.id ? updated : item));
-      setNotice(providerActionNotice(agent.name, action, updated.sync_status));
+      setNotice(providerActionNotice(agent.name, action, updated.sync_status, correctionVerification));
     } catch (error) {
       try {
         const refreshed = await api.getAgent(agent.id);
@@ -439,7 +446,7 @@ export default function Agents() {
               <div className="agent-card-actions">
                 <button className="btn btn-secondary btn-sm" disabled={!catalogReady || providerOperationUnresolved(agent.sync_status)} onClick={() => openEdit(agent)}><Pencil size={12} /> Edit</button>
                 {agent.provider_agent_id ? (
-                  <button className="btn btn-secondary btn-sm" disabled={working === `sync-${agent.id}` || agent.sync_status === 'synced'} onClick={() => runAgentAction(agent, 'sync')}><RefreshCw size={12} /> {providerActionLabel(agent.sync_status)}</button>
+                  <button className="btn btn-secondary btn-sm" disabled={working === `sync-${agent.id}` || agent.sync_status === 'synced'} onClick={() => runAgentAction(agent, 'sync')} title={isProviderConfigCorrection(agent) ? 'Recheck Smallest.ai without publishing another revision.' : undefined}><RefreshCw size={12} /> {providerActionLabel(agent)}</button>
                 ) : agent.sync_status === 'provision_unknown' ? (
                   <button className="btn btn-primary btn-sm" disabled={working === `resolve-${agent.id}`} onClick={() => resolveProviderOperation(agent)}><RefreshCw size={12} /> Resolve create</button>
                 ) : agent.sync_status === 'provisioning' ? (
@@ -505,12 +512,6 @@ function syncBadge(status: VoiceAgent['sync_status']) {
 
 function providerOperationUnresolved(status: VoiceAgent['sync_status']) {
   return ['provisioning', 'provision_unknown', 'publishing', 'provider_scanning', 'publish_unknown'].includes(status);
-}
-
-function providerActionLabel(status: VoiceAgent['sync_status']) {
-  if (status === 'synced') return 'In sync';
-  if (['publishing', 'provider_scanning', 'publish_unknown'].includes(status)) return 'Check status';
-  return 'Publish';
 }
 
 function syncStatusLabel(status: VoiceAgent['sync_status']) {
