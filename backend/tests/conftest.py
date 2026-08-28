@@ -1,10 +1,12 @@
 """Test configuration and fixtures."""
 
 import asyncio
+import os
 from collections.abc import AsyncGenerator
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import event
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.ext.compiler import compiles
@@ -16,7 +18,7 @@ from app.main import app
 from app.models.tenant import Tenant
 from app.models.user import User
 
-TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
+TEST_DATABASE_URL = os.getenv("TEST_DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
 
 @compiles(JSONB, "sqlite")
@@ -24,11 +26,21 @@ def compile_jsonb_for_sqlite(_type, _compiler, **_kwargs):
     return "JSON"
 
 
-engine = create_async_engine(
-    TEST_DATABASE_URL,
-    echo=False,
-    poolclass=StaticPool,
-)
+if TEST_DATABASE_URL.startswith("sqlite"):
+    engine = create_async_engine(
+        TEST_DATABASE_URL,
+        echo=False,
+        poolclass=StaticPool,
+    )
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def enable_sqlite_foreign_keys(dbapi_connection, _connection_record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
+else:
+    engine = create_async_engine(TEST_DATABASE_URL, echo=False, pool_pre_ping=True)
 test_session_factory = async_sessionmaker(engine, expire_on_commit=False)
 
 

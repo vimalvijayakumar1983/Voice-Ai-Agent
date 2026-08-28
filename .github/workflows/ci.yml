@@ -1,6 +1,7 @@
 name: CI
 
 on:
+  workflow_dispatch:
   pull_request:
   push:
     branches:
@@ -13,6 +14,23 @@ permissions:
 jobs:
   backend:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: voice_ai_ci
+          POSTGRES_USER: voice_ai_ci
+          POSTGRES_PASSWORD: voice_ai_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U voice_ai_ci -d voice_ai_ci"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgresql+asyncpg://voice_ai_ci:voice_ai_ci@localhost:5432/voice_ai_ci
+      TEST_DATABASE_URL: postgresql+asyncpg://voice_ai_ci:voice_ai_ci@localhost:5432/voice_ai_ci
     defaults:
       run:
         working-directory: backend
@@ -23,6 +41,8 @@ jobs:
           python-version: '3.11'
           cache: pip
       - run: pip install -e '.[dev]'
+      - run: python -m pip check
+      - run: alembic upgrade head
       - run: python -m ruff check app tests migrations
       - run: python -m ruff format --check app tests migrations
       - run: python -m pytest -q
@@ -40,5 +60,7 @@ jobs:
           cache: npm
           cache-dependency-path: frontend/package-lock.json
       - run: npm ci
+      - run: npm audit --omit=dev --audit-level=high
+      - run: npm run test:session-boundary
       - run: npm run lint
       - run: npm run build

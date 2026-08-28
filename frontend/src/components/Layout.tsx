@@ -1,25 +1,25 @@
 import Link from 'next/link';
 import { useRouter } from 'next/router';
-import { ReactNode, useState } from 'react';
+import { ReactNode, useEffect, useRef, useState } from 'react';
 import {
   Activity,
   AudioWaveform,
-  Bell,
   Bot,
   ChevronDown,
   CreditCard,
   FlaskConical,
+  LogOut,
   Menu,
   Megaphone,
   PhoneCall,
   Plug,
-  Search,
   Settings,
   ShieldCheck,
   Sparkles,
   Workflow,
   X,
 } from 'lucide-react';
+import { api, CurrentUser } from '@/lib/api';
 
 const navigation = [
   {
@@ -49,15 +49,79 @@ const navigation = [
   },
 ];
 
+function getInitials(user: CurrentUser | null) {
+  const source = user?.full_name?.trim() || user?.email || 'Account';
+  return source
+    .split(/[\s@._-]+/)
+    .filter(Boolean)
+    .slice(0, 2)
+    .map((part) => part[0]?.toUpperCase())
+    .join('') || 'AC';
+}
+
+function formatRole(role?: string) {
+  if (!role) return 'Workspace member';
+  return role.replace(/_/g, ' ').replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+function getWorkspaceInitials(user: CurrentUser | null) {
+  const name = user?.tenant_name?.trim();
+  if (!name) return 'VA';
+  return name
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, 2)
+    .map((part) => part[0]?.toUpperCase())
+    .join('');
+}
+
 export default function Layout({ children }: { children: ReactNode }) {
   const router = useRouter();
   const [mobileOpen, setMobileOpen] = useState(false);
+  const [user, setUser] = useState<CurrentUser | null>(null);
+  const [profileOpen, setProfileOpen] = useState(false);
+  const profileRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    let active = true;
+    api.getMe().then((currentUser) => {
+      if (active) setUser(currentUser);
+    }).catch(() => {
+      // The application-level session guard handles expired sessions.
+    });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!profileOpen) return;
+
+    const handlePointerDown = (event: PointerEvent) => {
+      if (!profileRef.current?.contains(event.target as Node)) setProfileOpen(false);
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setProfileOpen(false);
+    };
+    document.addEventListener('pointerdown', handlePointerDown);
+    document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.removeEventListener('pointerdown', handlePointerDown);
+      document.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [profileOpen]);
+
+  const logout = () => {
+    setProfileOpen(false);
+    api.logout();
+  };
 
   const isActive = (href: string) =>
     href === '/' ? router.pathname === '/' : router.pathname.startsWith(href);
 
   return (
     <div className="app-shell">
+      <a className="skip-link" href="#main-content">Skip to main content</a>
       <aside className={`sidebar ${mobileOpen ? 'sidebar-open' : ''}`}>
         <div className="brand-lockup">
           <div className="brand-mark"><AudioWaveform size={20} strokeWidth={2.4} /></div>
@@ -70,10 +134,10 @@ export default function Layout({ children }: { children: ReactNode }) {
           </button>
         </div>
 
-        <div className="workspace-switcher">
-          <div className="workspace-avatar">AZ</div>
-          <div><strong>Al Zaabi Group</strong><span>Production</span></div>
-          <ChevronDown size={16} />
+        <div className="workspace-switcher workspace-static" aria-label="Current workspace environment">
+          <div className="workspace-avatar">{getWorkspaceInitials(user)}</div>
+          <div><strong>{user?.tenant_name || 'Voice operations'}</strong><span>Production workspace</span></div>
+          <ShieldCheck size={15} aria-hidden="true" />
         </div>
 
         <nav className="sidebar-nav" aria-label="Primary navigation">
@@ -87,6 +151,7 @@ export default function Layout({ children }: { children: ReactNode }) {
                     key={item.href}
                     href={item.href}
                     className={isActive(item.href) ? 'active' : ''}
+                    aria-current={isActive(item.href) ? 'page' : undefined}
                     onClick={() => setMobileOpen(false)}
                   >
                     <Icon size={17} strokeWidth={1.9} />
@@ -112,18 +177,39 @@ export default function Layout({ children }: { children: ReactNode }) {
           <button className="icon-button mobile-menu" onClick={() => setMobileOpen(true)} aria-label="Open menu">
             <Menu size={19} />
           </button>
-          <div className="command-search">
-            <Search size={16} />
-            <span>Search agents, calls, contacts…</span>
-            <kbd>⌘ K</kbd>
+          <div className="topbar-context">
+            <span className="status-dot" aria-hidden="true" />
+            <span>Secure production workspace</span>
           </div>
           <div className="topbar-actions">
             <Link className="ai-action" href="/agents"><Sparkles size={15} /> Create with AI</Link>
-            <button className="icon-button" aria-label="Notifications"><Bell size={18} /></button>
-            <button className="profile-menu"><span>VV</span><div><strong>Vimal</strong><small>Owner</small></div><ChevronDown size={14} /></button>
+            <div className="profile-control" ref={profileRef}>
+              <button
+                type="button"
+                className="profile-menu"
+                aria-expanded={profileOpen}
+                aria-haspopup="menu"
+                onClick={() => setProfileOpen((open) => !open)}
+              >
+                <span>{getInitials(user)}</span>
+                <div><strong>{user?.full_name || 'Your account'}</strong><small>{formatRole(user?.role)}</small></div>
+                <ChevronDown size={14} aria-hidden="true" />
+              </button>
+              {profileOpen ? (
+                <div className="profile-popover" role="menu">
+                  <div className="profile-popover-identity">
+                    <strong>{user?.full_name || 'Signed-in user'}</strong>
+                    <span>{user?.email || 'Loading account…'}</span>
+                  </div>
+                  <button type="button" role="menuitem" onClick={logout}>
+                    <LogOut size={15} /> Sign out
+                  </button>
+                </div>
+              ) : null}
+            </div>
           </div>
         </header>
-        <main className="main-content">{children}</main>
+        <main id="main-content" className="main-content" tabIndex={-1}>{children}</main>
       </div>
     </div>
   );

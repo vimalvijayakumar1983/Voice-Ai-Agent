@@ -40,10 +40,21 @@ def _timezone_config(timezone_name: str) -> dict[str, str | int | float]:
 class SmallestAIError(RuntimeError):
     """A normalized Smallest.ai API failure."""
 
-    def __init__(self, message: str, *, status_code: int = 502, details: Any = None):
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int = 502,
+        details: Any = None,
+        ambiguous: bool = False,
+    ):
         super().__init__(message)
         self.status_code = status_code
         self.details = details
+        # A timeout/connection loss after a mutating request may mean Smallest
+        # accepted the operation even though we never received its response.
+        # Callers must reconcile these failures instead of blindly retrying.
+        self.ambiguous = ambiguous
 
 
 @dataclass(frozen=True)
@@ -91,6 +102,7 @@ class SmallestAIClient:
                 status_code=503,
             )
 
+        mutation = method.upper() not in {"GET", "HEAD", "OPTIONS"}
         async with httpx.AsyncClient(
             base_url=base_url or self.base_url,
             timeout=self.timeout,
@@ -105,10 +117,15 @@ class SmallestAIClient:
                 response = await client.request(method, path, json=json, params=params)
             except httpx.TimeoutException as exc:
                 raise SmallestAIError(
-                    "Smallest.ai timed out. Please retry.", status_code=504
+                    "Smallest.ai timed out. Please retry.",
+                    status_code=504,
+                    ambiguous=mutation,
                 ) from exc
             except httpx.HTTPError as exc:
-                raise SmallestAIError("Could not connect to Smallest.ai.") from exc
+                raise SmallestAIError(
+                    "Could not connect to Smallest.ai.",
+                    ambiguous=mutation,
+                ) from exc
 
         if response.is_error:
             try:
@@ -124,13 +141,27 @@ class SmallestAIClient:
             message = "Smallest.ai rejected the request."
             if isinstance(details, dict):
                 message = str(details.get("message") or details.get("error") or message)
-            raise SmallestAIError(message, status_code=response.status_code, details=details)
+            raise SmallestAIError(
+                message,
+                status_code=response.status_code,
+                details=details,
+                ambiguous=mutation and (response.status_code == 408 or response.status_code >= 500),
+            )
 
         if response.status_code == 204 or not response.content:
             return {}
-        payload = response.json()
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise SmallestAIError(
+                "Smallest.ai returned an invalid JSON response.",
+                ambiguous=mutation,
+            ) from exc
         if not isinstance(payload, dict):
-            raise SmallestAIError("Smallest.ai returned an unexpected response.")
+            raise SmallestAIError(
+                "Smallest.ai returned an unexpected response.",
+                ambiguous=mutation,
+            )
         return payload
 
     async def list_voices(self) -> list[dict[str, Any]]:
@@ -161,7 +192,10 @@ class SmallestAIClient:
         if isinstance(agent_id, dict):
             agent_id = agent_id.get("_id") or agent_id.get("id")
         if not isinstance(agent_id, str) or not agent_id:
-            raise SmallestAIError("Smallest.ai did not return an agent ID.")
+            raise SmallestAIError(
+                "Smallest.ai accepted the request but did not return an agent ID.",
+                ambiguous=True,
+            )
         return agent_id
 
     async def get_default_branch_id(self, agent_id: str) -> str:
@@ -176,6 +210,26 @@ class SmallestAIClient:
                     return str(branch_id)
         raise SmallestAIError("Smallest.ai agent has no default branch.")
 
+    async def set_agent_webhook_subscriptions(
+        self,
+        *,
+        agent_id: str,
+        webhook_id: str,
+    ) -> dict[str, Any]:
+        """Replace an agent's subscriptions with the required lifecycle events."""
+        return await self._request(
+            "POST",
+            f"/agent/{agent_id}/webhook-subscriptions",
+            json={
+                "eventTypes": [
+                    "pre-conversation",
+                    "post-conversation",
+                    "analytics-completed",
+                ],
+                "webhookId": webhook_id,
+            },
+        )
+
     async def update_agent_draft(
         self,
         *,
@@ -189,6 +243,7 @@ class SmallestAIClient:
         timezone: str,
         voice_id: str | None = None,
         speech_rate: float = 1.0,
+        synthesizer_model: str | None = None,
     ) -> dict[str, Any]:
         resolved_languages = list(dict.fromkeys(supported_languages or [language]))
         if language not in resolved_languages:
@@ -210,9 +265,14 @@ class SmallestAIClient:
         if first_message is not None:
             payload["firstMessage"] = first_message
         if voice_id:
+            if not synthesizer_model:
+                raise SmallestAIError(
+                    "Selected voice has no verified Smallest.ai synthesizer model.",
+                    status_code=422,
+                )
             payload["synthesizer"] = {
                 "voiceConfig": {
-                    "model": "waves_lightning_v3_1",
+                    "model": synthesizer_model,
                     "voiceId": voice_id,
                 },
                 "speed": speech_rate,
@@ -228,7 +288,59 @@ class SmallestAIClient:
             json={"label": label},
         )
         data = response.get("data")
-        return data if isinstance(data, dict) else {"state": data}
+        result = data if isinstance(data, dict) else {"state": data}
+        state = str(result.get("state") or "").lower()
+        if state not in {"committed", "scanning"}:
+            raise SmallestAIError(
+                "Smallest.ai accepted the publish request but returned an unknown state.",
+                details=result,
+                ambiguous=True,
+            )
+        return {**result, "state": state}
+
+    async def get_latest_branch_revision(
+        self,
+        *,
+        agent_id: str,
+        branch_id: str,
+    ) -> dict[str, Any] | None:
+        """Return the latest revision summary for a branch, if one exists."""
+        response = await self._request(
+            "GET",
+            f"/agent/{agent_id}/branches/{branch_id}/revisions",
+            params={"limit": 1},
+        )
+        data = response.get("data")
+        revisions = data.get("revisions") if isinstance(data, dict) else None
+        if revisions is None and isinstance(data, list):
+            revisions = data
+        if not isinstance(revisions, list) or not revisions:
+            return None
+        latest = revisions[0]
+        if not isinstance(latest, dict):
+            raise SmallestAIError("Smallest.ai returned an invalid revision summary.")
+        revision = latest.get("revision")
+        return revision if isinstance(revision, dict) else latest
+
+    async def get_branch_revision(
+        self,
+        *,
+        agent_id: str,
+        branch_id: str,
+        revision_id: str,
+    ) -> dict[str, Any]:
+        """Return a revision including publish and security-check status."""
+        response = await self._request(
+            "GET",
+            f"/agent/{agent_id}/branches/{branch_id}/revisions/{revision_id}",
+        )
+        data = response.get("data")
+        revision = data.get("revision") if isinstance(data, dict) else None
+        if revision is None and isinstance(data, dict):
+            revision = data
+        if not isinstance(revision, dict):
+            raise SmallestAIError("Smallest.ai returned an invalid revision.")
+        return revision
 
     async def create_browser_session(
         self,
@@ -274,7 +386,10 @@ class SmallestAIClient:
             data.get("conversation_id") if isinstance(data, dict) else None
         )
         if not conversation_id:
-            raise SmallestAIError("Smallest.ai did not return a conversation ID.")
+            raise SmallestAIError(
+                "Smallest.ai accepted the call request but did not return a conversation ID.",
+                ambiguous=True,
+            )
         return str(conversation_id)
 
 

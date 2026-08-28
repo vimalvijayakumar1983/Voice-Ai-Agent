@@ -57,7 +57,7 @@ services:
         condition: service_healthy
     volumes:
       - ./backend:/app
-    command: celery -A app.tasks.worker worker --loglevel=info --concurrency=4
+    command: celery -A app.tasks.worker worker -B --loglevel=info --concurrency=4
 
   frontend:
     build:

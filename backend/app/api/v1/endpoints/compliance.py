@@ -8,7 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
-from app.middleware.tenant import CurrentUser, get_current_user
+from app.middleware.tenant import CurrentUser, get_current_user, require_role
 from app.models.compliance import ConsentRecord, DncEntry
 from app.schemas.compliance import (
     ConsentRecordCreate,
@@ -16,6 +16,11 @@ from app.schemas.compliance import (
     DncCheckResponse,
     DncEntryCreate,
     DncEntryResponse,
+)
+from app.services.phone_numbers import (
+    is_number_on_tenant_dnc,
+    normalize_e164,
+    tenant_phone_dnc_lock,
 )
 
 router = APIRouter(prefix="/compliance", tags=["Compliance"])
@@ -41,28 +46,26 @@ async def list_dnc_entries(
 @router.post("/dnc", response_model=DncEntryResponse, status_code=status.HTTP_201_CREATED)
 async def add_dnc_entry(
     data: DncEntryCreate,
-    current_user: CurrentUser = Depends(get_current_user),
+    current_user: CurrentUser = Depends(require_role("owner", "admin", "member")),
     db: AsyncSession = Depends(get_db),
 ):
-    # Check if already exists
-    existing = await db.execute(
-        select(DncEntry).where(
-            DncEntry.tenant_id == current_user.tenant_id,
-            DncEntry.phone_number == data.phone_number,
-        )
-    )
-    if existing.scalar_one_or_none():
-        raise HTTPException(status_code=400, detail="Number already on DNC list")
+    normalized_number = normalize_e164(data.phone_number)
+    if not normalized_number:
+        raise HTTPException(status_code=422, detail="Phone number must be a valid E.164 number")
 
-    entry = DncEntry(
-        tenant_id=current_user.tenant_id,
-        phone_number=data.phone_number,
-        reason=data.reason,
-        source=data.source,
-        added_by=current_user.id,
-    )
-    db.add(entry)
-    await db.flush()
+    async with tenant_phone_dnc_lock(db, current_user.tenant_id, normalized_number):
+        if await is_number_on_tenant_dnc(db, current_user.tenant_id, normalized_number):
+            raise HTTPException(status_code=400, detail="Number already on DNC list")
+
+        entry = DncEntry(
+            tenant_id=current_user.tenant_id,
+            phone_number=normalized_number,
+            reason=data.reason,
+            source=data.source,
+            added_by=current_user.id,
+        )
+        db.add(entry)
+        await db.commit()
     return DncEntryResponse.model_validate(entry)
 
 
@@ -73,22 +76,23 @@ async def check_dnc(
     db: AsyncSession = Depends(get_db),
 ):
     """Check if a phone number is on the DNC list."""
-    result = await db.execute(
-        select(DncEntry).where(
-            DncEntry.tenant_id == current_user.tenant_id,
-            DncEntry.phone_number == phone_number,
-        )
-    )
+    normalized_number = normalize_e164(phone_number)
+    if not normalized_number:
+        raise HTTPException(status_code=422, detail="Phone number must be a valid E.164 number")
     return DncCheckResponse(
-        phone_number=phone_number,
-        is_on_dnc=result.scalar_one_or_none() is not None,
+        phone_number=normalized_number,
+        is_on_dnc=await is_number_on_tenant_dnc(
+            db,
+            current_user.tenant_id,
+            normalized_number,
+        ),
     )
 
 
 @router.delete("/dnc/{entry_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def remove_dnc_entry(
     entry_id: UUID,
-    current_user: CurrentUser = Depends(get_current_user),
+    current_user: CurrentUser = Depends(require_role("owner", "admin", "member")),
     db: AsyncSession = Depends(get_db),
 ):
     result = await db.execute(
@@ -96,10 +100,28 @@ async def remove_dnc_entry(
             DncEntry.id == entry_id, DncEntry.tenant_id == current_user.tenant_id
         )
     )
-    entry = result.scalar_one_or_none()
-    if not entry:
+    entry_probe = result.scalar_one_or_none()
+    if not entry_probe:
         raise HTTPException(status_code=404, detail="DNC entry not found")
-    await db.delete(entry)
+    normalized_number = normalize_e164(entry_probe.phone_number)
+    if not normalized_number:
+        raise HTTPException(status_code=409, detail="DNC entry has an invalid phone number")
+
+    # Re-read after acquiring the number guard because a concurrent delete may
+    # have removed the probed row while this request was waiting.
+    await db.commit()
+    async with tenant_phone_dnc_lock(db, current_user.tenant_id, normalized_number):
+        locked_result = await db.execute(
+            select(DncEntry).where(
+                DncEntry.id == entry_id,
+                DncEntry.tenant_id == current_user.tenant_id,
+            )
+        )
+        entry = locked_result.scalar_one_or_none()
+        if not entry:
+            raise HTTPException(status_code=404, detail="DNC entry not found")
+        await db.delete(entry)
+        await db.commit()
 
 
 # Consent Management
@@ -119,7 +141,7 @@ async def list_consent_records(
 @router.post("/consent", response_model=ConsentRecordResponse, status_code=status.HTTP_201_CREATED)
 async def create_consent_record(
     data: ConsentRecordCreate,
-    current_user: CurrentUser = Depends(get_current_user),
+    current_user: CurrentUser = Depends(require_role("owner", "admin", "member")),
     db: AsyncSession = Depends(get_db),
 ):
     from datetime import datetime

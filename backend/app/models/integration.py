@@ -19,8 +19,11 @@ class Integration(TenantScopedModel):
         String(50), nullable=False
     )  # webhook, crm, zapier
     config: Mapped[dict] = mapped_column(JSONB, nullable=False)
-    # webhook config includes URL, signing secret, and subscribed event names.
-    # crm config: {"provider": "hubspot", "api_key": "...", "sync_contacts": true}
+    # JSONB contains only the API-safe projection. The complete configuration,
+    # including credentials, is held in an authenticated encryption envelope.
+    # Null is retained temporarily for legacy rows and migrated on mutation.
+    encrypted_config: Mapped[str | None] = mapped_column(Text, nullable=True)
+    config_encryption_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
 
 

@@ -286,7 +286,7 @@ export default function AgentEditor({
 }
 
 function VoiceOption({ voice }: { voice: VoiceCatalogItem }) {
-  return <option value={voice.id}>{voice.name} · {voice.languages.join(', ').toUpperCase() || 'Multilingual'}{voice.accent ? ` · ${voice.accent}` : ''}{voice.source === 'cloned' ? ' · Cloned' : ''}</option>;
+  return <option value={voice.id} disabled={!voice.synthesizer_model}>{voice.name} · {voice.languages.join(', ').toUpperCase() || 'Multilingual'}{voice.accent ? ` · ${voice.accent}` : ''}{voice.source === 'cloned' ? ' · Cloned' : ''}{voice.unavailability_reason ? ` · ${voice.unavailability_reason}` : ''}</option>;
 }
 
 function voiceDescription(voice: VoiceCatalogItem) {

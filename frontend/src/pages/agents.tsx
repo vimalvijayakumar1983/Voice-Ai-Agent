@@ -96,9 +96,7 @@ export default function Agents() {
       setAgents((current) => current.map((item) => item.id === updated.id ? updated : item));
       setNotice({
         type: 'success',
-        text: action === 'provision'
-          ? `${agent.name} is now provisioned on Smallest.ai.`
-          : `${agent.name} has been published through the Smallest.ai versioning workflow.`,
+        text: providerActionNotice(agent.name, action, updated.sync_status),
       });
     } catch (error) {
       setNotice({
@@ -122,6 +120,52 @@ export default function Agents() {
       setNotice({
         type: 'error',
         text: error instanceof Error ? error.message : 'Could not delete the agent.',
+      });
+    } finally {
+      setWorking(null);
+    }
+  };
+
+  const resolveProviderOperation = async (agent: VoiceAgent) => {
+    setNotice(null);
+    let payload:
+      | {
+          action: 'confirm_create_absent' | 'confirm_publish_absent';
+          confirmation: string;
+        }
+      | null = null;
+    if (agent.sync_status === 'provision_unknown') {
+      if (window.confirm(
+        'Confirm that the Smallest.ai dashboard shows no remote agent for this operation. If one exists, cancel and contact a platform operator; workspace users cannot safely claim shared provider resources.',
+      )) {
+        payload = {
+          action: 'confirm_create_absent',
+          confirmation: 'I CONFIRM NO REMOTE AGENT EXISTS',
+        };
+      }
+    } else if (
+      agent.sync_status === 'publish_unknown'
+      && window.confirm('Confirm that Smallest.ai shows no new branch revision for this publish operation?')
+    ) {
+      payload = {
+        action: 'confirm_publish_absent',
+        confirmation: 'I CONFIRM NO NEW REVISION EXISTS',
+      };
+    }
+    if (!payload) return;
+
+    setWorking(`resolve-${agent.id}`);
+    try {
+      const updated = await api.resolveSmallestAgent(agent.id, payload);
+      setAgents((current) => current.map((item) => item.id === updated.id ? updated : item));
+      setNotice({
+        type: 'success',
+        text: `${agent.name}'s provider operation was reconciled and recorded in the audit log.`,
+      });
+    } catch (error) {
+      setNotice({
+        type: 'error',
+        text: error instanceof Error ? error.message : 'Could not reconcile the provider operation.',
       });
     } finally {
       setWorking(null);
@@ -196,7 +240,7 @@ export default function Agents() {
                   <h3>{agent.name}</h3>
                   <p>{agent.provider_agent_id ? `Atoms ID · ${agent.provider_agent_id.slice(0, 12)}…` : 'Local draft · not provisioned'}</p>
                 </div>
-                <button className="icon-button" onClick={() => openEdit(agent)} aria-label={`Edit ${agent.name}`}><Pencil size={15} /></button>
+                <button className="icon-button" disabled={providerOperationUnresolved(agent.sync_status)} onClick={() => openEdit(agent)} aria-label={`Edit ${agent.name}`}><Pencil size={15} /></button>
               </div>
               <p className="agent-card-body">{agent.description || agent.system_prompt}</p>
               <div className="agent-card-meta">
@@ -206,14 +250,25 @@ export default function Agents() {
                 <span className={`badge ${syncBadge(agent.sync_status)}`}>{agent.sync_status.replace('_', ' ')}</span>
               </div>
               <div className="agent-card-actions">
-                <button className="btn btn-secondary btn-sm" onClick={() => openEdit(agent)}><Pencil size={12} /> Edit</button>
+                <button className="btn btn-secondary btn-sm" disabled={providerOperationUnresolved(agent.sync_status)} onClick={() => openEdit(agent)}><Pencil size={12} /> Edit</button>
                 {agent.provider_agent_id ? (
-                  <button className="btn btn-secondary btn-sm" disabled={working === `sync-${agent.id}` || agent.sync_status === 'synced'} onClick={() => runAgentAction(agent, 'sync')}><RefreshCw size={12} /> {agent.sync_status === 'synced' ? 'In sync' : 'Publish'}</button>
+                  <button className="btn btn-secondary btn-sm" disabled={working === `sync-${agent.id}` || agent.sync_status === 'synced'} onClick={() => runAgentAction(agent, 'sync')}><RefreshCw size={12} /> {providerActionLabel(agent.sync_status)}</button>
+                ) : agent.sync_status === 'provision_unknown' ? (
+                  <button className="btn btn-primary btn-sm" disabled={working === `resolve-${agent.id}`} onClick={() => resolveProviderOperation(agent)}><RefreshCw size={12} /> Resolve create</button>
+                ) : agent.sync_status === 'provisioning' ? (
+                  <button className="btn btn-secondary btn-sm" disabled={working === `provision-${agent.id}`} onClick={() => runAgentAction(agent, 'provision')}><RefreshCw size={12} /> Check status</button>
                 ) : (
-                  <button className="btn btn-primary btn-sm" disabled={!provider?.configured || working === `provision-${agent.id}`} onClick={() => runAgentAction(agent, 'provision')}><CloudUpload size={12} /> Provision</button>
+                  <button className="btn btn-primary btn-sm" disabled={!provider?.configured || !provider?.webhook_configured || providerOperationUnresolved(agent.sync_status) || working === `provision-${agent.id}`} onClick={() => runAgentAction(agent, 'provision')}><CloudUpload size={12} /> Provision</button>
                 )}
-                <Link href={`/playground?agent=${agent.id}`} className="btn btn-secondary btn-sm"><FlaskConical size={12} /> Test</Link>
-                <button className="btn btn-ghost btn-sm" disabled={working === `delete-${agent.id}`} onClick={() => removeAgent(agent)} aria-label={`Delete ${agent.name}`}><Trash2 size={12} /></button>
+                {agent.sync_status === 'publish_unknown' && (
+                  <button className="btn btn-secondary btn-sm" disabled={working === `resolve-${agent.id}`} onClick={() => resolveProviderOperation(agent)}><RefreshCw size={12} /> Resolve unknown</button>
+                )}
+                {agent.last_synced_at ? (
+                  <Link href={`/playground?agent=${agent.id}`} className="btn btn-secondary btn-sm"><FlaskConical size={12} /> Test</Link>
+                ) : (
+                  <button className="btn btn-secondary btn-sm" disabled><FlaskConical size={12} /> Test</button>
+                )}
+                <button className="btn btn-ghost btn-sm" disabled={Boolean(agent.provider_agent_id) || providerOperationUnresolved(agent.sync_status) || working === `delete-${agent.id}`} onClick={() => removeAgent(agent)} aria-label={`Delete ${agent.name}`} title={agent.provider_agent_id ? 'Provisioned agents must be archived with their provider resource.' : undefined}><Trash2 size={12} /></button>
               </div>
             </article>
           ))}
@@ -253,6 +308,32 @@ function voiceLabel(id: string, catalog: AgentProviderCatalog | null) {
 function syncBadge(status: VoiceAgent['sync_status']) {
   if (status === 'synced') return 'badge-success';
   if (status === 'error') return 'badge-danger';
-  if (status === 'dirty' || status === 'publishing') return 'badge-warning';
+  if (status === 'dirty' || providerOperationUnresolved(status)) return 'badge-warning';
   return 'badge-neutral';
+}
+
+function providerOperationUnresolved(status: VoiceAgent['sync_status']) {
+  return ['provisioning', 'provision_unknown', 'publishing', 'provider_scanning', 'publish_unknown'].includes(status);
+}
+
+function providerActionLabel(status: VoiceAgent['sync_status']) {
+  if (status === 'synced') return 'In sync';
+  if (['publishing', 'provider_scanning', 'publish_unknown'].includes(status)) return 'Check status';
+  return 'Publish';
+}
+
+function providerActionNotice(
+  name: string,
+  action: 'provision' | 'sync',
+  status: VoiceAgent['sync_status'],
+) {
+  if (status === 'provider_scanning' || status === 'publish_unknown') {
+    return `${name} is awaiting Smallest.ai revision and security checks. Use Check status before retrying.`;
+  }
+  if (status === 'dirty') {
+    return `${name}'s interrupted provider update is safe to publish again.`;
+  }
+  return action === 'provision'
+    ? `${name} is provisioned and published on Smallest.ai.`
+    : `${name} has been verified through the Smallest.ai versioning workflow.`;
 }

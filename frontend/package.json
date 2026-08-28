@@ -6,7 +6,8 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint . --max-warnings=0"
+    "lint": "eslint . --max-warnings=0",
+    "test:session-boundary": "node --test tests/session-boundary.test.mjs"
   },
   "dependencies": {
     "@smallest-ai/agent-sdk": "^0.3.0",

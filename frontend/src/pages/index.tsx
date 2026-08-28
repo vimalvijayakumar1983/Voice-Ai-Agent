@@ -12,7 +12,7 @@ import {
   Zap,
 } from 'lucide-react';
 import Layout from '@/components/Layout';
-import { AnalyticsOverview, AnalyticsTimeSeries, api, ProviderStatus, VoiceAgent } from '@/lib/api';
+import { AnalyticsOverview, AnalyticsTimeSeries, api, CurrentUser, ProviderStatus, VoiceAgent } from '@/lib/api';
 
 const emptyOverview: AnalyticsOverview = {
   total_calls: 0,
@@ -29,6 +29,7 @@ export default function Dashboard() {
   const [timeseries, setTimeseries] = useState<AnalyticsTimeSeries['data']>([]);
   const [agents, setAgents] = useState<VoiceAgent[]>([]);
   const [provider, setProvider] = useState<ProviderStatus | null>(null);
+  const [user, setUser] = useState<CurrentUser | null>(null);
   const [days, setDays] = useState(30);
 
   useEffect(() => {
@@ -37,11 +38,13 @@ export default function Dashboard() {
       api.getTimeseries(days),
       api.listAgents(),
       api.getProviderStatus(),
-    ]).then(([overviewResult, timeseriesResult, agentsResult, providerResult]) => {
+      api.getMe(),
+    ]).then(([overviewResult, timeseriesResult, agentsResult, providerResult, userResult]) => {
       if (overviewResult.status === 'fulfilled') setOverview(overviewResult.value);
       if (timeseriesResult.status === 'fulfilled') setTimeseries(timeseriesResult.value.data);
       if (agentsResult.status === 'fulfilled') setAgents(agentsResult.value);
       if (providerResult.status === 'fulfilled') setProvider(providerResult.value);
+      if (userResult.status === 'fulfilled') setUser(userResult.value);
     });
   }, [days]);
 
@@ -65,8 +68,8 @@ export default function Dashboard() {
       <div className="page-header">
         <div>
           <span className="page-kicker">Voice operations</span>
-          <h1>Welcome back, Vimal</h1>
-          <p className="page-subtitle">A clear view of every AI conversation, agent, and customer outcome across Al Zaabi Group.</p>
+          <h1>Welcome back{user?.full_name ? `, ${user.full_name.split(/\s+/)[0]}` : ''}</h1>
+          <p className="page-subtitle">A clear view of every AI conversation, agent, and customer outcome across your workspace.</p>
         </div>
         <div className="header-actions">
           <select className="field-control" value={days} onChange={(event) => setDays(Number(event.target.value))} aria-label="Reporting period">

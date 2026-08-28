@@ -100,12 +100,14 @@ async def test_versioned_draft_contains_runtime_configuration():
         timezone="Asia/Dubai",
         voice_id="nyah",
         speech_rate=1.1,
+        synthesizer_model="waves_lightning_v3_1",
     )
 
     assert captured["globalPrompt"] == "Be concise and helpful."
     assert captured["slmModel"] == "electron"
     assert captured["language"] == {"default": "en", "supported": ["en", "hi"]}
     assert captured["synthesizer"]["voiceConfig"]["voiceId"] == "nyah"
+    assert captured["synthesizer"]["voiceConfig"]["model"] == "waves_lightning_v3_1"
     assert captured["timezone"] == {
         "label": "(GMT+4:00) Asia/Dubai",
         "offset": 4,
@@ -178,3 +180,70 @@ async def test_versioned_draft_rejects_tamil_in_multilingual_agent():
         )
 
     assert error.value.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_revision_lifecycle_and_webhook_subscription_contracts():
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path.endswith("/webhook-subscriptions"):
+            return httpx.Response(201, json={"status": True})
+        if request.url.path.endswith("/revisions"):
+            return httpx.Response(
+                200,
+                json={"data": {"revisions": [{"revision": {"_id": "revision_9"}}]}},
+            )
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "revision": {
+                        "_id": "revision_9",
+                        "status": "published",
+                        "securityCheck": {"status": "passed"},
+                    }
+                }
+            },
+        )
+
+    client = SmallestAIClient(api_key="sk_test", transport=httpx.MockTransport(handler))
+    await client.set_agent_webhook_subscriptions(
+        agent_id="agent_123",
+        webhook_id="webhook_123",
+    )
+    latest = await client.get_latest_branch_revision(
+        agent_id="agent_123",
+        branch_id="branch_123",
+    )
+    revision = await client.get_branch_revision(
+        agent_id="agent_123",
+        branch_id="branch_123",
+        revision_id="revision_9",
+    )
+
+    assert json.loads(requests[0].content) == {
+        "eventTypes": [
+            "pre-conversation",
+            "post-conversation",
+            "analytics-completed",
+        ],
+        "webhookId": "webhook_123",
+    }
+    assert latest == {"_id": "revision_9"}
+    assert revision["securityCheck"]["status"] == "passed"
+    assert requests[1].url.params["limit"] == "1"
+
+
+@pytest.mark.asyncio
+async def test_mutating_timeout_is_marked_as_ambiguous():
+    def handler(_request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("timed out")
+
+    client = SmallestAIClient(api_key="sk_test", transport=httpx.MockTransport(handler))
+    with pytest.raises(SmallestAIError) as error:
+        await client.create_agent(name="Uncertain create")
+
+    assert error.value.status_code == 504
+    assert error.value.ambiguous is True

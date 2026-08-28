@@ -3,6 +3,7 @@
 import structlog
 from twilio.request_validator import RequestValidator
 from twilio.rest import Client
+from twilio.twiml.voice_response import Connect, Dial, Gather, VoiceResponse
 
 from app.core.config import settings
 from app.telephony.base import (
@@ -48,39 +49,37 @@ class TwilioProvider(TelephonyProvider):
         logger.info("twilio_call_ended", call_sid=call_sid)
 
     def generate_greeting(self, message: str, voice: str) -> TwiMLResponse:
-        return TwiMLResponse(
-            xml=f'<?xml version="1.0" encoding="UTF-8"?>'
-            f'<Response><Say voice="{voice}">{message}</Say></Response>'
-        )
+        response = VoiceResponse()
+        response.say(message, voice=voice)
+        return TwiMLResponse(xml=str(response))
 
     def generate_gather(
         self, prompt: str, voice: str, action_url: str, num_digits: int = 1, timeout: int = 5
     ) -> TwiMLResponse:
-        return TwiMLResponse(
-            xml=f'<?xml version="1.0" encoding="UTF-8"?>'
-            f"<Response>"
-            f'<Gather numDigits="{num_digits}" action="{action_url}" timeout="{timeout}">'
-            f'<Say voice="{voice}">{prompt}</Say>'
-            f"</Gather>"
-            f'<Say voice="{voice}">We didn\'t receive any input. Goodbye!</Say>'
-            f"</Response>"
+        response = VoiceResponse()
+        gather = Gather(
+            num_digits=num_digits,
+            action=action_url,
+            timeout=timeout,
         )
+        gather.say(prompt, voice=voice)
+        response.append(gather)
+        response.say("We didn't receive any input. Goodbye!", voice=voice)
+        return TwiMLResponse(xml=str(response))
 
     def generate_connect_stream(self, websocket_url: str) -> TwiMLResponse:
-        return TwiMLResponse(
-            xml=f'<?xml version="1.0" encoding="UTF-8"?>'
-            f"<Response>"
-            f'<Connect><Stream url="{websocket_url}" /></Connect>'
-            f"</Response>"
-        )
+        response = VoiceResponse()
+        connect = Connect()
+        connect.stream(url=websocket_url)
+        response.append(connect)
+        return TwiMLResponse(xml=str(response))
 
     def generate_transfer(self, number: str, caller_id: str) -> TwiMLResponse:
-        return TwiMLResponse(
-            xml=f'<?xml version="1.0" encoding="UTF-8"?>'
-            f"<Response>"
-            f'<Dial callerId="{caller_id}"><Number>{number}</Number></Dial>'
-            f"</Response>"
-        )
+        response = VoiceResponse()
+        dial = Dial(caller_id=caller_id)
+        dial.number(number)
+        response.append(dial)
+        return TwiMLResponse(xml=str(response))
 
     def validate_webhook(self, url: str, params: dict, signature: str) -> bool:
         return self.validator.validate(url, params, signature)

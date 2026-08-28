@@ -28,7 +28,7 @@ class Agent(TenantScopedModel):
     # Voice Configuration
     voice_provider: Mapped[str] = mapped_column(String(50), default="smallest")
     voice_id: Mapped[str] = mapped_column(String(100), default="")
-    language: Mapped[str] = mapped_column(String(10), default="en")
+    language: Mapped[str] = mapped_column(String(63), default="en")
     supported_languages: Mapped[list[str]] = mapped_column(JSONB, default=lambda: ["en"])
     speech_rate: Mapped[float] = mapped_column(Float, default=1.0)
 

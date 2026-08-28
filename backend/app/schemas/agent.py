@@ -1,37 +1,52 @@
 from datetime import datetime
+from typing import Literal
 from uuid import UUID
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from app.services.agent_catalog import language_code
+from app.services.provider_variables import validate_provider_variables
+
 
 def _deduplicate_languages(languages: list[str]) -> list[str]:
-    return list(
-        dict.fromkeys(language.strip().lower() for language in languages if language.strip())
-    )
+    return list(dict.fromkeys(_normalize_language(language) for language in languages))
 
 
 def _normalize_language(language: str) -> str:
-    return language.strip().lower()
+    normalized = language_code(language)
+    if not normalized:
+        raise ValueError("Language must be a safe ISO or provider language code")
+    return normalized
+
+
+def _validate_timezone(timezone: str) -> str:
+    normalized = timezone.strip()
+    try:
+        ZoneInfo(normalized)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise ValueError("Timezone must be a valid IANA timezone") from exc
+    return normalized
 
 
 class AgentCreate(BaseModel):
     name: str = Field(min_length=2, max_length=255)
-    description: str | None = None
+    description: str | None = Field(None, max_length=2000)
     system_prompt: str = Field(min_length=10, max_length=4000)
-    model_provider: str = "smallest"
-    model_name: str = "electron"
+    model_provider: Literal["smallest"] = "smallest"
+    model_name: Literal["electron"] = "electron"
     temperature: float = Field(0.7, ge=0, le=2)
     max_tokens: int = Field(500, ge=32, le=8192)
-    voice_provider: str = "smallest"
-    voice_id: str = ""
-    language: str = "en"
+    voice_provider: Literal["smallest"] = "smallest"
+    voice_id: str = Field("", max_length=100)
+    language: str = Field("en", min_length=2, max_length=63)
     supported_languages: list[str] = Field(default_factory=lambda: ["en"], min_length=1)
     speech_rate: float = Field(1.0, ge=0.5, le=2)
     greeting_message: str | None = Field(None, max_length=500)
-    fallback_message: str | None = None
-    max_call_duration_seconds: int = 600
-    transfer_number: str | None = None
-    timezone: str = "Asia/Dubai"
+    fallback_message: str | None = Field(None, max_length=500)
+    max_call_duration_seconds: int = Field(600, ge=30, le=7200)
+    transfer_number: str | None = Field(None, pattern=r"^\+[1-9]\d{7,14}$")
+    timezone: str = Field("Asia/Dubai", max_length=64)
 
     @field_validator("supported_languages")
     @classmethod
@@ -43,6 +58,11 @@ class AgentCreate(BaseModel):
     def normalize_language(cls, value: str) -> str:
         return _normalize_language(value)
 
+    @field_validator("timezone")
+    @classmethod
+    def validate_timezone(cls, value: str) -> str:
+        return _validate_timezone(value)
+
     @model_validator(mode="after")
     def validate_language_configuration(self):
         if self.language not in self.supported_languages:
@@ -53,24 +73,24 @@ class AgentCreate(BaseModel):
 
 
 class AgentUpdate(BaseModel):
-    name: str | None = None
-    description: str | None = None
-    system_prompt: str | None = None
-    model_provider: str | None = None
-    model_name: str | None = None
-    temperature: float | None = None
-    max_tokens: int | None = None
-    voice_provider: str | None = None
-    voice_id: str | None = None
-    language: str | None = None
+    name: str | None = Field(None, min_length=2, max_length=255)
+    description: str | None = Field(None, max_length=2000)
+    system_prompt: str | None = Field(None, min_length=10, max_length=4000)
+    model_provider: Literal["smallest"] | None = None
+    model_name: Literal["electron"] | None = None
+    temperature: float | None = Field(None, ge=0, le=2)
+    max_tokens: int | None = Field(None, ge=32, le=8192)
+    voice_provider: Literal["smallest"] | None = None
+    voice_id: str | None = Field(None, max_length=100)
+    language: str | None = Field(None, min_length=2, max_length=63)
     supported_languages: list[str] | None = Field(None, min_length=1)
-    speech_rate: float | None = None
-    greeting_message: str | None = None
-    fallback_message: str | None = None
-    max_call_duration_seconds: int | None = None
-    transfer_number: str | None = None
+    speech_rate: float | None = Field(None, ge=0.5, le=2)
+    greeting_message: str | None = Field(None, max_length=500)
+    fallback_message: str | None = Field(None, max_length=500)
+    max_call_duration_seconds: int | None = Field(None, ge=30, le=7200)
+    transfer_number: str | None = Field(None, pattern=r"^\+[1-9]\d{7,14}$")
     is_active: bool | None = None
-    timezone: str | None = None
+    timezone: str | None = Field(None, max_length=64)
 
     @field_validator("supported_languages")
     @classmethod
@@ -81,6 +101,36 @@ class AgentUpdate(BaseModel):
     @classmethod
     def normalize_language(cls, value: str | None) -> str | None:
         return _normalize_language(value) if value is not None else None
+
+    @field_validator("timezone")
+    @classmethod
+    def validate_timezone(cls, value: str | None) -> str | None:
+        return _validate_timezone(value) if value is not None else None
+
+    @model_validator(mode="after")
+    def reject_null_for_required_columns(self):
+        required = {
+            "name",
+            "system_prompt",
+            "model_provider",
+            "model_name",
+            "temperature",
+            "max_tokens",
+            "voice_provider",
+            "voice_id",
+            "language",
+            "supported_languages",
+            "speech_rate",
+            "max_call_duration_seconds",
+            "is_active",
+            "timezone",
+        }
+        null_fields = sorted(
+            field for field in required & self.model_fields_set if getattr(self, field) is None
+        )
+        if null_fields:
+            raise ValueError(f"Fields cannot be null: {', '.join(null_fields)}")
+        return self
 
 
 class AgentResponse(BaseModel):
@@ -119,11 +169,41 @@ class AgentResponse(BaseModel):
 class SmallestSessionRequest(BaseModel):
     variables: dict[str, str | int | float | bool] = Field(default_factory=dict)
 
+    model_config = {"extra": "forbid"}
+
+    @field_validator("variables")
+    @classmethod
+    def validate_variables(
+        cls,
+        value: dict[str, str | int | float | bool],
+    ) -> dict[str, str | int | float | bool]:
+        return validate_provider_variables(value, label="Session variables") or {}
+
 
 class SmallestSessionResponse(BaseModel):
     access_token: str
     expires_in: int
     sample_rate: int = 24000
+
+
+class SmallestProviderResolution(BaseModel):
+    action: Literal[
+        "confirm_create_absent",
+        "confirm_publish_absent",
+    ]
+    confirmation: str = Field(min_length=10, max_length=100)
+
+    model_config = {"extra": "forbid"}
+
+    @model_validator(mode="after")
+    def validate_resolution_confirmation(self):
+        confirmations = {
+            "confirm_create_absent": "I CONFIRM NO REMOTE AGENT EXISTS",
+            "confirm_publish_absent": "I CONFIRM NO NEW REVISION EXISTS",
+        }
+        if self.confirmation != confirmations[self.action]:
+            raise ValueError("Provider resolution confirmation does not match the selected action")
+        return self
 
 
 class VoiceCatalogItem(BaseModel):
@@ -134,6 +214,8 @@ class VoiceCatalogItem(BaseModel):
     gender: str | None = None
     age: str | None = None
     use_cases: list[str] = Field(default_factory=list)
+    synthesizer_model: str | None = None
+    unavailability_reason: str | None = None
     source: str = "catalog"
 
 

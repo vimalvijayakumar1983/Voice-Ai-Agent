@@ -18,13 +18,20 @@ class Workflow(TenantScopedModel):
     )
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     description: Mapped[str | None] = mapped_column(Text)
-    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    # Workflows are drafts until an operator explicitly activates them. This
+    # keeps partially-authored graphs out of campaign execution.
+    is_active: Mapped[bool] = mapped_column(Boolean, default=False)
     trigger_type: Mapped[str] = mapped_column(String(50))  # inbound_call, campaign, api
     config: Mapped[dict | None] = mapped_column(JSONB)
 
     # Relationships
     nodes = relationship(
-        "WorkflowNode", back_populates="workflow", lazy="selectin", order_by="WorkflowNode.position"
+        "WorkflowNode",
+        back_populates="workflow",
+        cascade="all, delete-orphan",
+        lazy="raise",
+        order_by="WorkflowNode.position",
+        passive_deletes=True,
     )
 
 
