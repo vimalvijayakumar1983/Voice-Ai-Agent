@@ -8,6 +8,7 @@ from app.models.campaign import (
     CampaignContactAttempt,
     ProviderCallbackOutbox,
 )
+from app.models.commerce import CommerceAction, CommerceSession
 from app.models.compliance import ConsentRecord, DncEntry
 from app.models.integration import Integration, WebhookEvent
 from app.models.tenant import Tenant
@@ -38,6 +39,8 @@ __all__ = [
     "WebhookEvent",
     "DncEntry",
     "ConsentRecord",
+    "CommerceSession",
+    "CommerceAction",
     "BillingPlan",
     "TenantSubscription",
     "UsageRecord",
