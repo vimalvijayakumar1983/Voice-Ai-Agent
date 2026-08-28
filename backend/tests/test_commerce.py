@@ -126,6 +126,7 @@ async def test_purchase_controls_fail_closed_without_main_quantity_input():
     class FakePage:
         def __init__(self):
             self.selectors = []
+            self.url = "https://www.fepy.com/example-product"
 
         def locator(self, selector):
             self.selectors.append(selector)
@@ -204,7 +205,7 @@ async def test_add_to_cart_verifies_main_control_mutation_and_cart_page():
             self.visited.append(url)
 
         def locator(self, selector):
-            assert selector in {"h1", "body"}
+            assert selector == "body"
             return FakeWaitable()
 
         async def wait_for_timeout(self, _milliseconds):

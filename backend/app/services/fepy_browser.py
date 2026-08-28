@@ -49,8 +49,13 @@ class FepyBrowser:
         """Resolve the quantity and button from one verified product buy box."""
         quantity_input = page.locator('main input.num_input[type="number"]:visible').first
         try:
-            await quantity_input.wait_for(state="visible", timeout=5000)
+            await quantity_input.wait_for(state="visible", timeout=12000)
         except Exception as exc:
+            logger.warning(
+                "fepy_main_purchase_controls_missing",
+                page_url=page.url,
+                error_type=type(exc).__name__,
+            )
             raise FepyBrowserError("FEPY main purchase controls could not be verified") from exc
 
         purchase_panel = quantity_input.locator(
@@ -201,7 +206,6 @@ class FepyBrowser:
                 before_quantity = before_snapshot["verified_quantity"] or 0
                 await page.goto(self._url(product_path), wait_until="commit")
                 self._assert_loaded_origin(page)
-                await page.locator("h1").first.wait_for(state="visible")
                 quantity_input, add_button = await self._main_purchase_controls(page)
                 await quantity_input.fill(str(quantity))
                 try:
