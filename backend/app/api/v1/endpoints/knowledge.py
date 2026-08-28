@@ -192,13 +192,28 @@ def _provider_url_key(value: object) -> str:
     return urlunsplit((scheme, netloc, path, parsed.query, ""))
 
 
-def _provider_item_url(item: dict) -> object:
+def _provider_item_urls(item: dict) -> list[object]:
     metadata = item.get("metadata")
     if not isinstance(metadata, dict):
         metadata = {}
-    return (
-        item.get("url") or item.get("location") or metadata.get("url") or metadata.get("sourceUrl")
-    )
+    return [
+        value
+        for value in (
+            item.get("url"),
+            item.get("location"),
+            item.get("sourceUrl"),
+            item.get("sourceURL"),
+            item.get("source_url"),
+            metadata.get("url"),
+            metadata.get("sourceUrl"),
+            metadata.get("sourceURL"),
+            metadata.get("source_url"),
+            item.get("title"),
+            item.get("fileName"),
+            item.get("name"),
+        )
+        if value
+    ]
 
 
 def _provider_file_name(item: dict) -> str:
@@ -223,7 +238,10 @@ def _reconcile_provider_sources(
         if item.get("_id") or item.get("id")
     }
     urls_by_location = {
-        key: item for item in scraped if (key := _provider_url_key(_provider_item_url(item)))
+        key: item
+        for item in provider_items
+        for value in _provider_item_urls(item)
+        if (key := _provider_url_key(value))
     }
     files_by_name = {name: item for item in items if (name := _provider_file_name(item))}
     overall_status = _provider_source_status(provider_knowledge_base)

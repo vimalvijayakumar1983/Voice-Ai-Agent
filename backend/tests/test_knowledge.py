@@ -72,6 +72,32 @@ def test_reconcile_matches_normalized_provider_url():
     assert knowledge.indexed_source_count == 1
 
 
+def test_reconcile_matches_completed_url_returned_as_knowledge_item():
+    source = _url_source()
+    knowledge = _knowledge(source)
+    now = datetime.now(UTC)
+
+    _reconcile_provider_sources(
+        knowledge,
+        scraped=[],
+        items=[
+            {
+                "_id": "provider-item-1",
+                "processingStatus": "completed",
+                "metadata": {"sourceUrl": "https://www.aesmc.com"},
+            }
+        ],
+        provider_knowledge_base={"processingStatus": "processing"},
+        now=now,
+    )
+
+    assert source.status == "indexed"
+    assert source.provider_item_id == "provider-item-1"
+    assert source.last_synced_at == now
+    assert knowledge.sync_status == "ready"
+    assert knowledge.indexed_source_count == 1
+
+
 def test_reconcile_uses_completed_knowledge_base_as_safe_fallback():
     source = _url_source()
     knowledge = _knowledge(source)
