@@ -41,6 +41,7 @@ async def test_create_agent_and_browser_session_contract():
     assert json.loads(requests[0].content) == {
         "name": "Receptionist",
         "description": "Handles customer calls.",
+        "workflowType": "single_prompt",
     }
     assert json.loads(requests[1].content)["variables"] == {"customer_name": "Vimal"}
 
@@ -285,6 +286,7 @@ async def test_versioned_draft_contains_runtime_configuration():
     )
 
     assert captured["globalPrompt"] == "Be concise and helpful."
+    assert captured["singlePromptConfig"] == {"prompt": "Be concise and helpful."}
     assert captured["slmModel"] == "electron"
     assert captured["language"] == {
         "default": "en",

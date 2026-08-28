@@ -474,7 +474,11 @@ class SmallestAIClient:
         name: str,
         description: str | None = None,
     ) -> str:
-        payload: dict[str, Any] = {"name": name}
+        # Smallest.ai now defaults newly created agents to the single-prompt
+        # workflow. Keep that choice explicit so the draft payload below and
+        # the provider's resolved runtime configuration cannot drift if the
+        # provider changes its creation default again.
+        payload: dict[str, Any] = {"name": name, "workflowType": "single_prompt"}
         if description:
             payload["description"] = description
         response = await self._request("POST", "/agent", json=payload)
@@ -674,7 +678,13 @@ class SmallestAIClient:
         provider_timezone = _provider_timezone(timezone)
 
         payload: dict[str, Any] = {
+            # ``globalPrompt`` configures legacy workflow-graph agents, while
+            # current agents created by POST /agent use ``single_prompt`` and
+            # read their system prompt from ``singlePromptConfig.prompt``.
+            # Sending both keeps existing provisioned agents compatible while
+            # ensuring new single-prompt agents receive the requested prompt.
             "globalPrompt": global_prompt,
+            "singlePromptConfig": {"prompt": global_prompt},
             "firstMessage": first_message or "",
             "slmModel": slm_model,
             "language": {

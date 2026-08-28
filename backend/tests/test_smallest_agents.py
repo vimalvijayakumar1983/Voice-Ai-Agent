@@ -529,7 +529,7 @@ async def test_catalog_includes_public_voices_languages_and_templates_without_pr
     assert payload["templates"][0]["id"] == "receptionist"
     assert payload["field_capabilities"]["system_prompt"] == {
         "status": "synced",
-        "provider_field": "globalPrompt",
+        "provider_field": "singlePromptConfig.prompt",
         "reason": None,
     }
     assert payload["field_capabilities"]["temperature"]["status"] == "local_only"

@@ -85,7 +85,10 @@ PROVIDER_FIELD_CAPABILITIES = {
         "provider_field": "description",
         "reason": "Smallest agent metadata is set during initial provisioning.",
     },
-    "system_prompt": {"status": "synced", "provider_field": "globalPrompt"},
+    "system_prompt": {
+        "status": "synced",
+        "provider_field": "singlePromptConfig.prompt",
+    },
     "greeting_message": {"status": "synced", "provider_field": "firstMessage"},
     "model_name": {"status": "synced", "provider_field": "slmModel"},
     "model_provider": {
