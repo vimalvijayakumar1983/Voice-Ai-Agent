@@ -55,7 +55,13 @@ VOICE_PREVIEW_TEXTS = {
     "zh": "你好。这是一段语音试听。",
 }
 MAX_VOICE_PREVIEW_BYTES = 2_000_000
+MAX_KNOWLEDGE_BASE_DESCRIPTION_CHARS = 150
 _KNOWLEDGE_BINDING_UNSET = object()
+
+
+def _provider_knowledge_description(description: str) -> str:
+    """Fit local governance notes into Smallest.ai's 150-character field."""
+    return " ".join(description.split())[:MAX_KNOWLEDGE_BASE_DESCRIPTION_CHARS]
 
 
 def _validate_timezone_name(timezone_name: str) -> None:
@@ -449,7 +455,7 @@ class SmallestAIClient:
     async def create_knowledge_base(self, *, name: str, description: str = "") -> str:
         payload: dict[str, Any] = {"name": name}
         if description:
-            payload["description"] = description
+            payload["description"] = _provider_knowledge_description(description)
         response = await self._request("POST", "/knowledgebase", json=payload)
         knowledge_base_id = response.get("data")
         if isinstance(knowledge_base_id, dict):
@@ -467,7 +473,7 @@ class SmallestAIClient:
         await self._request(
             "POST",
             f"/knowledgebase/{quote(knowledge_base_id, safe='')}",
-            json={"name": name, "description": description},
+            json={"name": name, "description": _provider_knowledge_description(description)},
         )
 
     async def delete_knowledge_base(self, knowledge_base_id: str) -> None:

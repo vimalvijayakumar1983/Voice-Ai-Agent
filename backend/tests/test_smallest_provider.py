@@ -46,6 +46,65 @@ async def test_create_agent_and_browser_session_contract():
 
 
 @pytest.mark.asyncio
+async def test_knowledge_base_url_ingestion_contract():
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path.endswith("/knowledgebase"):
+            return httpx.Response(201, json={"status": True, "data": "kb_123"})
+        if request.url.path.endswith("/scrape-urls"):
+            return httpx.Response(200, json={"status": True, "data": {}})
+        return httpx.Response(200, json={"status": True, "data": []})
+
+    client = SmallestAIClient(
+        api_key="sk_test",
+        base_url="https://api.smallest.ai/atoms/v1",
+        transport=httpx.MockTransport(handler),
+    )
+    knowledge_base_id = await client.create_knowledge_base(
+        name="FEPY Support",
+        description="Approved product and policy content",
+    )
+    await client.scrape_knowledge_urls(
+        knowledge_base_id=knowledge_base_id,
+        urls=["https://www.fepy.com/delivery"],
+    )
+
+    assert knowledge_base_id == "kb_123"
+    assert requests[0].url.path == "/atoms/v1/knowledgebase"
+    assert json.loads(requests[0].content) == {
+        "name": "FEPY Support",
+        "description": "Approved product and policy content",
+    }
+    assert requests[1].url.path == "/atoms/v1/knowledgebase/kb_123/scrape-urls"
+    assert json.loads(requests[1].content) == {"urls": ["https://www.fepy.com/delivery"]}
+
+
+@pytest.mark.asyncio
+async def test_knowledge_base_description_is_normalized_to_provider_limit():
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(201, json={"status": True, "data": "kb_123"})
+
+    client = SmallestAIClient(
+        api_key="sk_test",
+        base_url="https://api.smallest.ai/atoms/v1",
+        transport=httpx.MockTransport(handler),
+    )
+    await client.create_knowledge_base(
+        name="FEPY Support",
+        description="  Live   product data must come from tools.  " * 10,
+    )
+
+    description = json.loads(requests[0].content)["description"]
+    assert len(description) == 150
+    assert "  " not in description
+
+
+@pytest.mark.asyncio
 async def test_outbound_call_uses_production_endpoint_and_scalar_variables():
     captured: dict = {}
 
@@ -152,6 +211,7 @@ async def test_versioned_draft_contains_runtime_configuration():
         voice_id="nyah",
         speech_rate=1.1,
         synthesizer_model="waves_lightning_v3_1",
+        global_knowledge_base_id="kb_123",
     )
 
     assert captured["globalPrompt"] == "Be concise and helpful."
@@ -165,6 +225,32 @@ async def test_versioned_draft_contains_runtime_configuration():
     assert captured["synthesizer"]["voiceConfig"]["model"] == "waves_lightning_v3_1"
     assert captured["timezone"] == "Asia/Dubai"
     assert captured["sessionTimeoutConfig"] == {"timeoutTimeInSecs": 600}
+    assert captured["globalKnowledgeBaseId"] == "kb_123"
+
+
+@pytest.mark.asyncio
+async def test_versioned_draft_can_explicitly_clear_knowledge_binding():
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content))
+        return httpx.Response(200, json={"status": True, "data": {"status": "draft"}})
+
+    client = SmallestAIClient(api_key="sk_test", transport=httpx.MockTransport(handler))
+    await client.update_agent_draft(
+        agent_id="agent_123",
+        branch_id="branch_123",
+        global_prompt="Be concise and helpful.",
+        first_message="Welcome.",
+        slm_model="electron",
+        language="en",
+        supported_languages=["en"],
+        timezone="Asia/Dubai",
+        global_knowledge_base_id=None,
+    )
+
+    assert "globalKnowledgeBaseId" in captured
+    assert captured["globalKnowledgeBaseId"] is None
 
 
 @pytest.mark.asyncio
