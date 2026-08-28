@@ -77,7 +77,7 @@ async def test_purchase_controls_are_scoped_to_quantity_panel():
             self.main_button = main_button
 
         def locator(self, selector):
-            assert selector == "button:visible"
+            assert selector == "button"
             return self.main_button
 
     class FakeQuantity:
@@ -91,6 +91,9 @@ async def test_purchase_controls_are_scoped_to_quantity_panel():
         async def wait_for(self, **_kwargs):
             return None
 
+        async def count(self):
+            return 1
+
         def locator(self, selector):
             assert selector.startswith("xpath=ancestor::")
             return self.panel
@@ -100,7 +103,7 @@ async def test_purchase_controls_are_scoped_to_quantity_panel():
             self.quantity = quantity
 
         def locator(self, selector):
-            assert selector == 'main input.num_input[type="number"]:visible'
+            assert selector == 'main input.num_input[type="number"]'
             return self.quantity
 
     main_button = FakeButtons()
@@ -137,7 +140,7 @@ async def test_purchase_controls_fail_closed_without_main_quantity_input():
     with pytest.raises(FepyBrowserError, match="main purchase controls"):
         await fepy_browser_module.FepyBrowser()._main_purchase_controls(page)
 
-    assert page.selectors == ['main input.num_input[type="number"]:visible']
+    assert page.selectors == ['main input.num_input[type="number"]']
 
 
 @pytest.mark.asyncio
@@ -184,12 +187,18 @@ async def test_add_to_cart_verifies_main_control_mutation_and_cart_page():
         async def input_value(self):
             return self.value
 
+        async def is_visible(self):
+            return True
+
     class FakeButton:
         def __init__(self):
             self.clicked = False
 
         async def scroll_into_view_if_needed(self):
             return None
+
+        async def is_visible(self):
+            return True
 
         async def click(self):
             self.clicked = True

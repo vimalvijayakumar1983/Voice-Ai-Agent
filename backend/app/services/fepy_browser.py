@@ -47,9 +47,10 @@ class FepyBrowser:
 
     async def _main_purchase_controls(self, page):
         """Resolve the quantity and button from one verified product buy box."""
-        quantity_input = page.locator('main input.num_input[type="number"]:visible').first
+        quantity_inputs = page.locator('main input.num_input[type="number"]')
+        quantity_input = quantity_inputs.first
         try:
-            await quantity_input.wait_for(state="visible", timeout=12000)
+            await quantity_input.wait_for(state="attached", timeout=12000)
         except Exception as exc:
             logger.warning(
                 "fepy_main_purchase_controls_missing",
@@ -57,16 +58,18 @@ class FepyBrowser:
                 error_type=type(exc).__name__,
             )
             raise FepyBrowserError("FEPY main purchase controls could not be verified") from exc
+        if await quantity_inputs.count() != 1:
+            raise FepyBrowserError("FEPY main purchase controls could not be verified")
 
         purchase_panel = quantity_input.locator(
             "xpath=ancestor::*[.//button[contains(translate(normalize-space(.), "
             "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'add to cart')]][1]"
         )
-        add_button = purchase_panel.locator("button:visible").filter(
+        add_button = purchase_panel.locator("button").filter(
             has_text=re.compile(r"^\s*Add to Cart\s*$", re.I)
         )
         try:
-            await add_button.first.wait_for(state="visible", timeout=5000)
+            await add_button.first.wait_for(state="attached", timeout=5000)
         except Exception as exc:
             raise FepyBrowserError("FEPY main purchase controls could not be verified") from exc
         if await add_button.count() != 1:
@@ -207,15 +210,28 @@ class FepyBrowser:
                 await page.goto(self._url(product_path), wait_until="commit")
                 self._assert_loaded_origin(page)
                 quantity_input, add_button = await self._main_purchase_controls(page)
-                await quantity_input.fill(str(quantity))
+                if await quantity_input.is_visible():
+                    await quantity_input.fill(str(quantity))
+                else:
+                    await quantity_input.evaluate(
+                        """(input, value) => {
+                          input.value = value;
+                          input.dispatchEvent(new Event('input', { bubbles: true }));
+                          input.dispatchEvent(new Event('change', { bubbles: true }));
+                        }""",
+                        str(quantity),
+                    )
                 try:
                     selected_quantity = int(await quantity_input.input_value())
                 except (TypeError, ValueError) as exc:
                     raise FepyBrowserError("FEPY product quantity could not be verified") from exc
                 if selected_quantity != quantity:
                     raise FepyBrowserError("FEPY product quantity could not be verified")
-                await add_button.scroll_into_view_if_needed()
-                await add_button.click()
+                if await add_button.is_visible():
+                    await add_button.scroll_into_view_if_needed()
+                    await add_button.click()
+                else:
+                    await add_button.evaluate("button => button.click()")
                 await page.wait_for_timeout(1200)
                 await page.goto(self._url("/shop/cart"), wait_until="commit")
                 self._assert_loaded_origin(page)
