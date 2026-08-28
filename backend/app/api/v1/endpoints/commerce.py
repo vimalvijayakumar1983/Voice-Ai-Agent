@@ -4,6 +4,7 @@ import hashlib
 import json
 import secrets
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from time import monotonic
 from uuid import UUID, uuid4
 
@@ -113,6 +114,40 @@ def _fail(action: CommerceAction, started: float, exc: Exception) -> None:
     action.duration_ms = round((monotonic() - started) * 1000)
 
 
+def _verified_cart(snapshot: dict) -> bool:
+    try:
+        item_count = int(snapshot.get("item_count") or 0)
+        total = Decimal(str(snapshot.get("total_including_vat") or "0").replace(",", ""))
+    except (InvalidOperation, TypeError, ValueError):
+        return False
+    return snapshot.get("verified") is True and item_count > 0 and total > 0
+
+
+async def _persist_browser_failure(
+    db: AsyncSession,
+    session: CommerceSession,
+    action: CommerceAction,
+    started: float,
+    exc: FepyBrowserError,
+) -> None:
+    _fail(action, started, exc)
+    session.last_error = str(exc)
+    await db.flush()
+    await db.commit()
+
+
+def _guard_replayed_action(action: CommerceAction, execute: bool) -> None:
+    if execute:
+        return
+    if action.status == "failed":
+        raise HTTPException(
+            status_code=502,
+            detail=action.error_message or "The previous browser action failed",
+        )
+    if action.status == "running":
+        raise HTTPException(status_code=409, detail="This browser action is still running")
+
+
 @router.get("/status", response_model=CommerceProviderStatus)
 async def provider_status(current_user: CurrentUser = Depends(get_current_user)):
     return CommerceProviderStatus(
@@ -184,6 +219,7 @@ async def search_products(
 ):
     session = await _load_session(db, current_user.tenant_id, session_id)
     action, execute = await _action(db, session, "search", idempotency_key, {"query": data.query})
+    _guard_replayed_action(action, execute)
     if execute:
         started = monotonic()
         try:
@@ -192,8 +228,7 @@ async def search_products(
             session.browser_checkpoint = {"stage": "search", "query": data.query}
             session.last_error = None
         except FepyBrowserError as exc:
-            _fail(action, started, exc)
-            session.last_error = str(exc)
+            await _persist_browser_failure(db, session, action, started, exc)
             raise HTTPException(status_code=502, detail=str(exc)) from exc
     await db.flush()
     return _session_response(await _load_session(db, current_user.tenant_id, session.id))
@@ -211,6 +246,7 @@ async def inspect_product(
     action, execute = await _action(
         db, session, "inspect_product", idempotency_key, {"product_path": data.product_path}
     )
+    _guard_replayed_action(action, execute)
     if execute:
         started = monotonic()
         try:
@@ -218,7 +254,7 @@ async def inspect_product(
             _finish(action, started, result)
             session.browser_checkpoint = {"stage": "product", "product_path": data.product_path}
         except FepyBrowserError as exc:
-            _fail(action, started, exc)
+            await _persist_browser_failure(db, session, action, started, exc)
             raise HTTPException(status_code=502, detail=str(exc)) from exc
     await db.flush()
     return _session_response(await _load_session(db, current_user.tenant_id, session.id))
@@ -242,6 +278,7 @@ async def add_cart_item(
         idempotency_key,
         {"product_path": data.product_path, "quantity": data.quantity},
     )
+    _guard_replayed_action(action, execute)
     if execute:
         started = monotonic()
         context = _context(session)
@@ -249,6 +286,8 @@ async def add_cart_item(
             snapshot, storage = await fepy_browser.add_to_cart(
                 data.product_path, data.quantity, context.get("browser_storage")
             )
+            if not _verified_cart(snapshot):
+                raise FepyBrowserError("FEPY cart contents could not be verified")
             context["browser_storage"] = storage
             _store_context(session, context)
             session.cart_snapshot = snapshot
@@ -258,7 +297,7 @@ async def add_cart_item(
             session.confirmed_at = None
             _finish(action, started, snapshot)
         except FepyBrowserError as exc:
-            _fail(action, started, exc)
+            await _persist_browser_failure(db, session, action, started, exc)
             raise HTTPException(status_code=502, detail=str(exc)) from exc
     await db.flush()
     return _session_response(await _load_session(db, current_user.tenant_id, session.id))
@@ -272,7 +311,7 @@ async def prepare_checkout(
     db: AsyncSession = Depends(get_db),
 ):
     session = await _load_session(db, current_user.tenant_id, session_id)
-    if not session.cart_snapshot:
+    if not _verified_cart(session.cart_snapshot):
         raise HTTPException(status_code=409, detail="Add at least one verified product first")
     if data.payment_method == "hosted_card":
         session.checkout_url = f"{settings.fepy_shop_origin.rstrip('/')}/shop/cart"
