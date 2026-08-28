@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json as jsonlib
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import quote
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -90,11 +91,24 @@ def _provider_knowledge_description(description: str) -> str:
     return " ".join(description.split())[:MAX_KNOWLEDGE_BASE_DESCRIPTION_CHARS]
 
 
-def _validate_timezone_name(timezone_name: str) -> None:
+def _provider_timezone(timezone_name: str) -> dict[str, str | float]:
+    """Translate an IANA zone into the object accepted by the live Atoms API."""
     try:
-        ZoneInfo(timezone_name)
+        zone = ZoneInfo(timezone_name)
     except (ZoneInfoNotFoundError, ValueError) as exc:
         raise SmallestAIError(f"Unknown IANA timezone: {timezone_name}", status_code=422) from exc
+
+    offset = datetime.now(UTC).astimezone(zone).utcoffset()
+    if offset is None:
+        raise SmallestAIError(f"Unknown UTC offset for timezone: {timezone_name}", status_code=422)
+    offset_hours = offset.total_seconds() / 3600
+    absolute_minutes = round(abs(offset.total_seconds()) / 60)
+    hours, minutes = divmod(absolute_minutes, 60)
+    sign = "+" if offset.total_seconds() >= 0 else "-"
+    return {
+        "label": f"(GMT{sign}{hours}:{minutes:02d}) {timezone_name}",
+        "offset": offset_hours,
+    }
 
 
 def _validate_language_switching(
@@ -650,7 +664,7 @@ class SmallestAIClient:
             enabled=language_switching_enabled,
             mode=language_switching_mode,
         )
-        _validate_timezone_name(timezone)
+        provider_timezone = _provider_timezone(timezone)
 
         payload: dict[str, Any] = {
             "globalPrompt": global_prompt,
@@ -661,10 +675,7 @@ class SmallestAIClient:
                 "supported": resolved_languages,
                 "switching": {"isEnabled": language_switching_enabled},
             },
-            # The current versioned-draft endpoint accepts an IANA timezone
-            # string. The create-agent DTO still documents an offset object,
-            # but this adapter writes only through the draft endpoint.
-            "timezone": timezone,
+            "timezone": provider_timezone,
             "allowInterruptions": True,
             "sessionTimeoutConfig": {
                 "timeoutTimeInSecs": max_call_duration_seconds,
