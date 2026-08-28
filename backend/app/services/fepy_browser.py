@@ -65,18 +65,6 @@ class FepyBrowser:
             raise FepyBrowserError("FEPY main purchase controls could not be verified")
         return quantity_input, add_button.first
 
-    async def _cart_count(self, page) -> int | None:
-        texts = await page.locator("a[href]:visible").evaluate_all(
-            """links => links
-              .filter(link => {
-                try { return new URL(link.href).pathname === '/shop/cart'; }
-                catch { return false; }
-              })
-              .map(link => (link.innerText || '').trim())"""
-        )
-        counts = [int(text) for text in texts if re.fullmatch(r"\d+", text)]
-        return max(counts) if counts else None
-
     @asynccontextmanager
     async def _page(self, storage_state: dict[str, Any] | None = None):
         if not settings.fepy_commerce_enabled:
@@ -200,13 +188,18 @@ class FepyBrowser:
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         try:
             async with self._page(storage_state) as (page, context):
+                await page.goto(self._url("/shop/cart"), wait_until="domcontentloaded")
+                self._assert_loaded_origin(page)
+                await page.locator("body").wait_for(state="visible")
+                before_snapshot = await self._cart_snapshot(
+                    page,
+                    expected_product_path=product_path,
+                )
+                before_quantity = before_snapshot["verified_quantity"] or 0
                 await page.goto(self._url(product_path), wait_until="domcontentloaded")
                 self._assert_loaded_origin(page)
                 await page.locator("h1").first.wait_for(state="visible")
                 quantity_input, add_button = await self._main_purchase_controls(page)
-                before_count = await self._cart_count(page)
-                if before_count is None:
-                    raise FepyBrowserError("FEPY cart state could not be verified")
                 await quantity_input.fill(str(quantity))
                 try:
                     selected_quantity = int(await quantity_input.input_value())
@@ -216,17 +209,7 @@ class FepyBrowser:
                     raise FepyBrowserError("FEPY product quantity could not be verified")
                 await add_button.scroll_into_view_if_needed()
                 await add_button.click()
-                await page.wait_for_function(
-                    """before => Array.from(document.querySelectorAll('a[href]'))
-                      .filter(link => {
-                        try { return new URL(link.href).pathname === '/shop/cart'; }
-                        catch { return false; }
-                      })
-                      .map(link => Number.parseInt((link.innerText || '').trim(), 10))
-                      .some(value => Number.isInteger(value) && value > before)""",
-                    before_count,
-                    timeout=settings.fepy_browser_timeout_seconds * 1000,
-                )
+                await page.wait_for_timeout(1200)
                 await page.goto(self._url("/shop/cart"), wait_until="domcontentloaded")
                 self._assert_loaded_origin(page)
                 await page.locator("body").wait_for(state="visible")
@@ -234,7 +217,7 @@ class FepyBrowser:
                 snapshot = await self._cart_snapshot(
                     page,
                     expected_product_path=product_path,
-                    expected_quantity=quantity,
+                    expected_quantity=before_quantity + quantity,
                 )
                 if not snapshot["verified"]:
                     raise FepyBrowserError("FEPY cart contents could not be verified")
@@ -314,7 +297,7 @@ class FepyBrowser:
                     product_verification["found"]
                     and product_verification["quantity"] is not None
                     and expected_quantity is not None
-                    and product_verification["quantity"] >= expected_quantity
+                    and product_verification["quantity"] == expected_quantity
                 )
             )
         )

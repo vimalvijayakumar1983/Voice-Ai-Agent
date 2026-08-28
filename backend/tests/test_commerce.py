@@ -197,7 +197,6 @@ async def test_add_to_cart_verifies_main_control_mutation_and_cart_page():
         def __init__(self, origin):
             self.url = origin
             self.visited = []
-            self.waited_from_count = None
 
         async def goto(self, url, **_kwargs):
             self.url = url
@@ -206,9 +205,6 @@ async def test_add_to_cart_verifies_main_control_mutation_and_cart_page():
         def locator(self, selector):
             assert selector in {"h1", "body"}
             return FakeWaitable()
-
-        async def wait_for_function(self, _script, count, **_kwargs):
-            self.waited_from_count = count
 
         async def wait_for_timeout(self, _milliseconds):
             return None
@@ -223,6 +219,7 @@ async def test_add_to_cart_verifies_main_control_mutation_and_cart_page():
             self.page = FakePage(self.origin)
             self.quantity = FakeQuantity()
             self.button = FakeButton()
+            self.snapshots = 0
 
         @asynccontextmanager
         async def _page(self, storage_state=None):
@@ -232,14 +229,19 @@ async def test_add_to_cart_verifies_main_control_mutation_and_cart_page():
         async def _main_purchase_controls(self, _page):
             return self.quantity, self.button
 
-        async def _cart_count(self, _page):
-            return 0
-
         async def _cart_snapshot(self, _page, **kwargs):
-            assert kwargs == {
-                "expected_product_path": "/bosch-drill",
-                "expected_quantity": 2,
-            }
+            self.snapshots += 1
+            if self.snapshots == 1:
+                assert kwargs == {"expected_product_path": "/bosch-drill"}
+                return {
+                    "item_count": 0,
+                    "total_including_vat": "0.00",
+                    "currency": "AED",
+                    "verified": False,
+                    "verified_product_path": None,
+                    "verified_quantity": None,
+                }
+            assert kwargs == {"expected_product_path": "/bosch-drill", "expected_quantity": 2}
             return {
                 "item_count": 2,
                 "total_including_vat": "1130.14",
@@ -254,8 +256,8 @@ async def test_add_to_cart_verifies_main_control_mutation_and_cart_page():
 
     assert browser.quantity.value == "2"
     assert browser.button.clicked is True
-    assert browser.page.waited_from_count == 0
     assert browser.page.visited == [
+        f"{browser.origin}/shop/cart",
         f"{browser.origin}/bosch-drill",
         f"{browser.origin}/shop/cart",
     ]
