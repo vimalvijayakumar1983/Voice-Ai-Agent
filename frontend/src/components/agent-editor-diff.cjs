@@ -30,4 +30,8 @@ function agentEditorPatch(original, current) {
   return patch;
 }
 
-module.exports = { agentEditorPatch, valuesEqual };
+function agentUpdateNotice(name, syncStatus) {
+  return `${name} was updated${syncStatus === 'dirty' ? ' and is ready to publish' : ''}.`;
+}
+
+module.exports = { agentEditorPatch, agentUpdateNotice, valuesEqual };

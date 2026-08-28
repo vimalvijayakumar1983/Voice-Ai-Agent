@@ -1,7 +1,29 @@
+import apiProxyTargetHelpers from './src/lib/api-proxy-target.cjs';
+
+const { normalizeApiProxyTarget } = apiProxyTargetHelpers;
+
+// Browser API traffic stays on the frontend origin so the rotating HttpOnly
+// refresh cookie remains first-party even when Railway assigns the services
+// different public hostnames. The external destination is fixed at build time
+// and is never derived from a request.
+const apiProxyTarget = normalizeApiProxyTarget(
+  process.env.API_PROXY_TARGET
+    || process.env.NEXT_PUBLIC_API_URL
+    || 'http://localhost:8000',
+);
+
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   reactStrictMode: true,
   output: 'standalone',
+  async rewrites() {
+    return [
+      {
+        source: '/api/v1/:path*',
+        destination: `${apiProxyTarget}/api/v1/:path*`,
+      },
+    ];
+  },
   async headers() {
     const isProduction = process.env.NODE_ENV === 'production';
     const securityHeaders = [
@@ -24,6 +46,6 @@ const nextConfig = {
       },
     ];
   },
-}
+};
 
-module.exports = nextConfig
+export default nextConfig;

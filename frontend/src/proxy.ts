@@ -5,7 +5,6 @@ export function proxy(request: NextRequest) {
   const nonce = crypto.randomUUID().replaceAll('-', '');
   const contentSecurityPolicy = buildContentSecurityPolicy({
     nonce,
-    apiUrl: process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000',
     production: process.env.NODE_ENV === 'production',
   });
   const requestHeaders = new Headers(request.headers);

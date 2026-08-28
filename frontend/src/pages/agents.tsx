@@ -19,7 +19,7 @@ import {
   X,
 } from 'lucide-react';
 import AgentEditor, { AgentEditorValues, defaultAgentValues } from '@/components/AgentEditor';
-import { agentEditorPatch } from '@/components/agent-editor-diff.cjs';
+import { agentEditorPatch, agentUpdateNotice } from '@/components/agent-editor-diff.cjs';
 import Layout from '@/components/Layout';
 import { agentTestReadinessMessage, isAgentCallReady, providerActionNotice } from '@/lib/agent-readiness.cjs';
 import { api, AgentProviderCatalog, ProviderStatus, VoiceAgent } from '@/lib/api';
@@ -153,7 +153,7 @@ export default function Agents() {
         setEditingAgentId(null);
         setNotice({
           type: 'success',
-          text: `${updated.name} was updated${updated.provider_agent_id ? ' and is ready to publish' : ''}.`,
+          text: agentUpdateNotice(updated.name, updated.sync_status),
         });
       } else {
         const created = await api.createAgent(values);

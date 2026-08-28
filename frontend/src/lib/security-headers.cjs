@@ -1,26 +1,12 @@
 'use strict';
 
-function apiOrigin(apiUrl) {
-  let parsed;
-  try {
-    parsed = new URL(apiUrl);
-  } catch {
-    throw new Error('NEXT_PUBLIC_API_URL must be an absolute HTTP(S) URL.');
-  }
-  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
-    throw new Error('NEXT_PUBLIC_API_URL must use HTTP or HTTPS.');
-  }
-  return parsed.origin;
-}
-
-function buildContentSecurityPolicy({ nonce, apiUrl, production }) {
+function buildContentSecurityPolicy({ nonce, production }) {
   if (!/^[A-Za-z0-9_-]{16,}$/.test(nonce)) {
     throw new Error('A strong CSP nonce is required.');
   }
 
   const connectSources = new Set([
     "'self'",
-    apiOrigin(apiUrl),
     'wss://api.smallest.ai',
   ]);
   if (!production) {
@@ -45,4 +31,4 @@ function buildContentSecurityPolicy({ nonce, apiUrl, production }) {
   ].join('; ');
 }
 
-module.exports = { apiOrigin, buildContentSecurityPolicy };
+module.exports = { buildContentSecurityPolicy };

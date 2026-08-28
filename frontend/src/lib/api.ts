@@ -5,7 +5,10 @@ import {
   type SessionBoundary,
 } from './session-boundary.cjs';
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+// All browser requests use the same-origin Next.js proxy. Besides avoiding a
+// needless cross-origin trust boundary, this keeps the rotating HttpOnly
+// refresh cookie first-party on browsers that block third-party cookies.
+const API_URL = '';
 const SESSION_SIGNAL_KEY = 'vav:session-signal';
 
 function createIdempotencyKey() {

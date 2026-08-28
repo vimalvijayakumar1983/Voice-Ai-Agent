@@ -87,7 +87,7 @@ Set these service variables with Railway references where shown:
 | API + worker | `CORS_ORIGINS` | `https://${{frontend.RAILWAY_PUBLIC_DOMAIN}}` |
 | API + worker | `BASE_URL` | `https://${{api.RAILWAY_PUBLIC_DOMAIN}}` |
 | API + worker | `TRUST_RAILWAY_PROXY_HEADERS` | `true` (uses Railway's edge-injected `X-Real-IP` for auth limits) |
-| Frontend | `NEXT_PUBLIC_API_URL` | `https://${{api.RAILWAY_PUBLIC_DOMAIN}}` |
+| Frontend | `NEXT_PUBLIC_API_URL` | `https://${{api.RAILWAY_PUBLIC_DOMAIN}}` (build-time destination for the same-origin `/api/v1/*` proxy; it is not exposed as the browser request origin) |
 | API + worker | `SECRET_KEY` | One identical generated, sealed production secret |
 | API + worker | `INTEGRATION_ENCRYPTION_KEY` | One identical generated, sealed value on both services |
 | API + worker | `REGISTRATION_MODE` | `bootstrap` for first launch or `invite_only`; production rejects `open` |
@@ -98,7 +98,7 @@ Set these service variables with Railway references where shown:
 | API + worker | `SMALLEST_WEBHOOK_ID` | The Smallest.ai webhook ID whose signing secret is configured above |
 | API | `MAX_REQUEST_BODY_BYTES` | `8388608` (8 MiB app-wide ceiling; provider webhooks retain their tighter 2 MiB limit) |
 
-Railway deprecated Config as Code for new services, so configure these settings in the dashboard instead of relying on `railway.toml`. The API migration must run before traffic switches, both web services use Railway's dynamic `PORT`, and the frontend build embeds the API's public HTTPS URL. Generate public Railway domains for `api` and `frontend`, then configure the Smallest.ai webhook as `https://YOUR_API_DOMAIN/api/v1/webhooks/smallest`.
+Railway deprecated Config as Code for new services, so configure these settings in the dashboard instead of relying on `railway.toml`. The API migration must run before traffic switches, both web services use Railway's dynamic `PORT`, and the frontend build embeds the API's public HTTPS URL only as its fixed server-side rewrite destination. Browser requests remain on the frontend origin at `/api/v1/*`, keeping the refresh cookie first-party even when privacy controls block third-party cookies. Generate public Railway domains for `api` and `frontend`, then configure the Smallest.ai webhook as `https://YOUR_API_DOMAIN/api/v1/webhooks/smallest`.
 
 Use `/health` only as the inexpensive process-liveness probe. Railway must use
 `/ready`: it returns `200` only when PostgreSQL is reachable and its
@@ -129,8 +129,9 @@ in every mode.
 
 Browser refresh credentials are write-only `HttpOnly` cookies scoped to
 `/api/v1/auth`; production uses `Secure` plus `SameSite=None`, while local HTTP
-development uses `SameSite=Lax`. Refresh and logout require an exact configured
-console `Origin`. `LEGACY_SESSION_MIGRATION_ENABLED` is a temporary one-release
+development uses `SameSite=Lax`. The console's same-origin API rewrite makes
+that cookie first-party in the browser, while refresh and logout still require
+an exact configured console `Origin` at the API. `LEGACY_SESSION_MIGRATION_ENABLED` is a temporary one-release
 switch, disabled by default, that lets the console exchange a pre-cookie JSON
 refresh credential once at `/api/v1/auth/migrate-session`. Enable it only for a
 planned rollout window, then disable it after existing sessions have expired.

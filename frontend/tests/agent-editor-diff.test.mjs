@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 
 import editorDiff from '../src/components/agent-editor-diff.cjs';
 
-const { agentEditorPatch } = editorDiff;
+const { agentEditorPatch, agentUpdateNotice } = editorDiff;
 
 test('agent edit patch contains only fields whose persisted value changed', () => {
   const original = {
@@ -39,4 +39,19 @@ test('equal arrays do not create a redundant agent patch', () => {
   const original = { supported_languages: ['en', 'hi'] };
   const current = { supported_languages: ['en', 'hi'] };
   assert.deepEqual(agentEditorPatch(original, current), {});
+});
+
+test('edit success invites publishing only when the saved agent is dirty', () => {
+  assert.equal(
+    agentUpdateNotice('Front desk', 'dirty'),
+    'Front desk was updated and is ready to publish.',
+  );
+  assert.equal(
+    agentUpdateNotice('Front desk', 'synced'),
+    'Front desk was updated.',
+  );
+  assert.equal(
+    agentUpdateNotice('Front desk', 'draft'),
+    'Front desk was updated.',
+  );
 });
