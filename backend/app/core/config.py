@@ -73,6 +73,7 @@ class Settings(BaseSettings):
     fepy_commerce_enabled: bool = True
     fepy_allow_order_submission: bool = False
     fepy_shop_origin: str = "https://www.fepy.com"
+    fepy_search_origin: str = "https://search.fepy.com"
     fepy_browser_timeout_seconds: int = Field(default=25, ge=5, le=60)
     chromium_executable_path: str = "/usr/bin/chromium"
 

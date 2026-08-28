@@ -4,8 +4,11 @@ from __future__ import annotations
 import asyncio
 import re
 from contextlib import asynccontextmanager
+from decimal import Decimal, InvalidOperation
 from typing import Any
-from urllib.parse import quote, urljoin, urlsplit
+from urllib.parse import urljoin, urlsplit
+
+import httpx
 
 from app.core.config import settings
 
@@ -68,26 +71,55 @@ class FepyBrowser:
                     await browser.close()
 
     async def search(self, query: str, limit: int) -> dict[str, Any]:
-        async with self._page() as (page, _context):
-            await page.goto(
-                self._url(f"/shop/search?query={quote(query)}"),
-                wait_until="domcontentloaded",
+        if not settings.fepy_commerce_enabled:
+            raise FepyBrowserError("FEPY browser commerce is not enabled")
+        endpoint = f"{settings.fepy_search_origin.rstrip('/')}/api/search"
+        try:
+            async with httpx.AsyncClient(
+                timeout=settings.fepy_browser_timeout_seconds,
+                follow_redirects=False,
+            ) as client:
+                response = await client.get(
+                    endpoint,
+                    params={
+                        "q": query,
+                        "page": 1,
+                        "limit": limit,
+                        "sortBy": "",
+                        "sortOrder": "",
+                    },
+                )
+            response.raise_for_status()
+            payload = response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            raise FepyBrowserError("Live FEPY catalogue is temporarily unavailable") from exc
+
+        products = []
+        for hit in payload.get("hits", [])[:limit]:
+            slug = str(hit.get("url") or "").strip("/")
+            name = str(hit.get("name") or "").strip()
+            if not slug or not name:
+                continue
+            product_path = f"/{slug}"
+            self._url(product_path)
+            price = None
+            try:
+                excluding_vat = Decimal(str(hit.get("price")))
+                including_vat = (excluding_vat * Decimal("1.05")).quantize(Decimal("0.01"))
+                price = f"AED {including_vat}"
+            except (InvalidOperation, TypeError):
+                pass
+            products.append(
+                {
+                    "name": name,
+                    "product_path": product_path,
+                    "price": price,
+                    "stock": "in_stock" if hit.get("inStock") == "yes" else "unknown",
+                    "delivery": None,
+                    "sku": hit.get("sku"),
+                }
             )
-            await page.locator("main h4").first.wait_for(state="visible")
-            products = await page.evaluate(
-                """(limit) => Array.from(document.querySelectorAll('main h4')).slice(0, limit)
-                .map((heading) => {
-                  const nameLink = heading.closest('a') || heading.parentElement?.closest('a');
-                  const href = nameLink?.getAttribute('href') || '';
-                  const root = heading.closest('li, article') || heading.parentElement?.parentElement;
-                  const text = root?.innerText || '';
-                  const price = text.match(/AED\\s?[\\d,]+(?:\\.\\d{2})?/)?.[0] || null;
-                  const delivery = text.match(/(?:Get it by|Delivery by)\\s*([^\n]+)/i)?.[1] || null;
-                  return { name: heading.textContent?.trim(), product_path: href, price, delivery };
-                }).filter((item) => item.name && item.product_path)""",
-                limit,
-            )
-            return {"query": query, "products": products, "source": "visible_fepy_page"}
+        return {"query": query, "products": products, "source": "fepy_live_catalogue"}
 
     async def inspect_product(self, product_path: str) -> dict[str, Any]:
         async with self._page() as (page, _context):

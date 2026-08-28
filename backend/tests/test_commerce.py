@@ -1,8 +1,56 @@
 import uuid
 
+import httpx
 import pytest
 
 from app.api.v1.endpoints import commerce
+from app.services import fepy_browser as fepy_browser_module
+
+
+@pytest.mark.asyncio
+async def test_live_catalogue_search_maps_vat_stock_and_safe_product_path(monkeypatch):
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, url, params):
+            assert url == "https://search.fepy.com/api/search"
+            assert params["q"] == "Bosch drill"
+            request = httpx.Request("GET", url, params=params)
+            return httpx.Response(
+                200,
+                request=request,
+                json={
+                    "hits": [
+                        {
+                            "name": "Bosch Drill",
+                            "url": "bosch-drill",
+                            "price": 100,
+                            "inStock": "yes",
+                            "sku": "BOSCH-1",
+                        }
+                    ]
+                },
+            )
+
+    monkeypatch.setattr(fepy_browser_module.httpx, "AsyncClient", lambda **_kwargs: FakeClient())
+
+    result = await fepy_browser_module.FepyBrowser().search("Bosch drill", 5)
+
+    assert result["source"] == "fepy_live_catalogue"
+    assert result["products"] == [
+        {
+            "name": "Bosch Drill",
+            "product_path": "/bosch-drill",
+            "price": "AED 105.00",
+            "stock": "in_stock",
+            "delivery": None,
+            "sku": "BOSCH-1",
+        }
+    ]
 
 
 @pytest.mark.asyncio
