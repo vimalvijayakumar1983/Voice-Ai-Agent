@@ -10,6 +10,7 @@ from app.api.v1.endpoints import (
     billing,
     calls,
     campaigns,
+    commerce,
     compliance,
     integrations,
     knowledge,
@@ -29,5 +30,6 @@ api_router.include_router(analytics.router)
 api_router.include_router(audit.router)
 api_router.include_router(integrations.router)
 api_router.include_router(compliance.router)
+api_router.include_router(commerce.router)
 api_router.include_router(billing.router)
 api_router.include_router(webhooks.router)

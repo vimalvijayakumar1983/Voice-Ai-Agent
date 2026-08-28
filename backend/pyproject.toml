@@ -33,6 +33,7 @@ dependencies = [
     "structlog>=24.1.0",
     "aiosqlite>=0.20.0",
     "tzdata>=2025.2",
+    "playwright>=1.55.0,<2.0.0",
 ]
 
 [project.optional-dependencies]
