@@ -12,6 +12,7 @@ from app.api.v1.endpoints import (
     campaigns,
     compliance,
     integrations,
+    knowledge,
     webhooks,
     workflows,
 )
@@ -20,6 +21,7 @@ api_router = APIRouter(prefix="/api/v1")
 
 api_router.include_router(auth.router)
 api_router.include_router(agents.router)
+api_router.include_router(knowledge.router)
 api_router.include_router(calls.router)
 api_router.include_router(workflows.router)
 api_router.include_router(campaigns.router)

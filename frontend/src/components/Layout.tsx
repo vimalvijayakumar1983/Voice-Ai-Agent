@@ -6,6 +6,7 @@ import {
   Activity,
   AudioWaveform,
   Bot,
+  BookOpenCheck,
   ChevronDown,
   CreditCard,
   FlaskConical,
@@ -31,6 +32,7 @@ const navigation = [
     items: [
       { href: '/', label: 'Overview', icon: Activity },
       { href: '/agents', label: 'Agents', icon: Bot },
+      { href: '/knowledge', label: 'Knowledge', icon: BookOpenCheck },
       { href: '/playground', label: 'Playground', icon: FlaskConical },
       { href: '/calls', label: 'Conversations', icon: PhoneCall },
       { href: '/workflows', label: 'Workflows', icon: Workflow },

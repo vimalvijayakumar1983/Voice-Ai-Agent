@@ -3,6 +3,7 @@
 const PAGE_TITLES = Object.freeze({
   '/': 'Overview',
   '/agents': 'Voice agents',
+  '/knowledge': 'Knowledge Studio',
   '/playground': 'Voice playground',
   '/calls': 'Conversations',
   '/workflows': 'Workflows',

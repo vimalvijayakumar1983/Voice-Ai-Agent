@@ -20,7 +20,7 @@ export default class NoncedDocument extends Document<NoncedDocumentProps> {
   render() {
     const { nonce } = this.props;
     return (
-      <Html lang="en" dir="ltr">
+      <Html lang="en" dir="ltr" data-scroll-behavior="smooth">
         <Head nonce={nonce}>
           <meta name="theme-color" content="#111525" />
           <meta name="color-scheme" content="light" />

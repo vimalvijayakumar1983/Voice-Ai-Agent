@@ -55,6 +55,7 @@ VOICE_PREVIEW_TEXTS = {
     "zh": "你好。这是一段语音试听。",
 }
 MAX_VOICE_PREVIEW_BYTES = 2_000_000
+_KNOWLEDGE_BINDING_UNSET = object()
 
 
 def _validate_timezone_name(timezone_name: str) -> None:
@@ -314,6 +315,75 @@ class SmallestAIClient:
             raise SmallestAIError("Smallest.ai returned an invalid WAV voice preview.")
         return bytes(audio)
 
+    async def _request_media(
+        self,
+        method: str,
+        path: str,
+        *,
+        file_name: str,
+        content: bytes,
+        content_type: str,
+    ) -> dict[str, Any]:
+        """Upload one bounded server-validated media item without exposing credentials."""
+        if not self.api_key:
+            raise SmallestAIError(
+                "Smallest.ai is not configured. Add SMALLEST_API_KEY to the backend environment.",
+                status_code=503,
+            )
+        async with httpx.AsyncClient(
+            base_url=self.base_url,
+            timeout=self.timeout,
+            transport=self.transport,
+            headers={"Authorization": f"Bearer {self.api_key}", "Accept": "application/json"},
+        ) as client:
+            try:
+                response = await client.request(
+                    method,
+                    path,
+                    files={"media": (file_name, content, content_type)},
+                )
+            except httpx.TimeoutException as exc:
+                raise SmallestAIError(
+                    "Smallest.ai timed out while uploading the knowledge source.",
+                    status_code=504,
+                    ambiguous=True,
+                ) from exc
+            except httpx.HTTPError as exc:
+                raise SmallestAIError(
+                    "Could not connect to Smallest.ai while uploading the knowledge source.",
+                    ambiguous=True,
+                ) from exc
+        if response.is_error:
+            try:
+                details: Any = response.json()
+            except ValueError:
+                details = response.text[:500]
+            message = "Smallest.ai rejected the knowledge source upload."
+            if isinstance(details, dict):
+                message = str(details.get("message") or details.get("error") or message)
+            if response.status_code in {401, 403}:
+                message = "Smallest.ai rejected the configured server credentials or permissions."
+            raise SmallestAIError(
+                message,
+                status_code=502 if response.status_code in {401, 403} else response.status_code,
+                upstream_status_code=response.status_code,
+                details=details,
+                ambiguous=response.status_code == 408 or response.status_code >= 500,
+            )
+        if not response.content:
+            return {}
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise SmallestAIError(
+                "Smallest.ai returned an invalid knowledge upload response.", ambiguous=True
+            ) from exc
+        if not isinstance(payload, dict):
+            raise SmallestAIError(
+                "Smallest.ai returned an unexpected knowledge upload response.", ambiguous=True
+            )
+        return payload
+
     async def list_voices(self) -> list[dict[str, Any]]:
         response = await self._request(
             "GET",
@@ -375,6 +445,77 @@ class SmallestAIClient:
                 ambiguous=True,
             )
         return agent_id
+
+    async def create_knowledge_base(self, *, name: str, description: str = "") -> str:
+        payload: dict[str, Any] = {"name": name}
+        if description:
+            payload["description"] = description
+        response = await self._request("POST", "/knowledgebase", json=payload)
+        knowledge_base_id = response.get("data")
+        if isinstance(knowledge_base_id, dict):
+            knowledge_base_id = knowledge_base_id.get("_id") or knowledge_base_id.get("id")
+        if not isinstance(knowledge_base_id, str) or not knowledge_base_id:
+            raise SmallestAIError(
+                "Smallest.ai accepted the request but did not return a knowledge base ID.",
+                ambiguous=True,
+            )
+        return knowledge_base_id
+
+    async def update_knowledge_base(
+        self, *, knowledge_base_id: str, name: str, description: str = ""
+    ) -> None:
+        await self._request(
+            "POST",
+            f"/knowledgebase/{quote(knowledge_base_id, safe='')}",
+            json={"name": name, "description": description},
+        )
+
+    async def delete_knowledge_base(self, knowledge_base_id: str) -> None:
+        await self._request("DELETE", f"/knowledgebase/{quote(knowledge_base_id, safe='')}")
+
+    async def discover_sitemap_urls(self, *, knowledge_base_id: str, sitemap_url: str) -> list[str]:
+        response = await self._request(
+            "POST",
+            "/knowledgebase/get-sitemap-urls",
+            json={"siteUrl": sitemap_url, "knowledgeBaseId": knowledge_base_id},
+        )
+        data = response.get("data")
+        urls = data.get("urls") if isinstance(data, dict) else None
+        if not isinstance(urls, list):
+            raise SmallestAIError("Smallest.ai returned an invalid sitemap response.")
+        return [str(url) for url in urls if isinstance(url, str)][:1000]
+
+    async def scrape_knowledge_urls(self, *, knowledge_base_id: str, urls: list[str]) -> None:
+        await self._request(
+            "POST",
+            f"/knowledgebase/{quote(knowledge_base_id, safe='')}/scrape-urls",
+            json={"urls": urls},
+        )
+
+    async def list_scraped_knowledge_urls(self, knowledge_base_id: str) -> list[dict[str, Any]]:
+        response = await self._request(
+            "GET", f"/knowledgebase/{quote(knowledge_base_id, safe='')}/scraped-urls"
+        )
+        data = response.get("data")
+        return [item for item in data if isinstance(item, dict)] if isinstance(data, list) else []
+
+    async def list_knowledge_items(self, knowledge_base_id: str) -> list[dict[str, Any]]:
+        response = await self._request(
+            "GET", f"/knowledgebase/{quote(knowledge_base_id, safe='')}/items"
+        )
+        data = response.get("data")
+        return [item for item in data if isinstance(item, dict)] if isinstance(data, list) else []
+
+    async def upload_knowledge_pdf(
+        self, *, knowledge_base_id: str, file_name: str, content: bytes
+    ) -> None:
+        await self._request_media(
+            "POST",
+            f"/knowledgebase/{quote(knowledge_base_id, safe='')}/items/upload-media",
+            file_name=file_name,
+            content=content,
+            content_type="application/pdf",
+        )
 
     async def get_agent(
         self,
@@ -450,6 +591,7 @@ class SmallestAIClient:
         speech_rate: float = 1.0,
         synthesizer_model: str | None = None,
         max_call_duration_seconds: int = 600,
+        global_knowledge_base_id: str | None | object = _KNOWLEDGE_BINDING_UNSET,
     ) -> dict[str, Any]:
         resolved_languages = list(dict.fromkeys(supported_languages or [language]))
         if language not in resolved_languages:
@@ -481,6 +623,8 @@ class SmallestAIClient:
                 "timeoutTimeInSecs": max_call_duration_seconds,
             },
         }
+        if global_knowledge_base_id is not _KNOWLEDGE_BINDING_UNSET:
+            payload["globalKnowledgeBaseId"] = global_knowledge_base_id
         if voice_id:
             if not synthesizer_model:
                 raise SmallestAIError(

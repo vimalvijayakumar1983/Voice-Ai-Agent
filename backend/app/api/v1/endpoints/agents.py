@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.core.database import get_db
 from app.middleware.tenant import CurrentUser, get_current_user, require_role
-from app.models.agent import Agent, KnowledgeBase
+from app.models.agent import Agent, AgentKnowledgeBinding, KnowledgeBase
 from app.models.call import Call
 from app.models.campaign import Campaign, CampaignContactAttempt
 from app.providers.smallest import SmallestAIError, get_smallest_client
@@ -587,6 +587,19 @@ def _provider_configuration_mismatches(
         else _MISSING,
         expected["max_call_duration_seconds"],
     )
+    if "global_knowledge_base_id" in expected:
+        actual_knowledge_base_id = _first_present(
+            provider_agent,
+            "globalKnowledgeBaseId",
+            "global_knowledge_base_id",
+        )
+        if actual_knowledge_base_id is _MISSING and expected["global_knowledge_base_id"] is None:
+            actual_knowledge_base_id = None
+        compare(
+            "global_knowledge_base_id",
+            actual_knowledge_base_id,
+            expected["global_knowledge_base_id"],
+        )
     return mismatches
 
 
@@ -864,6 +877,9 @@ async def _reconcile_smallest_publish(
             configuration_mismatches = ["voice_resolution"]
         else:
             expected_configuration = _publish_kwargs(agent, voice)
+            expected_configuration["global_knowledge_base_id"] = operation.get(
+                "global_knowledge_base_id"
+            )
             await db.commit()
             try:
                 published_provider_agent = await client.get_agent(
@@ -928,6 +944,15 @@ async def _reconcile_smallest_publish(
     elif revision_status == "published" and security_status == "passed":
         agent.sync_status = "synced"
         agent.last_synced_at = datetime.now(UTC)
+        binding = await db.scalar(
+            select(AgentKnowledgeBinding).where(
+                AgentKnowledgeBinding.agent_id == agent.id,
+                AgentKnowledgeBinding.tenant_id == tenant_id,
+            )
+        )
+        if binding:
+            binding.sync_status = "synced"
+            binding.last_synced_at = agent.last_synced_at
         phase = "complete"
         last_error = None
     else:
@@ -966,6 +991,32 @@ async def _publish_smallest_agent(
     operation_label = f"{label} [{operation_id}]"
     now = datetime.now(UTC)
     agent = await _tenant_agent(db, agent_id, tenant_id, for_update=True)
+    provider_agent_id = agent.provider_agent_id
+    branch_id = agent.provider_branch_id
+    if not provider_agent_id:
+        raise HTTPException(status_code=409, detail="Provider mapping is incomplete")
+
+    remote_knowledge_id = None
+    knowledge_binding = await db.scalar(
+        select(AgentKnowledgeBinding).where(
+            AgentKnowledgeBinding.agent_id == agent.id,
+            AgentKnowledgeBinding.tenant_id == tenant_id,
+        )
+    )
+    if knowledge_binding:
+        remote_knowledge_id = await db.scalar(
+            select(KnowledgeBase.provider_knowledge_base_id).where(
+                KnowledgeBase.id == knowledge_binding.knowledge_base_id,
+                KnowledgeBase.tenant_id == tenant_id,
+                KnowledgeBase.approval_status == "approved",
+            )
+        )
+        if not remote_knowledge_id:
+            raise HTTPException(
+                status_code=409,
+                detail="Bound knowledge must be approved and provisioned before publishing",
+            )
+
     agent.sync_status = "publishing"
     config = _provider_config(agent)
     config["requested_voice_id"] = voice.requested_voice_id
@@ -982,12 +1033,7 @@ async def _publish_smallest_agent(
         started_at=now.isoformat(),
         lease_expires_at=(now + PROVIDER_OPERATION_LEASE).isoformat(),
     )
-    provider_agent_id = agent.provider_agent_id
-    branch_id = agent.provider_branch_id
     await db.commit()
-
-    if not provider_agent_id:
-        raise HTTPException(status_code=409, detail="Provider mapping is incomplete")
 
     try:
         await client.set_agent_webhook_subscriptions(
@@ -1013,10 +1059,14 @@ async def _publish_smallest_agent(
         raise HTTPException(status_code=409, detail="Provider operation was superseded")
     agent.provider_branch_id = branch_id
     snapshot = _publish_kwargs(agent, voice)
+    # Explicit null removes a previously published binding; omitting the field
+    # would let the provider retain stale knowledge after an operator unbinds it.
+    snapshot["global_knowledge_base_id"] = remote_knowledge_id
     _set_provider_operation(
         agent,
         "publish",
         phase="draft_update",
+        global_knowledge_base_id=remote_knowledge_id,
         lease_expires_at=(datetime.now(UTC) + PROVIDER_OPERATION_LEASE).isoformat(),
     )
     await db.commit()

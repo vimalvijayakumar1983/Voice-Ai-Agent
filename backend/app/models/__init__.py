@@ -1,4 +1,4 @@
-from app.models.agent import Agent, KnowledgeBase
+from app.models.agent import Agent, AgentKnowledgeBinding, KnowledgeBase, KnowledgeSource
 from app.models.audit import AuditEvent
 from app.models.billing import BillingPlan, TenantSubscription, UsageRecord
 from app.models.call import Call, CallSummary, CallTranscript
@@ -22,6 +22,8 @@ __all__ = [
     "UserInvitation",
     "Agent",
     "KnowledgeBase",
+    "KnowledgeSource",
+    "AgentKnowledgeBinding",
     "AuditEvent",
     "Call",
     "CallTranscript",

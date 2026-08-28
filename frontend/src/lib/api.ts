@@ -110,6 +110,58 @@ export interface AgentProviderCatalog {
   templates: AgentTemplate[];
 }
 
+export type KnowledgeScope = 'workspace' | 'group' | 'division' | 'branch' | 'department';
+export type KnowledgeSyncStatus = 'local_only' | 'provisioning' | 'processing' | 'ready' | 'error';
+
+export interface KnowledgeSource {
+  id: string;
+  knowledge_base_id: string;
+  source_type: 'website' | 'sitemap' | 'url' | 'file' | 'text';
+  name: string;
+  location: string | null;
+  mime_type: string | null;
+  size_bytes: number | null;
+  status: 'pending' | 'processing' | 'indexed' | 'failed' | 'local_only';
+  provider_item_id: string | null;
+  error_message: string | null;
+  source_metadata: Record<string, unknown> | null;
+  last_synced_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface KnowledgeAgentBinding {
+  id: string;
+  agent_id: string;
+  agent_name: string;
+  knowledge_base_id: string;
+  sync_status: string;
+  last_synced_at: string | null;
+}
+
+export interface KnowledgeBase {
+  id: string;
+  name: string;
+  description: string | null;
+  provider: string;
+  provider_knowledge_base_id: string | null;
+  sync_status: KnowledgeSyncStatus;
+  sync_error: string | null;
+  approval_status: 'draft' | 'approved';
+  scope_type: KnowledgeScope;
+  scope_label: string | null;
+  languages: string[];
+  tags: string[];
+  source_count: number;
+  indexed_source_count: number;
+  last_synced_at: string | null;
+  published_at: string | null;
+  sources: KnowledgeSource[];
+  agent_bindings: KnowledgeAgentBinding[];
+  created_at: string;
+  updated_at: string;
+}
+
 export interface BrowserSession {
   access_token: string;
   expires_in: number;
@@ -753,7 +805,7 @@ class ApiClient {
     }
     const token = authenticated ? requestBoundary.accessToken : null;
     const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
+      ...(options.body instanceof FormData ? {} : { 'Content-Type': 'application/json' }),
       ...(options.headers as Record<string, string> || {}),
     };
     if (authenticated && token) {
@@ -1046,6 +1098,95 @@ class ApiClient {
       method: 'POST',
       body: JSON.stringify({ variables }),
     });
+  }
+
+  // Knowledge Studio
+  async listKnowledgeBases() {
+    return this.request<KnowledgeBase[]>('/api/v1/knowledge');
+  }
+
+  async createKnowledgeBase(data: {
+    name: string;
+    description?: string;
+    scope_type?: KnowledgeScope;
+    scope_label?: string;
+    languages?: string[];
+    tags?: string[];
+  }) {
+    return this.request<KnowledgeBase>('/api/v1/knowledge', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    });
+  }
+
+  async updateKnowledgeBase(id: string, data: Partial<Pick<KnowledgeBase,
+    'name' | 'description' | 'scope_type' | 'scope_label' | 'languages' | 'tags'>>) {
+    return this.request<KnowledgeBase>(`/api/v1/knowledge/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify(data),
+    });
+  }
+
+  async provisionKnowledgeBase(id: string) {
+    return this.request<KnowledgeBase>(`/api/v1/knowledge/${id}/provision`, { method: 'POST' });
+  }
+
+  async discoverKnowledgeSitemap(id: string, sitemapUrl: string) {
+    return this.request<{ urls: string[] }>(`/api/v1/knowledge/${id}/sitemap/discover`, {
+      method: 'POST',
+      body: JSON.stringify({ sitemap_url: sitemapUrl }),
+    });
+  }
+
+  async addKnowledgeUrls(id: string, urls: string[]) {
+    return this.request<KnowledgeBase>(`/api/v1/knowledge/${id}/sources/urls`, {
+      method: 'POST',
+      body: JSON.stringify({ urls }),
+    });
+  }
+
+  async addKnowledgeText(id: string, name: string, content: string) {
+    return this.request<KnowledgeBase>(`/api/v1/knowledge/${id}/sources/text`, {
+      method: 'POST',
+      body: JSON.stringify({ name, content }),
+    });
+  }
+
+  async uploadKnowledgePdf(id: string, file: File) {
+    const form = new FormData();
+    form.append('media', file);
+    return this.request<KnowledgeBase>(`/api/v1/knowledge/${id}/sources/pdf`, {
+      method: 'POST',
+      body: form,
+    });
+  }
+
+  async refreshKnowledgeBase(id: string) {
+    return this.request<KnowledgeBase>(`/api/v1/knowledge/${id}/refresh`, { method: 'POST' });
+  }
+
+  async approveKnowledgeBase(id: string, approved: boolean) {
+    return this.request<KnowledgeBase>(`/api/v1/knowledge/${id}/approval`, {
+      method: 'POST',
+      body: JSON.stringify({ approved }),
+    });
+  }
+
+  async bindKnowledgeAgent(id: string, agentId: string) {
+    return this.request<KnowledgeBase>(`/api/v1/knowledge/${id}/bindings`, {
+      method: 'POST',
+      body: JSON.stringify({ agent_id: agentId }),
+    });
+  }
+
+  async unbindKnowledgeAgent(id: string, agentId: string) {
+    return this.request<KnowledgeBase>(`/api/v1/knowledge/${id}/bindings/${agentId}`, {
+      method: 'DELETE',
+    });
+  }
+
+  async deleteKnowledgeBase(id: string) {
+    return this.request<void>(`/api/v1/knowledge/${id}`, { method: 'DELETE' });
   }
 
   // Calls
