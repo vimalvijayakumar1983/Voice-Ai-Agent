@@ -68,6 +68,7 @@ async def _seed_campaign(
         provider_agent_id="smallest-reliability-agent" if provider == "smallest" else None,
         provider_revision_id="smallest-reliability-revision" if provider == "smallest" else None,
         last_synced_at=datetime.now(UTC) if provider == "smallest" else None,
+        sync_status="synced" if provider == "smallest" else "local_only",
     )
     db.add(agent)
     await db.flush()
@@ -188,7 +189,8 @@ async def test_public_provider_webhooks_reject_declared_oversize_before_signatur
 
 @pytest.mark.asyncio
 async def test_concurrent_workers_dispatch_one_paid_call(tenant, db, monkeypatch):
-    _agent, campaign, contacts = await _seed_campaign(db, tenant.id)
+    agent, campaign, contacts = await _seed_campaign(db, tenant.id)
+    expected_revision = agent.provider_revision_id
     campaign_id = campaign.id
     contact_id = contacts[0].id
     entered_provider = asyncio.Event()
@@ -221,6 +223,8 @@ async def test_concurrent_workers_dispatch_one_paid_call(tenant, db, monkeypatch
 
     db.expire_all()
     assert provider_calls == 1
+    smallest.start_outbound_call.assert_awaited_once()
+    assert smallest.start_outbound_call.await_args.kwargs["version_id"] == expected_revision
     assert await db.scalar(select(func.count()).select_from(Call)) == 1
     assert await db.scalar(select(func.count()).select_from(CampaignContactAttempt)) == 1
     attempt = await db.scalar(select(CampaignContactAttempt))
@@ -1326,7 +1330,10 @@ async def test_dnc_write_winning_final_guard_prevents_campaign_dial(tenant, db, 
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("readiness_target", ["agent", "workflow"])
+@pytest.mark.parametrize(
+    "readiness_target",
+    ["agent", "agent_sync", "agent_revision", "workflow"],
+)
 async def test_final_guard_reloads_committed_readiness_change_before_dial(
     readiness_target,
     tenant,
@@ -1336,12 +1343,20 @@ async def test_final_guard_reloads_committed_readiness_change_before_dial(
     agent_id, workflow_id, campaign_id, contact_id, payload = await _prepare_workflow_dispatch(
         db, tenant.id
     )
+    original_revision = payload.provider_revision_id
     async with session_factory() as update_db:
-        if readiness_target == "agent":
+        if readiness_target in {"agent", "agent_sync", "agent_revision"}:
             resource = await update_db.get(Agent, agent_id)
         else:
             resource = await update_db.get(Workflow, workflow_id)
-        resource.is_active = False
+        if readiness_target == "agent_sync":
+            resource.sync_status = "dirty"
+        elif readiness_target == "agent_revision":
+            resource.provider_revision_id = "new-synced-revision-before-final-guard"
+            resource.sync_status = "synced"
+            resource.last_synced_at = datetime.now(UTC)
+        else:
+            resource.is_active = False
         await update_db.commit()
 
     provider_call = AsyncMock(return_value="must-not-be-used")
@@ -1350,6 +1365,9 @@ async def test_final_guard_reloads_committed_readiness_change_before_dial(
         assert await campaign_tasks._call_provider_with_final_guard(dispatch_db, payload) is None
 
     provider_call.assert_not_awaited()
+    if readiness_target == "agent_revision":
+        assert original_revision == "smallest-reliability-revision"
+        assert payload.provider_revision_id == original_revision
     db.expire_all()
     campaign = await db.get(Campaign, campaign_id)
     contact = await db.get(CampaignContact, contact_id)
@@ -1362,7 +1380,10 @@ async def test_final_guard_reloads_committed_readiness_change_before_dial(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("readiness_target", ["agent", "workflow"])
+@pytest.mark.parametrize(
+    "readiness_target",
+    ["agent", "agent_sync", "agent_revision", "workflow"],
+)
 async def test_postgres_final_guard_waits_for_readiness_update(
     readiness_target,
     tenant,
@@ -1380,15 +1401,23 @@ async def test_postgres_final_guard_waits_for_readiness_update(
     dispatch_task = None
     readiness_lock_requested = asyncio.Event()
     loop = asyncio.get_running_loop()
-    model = Agent if readiness_target == "agent" else Workflow
-    resource_id = agent_id if readiness_target == "agent" else workflow_id
-    table_name = "AGENTS" if readiness_target == "agent" else "WORKFLOWS"
+    agent_target = readiness_target in {"agent", "agent_sync", "agent_revision"}
+    model = Agent if agent_target else Workflow
+    resource_id = agent_id if agent_target else workflow_id
+    table_name = "AGENTS" if agent_target else "WORKFLOWS"
 
     try:
         resource = await blocker.scalar(
             select(model).where(model.id == resource_id).with_for_update()
         )
-        resource.is_active = False
+        if readiness_target == "agent_sync":
+            resource.sync_status = "dirty"
+        elif readiness_target == "agent_revision":
+            resource.provider_revision_id = "new-synced-revision-before-final-lock"
+            resource.sync_status = "synced"
+            resource.last_synced_at = datetime.now(UTC)
+        else:
+            resource.is_active = False
         await blocker.flush()
 
         def observe_readiness_lock(_conn, _cursor, statement, _parameters, _context, _many):
@@ -1573,14 +1602,14 @@ async def test_unpublished_campaign_fails_closed_without_consuming_attempts(
 
 
 @pytest.mark.asyncio
-async def test_previously_published_dirty_agent_can_start_campaign(
+async def test_previously_published_dirty_agent_cannot_start_campaign(
     client,
     auth_headers,
     tenant,
     db,
     monkeypatch,
 ):
-    agent, campaign, _contacts = await _seed_campaign(db, tenant.id)
+    agent, campaign, contacts = await _seed_campaign(db, tenant.id)
     agent.sync_status = "dirty"
     campaign.status = "draft"
     await db.commit()
@@ -1592,8 +1621,25 @@ async def test_previously_published_dirty_agent_can_start_campaign(
         headers=auth_headers,
     )
 
-    assert response.status_code == 200
-    enqueue.assert_called_once_with(str(campaign.id), str(tenant.id))
+    assert response.status_code == 409
+    assert "current changes" in response.json()["detail"]
+    enqueue.assert_not_called()
+
+    campaign_id = campaign.id
+    contact_id = contacts[0].id
+    campaign.status = "running"
+    await db.commit()
+    monkeypatch.setattr(database, "async_session_factory", session_factory)
+    await campaign_tasks._run_campaign_async(str(campaign_id), str(tenant.id))
+
+    db.expire_all()
+    stored_campaign = await db.get(Campaign, campaign_id)
+    stored_contact = await db.get(CampaignContact, contact_id)
+    assert stored_campaign.status == "paused"
+    assert "unpublished or unverified" in stored_campaign.settings["last_dispatch_error"]
+    assert stored_contact.status == "pending"
+    assert stored_contact.attempts == 0
+    assert await db.scalar(select(func.count()).select_from(Call)) == 0
 
 
 @pytest.mark.asyncio

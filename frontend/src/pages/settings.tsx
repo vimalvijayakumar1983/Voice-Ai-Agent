@@ -1,6 +1,6 @@
 import Head from 'next/head';
 import type { FormEvent } from 'react';
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Activity,
   Check,
@@ -30,6 +30,7 @@ type SecretRevealState = {
   label: string;
   value: string;
   message: string;
+  returnFocusId: string;
 };
 
 const DATE_FORMATTER = new Intl.DateTimeFormat(undefined, {
@@ -76,8 +77,22 @@ function SecretReveal({
   onCopy: () => void;
   onDismiss: () => void;
 }) {
+  const secretInput = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    secretInput.current?.focus();
+    secretInput.current?.select();
+  }, []);
+
   return (
-    <section className="secret-reveal" aria-labelledby="secret-reveal-title">
+    <section
+      className="secret-reveal"
+      aria-labelledby="secret-reveal-title"
+      aria-describedby="secret-reveal-message"
+      aria-live="assertive"
+      aria-atomic="true"
+      role="region"
+    >
       <div className="secret-reveal-icon"><ShieldCheck size={18} aria-hidden="true" /></div>
       <div className="secret-reveal-content">
         <div className="secret-reveal-heading">
@@ -89,19 +104,24 @@ function SecretReveal({
             <X size={15} />
           </button>
         </div>
-        <p>{secret.message}</p>
+        <p id="secret-reveal-message">{secret.message}</p>
         <label htmlFor="one-time-secret">{secret.label}</label>
         <div className="secret-copy-row">
           <input
             id="one-time-secret"
+            ref={secretInput}
             value={secret.value}
             readOnly
+            aria-describedby="secret-reveal-message"
             onFocus={(event) => event.currentTarget.select()}
           />
           <button type="button" className="btn btn-primary" onClick={onCopy}>
             {copied ? <Check size={14} /> : <Clipboard size={14} />}
             {copied ? 'Copied' : 'Copy'}
           </button>
+          <span className="visually-hidden" role="status" aria-live="polite">
+            {copied ? 'Secret copied to the clipboard.' : ''}
+          </span>
         </div>
       </div>
     </section>
@@ -200,6 +220,7 @@ export default function Settings() {
         label: 'Invitation link',
         value: inviteLink,
         message: 'Share this link securely. It expires in seven days and cannot be recovered later.',
+        returnFocusId: 'invite-email',
       });
       setInviteForm({ full_name: '', email: '', role: 'member' });
       const [nextInvitations, nextAuditEvents] = await Promise.all([
@@ -265,6 +286,7 @@ export default function Settings() {
         label: 'Secret API key',
         value: created.key,
         message: 'Copy this key into your secret manager now. It will never be shown again.',
+        returnFocusId: 'api-key-name',
       });
       setApiKeyName('');
       const [nextApiKeys, nextAuditEvents] = await Promise.all([
@@ -308,6 +330,15 @@ export default function Settings() {
       setCopied(true);
     } catch {
       setActionError('Copy was blocked by the browser. Select the value and copy it manually.');
+    }
+  };
+
+  const dismissSecret = () => {
+    const returnFocusId = secret?.returnFocusId;
+    setSecret(null);
+    setCopied(false);
+    if (returnFocusId) {
+      window.requestAnimationFrame(() => document.getElementById(returnFocusId)?.focus());
     }
   };
 
@@ -365,7 +396,7 @@ export default function Settings() {
               secret={secret}
               copied={copied}
               onCopy={() => void copySecret()}
-              onDismiss={() => { setSecret(null); setCopied(false); }}
+              onDismiss={dismissSecret}
             />
           ) : null}
 
@@ -454,7 +485,7 @@ export default function Settings() {
             <section className="settings-section" aria-labelledby="api-keys-heading">
               <div className="settings-section-heading">
                 <div className="settings-section-icon"><KeyRound size={18} /></div>
-                <div><h2 id="api-keys-heading">API keys</h2><p>Read-only server credentials that expire after 90 days. Scoped service accounts are staged next.</p></div>
+                <div><h2 id="api-keys-heading">API keys</h2><p>Read-only viewer credentials that expire after 90 days. Resource-scoped service accounts are not available.</p></div>
               </div>
               <form className="api-key-form" onSubmit={handleCreateApiKey}>
                 <div className="form-group"><label htmlFor="api-key-name">Key name</label><input id="api-key-name" placeholder="Production backend" value={apiKeyName} onChange={(event) => setApiKeyName(event.target.value)} maxLength={255} required /></div>
@@ -475,7 +506,7 @@ export default function Settings() {
             <section className="settings-section" aria-labelledby="audit-heading">
               <div className="settings-section-heading">
                 <div className="settings-section-icon"><Activity size={18} /></div>
-                <div><h2 id="audit-heading">Recent audit events</h2><p>Immutable history of security and administrative changes.</p></div>
+                <div><h2 id="audit-heading">Recent audit events</h2><p>Recorded identity and administrative events. This is not a complete tamper-evident audit export.</p></div>
               </div>
               <ol className="audit-list">
                 {auditEvents.length ? auditEvents.map((event) => {

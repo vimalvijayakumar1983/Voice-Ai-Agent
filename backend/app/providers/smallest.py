@@ -6,10 +6,10 @@ is never exposed to a browser or stored on an agent record.
 
 from __future__ import annotations
 
+import json as jsonlib
 from dataclasses import dataclass
-from datetime import datetime
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
@@ -19,22 +19,67 @@ from app.core.config import settings
 
 logger = structlog.get_logger()
 
+ATOMS_SYNTHESIZER_MODEL = "waves_lightning_v3_1"
+VOICE_PREVIEW_TEXT = "Hello. This is a preview of my voice."
+VOICE_PREVIEW_TEXTS = {
+    "ar": "مرحبًا. هذه معاينة للصوت.",
+    "bn": "নমস্কার। এটি কণ্ঠস্বরের একটি নমুনা।",
+    "de": "Hallo. Dies ist eine Stimmvorschau.",
+    "el": "Γεια σας. Αυτή είναι μια προεπισκόπηση φωνής.",
+    "en": VOICE_PREVIEW_TEXT,
+    "es": "Hola. Esta es una vista previa de la voz.",
+    "fi": "Hei. Tämä on äänen esikatselu.",
+    "fr": "Bonjour. Ceci est un aperçu de la voix.",
+    "gu": "નમસ્તે. આ અવાજનું પૂર્વદર્શન છે.",
+    "hi": "नमस्ते। यह आवाज़ का पूर्वावलोकन है।",
+    "id": "Halo. Ini adalah pratinjau suara.",
+    "it": "Ciao. Questa è un'anteprima della voce.",
+    "ja": "こんにちは。これは音声のプレビューです。",
+    "kn": "ನಮಸ್ಕಾರ. ಇದು ಧ್ವನಿಯ ಮುನ್ನೋಟವಾಗಿದೆ.",
+    "ko": "안녕하세요. 음성 미리 듣기입니다.",
+    "ml": "നമസ്കാരം. ഇത് ശബ്ദത്തിന്റെ പ്രിവ്യൂ ആണ്.",
+    "mr": "नमस्कार. हा आवाजाचा नमुना आहे.",
+    "ms": "Helo. Ini ialah pratonton suara.",
+    "nl": "Hallo. Dit is een stemvoorbeeld.",
+    "no": "Hei. Dette er en forhåndsvisning av stemmen.",
+    "or": "ନମସ୍କାର। ଏହା କଣ୍ଠସ୍ୱରର ଏକ ନମୁନା।",
+    "pa": "ਸਤ ਸ੍ਰੀ ਅਕਾਲ। ਇਹ ਆਵਾਜ਼ ਦੀ ਝਲਕ ਹੈ।",
+    "pl": "Dzień dobry. To jest podgląd głosu.",
+    "pt": "Olá. Esta é uma prévia da voz.",
+    "ru": "Здравствуйте. Это предварительный просмотр голоса.",
+    "sv": "Hej. Det här är en förhandsvisning av rösten.",
+    "ta": "வணக்கம். இது குரல் முன்னோட்டம்.",
+    "te": "నమస్కారం. ఇది వాయిస్ ప్రివ్యూ.",
+    "tr": "Merhaba. Bu bir ses önizlemesidir.",
+    "vi": "Xin chào. Đây là bản nghe thử giọng nói.",
+    "zh": "你好。这是一段语音试听。",
+}
+MAX_VOICE_PREVIEW_BYTES = 2_000_000
 
-def _timezone_config(timezone_name: str) -> dict[str, str | int | float]:
-    """Translate an IANA zone into the object currently accepted by Atoms."""
+
+def _validate_timezone_name(timezone_name: str) -> None:
     try:
-        offset = datetime.now(ZoneInfo(timezone_name)).utcoffset()
-    except ZoneInfoNotFoundError as exc:
+        ZoneInfo(timezone_name)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
         raise SmallestAIError(f"Unknown IANA timezone: {timezone_name}", status_code=422) from exc
 
-    total_minutes = int((offset.total_seconds() if offset else 0) / 60)
-    sign = "+" if total_minutes >= 0 else "-"
-    hours, minutes = divmod(abs(total_minutes), 60)
-    offset_hours = total_minutes / 60
-    return {
-        "label": f"(GMT{sign}{hours}:{minutes:02d}) {timezone_name}",
-        "offset": int(offset_hours) if offset_hours.is_integer() else offset_hours,
-    }
+
+def _validate_language_switching(
+    supported_languages: list[str],
+    *,
+    enabled: bool,
+    mode: str,
+) -> None:
+    if enabled != (mode == "automatic"):
+        raise SmallestAIError(
+            "Language switching mode and enabled state are inconsistent.",
+            status_code=422,
+        )
+    if enabled and len(supported_languages) < 2:
+        raise SmallestAIError(
+            "Automatic language switching requires at least two supported languages.",
+            status_code=422,
+        )
 
 
 class SmallestAIError(RuntimeError):
@@ -177,6 +222,98 @@ class SmallestAIClient:
             )
         return payload
 
+    async def _request_audio(
+        self,
+        method: str,
+        path: str,
+        *,
+        payload: dict[str, Any],
+        base_url: str,
+    ) -> bytes:
+        """Return a bounded WAV response while preserving provider error hygiene."""
+        if not self.api_key:
+            raise SmallestAIError(
+                "Smallest.ai is not configured. Add SMALLEST_API_KEY to the backend environment.",
+                status_code=503,
+            )
+
+        async with httpx.AsyncClient(
+            base_url=base_url,
+            timeout=self.timeout,
+            transport=self.transport,
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Accept": "audio/wav",
+                "Content-Type": "application/json",
+            },
+        ) as client:
+            try:
+                async with client.stream(method, path, json=payload) as response:
+                    if response.is_error:
+                        error_body = bytearray()
+                        async for chunk in response.aiter_bytes():
+                            remaining = 16_384 - len(error_body)
+                            if remaining <= 0:
+                                break
+                            error_body.extend(chunk[:remaining])
+                        try:
+                            details: Any = jsonlib.loads(error_body)
+                        except (UnicodeDecodeError, jsonlib.JSONDecodeError):
+                            details = bytes(error_body[:500]).decode("utf-8", errors="replace")
+                        message = "Smallest.ai rejected the voice preview request."
+                        if isinstance(details, dict):
+                            message = str(details.get("message") or details.get("error") or message)
+                        public_status_code = response.status_code
+                        if response.status_code in {401, 403}:
+                            public_status_code = 502
+                            message = (
+                                "Smallest.ai rejected the configured server credentials "
+                                "or permissions."
+                            )
+                        raise SmallestAIError(
+                            message,
+                            status_code=public_status_code,
+                            upstream_status_code=response.status_code,
+                            details=details,
+                        )
+
+                    content_type = response.headers.get("content-type", "").split(";", 1)[0].lower()
+                    if content_type not in {
+                        "audio/wav",
+                        "audio/x-wav",
+                        "application/octet-stream",
+                    }:
+                        raise SmallestAIError(
+                            "Smallest.ai returned an unexpected voice preview response."
+                        )
+                    content_length = response.headers.get("content-length")
+                    if content_length:
+                        try:
+                            if int(content_length) > MAX_VOICE_PREVIEW_BYTES:
+                                raise SmallestAIError(
+                                    "Smallest.ai returned an oversized voice preview."
+                                )
+                        except ValueError:
+                            pass
+
+                    audio = bytearray()
+                    async for chunk in response.aiter_bytes():
+                        if len(audio) + len(chunk) > MAX_VOICE_PREVIEW_BYTES:
+                            raise SmallestAIError(
+                                "Smallest.ai returned an oversized voice preview."
+                            )
+                        audio.extend(chunk)
+            except httpx.TimeoutException as exc:
+                raise SmallestAIError(
+                    "Smallest.ai timed out. Please retry.", status_code=504
+                ) from exc
+            except httpx.HTTPError as exc:
+                raise SmallestAIError("Could not connect to Smallest.ai.") from exc
+
+        if len(audio) < 12 or audio[:4] != b"RIFF" or audio[8:12] != b"WAVE":
+            raise SmallestAIError("Smallest.ai returned an invalid WAV voice preview.")
+        return bytes(audio)
+
     async def list_voices(self) -> list[dict[str, Any]]:
         response = await self._request(
             "GET",
@@ -190,6 +327,34 @@ class SmallestAIClient:
         response = await self._request("GET", "/voice-cloning", base_url=self.waves_base_url)
         voices = response.get("data") or response.get("voices") or []
         return voices if isinstance(voices, list) else []
+
+    async def synthesize_voice_preview(
+        self,
+        *,
+        voice_id: str,
+        model: str,
+        language: str,
+    ) -> bytes:
+        """Synthesize one server-owned preview phrase; callers cannot supply billable text."""
+        if model not in {"lightning_v3.1", "lightning_v3.1_pro"}:
+            raise SmallestAIError("Voice preview model could not be verified.", status_code=422)
+        base_language = language.split("-", 1)[0]
+        provider_language = base_language if base_language in VOICE_PREVIEW_TEXTS else language
+        return await self._request_audio(
+            "POST",
+            "/tts",
+            base_url=self.waves_base_url,
+            payload={
+                "text": VOICE_PREVIEW_TEXTS.get(
+                    provider_language,
+                    VOICE_PREVIEW_TEXT,
+                ),
+                "voice_id": voice_id,
+                "model": model,
+                "language": provider_language,
+                "output_format": "wav",
+            },
+        )
 
     async def create_agent(
         self,
@@ -210,6 +375,31 @@ class SmallestAIClient:
                 ambiguous=True,
             )
         return agent_id
+
+    async def get_agent(
+        self,
+        agent_id: str,
+        *,
+        version_id: str | None = None,
+        draft_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Return the agent with the provider-resolved version configuration."""
+        if version_id and draft_id:
+            raise ValueError("version_id and draft_id are mutually exclusive")
+        params: dict[str, str] = {}
+        if version_id:
+            params["versionId"] = version_id
+        if draft_id:
+            params["draftId"] = draft_id
+        response = await self._request(
+            "GET",
+            f"/agent/{agent_id}",
+            params=params or None,
+        )
+        data = response.get("data")
+        if not isinstance(data, dict):
+            raise SmallestAIError("Smallest.ai returned an invalid agent configuration.")
+        return data
 
     async def get_default_branch_id(self, agent_id: str) -> str:
         response = await self._request("GET", f"/agent/{agent_id}/branches")
@@ -253,30 +443,44 @@ class SmallestAIClient:
         slm_model: str,
         language: str,
         supported_languages: list[str] | None,
+        language_switching_enabled: bool = False,
+        language_switching_mode: str = "disabled",
         timezone: str,
         voice_id: str | None = None,
         speech_rate: float = 1.0,
         synthesizer_model: str | None = None,
+        max_call_duration_seconds: int = 600,
     ) -> dict[str, Any]:
         resolved_languages = list(dict.fromkeys(supported_languages or [language]))
         if language not in resolved_languages:
             raise SmallestAIError(
                 "Primary language must be included in supported languages.", status_code=422
             )
-        if "ta" in resolved_languages and len(resolved_languages) > 1:
-            raise SmallestAIError(
-                "Tamil cannot be combined with other supported languages.", status_code=422
-            )
+        _validate_language_switching(
+            resolved_languages,
+            enabled=language_switching_enabled,
+            mode=language_switching_mode,
+        )
+        _validate_timezone_name(timezone)
 
         payload: dict[str, Any] = {
             "globalPrompt": global_prompt,
+            "firstMessage": first_message or "",
             "slmModel": slm_model,
-            "language": {"default": language, "supported": resolved_languages},
-            "timezone": _timezone_config(timezone),
+            "language": {
+                "default": language,
+                "supported": resolved_languages,
+                "switching": {"isEnabled": language_switching_enabled},
+            },
+            # The current versioned-draft endpoint accepts an IANA timezone
+            # string. The create-agent DTO still documents an offset object,
+            # but this adapter writes only through the draft endpoint.
+            "timezone": timezone,
             "allowInterruptions": True,
+            "sessionTimeoutConfig": {
+                "timeoutTimeInSecs": max_call_duration_seconds,
+            },
         }
-        if first_message is not None:
-            payload["firstMessage"] = first_message
         if voice_id:
             if not synthesizer_model:
                 raise SmallestAIError(
@@ -427,6 +631,25 @@ class SmallestAIClient:
                 ambiguous=True,
             )
         return str(conversation_id)
+
+    async def get_recording_download_url(self, *, call_id: str) -> str:
+        """Request a fresh, time-limited recording URL for one conversation.
+
+        Provider contract: Smallest documents
+        ``GET /conversation/{callId}/recording/download-url`` with
+        ``data.presignedUrl``. The returned URL is deliberately kept inside the
+        backend and must not be cached or returned to browser clients.
+        """
+        encoded_call_id = quote(call_id, safe="")
+        response = await self._request(
+            "GET",
+            f"/conversation/{encoded_call_id}/recording/download-url",
+        )
+        data = response.get("data")
+        presigned_url = data.get("presignedUrl") if isinstance(data, dict) else None
+        if not isinstance(presigned_url, str) or not presigned_url.strip():
+            raise SmallestAIError("Smallest.ai did not return a recording download URL.")
+        return presigned_url.strip()
 
 
 def get_smallest_client() -> SmallestAIClient:

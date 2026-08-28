@@ -6,7 +6,8 @@ function isAgentCallReady(agent) {
       && agent.is_active
       && agent.provider_agent_id
       && agent.provider_revision_id
-      && agent.last_synced_at,
+      && agent.last_synced_at
+      && agent.sync_status === 'synced',
   );
 }
 
@@ -15,6 +16,9 @@ function agentTestReadinessMessage(agent) {
   if (!agent.is_active) return 'Activate this agent before testing.';
   if (agent.sync_status === 'provider_scanning') {
     return 'Wait for Smallest.ai revision and security checks to finish before testing.';
+  }
+  if (agent.sync_status === 'dirty') {
+    return 'Publish and verify this agent\'s current changes before testing.';
   }
   return 'Publish and verify this agent before testing.';
 }

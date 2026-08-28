@@ -27,8 +27,8 @@ test('testing requires an active agent with a published provider revision', () =
   assert.equal(isAgentCallReady({ ...readyAgent, is_active: false }), false);
   assert.equal(
     isAgentCallReady({ ...readyAgent, sync_status: 'dirty' }),
-    true,
-    'a dirty local draft may still test its last published revision',
+    false,
+    'a dirty local draft must not test a stale published revision',
   );
   assert.equal(isAgentCallReady(undefined), false);
 });
@@ -45,6 +45,10 @@ test('readiness guidance explains provider scanning and local drafts', () => {
   assert.equal(
     agentTestReadinessMessage({ ...readyAgent, is_active: false }),
     'Activate this agent before testing.',
+  );
+  assert.equal(
+    agentTestReadinessMessage({ ...readyAgent, sync_status: 'dirty' }),
+    'Publish and verify this agent\'s current changes before testing.',
   );
 });
 

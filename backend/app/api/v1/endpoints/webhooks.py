@@ -22,6 +22,7 @@ from app.core.database import async_session_factory
 from app.models.agent import Agent
 from app.models.call import Call, CallSummary, CallTranscript
 from app.models.campaign import Campaign, CampaignContact, CampaignContactAttempt
+from app.services.call_metadata import agent_configuration_snapshot
 from app.services.campaign_lifecycle import (
     TERMINAL_CALL_STATUSES,
     CampaignLifecycleResult,
@@ -595,6 +596,7 @@ async def _process_smallest_webhook(
         await db.flush()
 
     call_metadata = dict(call.call_metadata or {})
+    call_metadata.setdefault("agent_configuration", agent_configuration_snapshot(agent))
     deliveries = list(call_metadata.get("smallest_webhook_deliveries", []))
     delivery_id = payload.get("id")
     if delivery_id and delivery_id not in deliveries:

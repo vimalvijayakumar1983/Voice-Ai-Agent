@@ -46,6 +46,13 @@ class Settings(BaseSettings):
     integration_encryption_key: str = ""
     access_token_expire_minutes: int = 30
     refresh_token_expire_days: int = 7
+    refresh_cookie_name: str = Field(
+        default="vai_refresh_token",
+        pattern=r"^[A-Za-z0-9_-]{1,64}$",
+    )
+    # Temporary, operator-controlled bridge for one release while existing
+    # browser sessions move from localStorage to the HttpOnly cookie.
+    legacy_session_migration_enabled: bool = False
     # Token verification must never be switched to an attacker-influenced or
     # accidentally unsupported algorithm through deployment configuration.
     algorithm: Literal["HS256"] = "HS256"
@@ -105,6 +112,10 @@ class Settings(BaseSettings):
             origin.strip().rstrip("/") for origin in self.cors_origins.split(",") if origin.strip()
         ]
 
+    @property
+    def is_production(self) -> bool:
+        return self.app_env.strip().lower() == "production"
+
     @model_validator(mode="after")
     def validate_production_security(self):
         """Refuse to boot production with forgeable or local-only defaults."""
@@ -143,11 +154,23 @@ class Settings(BaseSettings):
             errors.append("CORS_ORIGINS must contain at least one console origin")
         for origin in origins:
             parsed = urlsplit(origin)
+            try:
+                parsed.port
+            except ValueError:
+                valid_port = False
+            else:
+                valid_port = True
             if (
                 origin == "*"
                 or parsed.scheme != "https"
                 or not parsed.hostname
                 or _is_local_hostname(parsed.hostname)
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.path
+                or parsed.query
+                or parsed.fragment
+                or not valid_port
             ):
                 errors.append("CORS_ORIGINS must contain only public HTTPS origins")
                 break

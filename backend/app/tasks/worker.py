@@ -52,6 +52,10 @@ celery_app.conf.update(
             "task": "app.tasks.campaign_tasks.sweep_provider_callback_outbox",
             "schedule": 60.0,
         },
+        "sweep-pending-webhook-deliveries": {
+            "task": "app.tasks.webhook_tasks.sweep_pending_webhook_deliveries",
+            "schedule": 60.0,
+        },
     },
     # Celery's default autodiscovery only searches for a module named
     # ``tasks.py``. These application tasks are split by domain, so list them

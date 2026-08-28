@@ -5,7 +5,7 @@ from typing import Annotated
 from uuid import UUID, uuid5
 
 import structlog
-from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -22,7 +22,14 @@ from app.schemas.call import (
     CallSummaryResponse,
     CallTranscriptResponse,
 )
+from app.services.audit import record_audit_event
+from app.services.call_metadata import agent_configuration_snapshot
+from app.services.compliance_policy import (
+    is_outbound_consent_revoked,
+    is_recording_consent_revoked,
+)
 from app.services.phone_numbers import is_number_on_tenant_dnc, tenant_phone_dnc_lock
+from app.services.recordings import RecordingError, fetch_call_recording
 from app.telephony.base import CallRequest
 from app.telephony.twilio_provider import get_telephony_provider
 
@@ -142,6 +149,11 @@ async def initiate_outbound_call(
             status_code=409,
             detail="Phone number is on this workspace's Do Not Call list",
         )
+    if await is_outbound_consent_revoked(db, current_user.tenant_id, data.to_number):
+        raise HTTPException(
+            status_code=409,
+            detail="Outbound consent has been revoked for this phone number",
+        )
 
     is_smallest = agent.voice_provider == "smallest"
     if is_smallest and not agent.provider_agent_id:
@@ -153,6 +165,11 @@ async def initiate_outbound_call(
         raise HTTPException(
             status_code=409,
             detail="Agent cannot place calls until its initial provider revision is published",
+        )
+    if is_smallest and agent.sync_status != "synced":
+        raise HTTPException(
+            status_code=409,
+            detail="Publish and verify the agent's current changes before placing a call",
         )
     if is_smallest and data.from_number is not None:
         raise HTTPException(
@@ -172,7 +189,12 @@ async def initiate_outbound_call(
             detail="No from_number provided and no default configured",
         )
     from_number = from_number or "provider-managed"
-    provider_identity = (agent.voice_provider, agent.provider_agent_id, from_number)
+    provider_identity = (
+        agent.voice_provider,
+        agent.provider_agent_id,
+        agent.provider_revision_id,
+        from_number,
+    )
 
     # Create call record
     call = Call(
@@ -184,7 +206,10 @@ async def initiate_outbound_call(
         from_number=from_number,
         to_number=data.to_number,
         provider="smallest" if is_smallest else "twilio",
-        call_metadata={"request": request_identity},
+        call_metadata={
+            "request": request_identity,
+            "agent_configuration": agent_configuration_snapshot(agent),
+        },
     )
     db.add(call)
     try:
@@ -239,6 +264,18 @@ async def initiate_outbound_call(
             call.call_metadata = {**(call.call_metadata or {}), "dispatch_error": "dnc"}
             await db.commit()
             return CallResponse.model_validate(call)
+        if await is_outbound_consent_revoked(
+            db,
+            current_user.tenant_id,
+            data.to_number,
+        ):
+            call.status = "failed"
+            call.call_metadata = {
+                **(call.call_metadata or {}),
+                "dispatch_error": "consent_revoked",
+            }
+            await db.commit()
+            return CallResponse.model_validate(call)
 
         current_agent = (
             await db.execute(
@@ -261,6 +298,7 @@ async def initiate_outbound_call(
             and (
                 current_agent.voice_provider,
                 current_agent.provider_agent_id,
+                current_agent.provider_revision_id,
                 current_from_number,
             )
             != provider_identity
@@ -272,6 +310,7 @@ async def initiate_outbound_call(
                 not current_agent.provider_agent_id
                 or not current_agent.provider_revision_id
                 or not current_agent.last_synced_at
+                or current_agent.sync_status != "synced"
             )
         )
         if (
@@ -283,7 +322,7 @@ async def initiate_outbound_call(
             reason = (
                 "agent_inactive"
                 if current_agent is not None and not current_agent.is_active
-                else "agent_provider_changed"
+                else ("agent_not_synced" if provider_not_ready else "agent_provider_changed")
             )
             call.status = "failed"
             call.call_metadata = {**(call.call_metadata or {}), "dispatch_error": reason}
@@ -296,6 +335,7 @@ async def initiate_outbound_call(
                     agent_id=current_agent.provider_agent_id,
                     phone_number=data.to_number,
                     variables={**data.context, "_vav_call_id": str(call.id)},
+                    version_id=current_agent.provider_revision_id,
                 )
             else:
                 provider = get_telephony_provider()
@@ -394,6 +434,96 @@ async def get_call_transcript(
     if not transcript:
         raise HTTPException(status_code=404, detail="Transcript not found")
     return CallTranscriptResponse.model_validate(transcript)
+
+
+@router.get(
+    "/{call_id}/recording",
+    response_class=Response,
+    responses={
+        200: {
+            "description": "Tenant-authorized call recording audio",
+            "content": {
+                "audio/mpeg": {},
+                "audio/wav": {},
+                "audio/ogg": {},
+                "audio/mp4": {},
+            },
+        }
+    },
+)
+async def get_call_recording(
+    call_id: UUID,
+    current_user: CurrentUser = Depends(require_role("owner", "admin", "member")),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return bounded audio without revealing the provider's recording URL."""
+    result = await db.execute(
+        select(Call).where(Call.id == call_id, Call.tenant_id == current_user.tenant_id)
+    )
+    call = result.scalar_one_or_none()
+    if not call:
+        raise HTTPException(status_code=404, detail="Call not found")
+
+    customer_number = call.to_number if call.direction == "outbound" else call.from_number
+
+    async def reject_revoked_recording_access() -> None:
+        await record_audit_event(
+            db,
+            tenant_id=current_user.tenant_id,
+            actor_user_id=current_user.id,
+            action="call.recording_access_blocked",
+            resource_type="call",
+            resource_id=str(call.id),
+            details={"reason": "recording_consent_revoked"},
+        )
+        await db.commit()
+        raise HTTPException(
+            status_code=403,
+            detail="Recording playback is blocked by an explicit customer revocation",
+        )
+
+    if await is_recording_consent_revoked(
+        db,
+        current_user.tenant_id,
+        customer_number,
+    ):
+        await reject_revoked_recording_access()
+
+    try:
+        recording = await fetch_call_recording(call)
+    except RecordingError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+    # A revocation may commit while the provider bytes are being retrieved.
+    # Re-read immediately before release so such a race never reaches the
+    # browser; the first check above avoids an unnecessary provider fetch.
+    if await is_recording_consent_revoked(
+        db,
+        current_user.tenant_id,
+        customer_number,
+    ):
+        await reject_revoked_recording_access()
+
+    await record_audit_event(
+        db,
+        tenant_id=current_user.tenant_id,
+        actor_user_id=current_user.id,
+        action="call.recording_accessed",
+        resource_type="call",
+        resource_id=str(call.id),
+        details={"provider": call.provider, "bytes": len(recording.content)},
+    )
+    await db.commit()
+
+    return Response(
+        content=recording.content,
+        media_type=recording.content_type,
+        headers={
+            "Cache-Control": "private, no-store",
+            "Content-Disposition": f'inline; filename="call-recording.{recording.extension}"',
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 @router.get("/{call_id}/summary", response_model=CallSummaryResponse)

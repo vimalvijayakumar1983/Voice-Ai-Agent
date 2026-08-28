@@ -1,0 +1,138 @@
+.catalogLock {
+  margin-top: 11px;
+  padding: 10px 11px;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  color: #4f576c;
+  background: #f5f6fa;
+  border: 1px solid #dfe2ea;
+  border-radius: 9px;
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.catalogLock svg {
+  margin-top: 1px;
+  flex: 0 0 auto;
+}
+
+.languageOptionLocked {
+  color: #747b8d !important;
+  background: #f3f4f7 !important;
+  cursor: not-allowed !important;
+  opacity: .78;
+}
+
+.switchingFieldset {
+  min-width: 0;
+  margin-top: 14px;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: 11px;
+  background: #fafbfe;
+}
+
+.switchingFieldset legend {
+  padding: 0 6px;
+  color: var(--text-primary);
+  font-size: 12px;
+  font-weight: 750;
+}
+
+.switchingOptions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 9px;
+}
+
+.switchingOption {
+  min-height: 82px;
+  padding: 12px;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: flex-start;
+  gap: 9px;
+  color: var(--text-primary);
+  background: white;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  cursor: pointer;
+  transition: border-color .15s ease, box-shadow .15s ease, background .15s ease;
+}
+
+.switchingOption:hover:not(.switchingOptionDisabled) {
+  border-color: #c9c1ff;
+}
+
+.switchingOptionSelected {
+  background: var(--accent-soft);
+  border-color: #bdb3ff;
+  box-shadow: 0 0 0 2px rgba(103, 87, 232, .07);
+}
+
+.switchingOptionDisabled {
+  color: #787f91;
+  background: #f3f4f7;
+  cursor: not-allowed;
+}
+
+.switchingOption input {
+  width: 16px;
+  height: 16px;
+  margin-top: 2px;
+  accent-color: var(--accent);
+}
+
+.switchingOption strong,
+.switchingOption small {
+  display: block;
+}
+
+.switchingOption strong {
+  font-size: 12px;
+}
+
+.switchingOption small {
+  margin-top: 4px;
+  color: var(--text-secondary);
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.switchingStatus {
+  margin-top: 10px;
+  padding: 9px 10px;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  color: #5f6679;
+  background: white;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.switchingStatus svg {
+  margin-top: 1px;
+  flex: 0 0 auto;
+}
+
+.switchingStatusReady {
+  color: #126844;
+  background: var(--success-soft);
+  border-color: #b7dfce;
+}
+
+@media (max-width: 680px) {
+  .switchingOptions {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .switchingOption {
+    transition: none;
+  }
+}

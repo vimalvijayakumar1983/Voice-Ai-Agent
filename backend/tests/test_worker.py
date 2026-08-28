@@ -13,7 +13,7 @@ from app.tasks.campaign_tasks import (
     sweep_provider_callback_outbox,
     sweep_running_campaigns,
 )
-from app.tasks.webhook_tasks import fire_webhook_event
+from app.tasks.webhook_tasks import fire_webhook_event, sweep_pending_webhook_deliveries
 from app.tasks.worker import celery_app
 
 
@@ -31,6 +31,7 @@ def test_worker_registers_all_application_tasks():
         "app.tasks.call_tasks.sweep_stale_call_dispatches",
         "app.tasks.call_tasks.sweep_stale_direct_calls",
         "app.tasks.webhook_tasks.fire_webhook_event",
+        "app.tasks.webhook_tasks.sweep_pending_webhook_deliveries",
     }.issubset(celery_app.tasks)
     assert run_campaign.app is celery_app
     assert sweep_running_campaigns.app is celery_app
@@ -42,6 +43,7 @@ def test_worker_registers_all_application_tasks():
     assert sweep_stale_call_dispatches.app is celery_app
     assert sweep_stale_direct_calls.app is celery_app
     assert fire_webhook_event.app is celery_app
+    assert sweep_pending_webhook_deliveries.app is celery_app
 
 
 def test_default_worker_consumes_every_routed_queue():
@@ -60,6 +62,7 @@ def test_default_worker_consumes_every_routed_queue():
             "app.tasks.call_tasks.sweep_stale_call_dispatches",
             "app.tasks.call_tasks.sweep_stale_direct_calls",
             "app.tasks.webhook_tasks.fire_webhook_event",
+            "app.tasks.webhook_tasks.sweep_pending_webhook_deliveries",
         )
     }
 
@@ -71,3 +74,4 @@ def test_default_worker_consumes_every_routed_queue():
     assert celery_app.conf.beat_schedule["sweep-stale-direct-calls"]["schedule"] == 300.0
     assert celery_app.conf.beat_schedule["sweep-running-campaigns"]["schedule"] == 300.0
     assert celery_app.conf.beat_schedule["sweep-provider-callback-outbox"]["schedule"] == 60.0
+    assert celery_app.conf.beat_schedule["sweep-pending-webhook-deliveries"]["schedule"] == 60.0

@@ -12,6 +12,7 @@ from app.api.v1.endpoints import agents as agents_endpoint
 from app.api.v1.endpoints import calls as calls_endpoint
 from app.models.agent import Agent
 from app.providers.smallest import BrowserSession, SmallestAIClient, SmallestAIError
+from app.services.agent_catalog_cache import public_agent_catalog_cache
 from app.tasks.call_tasks import reconcile_call_dispatch, reconcile_direct_call_terminal
 from tests.conftest import engine as test_engine
 from tests.conftest import test_session_factory as session_factory
@@ -31,6 +32,8 @@ class FakeSmallestClient:
     publish_state: str = "committed"
     revision_status: str = "published"
     security_status: str = "passed"
+    preview_calls: list[dict] = field(default_factory=list)
+    voice_catalog_calls: int = 0
 
     async def create_agent(self, **_kwargs):
         self.create_calls += 1
@@ -48,6 +51,7 @@ class FakeSmallestClient:
         return {"status": True}
 
     async def list_voices(self):
+        self.voice_catalog_calls += 1
         return [
             {
                 "voiceId": "jordan",
@@ -73,6 +77,10 @@ class FakeSmallestClient:
             }
         ]
 
+    async def synthesize_voice_preview(self, **kwargs):
+        self.preview_calls.append(kwargs)
+        return b"RIFF\x04\x00\x00\x00WAVE"
+
     async def publish_draft(self, **kwargs):
         self.publish_calls += 1
         self.publish_labels.append(kwargs["label"])
@@ -97,6 +105,42 @@ class FakeSmallestClient:
             "securityCheck": {"status": self.security_status},
         }
 
+    async def get_agent(self, _agent_id, **kwargs):
+        draft = self.draft_calls[-1]
+        synthesizer = {
+            "voiceConfig": {
+                "voiceId": draft["voice_id"],
+                "model": draft["synthesizer_model"],
+            },
+            "speed": draft["speech_rate"],
+        }
+        return {
+            "_configSource": "version" if kwargs.get("version_id") else "active",
+            "timezone": draft["timezone"],
+            "language": {
+                "default": draft["language"],
+                "supported": draft["supported_languages"],
+                "switching": {"isEnabled": draft["language_switching_enabled"]},
+            },
+            "synthesizer": synthesizer,
+            "sessionTimeoutConfig": {
+                "timeoutTimeInSecs": draft["max_call_duration_seconds"],
+            },
+            "_resolvedConfig": {
+                "globalPrompt": draft["global_prompt"],
+                "firstMessage": draft["first_message"] or "",
+                "modelName": draft["slm_model"],
+                "timezone": draft["timezone"],
+                "defaultLanguage": draft["language"],
+                "supportedLanguages": draft["supported_languages"],
+                "languageSwitching": {"isEnabled": draft["language_switching_enabled"]},
+                "synthesizer": synthesizer,
+                "sessionTimeoutConfig": {
+                    "timeoutTimeInSecs": draft["max_call_duration_seconds"],
+                },
+            },
+        }
+
     async def create_browser_session(self, **_kwargs):
         return BrowserSession(access_token="wct_test", expires_in=30, sample_rate=24000)
 
@@ -106,9 +150,65 @@ class FakeSmallestClient:
         return "smallest_call_123"
 
 
+def _full_agent_editor_payload(agent: dict) -> dict:
+    fields = {
+        "name",
+        "description",
+        "system_prompt",
+        "model_provider",
+        "model_name",
+        "temperature",
+        "max_tokens",
+        "voice_provider",
+        "voice_id",
+        "language",
+        "supported_languages",
+        "language_switching_enabled",
+        "language_switching_mode",
+        "speech_rate",
+        "greeting_message",
+        "fallback_message",
+        "max_call_duration_seconds",
+        "transfer_number",
+        "is_active",
+        "timezone",
+    }
+    return {field: agent[field] for field in fields}
+
+
+async def _provision_editor_regression_agent(
+    client: AsyncClient,
+    auth_headers: dict,
+) -> dict:
+    created = await client.post(
+        "/api/v1/agents",
+        headers=auth_headers,
+        json={
+            "name": "Editor diff agent",
+            "description": "Original local metadata",
+            "system_prompt": "Keep provider configuration stable across local edits.",
+            "voice_id": "jordan",
+            "language": "en",
+            "supported_languages": ["en", "hi"],
+            "greeting_message": "Hello and welcome.",
+        },
+    )
+    assert created.status_code == 201
+    provisioned = await client.post(
+        f"/api/v1/agents/{created.json()['id']}/smallest/provision",
+        headers=auth_headers,
+    )
+    assert provisioned.status_code == 200
+    assert provisioned.json()["sync_status"] == "synced"
+    return provisioned.json()
+
+
 @pytest.fixture(autouse=True)
 def configured_smallest_webhook(monkeypatch):
+    public_agent_catalog_cache.clear()
     monkeypatch.setattr(agents_endpoint.settings, "smallest_webhook_id", "webhook_test_123")
+    yield
+    public_agent_catalog_cache.clear()
 
 
 @pytest.mark.asyncio
@@ -159,6 +259,14 @@ async def test_provision_sync_and_mint_browser_session(
     )
     assert updated.json()["sync_status"] == "dirty"
 
+    stale_session = await client.post(
+        f"/api/v1/agents/{agent_id}/smallest/session",
+        headers=auth_headers,
+        json={"variables": {"customer_name": "Vimal"}},
+    )
+    assert stale_session.status_code == 409
+    assert "current provider revision" in stale_session.json()["detail"]
+
     synced = await client.post(f"/api/v1/agents/{agent_id}/smallest/sync", headers=auth_headers)
     assert synced.status_code == 200
     assert synced.json()["sync_status"] == "synced"
@@ -192,6 +300,7 @@ async def test_provision_sync_and_mint_browser_session(
     assert outbound.json()["status"] == "ringing"
     assert fake.outbound_payloads[0]["variables"]["_vav_call_id"] == outbound.json()["id"]
     assert fake.outbound_payloads[0]["variables"]["customer_name"] == "Aisha"
+    assert fake.outbound_payloads[0]["version_id"] == "revision_124"
 
     replay = await client.post(
         "/api/v1/calls",
@@ -217,6 +326,112 @@ async def test_provision_sync_and_mint_browser_session(
 
 
 @pytest.mark.asyncio
+async def test_identical_full_editor_patch_preserves_synced_without_voice_catalog_call(
+    client: AsyncClient,
+    auth_headers,
+    monkeypatch,
+):
+    fake = FakeSmallestClient()
+    monkeypatch.setattr(agents_endpoint, "get_smallest_client", lambda: fake)
+    provisioned = await _provision_editor_regression_agent(client, auth_headers)
+    public_agent_catalog_cache.clear()
+    catalog_calls_before = fake.voice_catalog_calls
+
+    response = await client.patch(
+        f"/api/v1/agents/{provisioned['id']}",
+        headers=auth_headers,
+        json=_full_agent_editor_payload(provisioned),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["sync_status"] == "synced"
+    assert response.json()["updated_at"].removesuffix("Z") == provisioned[
+        "updated_at"
+    ].removesuffix("Z")
+    assert fake.voice_catalog_calls == catalog_calls_before
+
+
+@pytest.mark.asyncio
+async def test_full_editor_local_metadata_patch_preserves_synced_without_voice_catalog_call(
+    client: AsyncClient,
+    auth_headers,
+    monkeypatch,
+):
+    fake = FakeSmallestClient()
+    monkeypatch.setattr(agents_endpoint, "get_smallest_client", lambda: fake)
+    provisioned = await _provision_editor_regression_agent(client, auth_headers)
+    public_agent_catalog_cache.clear()
+    catalog_calls_before = fake.voice_catalog_calls
+    payload = _full_agent_editor_payload(provisioned)
+    payload.update(
+        {
+            "name": "Renamed locally",
+            "description": "Updated local metadata only",
+        }
+    )
+
+    response = await client.patch(
+        f"/api/v1/agents/{provisioned['id']}",
+        headers=auth_headers,
+        json=payload,
+    )
+
+    assert response.status_code == 200
+    assert response.json()["name"] == "Renamed locally"
+    assert response.json()["description"] == "Updated local metadata only"
+    assert response.json()["sync_status"] == "synced"
+    assert response.json()["provider_revision_id"] == provisioned["provider_revision_id"]
+    assert fake.voice_catalog_calls == catalog_calls_before
+
+
+@pytest.mark.asyncio
+async def test_voice_preflight_does_not_overwrite_concurrent_provider_operation(
+    client: AsyncClient,
+    auth_headers,
+    db,
+    monkeypatch,
+):
+    fake = FakeSmallestClient()
+    monkeypatch.setattr(agents_endpoint, "get_smallest_client", lambda: fake)
+    provisioned = await _provision_editor_regression_agent(client, auth_headers)
+    agent_id = UUID(provisioned["id"])
+    original_list_voices = fake.list_voices
+
+    async def list_voices_during_concurrent_sync():
+        async with session_factory() as concurrent_db:
+            concurrent_agent = await concurrent_db.scalar(select(Agent).where(Agent.id == agent_id))
+            config = dict(concurrent_agent.provider_config or {})
+            config["publish"] = {
+                "id": "concurrent-publish-operation",
+                "phase": "publish_request",
+            }
+            concurrent_agent.provider_config = config
+            concurrent_agent.sync_status = "publishing"
+            await concurrent_db.commit()
+        return await original_list_voices()
+
+    fake.list_voices = list_voices_during_concurrent_sync
+    public_agent_catalog_cache.clear()
+
+    response = await client.patch(
+        f"/api/v1/agents/{agent_id}",
+        headers=auth_headers,
+        json={"supported_languages": ["en"]},
+    )
+
+    await db.rollback()
+    persisted = await db.scalar(select(Agent).where(Agent.id == agent_id))
+    assert response.status_code == 409
+    assert response.json()["detail"] == (
+        "Agent cannot be edited while its provider operation is unresolved"
+    )
+    assert persisted.sync_status == "publishing"
+    assert persisted.provider_config["publish"]["id"] == "concurrent-publish-operation"
+    assert persisted.supported_languages == ["en", "hi"]
+    assert persisted.language_switching_enabled is True
+
+
+@pytest.mark.asyncio
 async def test_catalog_includes_public_voices_languages_and_templates_without_private_clones(
     client: AsyncClient, auth_headers, monkeypatch
 ):
@@ -229,10 +444,82 @@ async def test_catalog_includes_public_voices_languages_and_templates_without_pr
     payload = response.json()
     assert [voice["id"] for voice in payload["voices"]] == ["jordan"]
     assert payload["voices"][0]["synthesizer_model"] == "waves_lightning_v3_1"
+    assert payload["voices"][0]["voice_pool"] == "standard"
     assert {language["code"] for language in payload["languages"]} == {"en", "hi"}
     assert len(payload["templates"]) == 5
     assert payload["templates"][0]["id"] == "receptionist"
+    assert payload["field_capabilities"]["system_prompt"] == {
+        "status": "synced",
+        "provider_field": "globalPrompt",
+        "reason": None,
+    }
+    assert payload["field_capabilities"]["temperature"]["status"] == "local_only"
     assert fake.clone_catalog_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_voice_preview_is_catalog_validated_and_api_key_stays_server_side(
+    client: AsyncClient,
+    auth_headers,
+    monkeypatch,
+):
+    fake = FakeSmallestClient()
+    monkeypatch.setattr(agents_endpoint, "get_smallest_client", lambda: fake)
+
+    response = await client.post(
+        "/api/v1/agents/provider/voice-preview",
+        headers=auth_headers,
+        json={"voice_id": "jordan"},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "audio/wav"
+    assert response.headers["cache-control"] == "private, no-store"
+    assert response.content == b"RIFF\x04\x00\x00\x00WAVE"
+    assert fake.preview_calls == [
+        {"voice_id": "jordan", "model": "lightning_v3.1", "language": "en"}
+    ]
+    assert b"sk_" not in response.content
+
+
+@pytest.mark.asyncio
+async def test_voice_preview_rejects_ids_outside_public_catalog(
+    client: AsyncClient,
+    auth_headers,
+    monkeypatch,
+):
+    fake = FakeSmallestClient()
+    monkeypatch.setattr(agents_endpoint, "get_smallest_client", lambda: fake)
+
+    response = await client.post(
+        "/api/v1/agents/provider/voice-preview",
+        headers=auth_headers,
+        json={"voice_id": "brand_voice"},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "Voice is not in the public catalog"
+    assert fake.preview_calls == []
+
+
+@pytest.mark.asyncio
+async def test_voice_preview_rejects_language_outside_voice_capabilities(
+    client: AsyncClient,
+    auth_headers,
+    monkeypatch,
+):
+    fake = FakeSmallestClient()
+    monkeypatch.setattr(agents_endpoint, "get_smallest_client", lambda: fake)
+
+    response = await client.post(
+        "/api/v1/agents/provider/voice-preview",
+        headers=auth_headers,
+        json={"voice_id": "jordan", "language": "ml"},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"].endswith("ml")
+    assert fake.preview_calls == []
 
 
 @pytest.mark.asyncio
@@ -262,7 +549,7 @@ async def test_catalog_does_not_expose_provider_auth_as_application_auth(
 
 
 @pytest.mark.asyncio
-async def test_private_clone_id_cannot_be_provisioned_without_tenant_entitlement(
+async def test_private_clone_id_cannot_be_saved_without_tenant_entitlement(
     client: AsyncClient,
     auth_headers,
     monkeypatch,
@@ -279,12 +566,8 @@ async def test_private_clone_id_cannot_be_provisioned_without_tenant_entitlement
         },
     )
 
-    response = await client.post(
-        f"/api/v1/agents/{created.json()['id']}/smallest/provision",
-        headers=auth_headers,
-    )
-    assert response.status_code == 422
-    assert "tenant-owned entitlement" in response.json()["detail"]
+    assert created.status_code == 422
+    assert "tenant-owned entitlement" in created.json()["detail"]
     assert fake.create_calls == 0
 
 
@@ -1101,7 +1384,6 @@ async def test_agents_can_be_edited_with_multiple_languages(client: AsyncClient,
             "name": "Multilingual Support",
             "language": "hi",
             "supported_languages": ["hi", "en", "ml"],
-            "voice_id": "jordan",
         },
     )
 
@@ -1109,13 +1391,35 @@ async def test_agents_can_be_edited_with_multiple_languages(client: AsyncClient,
     assert updated.json()["name"] == "Multilingual Support"
     assert updated.json()["language"] == "hi"
     assert updated.json()["supported_languages"] == ["hi", "en", "ml"]
-    assert updated.json()["voice_id"] == "jordan"
+    assert updated.json()["language_switching_enabled"] is True
+    assert updated.json()["language_switching_mode"] == "automatic"
 
 
 @pytest.mark.asyncio
-async def test_agent_language_configuration_is_validated_on_create_and_edit(
-    client: AsyncClient, auth_headers
+async def test_multilingual_tamil_agents_require_one_voice_covering_every_language(
+    client: AsyncClient,
+    auth_headers,
+    monkeypatch,
 ):
+    fake = FakeSmallestClient()
+
+    async def multilingual_voices():
+        return [
+            {
+                "voiceId": "jordan",
+                "displayName": "Jordan",
+                "tags": {
+                    "language": ["English", "Tamil"],
+                    "accent": "Indian",
+                    "gender": "female",
+                },
+                "modelIds": ["lightning-v3.1"],
+            }
+        ]
+
+    fake.list_voices = multilingual_voices
+    monkeypatch.setattr(agents_endpoint, "get_smallest_client", lambda: fake)
+
     invalid_create = await client.post(
         "/api/v1/agents",
         headers=auth_headers,
@@ -1128,25 +1432,54 @@ async def test_agent_language_configuration_is_validated_on_create_and_edit(
     )
     assert invalid_create.status_code == 422
 
-    created = await client.post(
+    english_primary = await client.post(
         "/api/v1/agents",
         headers=auth_headers,
         json={
-            "name": "Tamil Agent",
+            "name": "English Tamil Agent",
             "system_prompt": "This prompt is long enough.",
-            "language": "ta",
-            "supported_languages": ["ta"],
+            "voice_id": "jordan",
+            "language": "en",
+            "supported_languages": ["en", "ta"],
+            "language_switching_enabled": True,
+            "language_switching_mode": "automatic",
         },
     )
-    invalid_edit = await client.patch(
-        f"/api/v1/agents/{created.json()['id']}",
+    assert english_primary.status_code == 201
+    assert english_primary.json()["supported_languages"] == ["en", "ta"]
+    assert english_primary.json()["language_switching_enabled"] is True
+
+    tamil_primary = await client.post(
+        "/api/v1/agents",
         headers=auth_headers,
-        json={"supported_languages": ["ta", "en"]},
+        json={
+            "name": "Tamil English Agent",
+            "system_prompt": "This prompt is long enough.",
+            "voice_id": "jordan",
+            "language": "ta",
+            "supported_languages": ["ta", "en"],
+            "language_switching_enabled": True,
+            "language_switching_mode": "automatic",
+        },
     )
-    assert invalid_edit.status_code == 422
-    assert (
-        invalid_edit.json()["detail"] == "Tamil cannot be combined with other supported languages"
+    assert tamil_primary.status_code == 201
+    assert tamil_primary.json()["language"] == "ta"
+    assert tamil_primary.json()["supported_languages"] == ["ta", "en"]
+    assert tamil_primary.json()["language_switching_enabled"] is True
+
+    unsupported_language = await client.post(
+        "/api/v1/agents",
+        headers=auth_headers,
+        json={
+            "name": "Unsupported Tamil Agent",
+            "system_prompt": "This prompt is long enough.",
+            "voice_id": "jordan",
+            "language": "ta",
+            "supported_languages": ["ta", "en", "hi"],
+        },
     )
+    assert unsupported_language.status_code == 422
+    assert unsupported_language.json()["detail"].endswith("hi")
 
 
 @pytest.mark.asyncio
@@ -1182,7 +1515,7 @@ async def test_agent_edits_reject_nulls_and_out_of_range_values(
 
 
 @pytest.mark.asyncio
-async def test_voice_language_capabilities_are_enforced_before_provision(
+async def test_voice_language_capabilities_are_enforced_before_save(
     client: AsyncClient,
     auth_headers,
     monkeypatch,
@@ -1201,17 +1534,56 @@ async def test_voice_language_capabilities_are_enforced_before_provision(
         },
     )
 
-    response = await client.post(
-        f"/api/v1/agents/{created.json()['id']}/smallest/provision",
-        headers=auth_headers,
-    )
-    assert response.status_code == 422
-    assert response.json()["detail"].endswith("ml")
+    assert created.status_code == 422
+    assert created.json()["detail"].endswith("ml")
     assert fake.create_calls == 0
 
 
 @pytest.mark.asyncio
-async def test_pro_voice_is_visible_but_cannot_use_an_undocumented_atoms_model(
+async def test_voice_language_preflight_accepts_base_and_matching_locale_tags(
+    client: AsyncClient,
+    auth_headers,
+    monkeypatch,
+):
+    fake = FakeSmallestClient()
+
+    async def regional_voices():
+        return [
+            {
+                "voiceId": "regional",
+                "displayName": "Regional",
+                "tags": {"language": ["English (United States)"]},
+                "modelIds": ["lightning-v3.1"],
+            }
+        ]
+
+    fake.list_voices = regional_voices
+    monkeypatch.setattr(agents_endpoint, "get_smallest_client", lambda: fake)
+    created = await client.post(
+        "/api/v1/agents",
+        headers=auth_headers,
+        json={
+            "name": "Locale compatible voice",
+            "system_prompt": "Accept a provider locale for its matching base language.",
+            "voice_id": "regional",
+            "language": "en",
+            "supported_languages": ["en"],
+        },
+    )
+    assert created.status_code == 201
+
+    updated = await client.patch(
+        f"/api/v1/agents/{created.json()['id']}",
+        headers=auth_headers,
+        json={"language": "en-US", "supported_languages": ["en-US"]},
+    )
+    assert updated.status_code == 200
+    assert updated.json()["language"] == "en-us"
+    assert updated.json()["supported_languages"] == ["en-us"]
+
+
+@pytest.mark.asyncio
+async def test_pro_voice_uses_provider_routed_atoms_synthesizer_model(
     client: AsyncClient,
     auth_headers,
     monkeypatch,
@@ -1247,8 +1619,206 @@ async def test_pro_voice_is_visible_but_cannot_use_an_undocumented_atoms_model(
     )
 
     assert catalog.status_code == 200
-    assert catalog.json()["voices"][0]["synthesizer_model"] is None
-    assert "not yet documented for Atoms" in catalog.json()["voices"][0]["unavailability_reason"]
-    assert response.status_code == 422
-    assert "catalog-visible" in response.json()["detail"]
-    assert fake.create_calls == 0
+    assert catalog.json()["voices"][0]["synthesizer_model"] == "waves_lightning_v3_1"
+    assert catalog.json()["voices"][0]["voice_pool"] == "pro"
+    assert catalog.json()["voices"][0]["unavailability_reason"] is None
+    assert response.status_code == 200
+    assert response.json()["sync_status"] == "synced"
+    assert fake.draft_calls[0]["voice_id"] == "rhea"
+    assert fake.draft_calls[0]["synthesizer_model"] == "waves_lightning_v3_1"
+    assert fake.create_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_clearing_voice_resolves_an_explicit_platform_default_on_sync(
+    client: AsyncClient,
+    auth_headers,
+    monkeypatch,
+):
+    class MultipleVoiceClient(FakeSmallestClient):
+        async def list_voices(self):
+            return [
+                {
+                    "voiceId": "jordan",
+                    "displayName": "Jordan",
+                    "tags": {"language": ["English", "Hindi"]},
+                    "modelIds": ["lightning-v3.1"],
+                },
+                {
+                    "voiceId": "nyah",
+                    "displayName": "Nyah",
+                    "tags": {"language": ["English", "Hindi"]},
+                    "modelIds": ["lightning-v3.1"],
+                },
+            ]
+
+    fake = MultipleVoiceClient()
+    monkeypatch.setattr(agents_endpoint, "get_smallest_client", lambda: fake)
+    created = await client.post(
+        "/api/v1/agents",
+        headers=auth_headers,
+        json={
+            "name": "Default voice reset",
+            "system_prompt": "Resolve every provider voice selection explicitly.",
+            "voice_id": "jordan",
+            "supported_languages": ["en", "hi"],
+        },
+    )
+    agent_id = created.json()["id"]
+    provisioned = await client.post(
+        f"/api/v1/agents/{agent_id}/smallest/provision",
+        headers=auth_headers,
+    )
+    assert provisioned.status_code == 200
+    assert fake.draft_calls[-1]["voice_id"] == "jordan"
+
+    cleared = await client.patch(
+        f"/api/v1/agents/{agent_id}",
+        headers=auth_headers,
+        json={"voice_id": ""},
+    )
+    assert cleared.status_code == 200
+    assert cleared.json()["voice_id"] == ""
+    assert cleared.json()["sync_status"] == "dirty"
+
+    synced = await client.post(
+        f"/api/v1/agents/{agent_id}/smallest/sync",
+        headers=auth_headers,
+    )
+    assert synced.status_code == 200
+    assert synced.json()["sync_status"] == "synced"
+    assert fake.draft_calls[-1]["voice_id"] == "nyah"
+    assert fake.draft_calls[-1]["synthesizer_model"] == "waves_lightning_v3_1"
+    assert synced.json()["provider_config"]["requested_voice_id"] == ""
+    assert synced.json()["provider_config"]["resolved_voice_id"] == "nyah"
+    assert synced.json()["provider_config"]["voice_resolution_source"] == "platform_default"
+
+
+@pytest.mark.asyncio
+async def test_provider_round_trip_mismatch_blocks_synced_status(
+    client: AsyncClient,
+    auth_headers,
+    monkeypatch,
+):
+    class MismatchedProviderClient(FakeSmallestClient):
+        async def get_agent(self, agent_id, **kwargs):
+            provider_agent = await super().get_agent(agent_id, **kwargs)
+            provider_agent["_resolvedConfig"]["supportedLanguages"] = ["en"]
+            return provider_agent
+
+    fake = MismatchedProviderClient()
+    monkeypatch.setattr(agents_endpoint, "get_smallest_client", lambda: fake)
+    created = await client.post(
+        "/api/v1/agents",
+        headers=auth_headers,
+        json={
+            "name": "Round trip guard",
+            "system_prompt": "Reject provider configuration drift before taking calls.",
+            "supported_languages": ["en", "hi"],
+        },
+    )
+
+    response = await client.post(
+        f"/api/v1/agents/{created.json()['id']}/smallest/provision",
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200
+    assert response.json()["sync_status"] == "error"
+    operation = response.json()["provider_config"]["publish"]
+    assert operation["phase"] == "provider_config_mismatch"
+    assert operation["configuration_mismatches"] == ["supported_languages"]
+    assert response.json()["last_synced_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_published_revision_must_also_match_active_runtime_configuration(
+    client: AsyncClient,
+    auth_headers,
+    monkeypatch,
+):
+    class StaleActiveProviderClient(FakeSmallestClient):
+        async def get_agent(self, agent_id, **kwargs):
+            provider_agent = await super().get_agent(agent_id, **kwargs)
+            if not kwargs.get("version_id"):
+                provider_agent["_resolvedConfig"]["firstMessage"] = "Stale active greeting"
+            return provider_agent
+
+    fake = StaleActiveProviderClient()
+    monkeypatch.setattr(agents_endpoint, "get_smallest_client", lambda: fake)
+    created = await client.post(
+        "/api/v1/agents",
+        headers=auth_headers,
+        json={
+            "name": "Active runtime guard",
+            "system_prompt": "Verify the published revision is also serving production calls.",
+            "greeting_message": "Current greeting",
+        },
+    )
+
+    response = await client.post(
+        f"/api/v1/agents/{created.json()['id']}/smallest/provision",
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200
+    assert response.json()["sync_status"] == "error"
+    operation = response.json()["provider_config"]["publish"]
+    assert operation["published_configuration_mismatches"] == []
+    assert operation["active_configuration_mismatches"] == ["greeting_message"]
+    assert operation["configuration_mismatches"] == ["greeting_message"]
+
+
+@pytest.mark.asyncio
+async def test_language_switching_rejects_inconsistent_and_single_language_tuples(
+    client: AsyncClient,
+    auth_headers,
+):
+    inconsistent = await client.post(
+        "/api/v1/agents",
+        headers=auth_headers,
+        json={
+            "name": "Inconsistent switching",
+            "system_prompt": "Reject inconsistent language switching policies.",
+            "supported_languages": ["en", "hi"],
+            "language_switching_enabled": False,
+            "language_switching_mode": "automatic",
+        },
+    )
+    single_language = await client.post(
+        "/api/v1/agents",
+        headers=auth_headers,
+        json={
+            "name": "Single switching",
+            "system_prompt": "Reject automatic switching for one language.",
+            "supported_languages": ["en"],
+            "language_switching_enabled": True,
+            "language_switching_mode": "automatic",
+        },
+    )
+
+    assert inconsistent.status_code == 422
+    assert single_language.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_cross_region_language_set_is_not_rejected_without_voice_evidence(
+    client: AsyncClient,
+    auth_headers,
+):
+    response = await client.post(
+        "/api/v1/agents",
+        headers=auth_headers,
+        json={
+            "name": "Provider governed language set",
+            "system_prompt": "Let the selected provider voice define its language coverage.",
+            "language": "en",
+            "supported_languages": ["en", "ml", "fr"],
+            "language_switching_enabled": True,
+            "language_switching_mode": "automatic",
+        },
+    )
+
+    assert response.status_code == 201
+    assert response.json()["supported_languages"] == ["en", "ml", "fr"]
+    assert response.json()["language_switching_enabled"] is True

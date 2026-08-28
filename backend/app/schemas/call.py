@@ -2,8 +2,9 @@ import re
 from datetime import datetime
 from uuid import UUID
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import AliasChoices, BaseModel, Field, ValidationInfo, field_validator
 
+from app.services.call_metadata import public_call_metadata
 from app.services.provider_variables import validate_provider_variables
 
 
@@ -18,6 +19,12 @@ class CallResponse(BaseModel):
     to_number: str
     provider: str
     provider_call_sid: str | None
+    # Validate from the private database locator, but serialize only a boolean.
+    # The raw provider URL is never part of an API response or browser contract.
+    recording_available: bool = Field(
+        validation_alias=AliasChoices("recording_available", "provider_recording_url")
+    )
+    call_metadata: dict | None
     started_at: datetime | None
     answered_at: datetime | None
     ended_at: datetime | None
@@ -28,6 +35,25 @@ class CallResponse(BaseModel):
     created_at: datetime
 
     model_config = {"from_attributes": True}
+
+    @field_validator("call_metadata", mode="before")
+    @classmethod
+    def redact_private_metadata(cls, value):
+        return public_call_metadata(value)
+
+    @field_validator("recording_available", mode="before")
+    @classmethod
+    def project_recording_availability(cls, value, info: ValidationInfo) -> bool:
+        # Twilio reports an explicit recording resource URL. Smallest exposes a
+        # fresh server-side download URL by conversation ID, so its provider call
+        # ID is sufficient to offer a secure load even when no URL was included
+        # in the lifecycle callback.
+        provider = info.data.get("provider")
+        if provider == "smallest":
+            return bool(info.data.get("provider_call_sid"))
+        if provider == "twilio":
+            return bool(value)
+        return False
 
 
 class CallOutbound(BaseModel):

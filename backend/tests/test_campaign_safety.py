@@ -30,6 +30,7 @@ def _agent(tenant_id, *, provider: str = "smallest", provider_agent_id: str | No
         provider_agent_id=provider_agent_id,
         provider_revision_id="published-revision" if provider_agent_id else None,
         last_synced_at=datetime.now(UTC) if provider_agent_id else None,
+        sync_status="synced" if provider_agent_id else "local_only",
     )
 
 
@@ -338,7 +339,7 @@ async def test_worker_uses_tenant_dnc_and_routes_smallest_agents(tenant, db, mon
     assert provider_request["variables"]["_vav_call_id"] == str(call.id)
     assert provider_request["variables"]["_voice_ai_attempt_id"]
     assert "from_product_id" not in provider_request
-    assert "version_id" not in provider_request
+    assert provider_request["version_id"] == "published-revision"
     # Accepted calls normally advance through signed callbacks, with one
     # bounded watchdog wake-up if that terminal lifecycle is lost.
     apply_async.assert_called_once()

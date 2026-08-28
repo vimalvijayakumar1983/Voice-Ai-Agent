@@ -22,7 +22,7 @@ import json
 import socket
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from urllib.parse import urlsplit
 
 import httpcore
@@ -48,6 +48,12 @@ SIGNATURE_HEADER = "X-VoiceAI-Signature"
 _DELIVERY_NAMESPACE = uuid.UUID("d92757e4-8fd7-4da1-aa76-a5bb6de5286f")
 _RETRYABLE_HTTP_STATUSES = {408, 425, 429}
 _HTTP_TIMEOUT = httpx.Timeout(connect=3.0, read=5.0, write=5.0, pool=3.0)
+_DNS_TIMEOUT_SECONDS = 3.0
+PENDING_DELIVERY_RECOVERY_AFTER_SECONDS = 120
+PENDING_DELIVERY_RECOVERY_BATCH_SIZE = 200
+WEBHOOK_QUEUE_PENDING = "queue_pending"
+WEBHOOK_QUEUE_UNAVAILABLE = "queue_unavailable"
+WEBHOOK_RECOVERABLE_QUEUE_STATES = (WEBHOOK_QUEUE_PENDING, WEBHOOK_QUEUE_UNAVAILABLE)
 
 
 @dataclass(frozen=True)
@@ -176,12 +182,17 @@ async def _resolve_public_destination(webhook_url: str) -> tuple[str, ...]:
     port = parsed.port or 443
 
     try:
-        answers = await asyncio.to_thread(
-            socket.getaddrinfo,
-            hostname,
-            port,
-            type=socket.SOCK_STREAM,
+        answers = await asyncio.wait_for(
+            asyncio.to_thread(
+                socket.getaddrinfo,
+                hostname,
+                port,
+                type=socket.SOCK_STREAM,
+            ),
+            timeout=_DNS_TIMEOUT_SECONDS,
         )
+    except TimeoutError as exc:
+        raise TimeoutError("webhook_dns_resolution_timeout") from exc
     except socket.gaierror as exc:
         raise OSError("webhook_dns_resolution_failed") from exc
 
@@ -280,11 +291,19 @@ async def _prepare_webhook_events(
                         event_type=event_type,
                         payload=payload,
                         status="pending",
+                        last_error=WEBHOOK_QUEUE_PENDING,
                     )
                 )
             elif existing.tenant_id != tenant_uuid or existing.integration_id != integration.id:
                 # A UUIDv5 collision is practically impossible, but never cross tenant bounds.
                 logger.error("webhook_event_identity_collision", event_id=str(delivery_id))
+                continue
+            elif (
+                existing.status != "pending"
+                or existing.last_error not in WEBHOOK_RECOVERABLE_QUEUE_STATES
+            ):
+                # Redispatch only an event whose durable enqueue is still
+                # outstanding. HTTP backoff and terminal states own themselves.
                 continue
             delivery_ids.append(str(delivery_id))
 
@@ -314,6 +333,11 @@ async def _attempt_webhook_delivery(event_id: str, tenant_id: str) -> DeliveryRe
             return DeliveryResult("missing", "delivery_not_found")
         if event.status == "sent":
             return DeliveryResult("sent")
+        if event.status != "pending":
+            # Failed is terminal until an operator explicitly replays it by
+            # moving the same stable event ID back to pending. This makes late
+            # or duplicate Celery messages harmless.
+            return DeliveryResult("terminal", "delivery_not_pending")
 
         integration_result = await db.execute(
             select(Integration).where(
@@ -367,7 +391,7 @@ async def _attempt_webhook_delivery(event_id: str, tenant_id: str) -> DeliveryRe
             status_code = await _send_request(webhook_url, body, headers)
         except IntegrationConfigError:
             outcome = DeliveryResult("terminal", "unsafe_destination")
-        except httpx.TimeoutException:
+        except (httpx.TimeoutException, TimeoutError):
             outcome = DeliveryResult("transient", "delivery_timeout")
         except (httpx.TransportError, OSError):
             outcome = DeliveryResult("transient", "transport_failure")
@@ -414,6 +438,65 @@ async def _mark_terminal_failure(event_id: str, tenant_id: str, error_code: str)
             event.status = "failed"
             event.last_error = error_code
             await db.commit()
+
+
+async def _claim_stale_pending_webhook_deliveries(
+    *,
+    now: datetime | None = None,
+    limit: int = PENDING_DELIVERY_RECOVERY_BATCH_SIZE,
+) -> list[tuple[str, str]]:
+    """Claim durable deliveries whose original enqueue or retry was lost.
+
+    Updating ``updated_at`` before enqueue creates a bounded recovery lease.
+    A crash after this commit is safe: the same stable event ID becomes
+    eligible again after the lease, and delivery itself is idempotent.
+    """
+    current_time = now or datetime.now(UTC)
+    stale_before = current_time - timedelta(seconds=PENDING_DELIVERY_RECOVERY_AFTER_SECONDS)
+
+    async with async_session_factory() as db:
+        result = await db.execute(
+            select(WebhookEvent)
+            .where(
+                WebhookEvent.status == "pending",
+                # These explicit states identify an outstanding initial or
+                # replay enqueue. Transient delivery errors use other codes and
+                # remain exclusively governed by Celery's bounded backoff.
+                WebhookEvent.last_error.in_(WEBHOOK_RECOVERABLE_QUEUE_STATES),
+                WebhookEvent.updated_at <= stale_before,
+            )
+            .order_by(WebhookEvent.updated_at.asc(), WebhookEvent.id.asc())
+            .limit(limit)
+            .with_for_update(skip_locked=True)
+        )
+        events = result.scalars().all()
+        claimed = []
+        for event in events:
+            event.updated_at = current_time
+            claimed.append((str(event.id), str(event.tenant_id)))
+        await db.commit()
+    return claimed
+
+
+@celery_app.task(name="app.tasks.webhook_tasks.sweep_pending_webhook_deliveries")
+def sweep_pending_webhook_deliveries():
+    """Re-enqueue stale pending deliveries from the database-backed outbox."""
+    claimed = _run_async(_claim_stale_pending_webhook_deliveries())
+    queued = 0
+    for event_id, tenant_id in claimed:
+        try:
+            deliver_webhook_event.delay(event_id, tenant_id)
+        except Exception as exc:
+            # The row remains pending and is claimed again after the recovery
+            # lease. Never log broker details that could include credentials.
+            logger.warning(
+                "webhook_delivery_recovery_enqueue_failed",
+                event_id=event_id,
+                error_type=type(exc).__name__,
+            )
+        else:
+            queued += 1
+    return queued
 
 
 @celery_app.task(

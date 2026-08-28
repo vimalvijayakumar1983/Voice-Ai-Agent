@@ -92,6 +92,7 @@ Set these service variables with Railway references where shown:
 | API + worker | `INTEGRATION_ENCRYPTION_KEY` | One identical generated, sealed value on both services |
 | API + worker | `REGISTRATION_MODE` | `bootstrap` for first launch or `invite_only`; production rejects `open` |
 | API + worker | `BOOTSTRAP_OWNER_EMAIL` | Valid designated owner email, required only for `bootstrap` and never returned publicly |
+| API | `LEGACY_SESSION_MIGRATION_ENABLED` | `false` by default; temporarily `true` only for the planned pre-cookie session rollout window |
 | API + worker | `SMALLEST_API_KEY` | A sealed Smallest.ai API key |
 | API + worker | `SMALLEST_WEBHOOK_SECRET` | One identical generated, sealed webhook signing secret |
 | API + worker | `SMALLEST_WEBHOOK_ID` | The Smallest.ai webhook ID whose signing secret is configured above |
@@ -126,6 +127,14 @@ The public registration-policy response and login screen never expose the
 configured bootstrap address. Existing workspace invitations continue to work
 in every mode.
 
+Browser refresh credentials are write-only `HttpOnly` cookies scoped to
+`/api/v1/auth`; production uses `Secure` plus `SameSite=None`, while local HTTP
+development uses `SameSite=Lax`. Refresh and logout require an exact configured
+console `Origin`. `LEGACY_SESSION_MIGRATION_ENABLED` is a temporary one-release
+switch, disabled by default, that lets the console exchange a pre-cookie JSON
+refresh credential once at `/api/v1/auth/migrate-session`. Enable it only for a
+planned rollout window, then disable it after existing sessions have expired.
+
 Integration configs use a versioned Fernet envelope in PostgreSQL; JSONB retains only an integration-type allowlist. Webhooks expose controlled event names plus a constant redacted URL sentinel, while the entire destination host/path/query and all arbitrary provider fields remain encrypted. `INTEGRATION_ENCRYPTION_KEY` falls back to `SECRET_KEY` for compatibility, but production should set a dedicated high-entropy value shared by the API and worker. Decryption also tries `SECRET_KEY` after the dedicated key so fallback-encrypted rows can be rewrapped during a controlled transition. Existing plaintext or older-policy rows are converted by the backfill or on their first control-plane mutation. This release does not provide general online key rotation, arbitrary old-key rings, or an external vault: changing an established dedicated key before explicitly rewrapping every envelope makes those configs unavailable. Use a managed secrets service and a controlled rewrap procedure for rotation-sensitive production workloads.
 
 Roll out this migration in order: pause webhook queues, run `python -m alembic upgrade head`, deploy the worker, and then deploy the API. Before resuming queues, invoke `POST /api/v1/integrations/encryption/backfill` as an owner/admin for every tenant until each response reports `remaining: 0` (or run the same bounded `backfill_legacy_integration_configs` application service across all tenants). Do not consider the at-rest migration complete while null envelopes remain. A pre-envelope worker cannot hydrate credentials written by the new API, and the new model cannot query before the column exists. Downgrades refuse to drop non-empty encrypted envelopes instead of silently discarding the only complete credential copy.
@@ -138,10 +147,11 @@ canonical identity conflicts and duplicate active invitations without merging
 or discarding account history.
 
 Migration `20260827_008` changes refresh tokens from stateless JWTs to one-time,
-server-tracked session families. Refresh tokens issued by an older release do not
-contain the required `jti` and `family_id` claims, so users with only an old
-refresh token must sign in again after cutover (an unexpired access token remains
-usable until its normal expiry). The downgrade refuses to remove any session
+server-tracked session families. Refresh tokens issued before that database
+migration do not contain the required `jti` and `family_id` claims and cannot be
+migrated; those users must sign in again. Sessions created after migration 008
+but before the HttpOnly-cookie release can be preserved only when operators
+temporarily enable the migration bridge described above. The downgrade refuses to remove any session
 rows: a safe rollback requires stopping auth traffic, rotating `SECRET_KEY` to
 invalidate every previously signed access/refresh JWT (or waiting through the
 maximum token expiry), explicitly clearing the session ledger after backup, and
@@ -170,7 +180,7 @@ https://YOUR_API_DOMAIN/api/v1/webhooks/smallest
 
 Set `SMALLEST_WEBHOOK_ID` to that endpoint's provider ID and use its signing secret as `SMALLEST_WEBHOOK_SECRET`. Provisioning attaches every new agent to all three required events: `pre-conversation`, `post-conversation`, and `analytics-completed`. Before enabling traffic, manually attach the endpoint to any provider agents that predate this release and verify all three subscriptions in Agent Settings → Webhook. Smallest.ai does not retry failed deliveries, so this release persists callback work to a database outbox before acknowledging it. Never place the raw API key in a `NEXT_PUBLIC_*` variable.
 
-The live Waves voice endpoint combines standard and Lightning v3.1 Pro voices. The current Atoms agent API documents only `waves_lightning_v3_1`; therefore the console shows the full public catalog but enables only voices whose standard-pool pairing is documented on the canonical model card. Pro-only and otherwise unclassified voices remain visible but disabled until Smallest.ai documents an Atoms-compatible model pairing. This fail-closed behavior prevents wrong-voice or silent deployments.
+The live Waves voice endpoint combines Standard and Lightning v3.1 Pro voices. The console normalizes the full public catalog, labels the provider-verified pool, and checks one voice against every selected agent language before it can be saved or published. Standard and Pro voices can be previewed through a short, server-generated sample; provider-routed voices with an unknown pool remain selectable only when their Atoms synthesizer pairing is verified, but preview stays unavailable. Private clones remain visible only after a tenant-owned entitlement model is implemented. This fail-closed behavior prevents wrong-voice or silent deployments without pretending that every voice supports every language.
 
 For an ambiguous remote create, workspace owners and admins can only confirm that no remote agent exists before retrying. They cannot attach an arbitrary provider agent ID because all tenants share the server-side Smallest credential; any discovered remote resource requires offline reconciliation by a trusted platform operator.
 

@@ -29,6 +29,23 @@ def _validate_timezone(timezone: str) -> str:
     return normalized
 
 
+def validate_language_configuration(
+    language: str,
+    supported_languages: list[str],
+    switching_enabled: bool,
+    switching_mode: str,
+) -> None:
+    if language not in supported_languages:
+        raise ValueError("Primary language must be included in supported languages")
+    if switching_enabled != (switching_mode == "automatic"):
+        raise ValueError(
+            "Language switching mode must be automatic when switching is enabled, "
+            "and disabled when switching is disabled"
+        )
+    if switching_enabled and len(supported_languages) < 2:
+        raise ValueError("Automatic language switching requires at least two supported languages")
+
+
 class AgentCreate(BaseModel):
     name: str = Field(min_length=2, max_length=255)
     description: str | None = Field(None, max_length=2000)
@@ -41,6 +58,8 @@ class AgentCreate(BaseModel):
     voice_id: str = Field("", max_length=100)
     language: str = Field("en", min_length=2, max_length=63)
     supported_languages: list[str] = Field(default_factory=lambda: ["en"], min_length=1)
+    language_switching_enabled: bool | None = None
+    language_switching_mode: Literal["disabled", "automatic"] | None = None
     speech_rate: float = Field(1.0, ge=0.5, le=2)
     greeting_message: str | None = Field(None, max_length=500)
     fallback_message: str | None = Field(None, max_length=500)
@@ -65,10 +84,23 @@ class AgentCreate(BaseModel):
 
     @model_validator(mode="after")
     def validate_language_configuration(self):
-        if self.language not in self.supported_languages:
-            raise ValueError("Primary language must be included in supported languages")
-        if "ta" in self.supported_languages and len(self.supported_languages) > 1:
-            raise ValueError("Tamil cannot be combined with other supported languages")
+        if self.language_switching_enabled is None and self.language_switching_mode is None:
+            self.language_switching_enabled = len(self.supported_languages) > 1
+            self.language_switching_mode = (
+                "automatic" if self.language_switching_enabled else "disabled"
+            )
+        elif self.language_switching_enabled is None:
+            self.language_switching_enabled = self.language_switching_mode == "automatic"
+        elif self.language_switching_mode is None:
+            self.language_switching_mode = (
+                "automatic" if self.language_switching_enabled else "disabled"
+            )
+        validate_language_configuration(
+            self.language,
+            self.supported_languages,
+            self.language_switching_enabled,
+            self.language_switching_mode,
+        )
         return self
 
 
@@ -84,6 +116,8 @@ class AgentUpdate(BaseModel):
     voice_id: str | None = Field(None, max_length=100)
     language: str | None = Field(None, min_length=2, max_length=63)
     supported_languages: list[str] | None = Field(None, min_length=1)
+    language_switching_enabled: bool | None = None
+    language_switching_mode: Literal["disabled", "automatic"] | None = None
     speech_rate: float | None = Field(None, ge=0.5, le=2)
     greeting_message: str | None = Field(None, max_length=500)
     fallback_message: str | None = Field(None, max_length=500)
@@ -120,6 +154,8 @@ class AgentUpdate(BaseModel):
             "voice_id",
             "language",
             "supported_languages",
+            "language_switching_enabled",
+            "language_switching_mode",
             "speech_rate",
             "max_call_duration_seconds",
             "is_active",
@@ -148,6 +184,8 @@ class AgentResponse(BaseModel):
     voice_id: str
     language: str
     supported_languages: list[str]
+    language_switching_enabled: bool
+    language_switching_mode: Literal["disabled", "automatic"]
     speech_rate: float
     greeting_message: str | None
     fallback_message: str | None
@@ -186,6 +224,18 @@ class SmallestSessionResponse(BaseModel):
     sample_rate: int = 24000
 
 
+class VoicePreviewRequest(BaseModel):
+    voice_id: str = Field(min_length=1, max_length=100)
+    language: str | None = Field(None, min_length=2, max_length=63)
+
+    model_config = {"extra": "forbid"}
+
+    @field_validator("language")
+    @classmethod
+    def normalize_language(cls, value: str | None) -> str | None:
+        return _normalize_language(value) if value is not None else None
+
+
 class SmallestProviderResolution(BaseModel):
     action: Literal[
         "confirm_create_absent",
@@ -216,6 +266,7 @@ class VoiceCatalogItem(BaseModel):
     use_cases: list[str] = Field(default_factory=list)
     synthesizer_model: str | None = None
     unavailability_reason: str | None = None
+    voice_pool: Literal["standard", "pro", "cloned", "unknown"] = "unknown"
     source: str = "catalog"
 
 
@@ -239,12 +290,19 @@ class AgentTemplate(BaseModel):
     timezone: str = "Asia/Dubai"
 
 
+class ProviderFieldCapability(BaseModel):
+    status: Literal["synced", "create_only", "local_only"]
+    provider_field: str | None = None
+    reason: str | None = None
+
+
 class AgentProviderCatalog(BaseModel):
     provider: str = "smallest"
     voice_model: str = "waves_lightning_v3_1"
     voices: list[VoiceCatalogItem]
     languages: list[LanguageCatalogItem]
     templates: list[AgentTemplate]
+    field_capabilities: dict[str, ProviderFieldCapability] = Field(default_factory=dict)
 
 
 class KnowledgeBaseCreate(BaseModel):

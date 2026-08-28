@@ -1,9 +1,10 @@
 """Agent builder endpoints - CRUD for AI voice agents."""
 
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -24,29 +25,118 @@ from app.schemas.agent import (
     SmallestProviderResolution,
     SmallestSessionRequest,
     SmallestSessionResponse,
+    VoicePreviewRequest,
+    validate_language_configuration,
 )
 from app.services.agent_catalog import (
     AGENT_TEMPLATES,
-    PRO_VOICE_IDS,
+    LanguageCompatibilityStatus,
+    VoiceModelPool,
     language_catalog,
     normalize_voices,
-    unsupported_voice_languages,
-    voice_synthesizer_model,
+    voice_language_compatibility,
+)
+from app.services.agent_catalog_cache import (
+    PUBLIC_CATALOG_CACHE_KEY,
+    public_agent_catalog_cache,
 )
 from app.services.audit import record_audit_event
+from app.services.rate_limit import enforce_rate_limit
 
 router = APIRouter(prefix="/agents", tags=["Agents"])
 
 SMALLEST_SYNC_FIELDS = {
-    "name",
     "system_prompt",
     "greeting_message",
     "model_name",
     "voice_id",
     "language",
     "supported_languages",
+    "language_switching_enabled",
+    "language_switching_mode",
     "speech_rate",
     "timezone",
+    "max_call_duration_seconds",
+}
+
+VOICE_PREFLIGHT_FIELDS = {
+    "voice_id",
+    "language",
+    "supported_languages",
+}
+
+VOICE_CONFIGURATION_FIELDS = VOICE_PREFLIGHT_FIELDS | {
+    "language_switching_enabled",
+    "language_switching_mode",
+}
+
+PROVIDER_FIELD_CAPABILITIES = {
+    "is_active": {
+        "status": "local_only",
+        "reason": "Activation in this app gates new calls but does not archive the provider agent.",
+    },
+    "name": {
+        "status": "create_only",
+        "provider_field": "name",
+        "reason": "Smallest agent metadata is set during initial provisioning.",
+    },
+    "description": {
+        "status": "create_only",
+        "provider_field": "description",
+        "reason": "Smallest agent metadata is set during initial provisioning.",
+    },
+    "system_prompt": {"status": "synced", "provider_field": "globalPrompt"},
+    "greeting_message": {"status": "synced", "provider_field": "firstMessage"},
+    "model_name": {"status": "synced", "provider_field": "slmModel"},
+    "model_provider": {
+        "status": "local_only",
+        "reason": "This deployment currently supports only the Smallest Electron runtime.",
+    },
+    "voice_id": {"status": "synced", "provider_field": "synthesizer.voiceConfig.voiceId"},
+    "voice_provider": {
+        "status": "local_only",
+        "reason": "This deployment currently supports only Smallest speech synthesis.",
+    },
+    "language": {"status": "synced", "provider_field": "language.default"},
+    "supported_languages": {"status": "synced", "provider_field": "language.supported"},
+    "language_switching_enabled": {
+        "status": "synced",
+        "provider_field": "language.switching.isEnabled",
+    },
+    "language_switching_mode": {
+        "status": "synced",
+        "provider_field": "language.switching.isEnabled",
+    },
+    "speech_rate": {"status": "synced", "provider_field": "synthesizer.speed"},
+    "timezone": {
+        "status": "synced",
+        "provider_field": "timezone",
+        "reason": (
+            "The draft API accepts the IANA identifier, but the provider read API returns only "
+            "an offset object, so identity is verified by write acknowledgement rather than "
+            "strict round trip."
+        ),
+    },
+    "max_call_duration_seconds": {
+        "status": "synced",
+        "provider_field": "sessionTimeoutConfig.timeoutTimeInSecs",
+    },
+    "temperature": {
+        "status": "local_only",
+        "reason": "The current Smallest Electron draft contract has no temperature field.",
+    },
+    "max_tokens": {
+        "status": "local_only",
+        "reason": "The current Smallest draft contract has no output-token limit field.",
+    },
+    "fallback_message": {
+        "status": "local_only",
+        "reason": "Fallback behavior requires a provider workflow/tool runtime.",
+    },
+    "transfer_number": {
+        "status": "local_only",
+        "reason": "Transfers require a configured Smallest transfer tool.",
+    },
 }
 
 UNRESOLVED_PROVIDER_STATES = frozenset(
@@ -70,6 +160,34 @@ TERMINAL_CALL_STATUSES = frozenset(
     {"completed", "failed", "busy", "no_answer", "canceled", "cancelled"}
 )
 TERMINAL_CAMPAIGN_ATTEMPT_STATES = frozenset({"completed", "failed", "rejected", "cancelled"})
+
+
+@dataclass(frozen=True)
+class VoiceResolution:
+    requested_voice_id: str
+    resolved_voice_id: str
+    synthesizer_model: str
+    source: str
+
+
+async def _public_voice_catalog(client) -> list[dict]:
+    """Load a normalized public catalog with a short transient-failure fallback."""
+    try:
+        provider_voices = await client.list_voices()
+    except SmallestAIError as exc:
+        provider_auth_failure = exc.upstream_status_code in {401, 403}
+        transient = exc.status_code == 429 or exc.status_code >= 500
+        if client.is_configured and transient and not provider_auth_failure:
+            cached = public_agent_catalog_cache.get(PUBLIC_CATALOG_CACHE_KEY)
+            if cached is not None:
+                return cached
+        raise
+
+    normalized = normalize_voices(provider_voices, [])
+    if public_agent_catalog_cache.remember(PUBLIC_CATALOG_CACHE_KEY, normalized):
+        return normalized
+    cached = public_agent_catalog_cache.get(PUBLIC_CATALOG_CACHE_KEY)
+    return cached if cached is not None else normalized
 
 
 def _provider_config(agent: Agent) -> dict:
@@ -190,18 +308,70 @@ def _revision_label(revision: dict | None) -> str | None:
     return str(label) if label is not None else None
 
 
-def _publish_kwargs(agent: Agent, voice_model: str | None) -> dict:
+def _publish_kwargs(agent: Agent, voice: VoiceResolution) -> dict:
     return {
         "global_prompt": agent.system_prompt,
         "first_message": agent.greeting_message,
         "slm_model": agent.model_name,
         "language": agent.language,
         "supported_languages": list(agent.supported_languages),
+        "language_switching_enabled": agent.language_switching_enabled,
+        "language_switching_mode": agent.language_switching_mode,
         "timezone": agent.timezone,
-        "voice_id": agent.voice_id,
+        "voice_id": voice.resolved_voice_id,
         "speech_rate": agent.speech_rate,
-        "synthesizer_model": voice_model,
+        "synthesizer_model": voice.synthesizer_model,
+        "max_call_duration_seconds": agent.max_call_duration_seconds,
     }
+
+
+def _voice_configuration_snapshot(agent: Agent) -> tuple:
+    return (
+        agent.voice_id,
+        agent.language,
+        tuple(agent.supported_languages),
+        agent.language_switching_enabled,
+        agent.language_switching_mode,
+        agent.speech_rate,
+        agent.max_call_duration_seconds,
+    )
+
+
+def _comparable_agent_field_value(field: str, value):
+    """Return an immutable representation for an authoritative update diff."""
+    if field == "supported_languages":
+        return tuple(value)
+    return value
+
+
+def _effective_agent_changes(agent: Agent, changes: dict) -> dict:
+    """Drop normalized PATCH values that already match the locked database row."""
+    return {
+        field: value
+        for field, value in changes.items()
+        if _comparable_agent_field_value(field, getattr(agent, field))
+        != _comparable_agent_field_value(field, value)
+    }
+
+
+def _agent_fields_snapshot(agent: Agent, fields: set[str]) -> dict:
+    return {field: _comparable_agent_field_value(field, getattr(agent, field)) for field in fields}
+
+
+def _stored_voice_resolution(agent: Agent) -> VoiceResolution | None:
+    config = _provider_config(agent)
+    resolved_voice_id = config.get("resolved_voice_id")
+    model = config.get("voice_model")
+    if not isinstance(resolved_voice_id, str) or not resolved_voice_id:
+        return None
+    if not isinstance(model, str) or not model:
+        return None
+    return VoiceResolution(
+        requested_voice_id=agent.voice_id,
+        resolved_voice_id=resolved_voice_id,
+        synthesizer_model=model,
+        source=str(config.get("voice_resolution_source") or "stored"),
+    )
 
 
 async def _tenant_agent(
@@ -225,20 +395,20 @@ async def _require_public_voice(
     client,
     voice_id: str,
     selected_languages: list[str],
-) -> str | None:
-    """Reject private/cloned voice IDs until tenant entitlements exist."""
-    if not voice_id:
-        return None
+) -> VoiceResolution:
+    """Resolve one public voice proven to support every selected language.
+
+    A blank local voice is an app-managed platform default. It is resolved to
+    an explicit compatible provider voice so clearing a previous custom voice
+    cannot leave stale synthesizer configuration in Smallest's merged draft.
+    """
     try:
-        provider_voices = await client.list_voices()
+        normalized_voices = await _public_voice_catalog(client)
     except SmallestAIError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
-    public_voice_ids = {
-        str(voice.get("voiceId") or voice.get("id"))
-        for voice in provider_voices
-        if voice.get("voiceId") or voice.get("id")
-    }
-    if voice_id not in public_voice_ids:
+    by_id = {str(voice["id"]): voice for voice in normalized_voices}
+    selected_voice = by_id.get(voice_id) if voice_id else None
+    if voice_id and selected_voice is None:
         raise HTTPException(
             status_code=422,
             detail=(
@@ -246,32 +416,178 @@ async def _require_public_voice(
                 "Private voice clones require a tenant-owned entitlement."
             ),
         )
-    unsupported = unsupported_voice_languages(provider_voices, voice_id, selected_languages)
-    if unsupported:
+
+    if not voice_id:
+        candidates = [
+            voice
+            for voice in normalized_voices
+            if voice_language_compatibility(
+                normalized_voices,
+                str(voice.get("id") or ""),
+                selected_languages,
+            )[0]
+            == LanguageCompatibilityStatus.COMPATIBLE
+            and voice.get("synthesizer_model")
+        ]
+        if not candidates:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "No public Smallest.ai voice has verified support for every selected "
+                    "language. Choose a compatible voice or split this into language-specific "
+                    "agents."
+                ),
+            )
+        selected_voice = min(
+            candidates,
+            key=lambda voice: (
+                str(voice.get("id")) != "nyah",
+                str(voice.get("name") or voice.get("id")).casefold(),
+                str(voice.get("id")),
+            ),
+        )
+
+    assert selected_voice is not None
+    compatibility, unsupported = voice_language_compatibility(
+        normalized_voices,
+        str(selected_voice["id"]),
+        selected_languages,
+    )
+    if compatibility == LanguageCompatibilityStatus.UNKNOWN:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Smallest.ai does not declare language coverage for the selected voice. "
+                "Choose a voice with verified language metadata."
+            ),
+        )
+    if compatibility != LanguageCompatibilityStatus.COMPATIBLE:
         raise HTTPException(
             status_code=422,
             detail=(
                 "Selected voice does not support these agent languages: " + ", ".join(unsupported)
             ),
         )
-    selected_voice = next(
-        voice
-        for voice in provider_voices
-        if str(voice.get("voiceId") or voice.get("id")) == voice_id
-    )
-    voice_model = voice_synthesizer_model(selected_voice)
-    if not voice_model:
-        is_pro_voice = voice_id.strip().casefold() in PRO_VOICE_IDS
+    voice_model = selected_voice.get("synthesizer_model")
+    if not isinstance(voice_model, str) or not voice_model:
         raise HTTPException(
             status_code=422,
-            detail=(
-                "Selected Pro voice is catalog-visible but Smallest.ai has not documented an "
-                "Atoms-compatible synthesizer model"
-                if is_pro_voice
-                else "Selected voice has no compatible Smallest.ai synthesizer model"
-            ),
+            detail="Selected voice has no verified Smallest.ai Atoms synthesizer model",
         )
-    return voice_model
+    return VoiceResolution(
+        requested_voice_id=voice_id,
+        resolved_voice_id=str(selected_voice["id"]),
+        synthesizer_model=voice_model,
+        source="operator" if voice_id else "platform_default",
+    )
+
+
+_MISSING = object()
+
+
+def _first_present(mapping: dict, *keys: str):
+    for key in keys:
+        if key in mapping:
+            return mapping[key]
+    return _MISSING
+
+
+def _provider_configuration_mismatches(
+    provider_agent: dict,
+    expected: dict,
+) -> list[str]:
+    """Compare documented resolved fields without storing prompt contents."""
+    resolved = provider_agent.get("_resolvedConfig")
+    if not isinstance(resolved, dict):
+        return ["_resolvedConfig"]
+
+    mismatches: list[str] = []
+
+    def compare(field: str, actual, expected_value) -> None:
+        if actual is _MISSING or actual != expected_value:
+            mismatches.append(field)
+
+    compare(
+        "system_prompt",
+        _first_present(resolved, "globalPrompt", "prompt"),
+        expected["global_prompt"],
+    )
+    compare(
+        "greeting_message",
+        _first_present(resolved, "firstMessage"),
+        expected["first_message"] or "",
+    )
+    compare(
+        "model_name",
+        _first_present(resolved, "modelName", "slmModel"),
+        expected["slm_model"],
+    )
+    language = provider_agent.get("language")
+    top_language = language if isinstance(language, dict) else {}
+    compare(
+        "language",
+        _first_present(resolved, "defaultLanguage")
+        if "defaultLanguage" in resolved
+        else _first_present(top_language, "default"),
+        expected["language"],
+    )
+    actual_languages = (
+        _first_present(resolved, "supportedLanguages")
+        if "supportedLanguages" in resolved
+        else _first_present(top_language, "supported")
+    )
+    if actual_languages is _MISSING or not isinstance(actual_languages, list):
+        mismatches.append("supported_languages")
+    elif list(dict.fromkeys(actual_languages)) != expected["supported_languages"]:
+        mismatches.append("supported_languages")
+
+    switching = _first_present(resolved, "languageSwitching")
+    if switching is _MISSING:
+        switching = top_language.get("switching", _MISSING)
+    actual_switching = (
+        switching.get("isEnabled", _MISSING) if isinstance(switching, dict) else _MISSING
+    )
+    compare(
+        "language_switching_enabled",
+        actual_switching,
+        expected["language_switching_enabled"],
+    )
+
+    synthesizer = resolved.get("synthesizer")
+    if not isinstance(synthesizer, dict):
+        synthesizer = provider_agent.get("synthesizer")
+    voice_config = synthesizer.get("voiceConfig") if isinstance(synthesizer, dict) else None
+    compare(
+        "voice_id",
+        voice_config.get("voiceId", _MISSING) if isinstance(voice_config, dict) else _MISSING,
+        expected["voice_id"],
+    )
+    compare(
+        "synthesizer_model",
+        voice_config.get("model", _MISSING) if isinstance(voice_config, dict) else _MISSING,
+        expected["synthesizer_model"],
+    )
+    actual_speed = synthesizer.get("speed", _MISSING) if isinstance(synthesizer, dict) else _MISSING
+    if actual_speed is _MISSING:
+        mismatches.append("speech_rate")
+    else:
+        try:
+            if abs(float(actual_speed) - float(expected["speech_rate"])) > 0.001:
+                mismatches.append("speech_rate")
+        except (TypeError, ValueError):
+            mismatches.append("speech_rate")
+
+    session_timeout = resolved.get("sessionTimeoutConfig")
+    if not isinstance(session_timeout, dict):
+        session_timeout = provider_agent.get("sessionTimeoutConfig")
+    compare(
+        "max_call_duration_seconds",
+        session_timeout.get("timeoutTimeInSecs", _MISSING)
+        if isinstance(session_timeout, dict)
+        else _MISSING,
+        expected["max_call_duration_seconds"],
+    )
+    return mismatches
 
 
 async def _mark_publish_failure(
@@ -536,6 +852,60 @@ async def _reconcile_smallest_publish(
         return agent
 
     revision_status, security_status = _revision_lifecycle(revision)
+    configuration_mismatches: list[str] = []
+    published_configuration_mismatches: list[str] = []
+    active_configuration_mismatches: list[str] = []
+    if revision_status == "published" and security_status == "passed":
+        agent = await _tenant_agent(db, agent_id, tenant_id, for_update=True)
+        if not _publish_reconciliation_is_current(agent, operation_id):
+            return agent
+        voice = _stored_voice_resolution(agent)
+        if voice is None:
+            configuration_mismatches = ["voice_resolution"]
+        else:
+            expected_configuration = _publish_kwargs(agent, voice)
+            await db.commit()
+            try:
+                published_provider_agent = await client.get_agent(
+                    provider_agent_id,
+                    version_id=latest_revision_id,
+                )
+                active_provider_agent = await client.get_agent(provider_agent_id)
+            except SmallestAIError as exc:
+                agent = await _tenant_agent(db, agent_id, tenant_id, for_update=True)
+                if not _publish_reconciliation_is_current(agent, operation_id):
+                    return agent
+                agent.provider_revision_id = latest_revision_id
+                agent.sync_status = "provider_scanning"
+                _set_provider_operation(
+                    agent,
+                    "publish",
+                    phase="provider_config_verification",
+                    lease_expires_at=None,
+                    revision_id=latest_revision_id,
+                    revision_status=revision_status,
+                    security_status=security_status,
+                    last_error=str(exc),
+                    last_checked_at=datetime.now(UTC).isoformat(),
+                )
+                await db.commit()
+                raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+            published_configuration_mismatches = _provider_configuration_mismatches(
+                published_provider_agent,
+                expected_configuration,
+            )
+            if published_provider_agent.get("_configSource") != "version":
+                published_configuration_mismatches.append("configuration_source")
+            active_configuration_mismatches = _provider_configuration_mismatches(
+                active_provider_agent,
+                expected_configuration,
+            )
+            if active_provider_agent.get("_configSource") != "active":
+                active_configuration_mismatches.append("configuration_source")
+            configuration_mismatches = sorted(
+                {*published_configuration_mismatches, *active_configuration_mismatches}
+            )
+
     agent = await _tenant_agent(db, agent_id, tenant_id, for_update=True)
     if not _publish_reconciliation_is_current(agent, operation_id):
         return agent
@@ -547,6 +917,13 @@ async def _reconcile_smallest_publish(
             "Smallest.ai rejected the revision "
             f"(revision state: {revision_status}; security state: {security_status}). "
             "Review the provider revision and security result, correct the issue, then sync again."
+        )
+    elif configuration_mismatches:
+        agent.sync_status = "error"
+        phase = "provider_config_mismatch"
+        last_error = (
+            "Smallest.ai published a revision whose resolved configuration differs from "
+            "the requested draft. Mismatched fields: " + ", ".join(configuration_mismatches)
         )
     elif revision_status == "published" and security_status == "passed":
         agent.sync_status = "synced"
@@ -565,6 +942,9 @@ async def _reconcile_smallest_publish(
         revision_id=latest_revision_id,
         revision_status=revision_status,
         security_status=security_status,
+        configuration_mismatches=configuration_mismatches,
+        published_configuration_mismatches=published_configuration_mismatches,
+        active_configuration_mismatches=active_configuration_mismatches,
         last_error=last_error,
         last_checked_at=datetime.now(UTC).isoformat(),
     )
@@ -579,7 +959,7 @@ async def _publish_smallest_agent(
     tenant_id: UUID,
     client,
     label: str,
-    voice_model: str | None,
+    voice: VoiceResolution,
 ) -> Agent:
     """Update a draft, publish once, then reconcile the resulting revision."""
     operation_id = str(uuid4())
@@ -588,7 +968,10 @@ async def _publish_smallest_agent(
     agent = await _tenant_agent(db, agent_id, tenant_id, for_update=True)
     agent.sync_status = "publishing"
     config = _provider_config(agent)
-    config["voice_model"] = voice_model
+    config["requested_voice_id"] = voice.requested_voice_id
+    config["resolved_voice_id"] = voice.resolved_voice_id
+    config["voice_model"] = voice.synthesizer_model
+    config["voice_resolution_source"] = voice.source
     agent.provider_config = config
     _replace_provider_operation(
         agent,
@@ -629,7 +1012,7 @@ async def _publish_smallest_agent(
     if operation.get("id") != operation_id or agent.sync_status != "publishing":
         raise HTTPException(status_code=409, detail="Provider operation was superseded")
     agent.provider_branch_id = branch_id
-    snapshot = _publish_kwargs(agent, voice_model)
+    snapshot = _publish_kwargs(agent, voice)
     _set_provider_operation(
         agent,
         "publish",
@@ -754,6 +1137,12 @@ async def create_agent(
     current_user: CurrentUser = Depends(require_role("owner", "admin", "member")),
     db: AsyncSession = Depends(get_db),
 ):
+    if data.voice_id:
+        await _require_public_voice(
+            get_smallest_client(),
+            data.voice_id,
+            list(data.supported_languages),
+        )
     agent = Agent(tenant_id=current_user.tenant_id, **data.model_dump())
     db.add(agent)
     await db.flush()
@@ -783,7 +1172,7 @@ async def get_provider_catalog(
     """Return the current Waves voice catalog and local agent templates."""
     client = get_smallest_client()
     try:
-        provider_voices = await client.list_voices()
+        voices = await _public_voice_catalog(client)
     except SmallestAIError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
     except Exception as exc:
@@ -793,11 +1182,98 @@ async def get_provider_catalog(
 
     # The provider account is shared across tenants. Private clones must not be
     # listed or selectable until a tenant-owned entitlement mapping exists.
-    voices = normalize_voices(provider_voices, [])
     return AgentProviderCatalog(
         voices=voices,
         languages=language_catalog(voices),
         templates=AGENT_TEMPLATES,
+        field_capabilities=PROVIDER_FIELD_CAPABILITIES,
+    )
+
+
+@router.post(
+    "/provider/voice-preview",
+    response_class=Response,
+    responses={
+        200: {
+            "description": "Short server-generated voice preview",
+            "content": {"audio/wav": {}},
+        }
+    },
+)
+async def preview_provider_voice(
+    data: VoicePreviewRequest,
+    request: Request,
+    current_user: CurrentUser = Depends(require_role("owner", "admin", "member")),
+):
+    """Proxy one bounded provider-owned phrase without exposing the server API key."""
+    await enforce_rate_limit(
+        request,
+        scope="voice-preview",
+        limit=20,
+        window_seconds=60,
+        subject=str(current_user.id),
+        bind_to_client=False,
+    )
+    client = get_smallest_client()
+    try:
+        voices = await _public_voice_catalog(client)
+    except SmallestAIError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+    voice = next((item for item in voices if item.get("id") == data.voice_id), None)
+    if voice is None:
+        raise HTTPException(status_code=422, detail="Voice is not in the public catalog")
+    if not voice.get("synthesizer_model"):
+        raise HTTPException(status_code=422, detail="Voice is not available for preview")
+
+    advertised_languages = voice.get("languages") or []
+    preview_language = data.language or (
+        str(advertised_languages[0]) if advertised_languages else None
+    )
+    if not preview_language:
+        raise HTTPException(
+            status_code=422,
+            detail="Voice preview language could not be verified from provider metadata",
+        )
+    preview_compatibility, preview_unsupported = voice_language_compatibility(
+        voices,
+        data.voice_id,
+        [preview_language],
+    )
+    if preview_compatibility != LanguageCompatibilityStatus.COMPATIBLE:
+        detail = "Voice does not support the requested preview language"
+        if preview_unsupported:
+            detail += ": " + ", ".join(preview_unsupported)
+        raise HTTPException(status_code=422, detail=detail)
+
+    pool = voice.get("_model_pool")
+    direct_model = {
+        VoiceModelPool.STANDARD: "lightning_v3.1",
+        VoiceModelPool.PRO: "lightning_v3.1_pro",
+    }.get(pool)
+    if not direct_model:
+        # Atoms can route newly-added public voices from the voice ID alone,
+        # while direct Waves TTS requires an explicit Standard/Pro model token.
+        raise HTTPException(
+            status_code=422,
+            detail="Voice preview pool could not be verified from provider metadata",
+        )
+
+    try:
+        audio = await client.synthesize_voice_preview(
+            voice_id=data.voice_id,
+            model=direct_model,
+            language=preview_language,
+        )
+    except SmallestAIError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    return Response(
+        content=audio,
+        media_type="audio/wav",
+        headers={
+            "Cache-Control": "private, no-store",
+            "X-Content-Type-Options": "nosniff",
+        },
     )
 
 
@@ -826,15 +1302,15 @@ async def provision_smallest_agent(
         )
 
     client = get_smallest_client()
-    voice_selection = (agent.voice_id, tuple(agent.supported_languages))
+    voice_selection = _voice_configuration_snapshot(agent)
     # Never retain a row lock while waiting on the provider catalog. A second
     # provisioner can race here, so re-lock and revalidate before recording the
     # durable create lease.
     await db.commit()
-    voice_model = await _require_public_voice(
+    voice = await _require_public_voice(
         client,
-        voice_selection[0],
-        list(voice_selection[1]),
+        agent.voice_id,
+        list(agent.supported_languages),
     )
     agent = await _tenant_agent(db, agent_id, current_user.tenant_id, for_update=True)
     if agent.provider_agent_id:
@@ -844,7 +1320,7 @@ async def provision_smallest_agent(
             status_code=409,
             detail="Agent has an unresolved provider operation and cannot be provisioned again",
         )
-    if (agent.voice_id, tuple(agent.supported_languages)) != voice_selection:
+    if _voice_configuration_snapshot(agent) != voice_selection:
         raise HTTPException(
             status_code=409,
             detail=(
@@ -917,7 +1393,7 @@ async def provision_smallest_agent(
         tenant_id=current_user.tenant_id,
         client=client,
         label=f"VAV Voice AI initial release {datetime.now(UTC).date().isoformat()}",
-        voice_model=voice_model,
+        voice=voice,
     )
     return AgentResponse.model_validate(agent)
 
@@ -959,14 +1435,14 @@ async def sync_smallest_agent(
             status_code=503,
             detail="SMALLEST_WEBHOOK_ID must be configured before publishing agents",
         )
-    voice_selection = (agent.voice_id, tuple(agent.supported_languages))
+    voice_selection = _voice_configuration_snapshot(agent)
     # Release the row lock around the provider catalog read, then re-lock and
     # prove no competing provider operation or voice edit superseded this sync.
     await db.commit()
-    voice_model = await _require_public_voice(
+    voice = await _require_public_voice(
         client,
-        voice_selection[0],
-        list(voice_selection[1]),
+        agent.voice_id,
+        list(agent.supported_languages),
     )
     agent = await _tenant_agent(db, agent_id, current_user.tenant_id, for_update=True)
     if agent.sync_status in UNRESOLVED_PROVIDER_STATES:
@@ -975,7 +1451,7 @@ async def sync_smallest_agent(
         raise HTTPException(status_code=409, detail="Agent is already in sync")
     if not agent.provider_agent_id:
         raise HTTPException(status_code=409, detail="Provider mapping is incomplete")
-    if (agent.voice_id, tuple(agent.supported_languages)) != voice_selection:
+    if _voice_configuration_snapshot(agent) != voice_selection:
         raise HTTPException(
             status_code=409,
             detail="Agent voice configuration changed during provider validation; retry sync",
@@ -986,7 +1462,7 @@ async def sync_smallest_agent(
         tenant_id=current_user.tenant_id,
         client=client,
         label=f"VAV Voice AI sync {datetime.now(UTC).date().isoformat()}",
-        voice_model=voice_model,
+        voice=voice,
     )
     return AgentResponse.model_validate(agent)
 
@@ -1130,10 +1606,10 @@ async def create_smallest_browser_session(
         raise HTTPException(status_code=409, detail="Agent is inactive")
     if not agent.provider_agent_id:
         raise HTTPException(status_code=409, detail="Provision this agent on Smallest.ai first")
-    if not agent.provider_revision_id or not agent.last_synced_at:
+    if agent.sync_status != "synced" or not agent.provider_revision_id or not agent.last_synced_at:
         raise HTTPException(
             status_code=409,
-            detail="Agent cannot take calls until its initial provider revision is published",
+            detail="Agent cannot take calls until its current provider revision is fully synced",
         )
     try:
         session = await get_smallest_client().create_browser_session(
@@ -1184,21 +1660,69 @@ async def update_agent(
     changes = data.model_dump(exclude_unset=True)
     language = changes.get("language", agent.language)
     supported_languages = changes.get("supported_languages", agent.supported_languages)
-    if language not in supported_languages:
-        raise HTTPException(
-            status_code=422,
-            detail="Primary language must be included in supported languages",
+    if "language_switching_enabled" in changes and "language_switching_mode" not in changes:
+        changes["language_switching_mode"] = (
+            "automatic" if changes["language_switching_enabled"] else "disabled"
         )
-    if "ta" in supported_languages and len(supported_languages) > 1:
-        raise HTTPException(
-            status_code=422,
-            detail="Tamil cannot be combined with other supported languages",
-        )
+    elif "language_switching_mode" in changes and "language_switching_enabled" not in changes:
+        changes["language_switching_enabled"] = changes["language_switching_mode"] == "automatic"
+    elif (
+        "supported_languages" in changes
+        and len(supported_languages) == 1
+        and agent.language_switching_enabled
+        and "language_switching_enabled" not in changes
+    ):
+        # Shrinking an automatic agent to one language must not leave an
+        # impossible switching policy behind.
+        changes["language_switching_enabled"] = False
+        changes["language_switching_mode"] = "disabled"
 
-    for key, value in changes.items():
+    switching_enabled = changes.get(
+        "language_switching_enabled",
+        agent.language_switching_enabled,
+    )
+    switching_mode = changes.get("language_switching_mode", agent.language_switching_mode)
+    try:
+        validate_language_configuration(
+            language,
+            supported_languages,
+            switching_enabled,
+            switching_mode,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    # AgentUpdate has already normalized language values. The database row is
+    # authoritative, so a full editor payload must behave like a semantic PATCH:
+    # unchanged values neither trigger provider I/O nor dirty a published agent.
+    effective_changes = _effective_agent_changes(agent, changes)
+    resulting_voice_id = effective_changes.get("voice_id", agent.voice_id)
+    voice_inputs_changed = bool(VOICE_PREFLIGHT_FIELDS.intersection(effective_changes))
+    if resulting_voice_id and voice_inputs_changed:
+        baseline_fields = set(effective_changes) | VOICE_CONFIGURATION_FIELDS
+        baseline = _agent_fields_snapshot(agent, baseline_fields)
+        await db.rollback()
+        await _require_public_voice(
+            get_smallest_client(),
+            resulting_voice_id,
+            list(supported_languages),
+        )
+        agent = await _tenant_agent(db, agent_id, current_user.tenant_id, for_update=True)
+        if agent.sync_status in UNRESOLVED_PROVIDER_STATES:
+            raise HTTPException(
+                status_code=409,
+                detail="Agent cannot be edited while its provider operation is unresolved",
+            )
+        if _agent_fields_snapshot(agent, baseline_fields) != baseline:
+            raise HTTPException(
+                status_code=409,
+                detail="Agent configuration changed during voice validation; retry the edit",
+            )
+
+    for key, value in effective_changes.items():
         setattr(agent, key, value)
 
-    if agent.provider_agent_id and SMALLEST_SYNC_FIELDS.intersection(changes):
+    if agent.provider_agent_id and SMALLEST_SYNC_FIELDS.intersection(effective_changes):
         agent.sync_status = "dirty"
 
     await db.flush()

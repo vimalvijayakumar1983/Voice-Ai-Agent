@@ -7,6 +7,7 @@ on:
     branches:
       - main
       - claude/mvp-multitenant-saas-0D7dQ
+      - codex/smallest-ai-platform
 
 permissions:
   contents: read

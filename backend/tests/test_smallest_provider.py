@@ -3,7 +3,7 @@ import json
 import httpx
 import pytest
 
-from app.providers.smallest import SmallestAIClient, SmallestAIError
+from app.providers.smallest import VOICE_PREVIEW_TEXTS, SmallestAIClient, SmallestAIError
 
 
 @pytest.mark.asyncio
@@ -73,6 +73,34 @@ async def test_outbound_call_uses_production_endpoint_and_scalar_variables():
 
 
 @pytest.mark.asyncio
+async def test_recording_download_url_uses_conversation_call_id_contract():
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        captured["authorization"] = request.headers.get("authorization")
+        return httpx.Response(
+            200,
+            json={
+                "status": True,
+                "data": {
+                    "presignedUrl": "https://recordings.s3.amazonaws.com/call.mp3?signature=test"
+                },
+            },
+        )
+
+    client = SmallestAIClient(api_key="sk_test", transport=httpx.MockTransport(handler))
+
+    url = await client.get_recording_download_url(call_id="CALL-123")
+
+    assert captured == {
+        "path": "/atoms/v1/conversation/CALL-123/recording/download-url",
+        "authorization": "Bearer sk_test",
+    }
+    assert url.startswith("https://recordings.s3.amazonaws.com/")
+
+
+@pytest.mark.asyncio
 async def test_missing_api_key_is_a_service_configuration_error():
     client = SmallestAIClient(api_key="")
     with pytest.raises(SmallestAIError) as error:
@@ -118,6 +146,8 @@ async def test_versioned_draft_contains_runtime_configuration():
         slm_model="electron",
         language="en",
         supported_languages=["en", "hi"],
+        language_switching_enabled=True,
+        language_switching_mode="automatic",
         timezone="Asia/Dubai",
         voice_id="nyah",
         speech_rate=1.1,
@@ -126,13 +156,15 @@ async def test_versioned_draft_contains_runtime_configuration():
 
     assert captured["globalPrompt"] == "Be concise and helpful."
     assert captured["slmModel"] == "electron"
-    assert captured["language"] == {"default": "en", "supported": ["en", "hi"]}
+    assert captured["language"] == {
+        "default": "en",
+        "supported": ["en", "hi"],
+        "switching": {"isEnabled": True},
+    }
     assert captured["synthesizer"]["voiceConfig"]["voiceId"] == "nyah"
     assert captured["synthesizer"]["voiceConfig"]["model"] == "waves_lightning_v3_1"
-    assert captured["timezone"] == {
-        "label": "(GMT+4:00) Asia/Dubai",
-        "offset": 4,
-    }
+    assert captured["timezone"] == "Asia/Dubai"
+    assert captured["sessionTimeoutConfig"] == {"timeoutTimeInSecs": 600}
 
 
 @pytest.mark.asyncio
@@ -185,22 +217,114 @@ async def test_waves_catalog_and_voice_clones_use_current_endpoints():
 
 
 @pytest.mark.asyncio
-async def test_versioned_draft_rejects_tamil_in_multilingual_agent():
-    client = SmallestAIClient(api_key="sk_test")
+async def test_voice_preview_uses_unified_tts_with_fixed_bounded_wav_contract():
+    captured: dict = {}
+    wav = b"RIFF\x04\x00\x00\x00WAVE"
 
-    with pytest.raises(SmallestAIError) as error:
-        await client.update_agent_draft(
-            agent_id="agent_123",
-            branch_id="branch_123",
-            global_prompt="Be concise and helpful.",
-            first_message="Welcome.",
-            slm_model="electron",
-            language="ta",
-            supported_languages=["ta", "en"],
-            timezone="Asia/Kolkata",
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        captured["headers"] = request.headers
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, headers={"Content-Type": "audio/wav"}, content=wav)
+
+    client = SmallestAIClient(
+        api_key="sk_test",
+        base_url="https://api.smallest.ai/atoms/v1",
+        transport=httpx.MockTransport(handler),
+    )
+
+    audio = await client.synthesize_voice_preview(
+        voice_id="rhea",
+        model="lightning_v3.1_pro",
+        language="hi",
+    )
+
+    assert audio == wav
+    assert captured["path"] == "/waves/v1/tts"
+    assert captured["headers"]["authorization"] == "Bearer sk_test"
+    assert captured["headers"]["accept"] == "audio/wav"
+    assert captured["body"] == {
+        "text": VOICE_PREVIEW_TEXTS["hi"],
+        "voice_id": "rhea",
+        "model": "lightning_v3.1_pro",
+        "language": "hi",
+        "output_format": "wav",
+    }
+
+
+@pytest.mark.asyncio
+async def test_voice_preview_rejects_non_audio_success_responses():
+    client = SmallestAIClient(
+        api_key="sk_test",
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                200,
+                headers={"Content-Type": "application/json"},
+                json={"audio": "not-binary-audio"},
+            )
+        ),
+    )
+
+    with pytest.raises(SmallestAIError, match="unexpected voice preview response"):
+        await client.synthesize_voice_preview(
+            voice_id="jordan",
+            model="lightning_v3.1",
+            language="en",
         )
 
-    assert error.value.status_code == 422
+
+@pytest.mark.asyncio
+async def test_voice_preview_rejects_oversized_response_before_buffering():
+    client = SmallestAIClient(
+        api_key="sk_test",
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                200,
+                headers={
+                    "Content-Type": "audio/wav",
+                    "Content-Length": "2000001",
+                },
+                content=b"",
+            )
+        ),
+    )
+
+    with pytest.raises(SmallestAIError, match="oversized voice preview"):
+        await client.synthesize_voice_preview(
+            voice_id="jordan",
+            model="lightning_v3.1",
+            language="en",
+        )
+
+
+@pytest.mark.asyncio
+async def test_versioned_draft_publishes_tamil_with_automatic_language_switching():
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content))
+        return httpx.Response(200, json={"status": True, "data": {"status": "draft"}})
+
+    client = SmallestAIClient(api_key="sk_test", transport=httpx.MockTransport(handler))
+
+    await client.update_agent_draft(
+        agent_id="agent_123",
+        branch_id="branch_123",
+        global_prompt="Be concise and helpful.",
+        first_message="Welcome.",
+        slm_model="electron",
+        language="ta",
+        supported_languages=["ta", "en"],
+        language_switching_enabled=True,
+        language_switching_mode="automatic",
+        timezone="Asia/Kolkata",
+    )
+
+    assert captured["language"] == {
+        "default": "ta",
+        "supported": ["ta", "en"],
+        "switching": {"isEnabled": True},
+    }
 
 
 @pytest.mark.asyncio

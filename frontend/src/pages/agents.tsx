@@ -1,23 +1,32 @@
 import Link from 'next/link';
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import {
+  ArrowDownAZ,
   Bot,
   CheckCircle2,
+  CircleAlert,
   CloudUpload,
   FlaskConical,
   Globe2,
+  Loader2,
   Pencil,
   Plus,
   Radio,
   RefreshCw,
+  Search,
   Sparkles,
   Trash2,
   X,
 } from 'lucide-react';
 import AgentEditor, { AgentEditorValues, defaultAgentValues } from '@/components/AgentEditor';
+import { agentEditorPatch } from '@/components/agent-editor-diff.cjs';
 import Layout from '@/components/Layout';
 import { agentTestReadinessMessage, isAgentCallReady, providerActionNotice } from '@/lib/agent-readiness.cjs';
 import { api, AgentProviderCatalog, ProviderStatus, VoiceAgent } from '@/lib/api';
+
+type AgentLoadErrors = Partial<Record<'agents' | 'provider' | 'catalog', string>>;
+type DeploymentFilter = 'all' | 'local' | 'synced' | 'changes' | 'attention';
+type AgentSort = 'updated' | 'created' | 'name-asc' | 'name-desc';
 
 export default function Agents() {
   const [agents, setAgents] = useState<VoiceAgent[]>([]);
@@ -27,6 +36,13 @@ export default function Agents() {
   const [editingAgentId, setEditingAgentId] = useState<string | null>(null);
   const [working, setWorking] = useState<string | null>(null);
   const [notice, setNotice] = useState<{ type: 'success' | 'info' | 'error'; text: string } | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [loadErrors, setLoadErrors] = useState<AgentLoadErrors>({});
+  const [reloadKey, setReloadKey] = useState(0);
+  const [query, setQuery] = useState('');
+  const [deploymentFilter, setDeploymentFilter] = useState<DeploymentFilter>('all');
+  const [languageFilter, setLanguageFilter] = useState('all');
+  const [sort, setSort] = useState<AgentSort>('updated');
 
   useEffect(() => {
     let active = true;
@@ -36,16 +52,75 @@ export default function Agents() {
       api.getAgentProviderCatalog(),
     ]).then(([agentResult, providerResult, catalogResult]) => {
       if (!active) return;
-      setAgents(agentResult.status === 'fulfilled' ? agentResult.value : []);
-      setProvider(providerResult.status === 'fulfilled' ? providerResult.value : null);
-      setCatalog(catalogResult.status === 'fulfilled' ? catalogResult.value : null);
+      const errors: AgentLoadErrors = {};
+      if (agentResult.status === 'fulfilled') setAgents(agentResult.value);
+      else {
+        setAgents([]);
+        errors.agents = errorMessage(agentResult.reason, 'Could not load agents.');
+      }
+      if (providerResult.status === 'fulfilled') setProvider(providerResult.value);
+      else {
+        setProvider(null);
+        errors.provider = errorMessage(providerResult.reason, 'Could not load provider status.');
+      }
+      if (catalogResult.status === 'fulfilled') setCatalog(catalogResult.value);
+      else {
+        setCatalog(null);
+        errors.catalog = errorMessage(catalogResult.reason, 'Could not load the current voice and language catalog.');
+      }
+      setLoadErrors(errors);
+      setLoading(false);
     });
     return () => { active = false; };
-  }, []);
+  }, [reloadKey]);
 
   const editingAgent = agents.find((agent) => agent.id === editingAgentId) ?? null;
+  const languageOptions = useMemo(() => {
+    const codes = new Set(agents.flatMap((agent) => agent.supported_languages));
+    return Array.from(codes).sort((left, right) => languageLabel(left, catalog).localeCompare(languageLabel(right, catalog)));
+  }, [agents, catalog]);
+  const filteredAgents = useMemo(() => {
+    const normalizedQuery = query.trim().toLowerCase();
+    const matches = agents.filter((agent) => {
+      const searchable = [
+        agent.name,
+        agent.description,
+        agent.system_prompt,
+        agent.provider_agent_id,
+        agent.provider_revision_id,
+        agent.voice_id,
+        voiceLabel(agent.voice_id, catalog),
+        ...agent.supported_languages,
+        ...agent.supported_languages.map((code) => languageLabel(code, catalog)),
+      ].filter(Boolean).join(' ').toLowerCase();
+      const deploymentMatches = deploymentFilter === 'all'
+        || (deploymentFilter === 'local' && !agent.provider_agent_id)
+        || (deploymentFilter === 'synced' && agent.sync_status === 'synced')
+        || (deploymentFilter === 'changes' && agent.sync_status === 'dirty')
+        || (deploymentFilter === 'attention' && (
+          agent.sync_status === 'error' || providerOperationUnresolved(agent.sync_status)
+        ));
+      return (!normalizedQuery || searchable.includes(normalizedQuery))
+        && deploymentMatches
+        && (languageFilter === 'all' || agent.supported_languages.includes(languageFilter));
+    });
+    return [...matches].sort((left, right) => {
+      if (sort === 'name-asc') return left.name.localeCompare(right.name);
+      if (sort === 'name-desc') return right.name.localeCompare(left.name);
+      if (sort === 'created') return Date.parse(right.created_at) - Date.parse(left.created_at);
+      return Date.parse(right.updated_at) - Date.parse(left.updated_at);
+    });
+  }, [agents, catalog, deploymentFilter, languageFilter, query, sort]);
+  const usableVoiceCount = catalog?.voices.filter((voice) => (
+    Boolean(voice.synthesizer_model) && !voice.unavailability_reason
+  )).length;
+  const catalogReady = Boolean(catalog && catalog.voices.length && catalog.languages.length);
 
   const openCreate = () => {
+    if (!catalogReady) {
+      setNotice({ type: 'error', text: 'The provider catalog must load before a voice or language configuration can be created safely.' });
+      return;
+    }
     setEditingAgentId(null);
     setShowCreate(true);
     setNotice(null);
@@ -54,7 +129,10 @@ export default function Agents() {
   const openEdit = (agent: VoiceAgent) => {
     setShowCreate(false);
     setEditingAgentId(agent.id);
-    setNotice(null);
+    setNotice(catalogReady ? null : {
+      type: 'info',
+      text: 'The provider catalog is unavailable. Existing voice and language settings are locked, but unrelated fields remain editable.',
+    });
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
 
@@ -64,7 +142,13 @@ export default function Agents() {
     setNotice(null);
     try {
       if (editingAgent) {
-        const updated = await api.updateAgent(editingAgent.id, values);
+        const patch = agentEditorPatch(editorValues(editingAgent), values);
+        if (Object.keys(patch).length === 0) {
+          setEditingAgentId(null);
+          setNotice({ type: 'info', text: `${editingAgent.name} has no changes to save.` });
+          return;
+        }
+        const updated = await api.updateAgent(editingAgent.id, patch);
         setAgents((current) => current.map((agent) => agent.id === updated.id ? updated : agent));
         setEditingAgentId(null);
         setNotice({
@@ -181,25 +265,65 @@ export default function Agents() {
     setEditingAgentId(null);
   };
 
+  const retryLoad = () => {
+    setShowCreate(false);
+    setEditingAgentId(null);
+    setLoading(true);
+    setLoadErrors({});
+    setAgents([]);
+    setProvider(null);
+    setCatalog(null);
+    setReloadKey((value) => value + 1);
+  };
+
   return (
     <Layout>
       <div className="page-header">
         <div>
           <span className="page-kicker">Build & govern</span>
           <h1>Voice agents</h1>
-          <p className="page-subtitle">Build multilingual Smallest.ai agents from proven templates, tune every voice, and publish only when ready.</p>
+          <p className="page-subtitle">Create and review Smallest.ai agent configurations. Provider sync is separate from local editing.</p>
         </div>
         <div className="header-actions">
           <Link href="/playground" className="btn btn-secondary"><FlaskConical size={14} /> Open playground</Link>
-          <button className="btn btn-primary" onClick={showCreate ? closeEditor : openCreate}>
+          <button
+            className="btn btn-primary"
+            onClick={showCreate ? closeEditor : openCreate}
+            disabled={loading || (!showCreate && !catalogReady)}
+            title={!loading && !catalogReady ? 'Retry the provider catalog before creating an agent.' : undefined}
+          >
             {showCreate ? <X size={14} /> : <Plus size={14} />}{showCreate ? 'Close' : 'Create agent'}
           </button>
         </div>
       </div>
 
       {notice && (
-        <div className={`provider-alert ${notice.type === 'error' ? 'provider-alert-error' : ''}`}>
-          {notice.type === 'success' ? <CheckCircle2 size={15} /> : <Radio size={15} />}{notice.text}
+        <div
+          className={`provider-alert ${notice.type === 'error' ? 'provider-alert-error' : ''}`}
+          role={notice.type === 'error' ? 'alert' : 'status'}
+          aria-live={notice.type === 'error' ? 'assertive' : 'polite'}
+        >
+          {notice.type === 'success' ? <CheckCircle2 size={15} /> : notice.type === 'error' ? <CircleAlert size={15} /> : <Radio size={15} />}
+          <span>{notice.text}</span>
+        </div>
+      )}
+
+      {loading && (
+        <div className="page-loading" role="status" aria-live="polite">
+          <Loader2 className="spin" size={16} /> Loading agents and provider capabilities…
+        </div>
+      )}
+
+      {!loading && Object.keys(loadErrors).length > 0 && (
+        <div className="provider-alert provider-alert-error" role="alert">
+          <CircleAlert size={15} />
+          <span>
+            {Object.entries(loadErrors).map(([area, message]) => `${area}: ${message}`).join(' ')}
+            {' '}Unavailable data is not treated as an empty workspace or a supported capability.
+          </span>
+          <button type="button" className="btn btn-secondary btn-sm" onClick={retryLoad}>
+            <RefreshCw size={12} /> Retry
+          </button>
         </div>
       )}
 
@@ -207,18 +331,19 @@ export default function Agents() {
         <section className="card create-panel agent-editor-panel">
           <aside className="create-panel-aside">
             <Sparkles size={22} />
-            <h3>{editingAgent ? `Edit ${editingAgent.name}` : 'Design an agent that sounds human.'}</h3>
-            <p>{editingAgent ? 'Change its prompt, voice, languages, and tuning. Provisioned changes stay local until you publish.' : 'Choose a template, customize every field, then provision it when it is ready.'}</p>
+            <h3>{editingAgent ? `Edit ${editingAgent.name}` : 'Create a local agent draft.'}</h3>
+            <p>{editingAgent ? 'Changes to a provisioned agent remain local until a provider publish succeeds.' : 'Choose a built-in starting point, review every field, then provision deliberately.'}</p>
             <div className="catalog-stats">
-              <div><strong>{catalog?.voices.length ?? '—'}</strong><span>voices</span></div>
-              <div><strong>{catalog?.languages.length ?? '—'}</strong><span>languages</span></div>
-              <div><strong>{catalog?.templates.length ?? '—'}</strong><span>templates</span></div>
+              <div><strong>{usableVoiceCount ?? '—'}</strong><span>usable catalog voices</span></div>
+              <div><strong>{catalog?.languages.length ?? '—'}</strong><span>catalog languages</span></div>
+              <div><strong>{catalog?.templates.length ?? '—'}</strong><span>built-in templates</span></div>
             </div>
           </aside>
           <AgentEditor
             key={editingAgent?.id ?? 'create'}
             mode={editingAgent ? 'edit' : 'create'}
             catalog={catalog}
+            catalogError={loadErrors.catalog ?? null}
             initialValues={editingAgent ? editorValues(editingAgent) : defaultAgentValues}
             busy={working === (editingAgent ? `save-${editingAgent.id}` : 'save-new')}
             onCancel={closeEditor}
@@ -227,34 +352,92 @@ export default function Agents() {
         </section>
       )}
 
-      {agents.length === 0 ? (
+      {!loading && !loadErrors.agents && agents.length > 0 && (
+        <section className="card" aria-label="Filter voice agents">
+          <div className="form-grid">
+            <div className="form-group">
+              <label htmlFor="agent-search">Search agents</label>
+              <div className="voice-search-control">
+                <Search size={14} aria-hidden="true" />
+                <input
+                  id="agent-search"
+                  type="search"
+                  value={query}
+                  placeholder="Name, voice, language, provider ID…"
+                  onChange={(event) => setQuery(event.target.value)}
+                />
+              </div>
+            </div>
+            <div className="form-group">
+              <label htmlFor="agent-deployment-filter">Deployment state</label>
+              <select id="agent-deployment-filter" value={deploymentFilter} onChange={(event) => setDeploymentFilter(event.target.value as DeploymentFilter)}>
+                <option value="all">All deployment states</option>
+                <option value="local">Local drafts</option>
+                <option value="synced">Provider synced</option>
+                <option value="changes">Unpublished local changes</option>
+                <option value="attention">Provider attention required</option>
+              </select>
+            </div>
+            <div className="form-group">
+              <label htmlFor="agent-language-filter">Configured language</label>
+              <select id="agent-language-filter" value={languageFilter} onChange={(event) => setLanguageFilter(event.target.value)}>
+                <option value="all">All configured languages</option>
+                {languageOptions.map((code) => <option value={code} key={code}>{languageLabel(code, catalog)}</option>)}
+              </select>
+            </div>
+            <div className="form-group">
+              <label htmlFor="agent-sort"><ArrowDownAZ size={12} aria-hidden="true" /> Sort</label>
+              <select id="agent-sort" value={sort} onChange={(event) => setSort(event.target.value as AgentSort)}>
+                <option value="updated">Recently updated</option>
+                <option value="created">Recently created</option>
+                <option value="name-asc">Name A–Z</option>
+                <option value="name-desc">Name Z–A</option>
+              </select>
+            </div>
+          </div>
+          <p className="form-hint" role="status">Showing {filteredAgents.length} of {agents.length} agents.</p>
+        </section>
+      )}
+
+      {!loading && !loadErrors.agents && agents.length === 0 ? (
         <div className="empty-state">
           <div className="empty-state-icon"><Bot size={23} /></div>
           <h3>No voice agents yet</h3>
-          <p>Choose a ready-made template, select languages and a Smallest.ai voice, then customize it for your business.</p>
-          <button className="btn btn-primary" onClick={openCreate}><Plus size={14} /> Create first agent</button>
+          <p>Create a local draft from a built-in template, then validate its voice and language configuration before provisioning.</p>
+          <button className="btn btn-primary" onClick={openCreate} disabled={!catalogReady}><Plus size={14} /> Create first agent</button>
         </div>
-      ) : (
+      ) : !loading && !loadErrors.agents && agents.length > 0 && filteredAgents.length === 0 ? (
+        <div className="empty-state">
+          <div className="empty-state-icon"><Search size={23} /></div>
+          <h3>No agents match these filters</h3>
+          <p>Clear the search or select broader deployment and language filters.</p>
+          <button type="button" className="btn btn-secondary" onClick={() => { setQuery(''); setDeploymentFilter('all'); setLanguageFilter('all'); }}>
+            Clear filters
+          </button>
+        </div>
+      ) : !loading && !loadErrors.agents && filteredAgents.length > 0 ? (
         <div className="agent-grid">
-          {agents.map((agent) => (
+          {filteredAgents.map((agent) => (
             <article className="agent-card" key={agent.id}>
               <div className="agent-card-top">
                 <div className="agent-avatar"><Bot size={19} /></div>
                 <div className="agent-card-title">
                   <h3>{agent.name}</h3>
-                  <p>{agent.provider_agent_id ? `Atoms ID · ${agent.provider_agent_id.slice(0, 12)}…` : 'Local draft · not provisioned'}</p>
+                  <p>{deploymentDescription(agent)}</p>
                 </div>
-                <button className="icon-button" disabled={providerOperationUnresolved(agent.sync_status)} onClick={() => openEdit(agent)} aria-label={`Edit ${agent.name}`}><Pencil size={15} /></button>
+                <button className="icon-button" disabled={!catalogReady || providerOperationUnresolved(agent.sync_status)} onClick={() => openEdit(agent)} aria-label={`Edit ${agent.name}`}><Pencil size={15} /></button>
               </div>
               <p className="agent-card-body">{agent.description || agent.system_prompt}</p>
               <div className="agent-card-meta">
-                <span className="meta-chip"><Globe2 size={9} /> {languageLabel(agent.language, catalog)}</span>
-                {agent.supported_languages.length > 1 && <span className="meta-chip">+{agent.supported_languages.length - 1} languages</span>}
-                <span className="meta-chip">{voiceLabel(agent.voice_id, catalog)}</span>
-                <span className={`badge ${syncBadge(agent.sync_status)}`}>{agent.sync_status.replace('_', ' ')}</span>
+                <span className="meta-chip"><Globe2 size={9} /> Primary: {languageLabel(agent.language, catalog)}</span>
+                <span className="meta-chip">{languageConfigurationLabel(agent)}</span>
+                <span className="meta-chip">Voice: {voiceLabel(agent.voice_id, catalog)}</span>
+                <span className={`badge ${syncBadge(agent.sync_status)}`}>{syncStatusLabel(agent.sync_status)}</span>
+                {agent.provider_revision_id && <span className="meta-chip">Revision: {agent.provider_revision_id.slice(0, 12)}…</span>}
+                {agent.last_synced_at && <span className="meta-chip">Last sync: {new Date(agent.last_synced_at).toLocaleString()}</span>}
               </div>
               <div className="agent-card-actions">
-                <button className="btn btn-secondary btn-sm" disabled={providerOperationUnresolved(agent.sync_status)} onClick={() => openEdit(agent)}><Pencil size={12} /> Edit</button>
+                <button className="btn btn-secondary btn-sm" disabled={!catalogReady || providerOperationUnresolved(agent.sync_status)} onClick={() => openEdit(agent)}><Pencil size={12} /> Edit</button>
                 {agent.provider_agent_id ? (
                   <button className="btn btn-secondary btn-sm" disabled={working === `sync-${agent.id}` || agent.sync_status === 'synced'} onClick={() => runAgentAction(agent, 'sync')}><RefreshCw size={12} /> {providerActionLabel(agent.sync_status)}</button>
                 ) : agent.sync_status === 'provision_unknown' ? (
@@ -277,7 +460,7 @@ export default function Agents() {
             </article>
           ))}
         </div>
-      )}
+      ) : null}
     </Layout>
   );
 }
@@ -295,6 +478,8 @@ function editorValues(agent: VoiceAgent): AgentEditorValues {
     temperature: agent.temperature,
     language: agent.language,
     supported_languages: agent.supported_languages,
+    language_switching_enabled: agent.language_switching_enabled,
+    language_switching_mode: agent.language_switching_mode,
     speech_rate: agent.speech_rate,
     timezone: agent.timezone,
   };
@@ -305,8 +490,10 @@ function languageLabel(code: string, catalog: AgentProviderCatalog | null) {
 }
 
 function voiceLabel(id: string, catalog: AgentProviderCatalog | null) {
-  if (!id) return 'Default voice';
-  return catalog?.voices.find((voice) => voice.id === id)?.name ?? id;
+  if (!id) return 'Provider default';
+  const voice = catalog?.voices.find((item) => item.id === id);
+  if (voice) return voice.name;
+  return catalog ? `${id} · not in current catalog` : `${id} · catalog unavailable`;
 }
 
 function syncBadge(status: VoiceAgent['sync_status']) {
@@ -324,4 +511,40 @@ function providerActionLabel(status: VoiceAgent['sync_status']) {
   if (status === 'synced') return 'In sync';
   if (['publishing', 'provider_scanning', 'publish_unknown'].includes(status)) return 'Check status';
   return 'Publish';
+}
+
+function syncStatusLabel(status: VoiceAgent['sync_status']) {
+  const labels: Record<VoiceAgent['sync_status'], string> = {
+    local_only: 'Local draft',
+    dirty: 'Unpublished changes',
+    provisioning: 'Provisioning',
+    provision_unknown: 'Create status unknown',
+    publishing: 'Publishing',
+    provider_scanning: 'Provider review',
+    publish_unknown: 'Publish status unknown',
+    synced: 'Provider synced',
+    error: 'Provider error',
+  };
+  return labels[status];
+}
+
+function deploymentDescription(agent: VoiceAgent) {
+  if (!agent.provider_agent_id) return 'Local draft · not provisioned';
+  const providerId = `Atoms ID · ${agent.provider_agent_id.slice(0, 12)}…`;
+  if (agent.sync_status === 'synced') return `${providerId} · published revision recorded`;
+  if (agent.sync_status === 'dirty') return `${providerId} · local changes not published`;
+  return `${providerId} · ${syncStatusLabel(agent.sync_status).toLowerCase()}`;
+}
+
+function languageConfigurationLabel(agent: VoiceAgent) {
+  const count = new Set([agent.language, ...agent.supported_languages]).size;
+  if (count === 1) return 'Single-language configuration';
+  if (agent.language_switching_enabled && agent.language_switching_mode === 'automatic') {
+    return `${count} languages · automatic switching configured`;
+  }
+  return `${count} languages · automatic switching off`;
+}
+
+function errorMessage(error: unknown, fallback: string) {
+  return error instanceof Error ? error.message : fallback;
 }

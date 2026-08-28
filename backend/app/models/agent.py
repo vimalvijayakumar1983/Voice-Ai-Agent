@@ -30,6 +30,8 @@ class Agent(TenantScopedModel):
     voice_id: Mapped[str] = mapped_column(String(100), default="")
     language: Mapped[str] = mapped_column(String(63), default="en")
     supported_languages: Mapped[list[str]] = mapped_column(JSONB, default=lambda: ["en"])
+    language_switching_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    language_switching_mode: Mapped[str] = mapped_column(String(20), default="disabled")
     speech_rate: Mapped[float] = mapped_column(Float, default=1.0)
 
     # Smallest.ai provider state. Secrets are never stored on the agent.

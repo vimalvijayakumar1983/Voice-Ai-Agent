@@ -13,6 +13,7 @@ from sqlalchemy import func, select
 
 from app.api.v1.endpoints import calls as calls_endpoint
 from app.models.agent import Agent
+from app.models.audit import AuditEvent
 from app.models.call import Call
 from app.models.compliance import DncEntry
 from app.services.phone_numbers import normalize_e164, tenant_phone_dnc_lock
@@ -24,6 +25,49 @@ def test_e164_normalization_handles_common_import_formats():
     assert normalize_e164("+971 (50) 123-4567") == "+971501234567"
     assert normalize_e164("00971 50 123 4567") == "+971501234567"
     assert normalize_e164("0501234567") is None
+
+
+@pytest.mark.asyncio
+async def test_direct_outbound_call_rejects_dirty_agent_before_dispatch(
+    client: AsyncClient,
+    auth_headers,
+    tenant,
+    db,
+    monkeypatch,
+):
+    agent = Agent(
+        tenant_id=tenant.id,
+        name="Dirty direct-call agent",
+        system_prompt="Do not run a stale provider revision.",
+        voice_provider="smallest",
+        provider_agent_id="smallest-dirty-direct-agent",
+        provider_revision_id="smallest-dirty-direct-revision",
+        last_synced_at=datetime.now(UTC),
+        sync_status="dirty",
+    )
+    db.add(agent)
+    await db.commit()
+
+    provider_call = AsyncMock(return_value="must-not-be-called")
+    monkeypatch.setattr(
+        calls_endpoint,
+        "get_smallest_client",
+        lambda: SimpleNamespace(start_outbound_call=provider_call),
+    )
+    reconcile = Mock()
+    monkeypatch.setattr(call_tasks.reconcile_call_dispatch, "apply_async", reconcile)
+
+    response = await client.post(
+        "/api/v1/calls",
+        headers={**auth_headers, "Idempotency-Key": "dirty-direct-preliminary-0001"},
+        json={"agent_id": str(agent.id), "to_number": "+971501234567"},
+    )
+
+    assert response.status_code == 409
+    assert "current changes" in response.json()["detail"]
+    provider_call.assert_not_awaited()
+    reconcile.assert_not_called()
+    assert await db.scalar(select(func.count()).select_from(Call)) == 0
 
 
 @pytest.mark.asyncio
@@ -83,6 +127,7 @@ async def test_committed_dnc_addition_wins_final_direct_dispatch_lock(
         provider_agent_id="smallest-dnc-lock-agent",
         provider_revision_id="smallest-dnc-lock-revision",
         last_synced_at=datetime.now(UTC),
+        sync_status="synced",
     )
     db.add(agent)
     await db.commit()
@@ -151,6 +196,7 @@ async def test_committed_agent_deactivation_wins_final_direct_dispatch_lock(
         provider_agent_id="smallest-deactivation-agent",
         provider_revision_id="smallest-deactivation-revision",
         last_synced_at=datetime.now(UTC),
+        sync_status="synced",
     )
     db.add(agent)
     await db.commit()
@@ -202,9 +248,151 @@ async def test_committed_agent_deactivation_wins_final_direct_dispatch_lock(
 
 
 @pytest.mark.asyncio
+async def test_committed_dirty_agent_wins_final_direct_dispatch_lock(
+    client: AsyncClient,
+    auth_headers,
+    tenant,
+    db,
+    monkeypatch,
+):
+    agent = Agent(
+        tenant_id=tenant.id,
+        name="Dirty race agent",
+        system_prompt="Never dial with unpublished provider changes.",
+        voice_provider="smallest",
+        provider_agent_id="smallest-dirty-race-agent",
+        provider_revision_id="smallest-dirty-race-revision",
+        last_synced_at=datetime.now(UTC),
+        sync_status="synced",
+    )
+    db.add(agent)
+    await db.commit()
+
+    provider_call = AsyncMock(return_value="must-not-be-called")
+    monkeypatch.setattr(
+        calls_endpoint,
+        "get_smallest_client",
+        lambda: SimpleNamespace(start_outbound_call=provider_call),
+    )
+    monkeypatch.setattr(call_tasks.reconcile_call_dispatch, "apply_async", Mock())
+
+    final_check_waiting = asyncio.Event()
+    real_lock = calls_endpoint.tenant_phone_dnc_lock
+
+    @asynccontextmanager
+    async def observed_final_lock(session, tenant_id, phone_number):
+        final_check_waiting.set()
+        async with real_lock(session, tenant_id, phone_number) as canonical:
+            yield canonical
+
+    monkeypatch.setattr(calls_endpoint, "tenant_phone_dnc_lock", observed_final_lock)
+
+    async with session_factory() as guard_db:
+        async with tenant_phone_dnc_lock(guard_db, tenant.id, "+971501234567"):
+            call_task = asyncio.create_task(
+                client.post(
+                    "/api/v1/calls",
+                    headers={
+                        **auth_headers,
+                        "Idempotency-Key": "dirty-agent-race-direct-0001",
+                    },
+                    json={"agent_id": str(agent.id), "to_number": "+971501234567"},
+                )
+            )
+            await asyncio.wait_for(final_check_waiting.wait(), timeout=2)
+            current_agent = await guard_db.get(Agent, agent.id)
+            current_agent.sync_status = "dirty"
+            await guard_db.commit()
+
+        response = await asyncio.wait_for(call_task, timeout=2)
+
+    assert response.status_code == 201
+    assert response.json()["status"] == "failed"
+    provider_call.assert_not_awaited()
+    db.expire_all()
+    stored_call = await db.scalar(select(Call))
+    assert stored_call.call_metadata["dispatch_error"] == "agent_not_synced"
+
+
+@pytest.mark.asyncio
+async def test_committed_new_revision_wins_final_direct_dispatch_lock(
+    client: AsyncClient,
+    auth_headers,
+    tenant,
+    db,
+    monkeypatch,
+):
+    original_revision = "smallest-revision-before-direct-dispatch"
+    agent = Agent(
+        tenant_id=tenant.id,
+        name="Revision race agent",
+        system_prompt="Never dial under a revision different from the call snapshot.",
+        voice_provider="smallest",
+        provider_agent_id="smallest-revision-race-agent",
+        provider_revision_id=original_revision,
+        last_synced_at=datetime.now(UTC),
+        sync_status="synced",
+    )
+    db.add(agent)
+    await db.commit()
+
+    provider_call = AsyncMock(return_value="must-not-be-called")
+    monkeypatch.setattr(
+        calls_endpoint,
+        "get_smallest_client",
+        lambda: SimpleNamespace(start_outbound_call=provider_call),
+    )
+    monkeypatch.setattr(call_tasks.reconcile_call_dispatch, "apply_async", Mock())
+
+    final_check_waiting = asyncio.Event()
+    real_lock = calls_endpoint.tenant_phone_dnc_lock
+
+    @asynccontextmanager
+    async def observed_final_lock(session, tenant_id, phone_number):
+        final_check_waiting.set()
+        async with real_lock(session, tenant_id, phone_number) as canonical:
+            yield canonical
+
+    monkeypatch.setattr(calls_endpoint, "tenant_phone_dnc_lock", observed_final_lock)
+
+    async with session_factory() as guard_db:
+        async with tenant_phone_dnc_lock(guard_db, tenant.id, "+971501234567"):
+            call_task = asyncio.create_task(
+                client.post(
+                    "/api/v1/calls",
+                    headers={
+                        **auth_headers,
+                        "Idempotency-Key": "revision-race-direct-0001",
+                    },
+                    json={"agent_id": str(agent.id), "to_number": "+971501234567"},
+                )
+            )
+            await asyncio.wait_for(final_check_waiting.wait(), timeout=2)
+            current_agent = await guard_db.get(Agent, agent.id)
+            current_agent.provider_revision_id = "smallest-revision-after-direct-dispatch"
+            current_agent.sync_status = "synced"
+            current_agent.last_synced_at = datetime.now(UTC)
+            await guard_db.commit()
+
+        response = await asyncio.wait_for(call_task, timeout=2)
+
+    assert response.status_code == 201
+    assert response.json()["status"] == "failed"
+    provider_call.assert_not_awaited()
+    db.expire_all()
+    stored_call = await db.scalar(select(Call))
+    assert stored_call.call_metadata["dispatch_error"] == "agent_provider_changed"
+    assert (
+        stored_call.call_metadata["agent_configuration"]["provider_revision_id"]
+        == original_revision
+    )
+
+
+@pytest.mark.asyncio
 async def test_dnc_delete_commits_before_number_can_be_dispatched(
     client: AsyncClient,
     auth_headers,
+    db,
 ):
     created = await client.post(
         "/api/v1/compliance/dnc",
@@ -227,6 +415,26 @@ async def test_dnc_delete_commits_before_number_can_be_dispatched(
     assert checked.status_code == 200
     assert checked.json()["is_on_dnc"] is False
 
+    audit_events = (
+        (
+            await db.execute(
+                select(AuditEvent)
+                .where(AuditEvent.action.in_(["compliance.dnc_added", "compliance.dnc_removed"]))
+                .order_by(AuditEvent.created_at.asc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert [event.action for event in audit_events] == [
+        "compliance.dnc_added",
+        "compliance.dnc_removed",
+    ]
+    assert (
+        audit_events[0].details["phone_fingerprint"] == audit_events[1].details["phone_fingerprint"]
+    )
+    assert "+971501234567" not in str(audit_events[0].details)
+
 
 @pytest.mark.asyncio
 async def test_provider_acceptance_arms_one_direct_terminal_watchdog(
@@ -244,6 +452,7 @@ async def test_provider_acceptance_arms_one_direct_terminal_watchdog(
         provider_agent_id="accepted-direct-agent",
         provider_revision_id="accepted-direct-revision",
         last_synced_at=datetime.now(UTC),
+        sync_status="synced",
         max_call_duration_seconds=30,
     )
     db.add(agent)
@@ -274,6 +483,7 @@ async def test_provider_acceptance_arms_one_direct_terminal_watchdog(
     assert response.json()["status"] == "ringing"
     assert replay.json()["id"] == response.json()["id"]
     provider_call.assert_awaited_once()
+    assert provider_call.await_args.kwargs["version_id"] == "accepted-direct-revision"
     terminal_watchdog.assert_called_once()
     scheduled = terminal_watchdog.call_args.kwargs
     assert scheduled["args"] == (response.json()["id"], str(tenant.id))

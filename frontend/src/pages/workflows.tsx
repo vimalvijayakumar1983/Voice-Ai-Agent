@@ -331,7 +331,7 @@ export default function Workflows() {
   const toggleWorkflowStatus = async (workflow: CallWorkflow) => {
     const nextActive = !workflow.is_active;
     if (nextActive && !window.confirm(
-      `Mark ${workflow.name} active? This only approves its configuration; the workflow runtime is not connected yet.`,
+      `Mark ${workflow.name} approved? The backend stores this as active, but no workflow runtime is connected.`,
     )) return;
 
     setWorking(`${nextActive ? 'activate' : 'deactivate'}-${workflow.id}`);
@@ -342,7 +342,7 @@ export default function Workflows() {
       setNotice({
         type: 'success',
         text: nextActive
-          ? `${updated.name} is marked active for configuration governance. It is not executing calls.`
+          ? `${updated.name} is approved as configuration only. It is not executing calls.`
           : `${updated.name} is now a draft and can be edited.`,
       });
     } catch (error) {
@@ -383,10 +383,10 @@ export default function Workflows() {
           <span className="page-kicker">Design & govern</span>
           <h1>Call workflows</h1>
           <p className="page-subtitle">
-            Author validated call-flow configurations from safe templates and control their approval status.
+            Store linear call-flow configurations and their review status. This screen does not execute them.
           </p>
         </div>
-        <button className="btn btn-primary" onClick={showForm ? closeForm : openCreate}>
+        <button className="btn btn-primary" onClick={showForm ? closeForm : openCreate} disabled={!showForm && (loading || Boolean(loadError))}>
           {showForm ? <X size={14} /> : <Plus size={14} />}
           {showForm ? 'Close' : 'Create workflow'}
         </button>
@@ -397,7 +397,7 @@ export default function Workflows() {
         <div>
           <strong>Configuration control plane</strong>
           <p>
-            The visual runtime and simulator are not connected in this release. Saving or marking a workflow active does not route calls,
+            The visual runtime and simulator are not connected in this release. Saving or approving a configuration does not route calls,
             launch campaigns, invoke transfers, or fire workflow-node webhooks.
           </p>
         </div>
@@ -574,7 +574,7 @@ export default function Workflows() {
         <div className="empty-state workflow-empty">
           <span className="empty-state-icon"><GitBranch size={22} /></span>
           <h3>No workflow drafts</h3>
-          <p>Create a safe linear configuration now, then test it when the simulator and runtime are connected.</p>
+          <p>Create a linear configuration draft now. It will not handle calls until a workflow runtime is implemented and connected.</p>
           <button className="btn btn-primary" onClick={openCreate}><Plus size={14} /> Create workflow</button>
         </div>
       ) : (
@@ -590,7 +590,7 @@ export default function Workflows() {
                     <div className="workflow-title-row">
                       <h2>{workflow.name}</h2>
                       <span className={`badge ${workflow.is_active ? 'badge-warning' : 'badge-neutral'}`}>
-                        {workflow.is_active ? 'Active config' : 'Draft'}
+                        {workflow.is_active ? 'Approved config · offline' : 'Draft config'}
                       </span>
                     </div>
                     <p>{workflow.description || 'No operator notes.'}</p>
@@ -621,7 +621,7 @@ export default function Workflows() {
                     </button>
                     <button className="btn btn-secondary btn-sm" onClick={() => toggleWorkflowStatus(workflow)} disabled={Boolean(working)}>
                       {isWorking ? <Loader2 className="spin" size={12} /> : <CheckCircle2 size={12} />}
-                      {workflow.is_active ? 'Deactivate' : 'Mark active'}
+                      {workflow.is_active ? 'Return to draft' : 'Mark approved'}
                     </button>
                     <button className="btn btn-danger btn-sm" onClick={() => deleteWorkflow(workflow)} disabled={Boolean(working)}>
                       {working === `delete-${workflow.id}` ? <Loader2 className="spin" size={12} /> : <Trash2 size={12} />}

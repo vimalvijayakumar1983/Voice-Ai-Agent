@@ -562,7 +562,7 @@ export default function Campaigns() {
         <div>
           <span className="page-kicker">Outbound operations</span>
           <h1>Campaigns</h1>
-          <p className="page-subtitle">Prepare contact lists, schedule compliant calling windows, and control every launch.</p>
+          <p className="page-subtitle">Prepare contact lists, configure calling windows, and explicitly control each outbound launch.</p>
         </div>
         <div className="header-actions">
           {canMutateCampaigns ? (
@@ -610,6 +610,10 @@ export default function Campaigns() {
               This can place real outbound calls to {pendingStart.total_contacts} contact{pendingStart.total_contacts === 1 ? '' : 's'}.
               Calls will follow {pendingStart.calling_hours_start}–{pendingStart.calling_hours_end} in {pendingStart.timezone}.
             </p>
+            <p>
+              Confirm that every recipient has the required permission to be called. This release enforces workspace DNC, calling windows,
+              and explicit outbound-consent revocations; lawful-basis requirements, missing consent evidence, and frequency caps still require operator review.
+            </p>
           </div>
           <div className="campaign-confirmation-actions">
             <button className="btn btn-secondary" type="button" onClick={() => setPendingStart(null)} disabled={Boolean(working)}>Cancel</button>
@@ -646,8 +650,9 @@ export default function Campaigns() {
               <span>No unknown provider dispatches remain for this campaign.</span>
             </div>
           ) : (
-            <div className="table-container">
+            <div className="table-container" role="region" aria-label="Ambiguous campaign dispatches" tabIndex={0}>
               <table>
+                <caption className="visually-hidden">Provider dispatches requiring operator evidence and reconciliation</caption>
                 <thead>
                   <tr>
                     <th>Attempt</th>
@@ -733,7 +738,7 @@ export default function Campaigns() {
           <div className="campaign-create-heading">
             <div className="campaign-create-icon"><CalendarClock size={19} /></div>
             <div>
-              <h2 id="campaign-create-title">Configure a safe campaign draft</h2>
+              <h2 id="campaign-create-title">Configure a reviewed campaign draft</h2>
               <p>Nothing calls automatically. Review the saved draft, then explicitly start it from the campaign table.</p>
             </div>
           </div>
@@ -746,9 +751,14 @@ export default function Campaigns() {
             </div>
           ) : null}
 
-          <form onSubmit={handleCreate} noValidate>
-            {formError ? <div className="inline-error campaign-form-error" role="alert">{formError}</div> : null}
-            <fieldset className="campaign-form-fields" disabled={creating}>
+          <div id="campaign-safety-note" className="provider-alert" role="note">
+            <CircleAlert size={15} />
+            <span>DNC and configured calling windows are checked at dispatch. Consent evidence, jurisdiction selection, holiday rules, and frequency caps require operator review in this release.</span>
+          </div>
+
+          <form onSubmit={handleCreate} noValidate aria-describedby={formError ? 'campaign-form-error campaign-safety-note' : 'campaign-safety-note'}>
+            {formError ? <div id="campaign-form-error" className="inline-error campaign-form-error" role="alert">{formError}</div> : null}
+            <fieldset className="campaign-form-fields" disabled={creating} aria-describedby="campaign-safety-note">
               <legend className="visually-hidden">Campaign settings</legend>
               <div className="campaign-form-grid">
                 <div className="form-group">
@@ -844,7 +854,7 @@ export default function Campaigns() {
                     onChange={(event) => setForm((current) => ({ ...current, max_concurrent_calls: Number(event.target.value) }))}
                     required
                   />
-                  <p className="form-hint">Between 1 and 100, subject to your account limit.</p>
+                  <p className="form-hint">The form allows 1–100. Confirm provider and commercial capacity separately; this screen does not prove an enforced plan limit.</p>
                 </div>
                 <div className="form-group">
                   <label htmlFor="campaign-retries">Retry attempts</label>
@@ -860,7 +870,7 @@ export default function Campaigns() {
                   <p className="form-hint">Between 0 and 10 per contact.</p>
                 </div>
                 <div className="form-group campaign-span-full">
-                  <label htmlFor="campaign-contacts">Contacts <span>{contactLineCount.toLocaleString()} line{contactLineCount === 1 ? '' : 's'}</span></label>
+                  <label htmlFor="campaign-contacts">Contacts <span aria-live="polite">{contactLineCount.toLocaleString()} line{contactLineCount === 1 ? '' : 's'}</span></label>
                   <textarea
                     id="campaign-contacts"
                     className="campaign-contacts-input"
@@ -891,14 +901,15 @@ export default function Campaigns() {
         <div className="empty-state">
           <div className="empty-state-icon"><Users size={23} /></div>
           <h3>No campaigns yet</h3>
-          <p>Build a reviewed draft with a provisioned agent, compliant calling hours, and a validated contact list.</p>
+          <p>Build a reviewed draft with a provisioned agent, configured calling hours, and a locally validated contact list.</p>
           {canMutateCampaigns ? (
             <button className="btn btn-primary" type="button" onClick={openCreate}><Plus size={14} /> Create first campaign</button>
           ) : null}
         </div>
       ) : campaigns.length ? (
-        <div className="table-container campaign-table" aria-busy={Boolean(working)}>
+        <div className="table-container campaign-table" aria-busy={Boolean(working)} role="region" aria-label="Campaign operations" tabIndex={0}>
           <table>
+            <caption className="visually-hidden">Campaign configuration, provider progress, and operator actions</caption>
             <thead>
               <tr>
                 <th>Campaign</th>
@@ -906,7 +917,7 @@ export default function Campaigns() {
                 <th>Status</th>
                 <th>Calling policy</th>
                 <th>Progress</th>
-                <th>Outcome</th>
+                <th>Provider result</th>
                 <th><span className="visually-hidden">Actions</span></th>
               </tr>
             </thead>
@@ -944,8 +955,8 @@ export default function Campaigns() {
                       />
                     </td>
                     <td>
-                      <strong className="campaign-outcome">{campaign.successful_contacts.toLocaleString()} successful</strong>
-                      <span className="campaign-secondary">{successRate}% of contacts</span>
+                      <strong className="campaign-outcome">{campaign.successful_contacts.toLocaleString()} completed status</strong>
+                      <span className="campaign-secondary">{successRate}% of contacts · not a business outcome</span>
                     </td>
                     <td className="campaign-action-cell">
                       {canReconcileAttempts && campaign.status === 'paused' ? (

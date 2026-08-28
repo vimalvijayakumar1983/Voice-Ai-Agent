@@ -124,6 +124,11 @@ def _validate_campaign_dispatch_provider(campaign: Campaign, agent: Agent) -> No
                 status_code=409,
                 detail="Complete the initial Smallest.ai publish before starting",
             )
+        if agent.sync_status != "synced":
+            raise HTTPException(
+                status_code=409,
+                detail="Publish and verify the campaign agent's current changes before starting",
+            )
         if any(
             key in (campaign.settings or {})
             for key in ("from_number", "from_product_id", "version_id")

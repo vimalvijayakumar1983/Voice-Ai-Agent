@@ -83,6 +83,16 @@ def test_jwt_algorithm_is_fixed_to_hs256():
         Settings(algorithm="ES256")
 
 
+def test_refresh_cookie_name_is_bounded_and_legacy_bridge_defaults_off():
+    settings = Settings()
+    assert settings.refresh_cookie_name == "vai_refresh_token"
+    assert settings.legacy_session_migration_enabled is False
+
+    assert Settings(refresh_cookie_name="custom_refresh").refresh_cookie_name == "custom_refresh"
+    with pytest.raises(ValidationError):
+        Settings(refresh_cookie_name="invalid cookie name")
+
+
 def test_request_body_limit_defaults_to_eight_mib_and_is_bounded():
     assert Settings().max_request_body_bytes == 8 * 1024 * 1024
     with pytest.raises(ValidationError):
@@ -128,6 +138,9 @@ def test_production_rejects_open_registration_and_accepts_bootstrap():
         {"base_url": "http://localhost:8000"},
         {"cors_origins": "*"},
         {"cors_origins": "http://localhost:3000"},
+        {"cors_origins": "https://voice.example.com/console"},
+        {"cors_origins": "https://user@voice.example.com"},
+        {"cors_origins": "https://voice.example.com?tenant=1"},
         {"redis_url": "redis://localhost:6379/0"},
         {"redis_url": "https://redis.example.com"},
         {"trust_railway_proxy_headers": False},

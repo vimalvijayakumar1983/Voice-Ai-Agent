@@ -8,6 +8,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi.responses import JSONResponse
 from sqlalchemy import func, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -17,6 +18,7 @@ from app.core.database import get_db
 from app.core.identity import normalize_email
 from app.core.security import (
     create_access_token,
+    decode_token,
     generate_api_key,
     hash_api_key,
     hash_password,
@@ -32,8 +34,8 @@ from app.schemas.auth import (
     InvitationAccept,
     InvitationCreatedResponse,
     InvitationResponse,
+    LegacySessionMigration,
     RegistrationPolicyResponse,
-    TokenRefresh,
     TokenResponse,
     UserInvite,
     UserLogin,
@@ -65,6 +67,85 @@ _REGISTRATION_LOCK_ID = int.from_bytes(
 REGISTRATION_UNAVAILABLE_DETAIL = (
     "Registration is unavailable. Ask a workspace owner for an invitation."
 )
+REFRESH_COOKIE_PATH = "/api/v1/auth"
+INVALID_AUTH_ORIGIN_DETAIL = "Request origin is not allowed"
+
+
+def _validate_auth_origin(request: Request, *, required: bool = False) -> None:
+    """Reject cross-site cookie mutations before credentials are processed.
+
+    Browser refresh and logout are deliberately stricter than login: they use
+    an ambient HttpOnly credential, so an exact configured Origin is required.
+    Login, registration, and invitation acceptance still support trusted
+    non-browser clients without an Origin header, but reject any supplied
+    Origin that is not an exact console allowlist entry.
+    """
+
+    origin = request.headers.get("origin")
+    if origin is None:
+        if required:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=INVALID_AUTH_ORIGIN_DETAIL,
+            )
+        return
+    if origin == "null" or not any(
+        hmac.compare_digest(origin, allowed_origin) for allowed_origin in settings.cors_origin_list
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=INVALID_AUTH_ORIGIN_DETAIL,
+        )
+
+
+def _refresh_cookie_policy() -> tuple[bool, str]:
+    if settings.is_production:
+        return True, "none"
+    return False, "lax"
+
+
+def _set_refresh_cookie(response: Response, token: str) -> None:
+    secure, same_site = _refresh_cookie_policy()
+    claims = decode_token(token)
+    expires_at = datetime.fromtimestamp(int(claims["exp"]), tz=UTC) if claims else None
+    max_age = None
+    if expires_at is not None:
+        max_age = max(0, int((expires_at - datetime.now(UTC)).total_seconds()))
+    response.set_cookie(
+        key=settings.refresh_cookie_name,
+        value=token,
+        max_age=max_age,
+        expires=expires_at,
+        path=REFRESH_COOKIE_PATH,
+        secure=secure,
+        httponly=True,
+        samesite=same_site,
+    )
+
+
+def _clear_refresh_cookie(response: Response) -> None:
+    secure, same_site = _refresh_cookie_policy()
+    response.delete_cookie(
+        key=settings.refresh_cookie_name,
+        path=REFRESH_COOKIE_PATH,
+        secure=secure,
+        httponly=True,
+        samesite=same_site,
+    )
+
+
+def _refresh_rejection(
+    detail: str,
+    *,
+    status_code: int,
+    preserve_cookie_on_conflict: bool = True,
+) -> JSONResponse:
+    response = JSONResponse(status_code=status_code, content={"detail": detail})
+    # A 409 means a concurrent tab already rotated the shared browser cookie.
+    # Clearing here could race with and destroy the winning response.
+    if not preserve_cookie_on_conflict or status_code != status.HTTP_409_CONFLICT:
+        _clear_refresh_cookie(response)
+    return response
 
 
 def _hash_invitation_token(token: str) -> str:
@@ -203,7 +284,7 @@ async def _create_registered_owner(
     data: UserRegister,
     email: str,
     db: AsyncSession,
-) -> TokenResponse:
+) -> tuple[TokenResponse, str]:
     existing = await db.execute(select(User).where(func.lower(func.trim(User.email)) == email))
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=400, detail="Email already registered")
@@ -240,12 +321,14 @@ async def _create_registered_owner(
         tenant_id=tenant.id,
     )
     await db.commit()
-    return TokenResponse(
-        access_token=create_access_token(user.id, tenant.id, user.role),
-        refresh_token=refresh_token,
-        tenant_id=tenant.id,
-        user_id=user.id,
-        role=user.role,
+    return (
+        TokenResponse(
+            access_token=create_access_token(user.id, tenant.id, user.role),
+            tenant_id=tenant.id,
+            user_id=user.id,
+            role=user.role,
+        ),
+        refresh_token,
     )
 
 
@@ -254,7 +337,7 @@ async def _bootstrap_registered_owner(
     data: UserRegister,
     email: str,
     db: AsyncSession,
-) -> TokenResponse:
+) -> tuple[TokenResponse, str]:
     configured_email = str(settings.bootstrap_owner_email or "")
     if not configured_email or not hmac.compare_digest(email, configured_email):
         raise HTTPException(status_code=403, detail=REGISTRATION_UNAVAILABLE_DETAIL)
@@ -264,8 +347,14 @@ async def _bootstrap_registered_owner(
 
 
 @router.post("/register", response_model=TokenResponse, status_code=status.HTTP_201_CREATED)
-async def register(request: Request, data: UserRegister, db: AsyncSession = Depends(get_db)):
+async def register(
+    request: Request,
+    response: Response,
+    data: UserRegister,
+    db: AsyncSession = Depends(get_db),
+):
     """Register a new tenant and owner user."""
+    _validate_auth_origin(request)
     email = normalize_email(data.email)
     await enforce_rate_limit(
         request,
@@ -285,18 +374,31 @@ async def register(request: Request, data: UserRegister, db: AsyncSession = Depe
     if mode == "invite_only":
         raise HTTPException(status_code=403, detail=REGISTRATION_UNAVAILABLE_DETAIL)
     if mode == "open":
-        return await _create_registered_owner(data=data, email=email, db=db)
-
-    if db.get_bind().dialect.name == "sqlite":
-        async with _SQLITE_REGISTRATION_LOCK:
-            return await _bootstrap_registered_owner(data=data, email=email, db=db)
-
-    if db.get_bind().dialect.name == "postgresql":
-        await db.execute(
-            text("SELECT pg_advisory_xact_lock(:lock_id)"),
-            {"lock_id": _REGISTRATION_LOCK_ID},
+        token_response, refresh_token = await _create_registered_owner(
+            data=data,
+            email=email,
+            db=db,
         )
-    return await _bootstrap_registered_owner(data=data, email=email, db=db)
+    elif db.get_bind().dialect.name == "sqlite":
+        async with _SQLITE_REGISTRATION_LOCK:
+            token_response, refresh_token = await _bootstrap_registered_owner(
+                data=data,
+                email=email,
+                db=db,
+            )
+    else:
+        if db.get_bind().dialect.name == "postgresql":
+            await db.execute(
+                text("SELECT pg_advisory_xact_lock(:lock_id)"),
+                {"lock_id": _REGISTRATION_LOCK_ID},
+            )
+        token_response, refresh_token = await _bootstrap_registered_owner(
+            data=data,
+            email=email,
+            db=db,
+        )
+    _set_refresh_cookie(response, refresh_token)
+    return token_response
 
 
 @router.get("/registration-policy", response_model=RegistrationPolicyResponse)
@@ -336,8 +438,14 @@ async def registration_policy(
 
 
 @router.post("/login", response_model=TokenResponse)
-async def login(request: Request, data: UserLogin, db: AsyncSession = Depends(get_db)):
+async def login(
+    request: Request,
+    response: Response,
+    data: UserLogin,
+    db: AsyncSession = Depends(get_db),
+):
     """Login with email and password."""
+    _validate_auth_origin(request)
     email = normalize_email(data.email)
     await enforce_rate_limit(
         request,
@@ -374,22 +482,28 @@ async def login(request: Request, data: UserLogin, db: AsyncSession = Depends(ge
         tenant_id=user.tenant_id,
     )
 
-    return TokenResponse(
+    token_response = TokenResponse(
         access_token=create_access_token(user.id, user.tenant_id, user.role),
-        refresh_token=refresh_token,
         tenant_id=user.tenant_id,
         user_id=user.id,
         role=user.role,
     )
+    _set_refresh_cookie(response, refresh_token)
+    return token_response
 
 
-@router.post("/refresh", response_model=TokenResponse)
-async def refresh_token(
+@router.post("/migrate-session", response_model=TokenResponse)
+async def migrate_legacy_session(
     request: Request,
-    data: TokenRefresh,
+    response: Response,
+    data: LegacySessionMigration,
     db: AsyncSession = Depends(get_db),
 ):
-    """Refresh access token."""
+    """One-release bridge from a legacy JSON refresh token to the cookie."""
+
+    if not settings.legacy_session_migration_enabled:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+    _validate_auth_origin(request, required=True)
     await enforce_rate_limit(
         request,
         scope="refresh-ip",
@@ -408,14 +522,59 @@ async def refresh_token(
         user, rotated_token = await rotate_refresh_session(db, data.refresh_token)
     except RefreshSessionRejectedError as exc:
         if exc.persist_changes:
+            await db.commit()
+        return _refresh_rejection(
+            exc.detail,
+            status_code=exc.status_code,
+            preserve_cookie_on_conflict=False,
+        )
+
+    _set_refresh_cookie(response, rotated_token)
+    return TokenResponse(
+        access_token=create_access_token(user.id, user.tenant_id, user.role),
+        tenant_id=user.tenant_id,
+        user_id=user.id,
+        role=user.role,
+    )
+
+
+@router.post("/refresh", response_model=TokenResponse)
+async def refresh_token(
+    request: Request,
+    response: Response,
+    db: AsyncSession = Depends(get_db),
+):
+    """Rotate the HttpOnly refresh cookie and return a new access token."""
+    _validate_auth_origin(request, required=True)
+    await enforce_rate_limit(
+        request,
+        scope="refresh-ip",
+        limit=60,
+        window_seconds=60,
+    )
+    refresh_credential = request.cookies.get(settings.refresh_cookie_name)
+    if refresh_credential is None or not 20 <= len(refresh_credential) <= 4096:
+        return _refresh_rejection("Invalid refresh token", status_code=401)
+    await enforce_rate_limit(
+        request,
+        scope="refresh-token",
+        subject=hashlib.sha256(refresh_credential.encode("utf-8")).hexdigest(),
+        bind_to_client=False,
+        limit=20,
+        window_seconds=60,
+    )
+    try:
+        user, rotated_token = await rotate_refresh_session(db, refresh_credential)
+    except RefreshSessionRejectedError as exc:
+        if exc.persist_changes:
             # Security mutations must survive the 401 response; the request
             # dependency otherwise rolls back exceptions by design.
             await db.commit()
-        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+        return _refresh_rejection(exc.detail, status_code=exc.status_code)
 
+    _set_refresh_cookie(response, rotated_token)
     return TokenResponse(
         access_token=create_access_token(user.id, user.tenant_id, user.role),
-        refresh_token=rotated_token,
         tenant_id=user.tenant_id,
         user_id=user.id,
         role=user.role,
@@ -425,19 +584,23 @@ async def refresh_token(
 @router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
 async def logout(
     request: Request,
-    data: TokenRefresh,
     db: AsyncSession = Depends(get_db),
 ):
     """Revoke a refresh-token family, even when its access token has expired."""
+    _validate_auth_origin(request, required=True)
     await enforce_rate_limit(
         request,
         scope="logout-ip",
         limit=120,
         window_seconds=60,
     )
-    await revoke_refresh_token(db, data.refresh_token)
+    refresh_credential = request.cookies.get(settings.refresh_cookie_name)
+    if refresh_credential is not None and 20 <= len(refresh_credential) <= 4096:
+        await revoke_refresh_token(db, refresh_credential)
     # Always return the same result so callers cannot probe session validity.
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
+    response = Response(status_code=status.HTTP_204_NO_CONTENT)
+    _clear_refresh_cookie(response)
+    return response
 
 
 @router.get("/me", response_model=UserResponse)
@@ -500,10 +663,12 @@ async def invite_user(
 @router.post("/invitations/accept", response_model=TokenResponse)
 async def accept_invitation(
     request: Request,
+    response: Response,
     data: InvitationAccept,
     db: AsyncSession = Depends(get_db),
 ):
     """Accept a valid invitation, set a password, and start a session."""
+    _validate_auth_origin(request)
     await enforce_rate_limit(
         request,
         scope="invitation-accept-ip",
@@ -570,13 +735,14 @@ async def accept_invitation(
         user_id=user.id,
         tenant_id=invitation.tenant_id,
     )
-    return TokenResponse(
+    token_response = TokenResponse(
         access_token=create_access_token(user.id, invitation.tenant_id, user.role),
-        refresh_token=refresh_token,
         tenant_id=invitation.tenant_id,
         user_id=user.id,
         role=user.role,
     )
+    _set_refresh_cookie(response, refresh_token)
+    return token_response
 
 
 @router.get("/invitations", response_model=list[InvitationResponse])

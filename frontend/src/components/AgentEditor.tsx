@@ -1,11 +1,23 @@
-import { FormEvent, useMemo, useState } from 'react';
-import { Languages, Search, Sparkles, Volume2 } from 'lucide-react';
+import { FormEvent, useId, useMemo, useState } from 'react';
+import { CheckCircle2, Languages, LockKeyhole, Sparkles, Volume2 } from 'lucide-react';
 import {
   AgentProviderCatalog,
   AgentTemplate,
   LanguageCatalogItem,
-  VoiceCatalogItem,
 } from '@/lib/api';
+import VoiceLibrary from './VoiceLibrary';
+import {
+  reconcileVoiceSelection,
+  voiceCompatibility,
+  voiceConfigurationGuard,
+} from './voice-library.cjs';
+import {
+  languageSwitchingState,
+  normalizeLanguageSwitching,
+  switchingStatus,
+  withValidSwitching,
+} from './language-switching.cjs';
+import styles from './AgentEditor.module.css';
 
 export interface AgentEditorValues {
   name: string;
@@ -19,6 +31,8 @@ export interface AgentEditorValues {
   temperature: number;
   language: string;
   supported_languages: string[];
+  language_switching_enabled: boolean;
+  language_switching_mode: 'disabled' | 'automatic';
   speech_rate: number;
   timezone: string;
 }
@@ -35,24 +49,25 @@ export const defaultAgentValues: AgentEditorValues = {
   temperature: 0.7,
   language: 'en',
   supported_languages: ['en'],
+  language_switching_enabled: false,
+  language_switching_mode: 'disabled',
   speech_rate: 1,
   timezone: 'Asia/Dubai',
 };
 
 const fallbackLanguages: LanguageCatalogItem[] = [
-  ['bn', 'Bengali'], ['nl', 'Dutch'], ['en', 'English'], ['fr', 'French'],
+  ['ar', 'Arabic'], ['bn', 'Bengali'], ['nl', 'Dutch'], ['en', 'English'], ['fr', 'French'],
   ['de', 'German'], ['gu', 'Gujarati'], ['hi', 'Hindi'], ['it', 'Italian'],
   ['kn', 'Kannada'], ['ml', 'Malayalam'], ['mr', 'Marathi'], ['or', 'Odia'],
   ['pl', 'Polish'], ['pt', 'Portuguese'], ['pa', 'Punjabi'], ['ru', 'Russian'],
   ['es', 'Spanish'], ['sv', 'Swedish'], ['ta', 'Tamil'], ['te', 'Telugu'],
 ].map(([code, name]) => ({ code, name }));
 
-const noVoices: VoiceCatalogItem[] = [];
-
 interface AgentEditorProps {
   mode: 'create' | 'edit';
   catalog: AgentProviderCatalog | null;
   initialValues?: AgentEditorValues;
+  catalogError?: string | null;
   busy?: boolean;
   onCancel: () => void;
   onSubmit: (values: AgentEditorValues) => Promise<void>;
@@ -62,68 +77,110 @@ export default function AgentEditor({
   mode,
   catalog,
   initialValues = defaultAgentValues,
+  catalogError = null,
   busy = false,
   onCancel,
   onSubmit,
 }: AgentEditorProps) {
-  const [form, setForm] = useState<AgentEditorValues>(initialValues);
-  const [voiceSearch, setVoiceSearch] = useState('');
-  const [showAllVoices, setShowAllVoices] = useState(false);
+  const [originalConfiguration] = useState<AgentEditorValues>(() => normalizeLanguageSwitching(initialValues));
+  const [form, setForm] = useState<AgentEditorValues>(originalConfiguration);
+  const [voiceNotice, setVoiceNotice] = useState<string | null>(null);
+  const nameId = useId();
+  const purposeId = useId();
+  const promptId = useId();
+  const greetingId = useId();
+  const primaryLanguageId = useId();
+  const modelId = useId();
+  const timezoneId = useId();
+  const speechRateId = useId();
   const languages = catalog?.languages.length ? catalog.languages : fallbackLanguages;
-  const voices = catalog?.voices ?? noVoices;
+  const voices = useMemo(() => catalog?.voices ?? [], [catalog?.voices]);
+  const catalogUsable = Boolean(catalog && !catalogError && voices.length > 0 && catalog.languages.length > 0);
+  const configurationGuard = voiceConfigurationGuard({
+    editorMode: mode,
+    catalogAvailable: catalogUsable,
+    original: originalConfiguration,
+    current: form,
+  });
+  const storedConfigurationPreserved = mode === 'edit' && !configurationGuard.changed;
 
-  const visibleVoices = useMemo(() => {
-    const query = voiceSearch.trim().toLowerCase();
-    return voices.filter((voice) => {
-      const matchesLanguage = showAllVoices || voice.languages.includes(form.language);
-      const searchable = [voice.name, voice.id, voice.accent, voice.gender, ...voice.languages]
-        .filter(Boolean)
-        .join(' ')
-        .toLowerCase();
-      return matchesLanguage && (!query || searchable.includes(query));
-    });
-  }, [form.language, showAllVoices, voiceSearch, voices]);
+  const compatibleVoiceCount = useMemo(
+    () => voices.filter((voice) => voiceCompatibility(voice, form.supported_languages).status === 'compatible').length,
+    [form.supported_languages, voices],
+  );
+  const currentVoice = voices.find((voice) => voice.id === form.voice_id);
+  const currentVoiceCompatibility = form.voice_id && catalog
+    ? voiceCompatibility(currentVoice, form.supported_languages)
+    : null;
+  const effectiveVoiceId = currentVoiceCompatibility?.status === 'compatible' ? form.voice_id : '';
+  const effectiveVoiceNotice = voiceNotice ?? (
+    currentVoiceCompatibility && currentVoiceCompatibility.status !== 'compatible'
+      ? storedConfigurationPreserved
+        ? `${currentVoice?.name ?? form.voice_id} cannot be revalidated against the current catalog. It will be preserved for unrelated edits; choose a replacement before changing voice or languages.`
+        : `${currentVoice?.name ?? form.voice_id} is not verified for every selected language. Choose a compatible voice before saving.`
+      : null
+  );
 
-  const selectedVoice = voices.find((voice) => voice.id === form.voice_id);
+  const applyLanguageConfiguration = (next: AgentEditorValues, previousLanguageCount: number) => {
+    if (!catalogUsable) {
+      setVoiceNotice(configurationGuard.reason);
+      return;
+    }
+    const switched = withValidSwitching(next, previousLanguageCount);
+    const selection = catalog
+      ? reconcileVoiceSelection(switched.voice_id, voices, switched.supported_languages)
+      : null;
+    if (selection?.removed && selection.compatibility) {
+      setForm({ ...switched, voice_id: selection.voiceId });
+      setVoiceNotice(
+        `${selection.voice?.name ?? switched.voice_id} was removed because it is ${selection.compatibility.status === 'incompatible' ? 'missing one or more selected languages' : 'not verified for this configuration'}. Choose a compatible voice below.`,
+      );
+      return;
+    }
+    setForm(switched);
+    setVoiceNotice(null);
+  };
 
   const updatePrimaryLanguage = (language: string) => {
-    setForm((current) => ({
-      ...current,
-      language,
-      supported_languages: language === 'ta'
-        ? ['ta']
-        : current.supported_languages.includes('ta')
-          ? [language]
-          : Array.from(new Set([...current.supported_languages, language])),
-    }));
+    const supportedLanguages = Array.from(new Set([...form.supported_languages, language]));
+    applyLanguageConfiguration(
+      { ...form, language, supported_languages: supportedLanguages },
+      form.supported_languages.length,
+    );
   };
 
   const toggleSupportedLanguage = (language: string) => {
-    setForm((current) => {
-      const selected = current.supported_languages.includes(language);
-      if (selected && current.language === language) return current;
-      if (selected) {
-        return {
-          ...current,
-          supported_languages: current.supported_languages.filter((code) => code !== language),
-        };
-      }
-      if (language === 'ta') {
-        return { ...current, language: 'ta', supported_languages: ['ta'] };
-      }
-      if (current.supported_languages.includes('ta')) {
-        return { ...current, language, supported_languages: [language] };
-      }
-      return {
-        ...current,
-        supported_languages: [...current.supported_languages, language],
-      };
-    });
+    const selected = form.supported_languages.includes(language);
+    if (selected && form.language === language) return;
+    if (selected) {
+      applyLanguageConfiguration({
+        ...form,
+        supported_languages: form.supported_languages.filter((code) => code !== language),
+      }, form.supported_languages.length);
+      return;
+    }
+    applyLanguageConfiguration({
+      ...form,
+      supported_languages: [...form.supported_languages, language],
+    }, form.supported_languages.length);
+  };
+
+  const updateSwitchingMode = (mode: AgentEditorValues['language_switching_mode']) => {
+    if (!catalogUsable) {
+      setVoiceNotice(configurationGuard.reason);
+      return;
+    }
+    setForm((current) => ({
+      ...current,
+      language_switching_mode: mode,
+      language_switching_enabled: mode === 'automatic',
+    }));
   };
 
   const applyTemplate = (template: AgentTemplate) => {
-    setForm((current) => ({
-      ...current,
+    const switching = languageSwitchingState(template.supported_languages);
+    applyLanguageConfiguration({
+      ...form,
       name: template.name,
       description: template.description,
       system_prompt: template.system_prompt,
@@ -134,11 +191,39 @@ export default function AgentEditor({
       speech_rate: template.speech_rate,
       temperature: template.temperature,
       timezone: template.timezone,
-    }));
+      ...switching,
+    }, form.supported_languages.length);
   };
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
+    const guard = voiceConfigurationGuard({
+      editorMode: mode,
+      catalogAvailable: catalogUsable,
+      original: originalConfiguration,
+      current: form,
+    });
+    if (!guard.allowed) {
+      setVoiceNotice(guard.reason);
+      return;
+    }
+    if (mode === 'edit' && !guard.changed) {
+      await onSubmit(form);
+      return;
+    }
+    const selectedVoice = voices.find((voice) => voice.id === form.voice_id);
+    const selectedCompatibility = form.voice_id
+      ? voiceCompatibility(selectedVoice, form.supported_languages)
+      : null;
+    if (selectedCompatibility && selectedCompatibility.status !== 'compatible') {
+      setForm((current) => ({ ...current, voice_id: '' }));
+      setVoiceNotice('The previous voice is no longer verified for this configuration. Choose a compatible voice before saving.');
+      return;
+    }
+    if (form.supported_languages.length > 1 && !selectedVoice) {
+      setVoiceNotice('Choose a voice verified for every selected language before saving a multilingual agent.');
+      return;
+    }
     await onSubmit(form);
   };
 
@@ -171,22 +256,22 @@ export default function AgentEditor({
         </div>
         <div className="form-grid">
           <div className="form-group">
-            <label>Agent name</label>
-            <input required value={form.name} placeholder="e.g. Customer Care Concierge" onChange={(event) => setForm({ ...form, name: event.target.value })} />
+            <label htmlFor={nameId}>Agent name</label>
+            <input id={nameId} required value={form.name} placeholder="e.g. Customer Care Concierge" onChange={(event) => setForm({ ...form, name: event.target.value })} />
           </div>
           <div className="form-group">
-            <label>Purpose</label>
-            <input value={form.description} placeholder="Appointments, sales, support…" onChange={(event) => setForm({ ...form, description: event.target.value })} />
+            <label htmlFor={purposeId}>Purpose</label>
+            <input id={purposeId} value={form.description} placeholder="Appointments, sales, support…" onChange={(event) => setForm({ ...form, description: event.target.value })} />
           </div>
         </div>
         <div className="form-group">
-          <label>System prompt <span>{form.system_prompt.length} characters</span></label>
-          <textarea required minLength={10} maxLength={4000} value={form.system_prompt} placeholder="Define the role, goals, conversation flow, escalation path, and guardrails…" onChange={(event) => setForm({ ...form, system_prompt: event.target.value })} />
+          <label htmlFor={promptId}>System prompt <span>{form.system_prompt.length} characters</span></label>
+          <textarea id={promptId} required minLength={10} maxLength={4000} value={form.system_prompt} placeholder="Define the role, goals, conversation flow, escalation path, and guardrails…" onChange={(event) => setForm({ ...form, system_prompt: event.target.value })} />
           <p className="form-hint">Keep responses spoken and concise. Confirm important information and never invent customer data.</p>
         </div>
         <div className="form-group">
-          <label>First message</label>
-          <input value={form.greeting_message} placeholder="Hello, how can I help you today?" onChange={(event) => setForm({ ...form, greeting_message: event.target.value })} />
+          <label htmlFor={greetingId}>First message</label>
+          <input id={greetingId} value={form.greeting_message} placeholder="Hello, how can I help you today?" onChange={(event) => setForm({ ...form, greeting_message: event.target.value })} />
         </div>
       </section>
 
@@ -196,8 +281,8 @@ export default function AgentEditor({
           <p>{form.supported_languages.length} selected · the agent starts in the primary language</p>
         </div>
         <div className="form-group language-primary">
-          <label>Primary language</label>
-          <select value={form.language} onChange={(event) => updatePrimaryLanguage(event.target.value)}>
+          <label htmlFor={primaryLanguageId}>Primary language</label>
+          <select id={primaryLanguageId} value={form.language} disabled={!catalogUsable} onChange={(event) => updatePrimaryLanguage(event.target.value)}>
             {languages.map((language) => <option value={language.code} key={language.code}>{language.name}</option>)}
           </select>
         </div>
@@ -208,8 +293,10 @@ export default function AgentEditor({
             return (
               <button
                 type="button"
-                className={`language-option ${selected ? 'selected' : ''}`}
+                className={`language-option ${selected ? 'selected' : ''} ${!catalogUsable ? styles.languageOptionLocked : ''}`}
                 aria-pressed={selected}
+                aria-label={`${selected ? 'Remove' : 'Add'} ${language.name}${primary ? ', primary language' : ''}`}
+                disabled={!catalogUsable}
                 key={language.code}
                 onClick={() => toggleSupportedLanguage(language.code)}
               >
@@ -218,38 +305,75 @@ export default function AgentEditor({
             );
           })}
         </div>
-        {form.supported_languages.includes('ta') && (
-          <p className="form-hint">Smallest.ai currently requires Tamil agents to use Tamil as their only language.</p>
+        {!catalogUsable && (
+          <div className={styles.catalogLock} role="status">
+            <LockKeyhole size={15} aria-hidden="true" />
+            <span>{mode === 'edit'
+              ? 'The voice catalog is unavailable, so the stored voice, languages, and switching mode are locked. You can still save unrelated agent changes.'
+              : 'Connect to the Smallest.ai voice catalog before choosing languages or creating this agent.'}</span>
+          </div>
         )}
+        <fieldset className={styles.switchingFieldset}>
+          <legend>Same-call language behavior</legend>
+          <div className={styles.switchingOptions}>
+            <label className={`${styles.switchingOption} ${form.language_switching_mode === 'disabled' ? styles.switchingOptionSelected : ''} ${!catalogUsable ? styles.switchingOptionDisabled : ''}`}>
+              <input
+                type="radio"
+                name="language-switching-mode"
+                value="disabled"
+                checked={form.language_switching_mode === 'disabled'}
+                disabled={!catalogUsable}
+                onChange={() => updateSwitchingMode('disabled')}
+              />
+              <span>
+                <strong>Fixed language per call</strong>
+                <small>The agent stays in the primary language for the entire conversation.</small>
+              </span>
+            </label>
+            <label className={`${styles.switchingOption} ${form.language_switching_mode === 'automatic' ? styles.switchingOptionSelected : ''} ${!catalogUsable || form.supported_languages.length < 2 ? styles.switchingOptionDisabled : ''}`}>
+              <input
+                type="radio"
+                name="language-switching-mode"
+                value="automatic"
+                checked={form.language_switching_mode === 'automatic'}
+                disabled={!catalogUsable || form.supported_languages.length < 2}
+                onChange={() => updateSwitchingMode('automatic')}
+              />
+              <span>
+                <strong>Automatic same-call switching</strong>
+                <small>Smallest.ai can detect a caller changing languages when the exact combination is supported.</small>
+              </span>
+            </label>
+          </div>
+          <div className={`${styles.switchingStatus} ${form.language_switching_enabled ? styles.switchingStatusReady : ''}`} role="status">
+            {form.language_switching_enabled ? <CheckCircle2 size={15} aria-hidden="true" /> : <Languages size={15} aria-hidden="true" />}
+            <span>{!catalogUsable && mode === 'edit'
+              ? 'Stored same-call behavior is preserved until the catalog is available for validation.'
+              : switchingStatus(form)}</span>
+          </div>
+        </fieldset>
       </section>
 
       <section className="editor-section">
         <div className="editor-section-heading">
           <div><span className="section-icon"><Volume2 size={14} /></span><h3>Voice</h3></div>
-          <p>{voices.length} Smallest.ai voices available</p>
+          <p>{compatibleVoiceCount} compatible · {voices.length} catalog voices</p>
         </div>
-        <div className="voice-toolbar">
-          <label className="voice-search"><Search size={14} /><input value={voiceSearch} placeholder="Search voice, ID, accent…" onChange={(event) => setVoiceSearch(event.target.value)} /></label>
-          <label className="checkbox-control"><input type="checkbox" checked={showAllVoices} onChange={(event) => setShowAllVoices(event.target.checked)} /> Show every language</label>
-        </div>
-        <div className="form-group">
-          <label>Smallest.ai voice <span>{visibleVoices.length} matches</span></label>
-          <select value={form.voice_id} onChange={(event) => setForm({ ...form, voice_id: event.target.value })}>
-            <option value="">Platform default voice</option>
-            {form.voice_id && !visibleVoices.some((voice) => voice.id === form.voice_id) && (
-              <option value={form.voice_id}>{selectedVoice?.name ?? form.voice_id} · Current selection</option>
-            )}
-            {visibleVoices.map((voice) => <VoiceOption voice={voice} key={voice.id} />)}
-          </select>
-        </div>
-        {selectedVoice && (
-          <div className="voice-summary">
-            <div className="voice-summary-icon"><Volume2 size={16} /></div>
-            <div><strong>{selectedVoice.name}</strong><span>{voiceDescription(selectedVoice)}</span></div>
-            <code>{selectedVoice.id}</code>
-            {selectedVoice.source === 'cloned' && <span className="badge badge-info">Your clone</span>}
-          </div>
-        )}
+        <VoiceLibrary
+          voices={voices}
+          languages={languages}
+          selectedLanguages={form.supported_languages}
+          selectedVoiceId={effectiveVoiceId}
+          catalogState={catalog ? 'ready' : catalogError ? 'error' : 'loading'}
+          catalogError={catalogError}
+          notice={effectiveVoiceNotice}
+          configurationLocked={!catalogUsable}
+          preservedVoiceId={storedConfigurationPreserved ? form.voice_id : undefined}
+          onSelect={(voiceId) => {
+            setForm((current) => ({ ...current, voice_id: voiceId }));
+            setVoiceNotice(null);
+          }}
+        />
       </section>
 
       <section className="editor-section editor-section-compact">
@@ -258,39 +382,32 @@ export default function AgentEditor({
         </div>
         <div className="form-grid">
           <div className="form-group">
-            <label>Model</label>
-            <select value={form.model_name} onChange={(event) => setForm({ ...form, model_name: event.target.value })}><option value="electron">Electron · voice optimized</option></select>
+            <label htmlFor={modelId}>Model</label>
+            <select id={modelId} value={form.model_name} onChange={(event) => setForm({ ...form, model_name: event.target.value })}><option value="electron">Electron · voice optimized</option></select>
           </div>
           <div className="form-group">
-            <label>Timezone</label>
-            <input required list="common-timezones" value={form.timezone} onChange={(event) => setForm({ ...form, timezone: event.target.value })} />
+            <label htmlFor={timezoneId}>Timezone</label>
+            <input id={timezoneId} required list="common-timezones" value={form.timezone} onChange={(event) => setForm({ ...form, timezone: event.target.value })} />
             <datalist id="common-timezones"><option value="Asia/Dubai" /><option value="Asia/Kolkata" /><option value="Europe/London" /><option value="America/New_York" /><option value="America/Los_Angeles" /></datalist>
           </div>
           <div className="form-group range-control">
-            <label>Speech rate <span>{form.speech_rate.toFixed(2)}×</span></label>
-            <input type="range" min="0.5" max="2" step="0.05" value={form.speech_rate} onChange={(event) => setForm({ ...form, speech_rate: Number(event.target.value) })} />
-          </div>
-          <div className="form-group range-control">
-            <label>Creativity <span>{form.temperature.toFixed(1)}</span></label>
-            <input type="range" min="0" max="2" step="0.1" value={form.temperature} onChange={(event) => setForm({ ...form, temperature: Number(event.target.value) })} />
+            <label htmlFor={speechRateId}>Speech rate <span>{form.speech_rate.toFixed(2)}×</span></label>
+            <input id={speechRateId} type="range" min="0.5" max="2" step="0.05" value={form.speech_rate} onChange={(event) => setForm({ ...form, speech_rate: Number(event.target.value) })} />
           </div>
         </div>
       </section>
 
       <div className="editor-actions">
         <button type="button" className="btn btn-secondary" onClick={onCancel}>Cancel</button>
-        <button type="submit" className="btn btn-primary" disabled={busy}>{busy ? 'Saving…' : mode === 'create' ? 'Create local draft' : 'Save changes'}</button>
+        <button
+          type="submit"
+          className="btn btn-primary"
+          disabled={busy || !configurationGuard.allowed}
+          title={!configurationGuard.allowed ? configurationGuard.reason ?? undefined : undefined}
+        >
+          {busy ? 'Saving…' : mode === 'create' ? 'Create local draft' : 'Save changes'}
+        </button>
       </div>
     </form>
   );
-}
-
-function VoiceOption({ voice }: { voice: VoiceCatalogItem }) {
-  return <option value={voice.id} disabled={!voice.synthesizer_model}>{voice.name} · {voice.languages.join(', ').toUpperCase() || 'Multilingual'}{voice.accent ? ` · ${voice.accent}` : ''}{voice.source === 'cloned' ? ' · Cloned' : ''}{voice.unavailability_reason ? ` · ${voice.unavailability_reason}` : ''}</option>;
-}
-
-function voiceDescription(voice: VoiceCatalogItem) {
-  return [voice.languages.join(', ').toUpperCase(), voice.accent, voice.gender, voice.age]
-    .filter(Boolean)
-    .join(' · ');
 }

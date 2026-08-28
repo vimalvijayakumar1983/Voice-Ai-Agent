@@ -1,3 +1,4 @@
+from datetime import datetime
 from typing import Any
 from uuid import UUID
 
@@ -61,3 +62,16 @@ class IntegrationResponse(BaseModel):
 class IntegrationEncryptionBackfillResponse(BaseModel):
     migrated: int = Field(ge=0)
     remaining: int = Field(ge=0)
+
+
+class WebhookDeliveryResponse(BaseModel):
+    id: UUID
+    integration_id: UUID
+    event_type: str
+    status: str
+    attempts: int
+    last_error: str | None
+    delivered_at: datetime | None
+    created_at: datetime
+
+    model_config = {"from_attributes": True}

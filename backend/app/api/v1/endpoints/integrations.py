@@ -1,19 +1,21 @@
 """Integration management endpoints."""
 
-from uuid import UUID
+from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select
+import structlog
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.middleware.tenant import CurrentUser, get_current_user, require_role
-from app.models.integration import Integration
+from app.models.integration import Integration, WebhookEvent
 from app.schemas.integration import (
     IntegrationCreate,
     IntegrationEncryptionBackfillResponse,
     IntegrationResponse,
     IntegrationUpdate,
+    WebhookDeliveryResponse,
 )
 from app.services.integration_security import (
     INTEGRATION_CONFIG_STORAGE_VERSION,
@@ -29,6 +31,7 @@ from app.services.integration_security import (
 )
 
 router = APIRouter(prefix="/integrations", tags=["Integrations"])
+logger = structlog.get_logger()
 
 
 def _locked_tenant_integration_statement(integration_id: UUID, tenant_id: UUID):
@@ -231,3 +234,168 @@ async def delete_integration(
     if not integration:
         raise HTTPException(status_code=404, detail="Integration not found")
     await db.delete(integration)
+
+
+async def _load_webhook_integration_or_404(
+    db: AsyncSession,
+    integration_id: UUID,
+    tenant_id: UUID,
+) -> Integration:
+    result = await db.execute(
+        select(Integration).where(
+            Integration.id == integration_id,
+            Integration.tenant_id == tenant_id,
+            Integration.integration_type == "webhook",
+        )
+    )
+    integration = result.scalar_one_or_none()
+    if integration is None:
+        raise HTTPException(status_code=404, detail="Webhook integration not found")
+    return integration
+
+
+@router.get(
+    "/{integration_id}/deliveries",
+    response_model=list[WebhookDeliveryResponse],
+)
+async def list_webhook_deliveries(
+    integration_id: UUID,
+    current_user: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=200),
+):
+    """Return a safe delivery log without webhook payloads or credentials."""
+    await _load_webhook_integration_or_404(db, integration_id, current_user.tenant_id)
+    result = await db.execute(
+        select(WebhookEvent)
+        .where(
+            WebhookEvent.integration_id == integration_id,
+            WebhookEvent.tenant_id == current_user.tenant_id,
+        )
+        .order_by(WebhookEvent.created_at.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+    )
+    return [WebhookDeliveryResponse.model_validate(event) for event in result.scalars().all()]
+
+
+async def _enqueue_webhook_delivery(
+    db: AsyncSession,
+    event: WebhookEvent,
+    tenant_id: UUID,
+) -> None:
+    from app.tasks.webhook_tasks import (
+        WEBHOOK_QUEUE_PENDING,
+        WEBHOOK_QUEUE_UNAVAILABLE,
+        deliver_webhook_event,
+    )
+
+    # Persist an explicit outbox state before publishing. It remains until the
+    # worker records an attempt outcome, so a process crash or lost publish is
+    # recoverable without conflating it with Celery's transient HTTP backoff.
+    event.last_error = WEBHOOK_QUEUE_PENDING
+    await db.commit()
+    try:
+        deliver_webhook_event.delay(str(event.id), str(tenant_id))
+    except Exception:
+        # A publish can fail ambiguously after the worker has already consumed
+        # it. Update only the untouched enqueue sentinel, never a fast worker's
+        # sent/failed/transient result.
+        await db.execute(
+            update(WebhookEvent)
+            .where(
+                WebhookEvent.id == event.id,
+                WebhookEvent.tenant_id == tenant_id,
+                WebhookEvent.status == "pending",
+                WebhookEvent.last_error == WEBHOOK_QUEUE_PENDING,
+            )
+            .values(last_error=WEBHOOK_QUEUE_UNAVAILABLE)
+            .execution_options(synchronize_session=False)
+        )
+        await db.commit()
+        await db.refresh(event)
+        logger.warning(
+            "webhook_delivery_enqueue_deferred",
+            event_id=str(event.id),
+            tenant_id=str(tenant_id),
+        )
+
+
+@router.post(
+    "/{integration_id}/test",
+    response_model=WebhookDeliveryResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def test_webhook_integration(
+    integration_id: UUID,
+    current_user: CurrentUser = Depends(require_role("owner", "admin")),
+    db: AsyncSession = Depends(get_db),
+):
+    """Queue a signed, non-production test event for one active webhook."""
+    integration = await _load_webhook_integration_or_404(
+        db,
+        integration_id,
+        current_user.tenant_id,
+    )
+    if not integration.is_active:
+        raise HTTPException(status_code=409, detail="Activate the webhook before testing it")
+
+    event = WebhookEvent(
+        id=uuid4(),
+        tenant_id=current_user.tenant_id,
+        integration_id=integration.id,
+        event_type="integration.test",
+        payload={
+            "integration_id": str(integration.id),
+            "message": "Voice AI webhook test",
+        },
+        status="pending",
+    )
+    db.add(event)
+    await db.flush()
+    await _enqueue_webhook_delivery(db, event, current_user.tenant_id)
+    return WebhookDeliveryResponse.model_validate(event)
+
+
+@router.post(
+    "/{integration_id}/deliveries/{delivery_id}/replay",
+    response_model=WebhookDeliveryResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def replay_webhook_delivery(
+    integration_id: UUID,
+    delivery_id: UUID,
+    current_user: CurrentUser = Depends(require_role("owner", "admin")),
+    db: AsyncSession = Depends(get_db),
+):
+    """Requeue one failed delivery while preserving its stable event ID."""
+    integration = await _load_webhook_integration_or_404(
+        db,
+        integration_id,
+        current_user.tenant_id,
+    )
+    if not integration.is_active:
+        raise HTTPException(status_code=409, detail="Activate the webhook before replaying it")
+    result = await db.execute(
+        select(WebhookEvent)
+        .where(
+            WebhookEvent.id == delivery_id,
+            WebhookEvent.integration_id == integration_id,
+            WebhookEvent.tenant_id == current_user.tenant_id,
+        )
+        .with_for_update()
+    )
+    event = result.scalar_one_or_none()
+    if event is None:
+        raise HTTPException(status_code=404, detail="Webhook delivery not found")
+    if event.status != "failed":
+        raise HTTPException(
+            status_code=409,
+            detail="Only failed webhook deliveries can be replayed",
+        )
+
+    event.status = "pending"
+    event.delivered_at = None
+    await _enqueue_webhook_delivery(db, event, current_user.tenant_id)
+    return WebhookDeliveryResponse.model_validate(event)

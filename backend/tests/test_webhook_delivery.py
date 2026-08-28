@@ -1,8 +1,10 @@
 """Outbound webhook delivery security and reliability tests."""
 
+import asyncio
 import hashlib
 import hmac
 import uuid
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import func, select
@@ -121,6 +123,18 @@ async def test_delivery_rejects_non_global_dns_answer(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_delivery_dns_resolution_has_a_bounded_timeout(monkeypatch):
+    async def stalled_to_thread(*_args, **_kwargs):
+        await asyncio.Future()
+
+    monkeypatch.setattr(webhook_tasks.asyncio, "to_thread", stalled_to_thread)
+    monkeypatch.setattr(webhook_tasks, "_DNS_TIMEOUT_SECONDS", 0.001)
+
+    with pytest.raises(TimeoutError, match="webhook_dns_resolution_timeout"):
+        await webhook_tasks._resolve_public_destination("https://hooks.vendor.com/events")
+
+
+@pytest.mark.asyncio
 async def test_delivery_transport_pins_the_validated_address(monkeypatch):
     monkeypatch.setattr(
         webhook_tasks.socket,
@@ -202,6 +216,32 @@ async def test_corrupt_envelope_fails_delivery_closed_without_network_access(
     assert event.status == "failed"
     assert event.attempts == 1
     assert event.last_error == "invalid_configuration"
+
+
+@pytest.mark.asyncio
+async def test_duplicate_task_never_retries_a_terminal_failed_delivery(
+    monkeypatch,
+    db: AsyncSession,
+    tenant,
+    use_test_session_factory,
+):
+    _integration, event = await _seed_delivery(db, tenant.id)
+    event.status = "failed"
+    event.attempts = 5
+    event.last_error = "retry_limit_exhausted"
+    await db.commit()
+
+    async def should_not_send(*_args, **_kwargs) -> int:
+        raise AssertionError("terminal failed deliveries require explicit replay")
+
+    monkeypatch.setattr(webhook_tasks, "_send_request", should_not_send)
+    result = await webhook_tasks._attempt_webhook_delivery(str(event.id), str(tenant.id))
+
+    assert result == webhook_tasks.DeliveryResult("terminal", "delivery_not_pending")
+    await db.refresh(event)
+    assert event.status == "failed"
+    assert event.attempts == 5
+    assert event.last_error == "retry_limit_exhausted"
 
 
 @pytest.mark.asyncio
@@ -345,3 +385,94 @@ def test_delivery_enqueue_failure_retries_the_stable_dispatch(monkeypatch):
 
     assert seen["countdown"] == 30
     assert isinstance(seen["exc"], webhook_tasks.WebhookPreparationError)
+
+
+@pytest.mark.asyncio
+async def test_stale_pending_delivery_recovery_uses_a_repeatable_idempotent_lease(
+    db: AsyncSession,
+    tenant,
+    use_test_session_factory,
+):
+    _integration, event = await _seed_delivery(db, tenant.id)
+    now = datetime(2026, 8, 28, 12, 0, tzinfo=UTC)
+    event.updated_at = now - timedelta(
+        seconds=webhook_tasks.PENDING_DELIVERY_RECOVERY_AFTER_SECONDS + 1
+    )
+    event.last_error = webhook_tasks.WEBHOOK_QUEUE_PENDING
+    await db.commit()
+
+    first_claim = await webhook_tasks._claim_stale_pending_webhook_deliveries(now=now)
+    immediate_duplicate = await webhook_tasks._claim_stale_pending_webhook_deliveries(now=now)
+    after_crash_window = await webhook_tasks._claim_stale_pending_webhook_deliveries(
+        now=now + timedelta(seconds=webhook_tasks.PENDING_DELIVERY_RECOVERY_AFTER_SECONDS + 1)
+    )
+
+    stable_identity = (str(event.id), str(tenant.id))
+    assert first_claim == [stable_identity]
+    assert immediate_duplicate == []
+    assert after_crash_window == [stable_identity]
+
+
+@pytest.mark.asyncio
+async def test_recovery_sweep_does_not_bypass_transient_delivery_backoff(
+    db: AsyncSession,
+    tenant,
+    use_test_session_factory,
+):
+    _integration, event = await _seed_delivery(db, tenant.id)
+    now = datetime(2026, 8, 28, 12, 0, tzinfo=UTC)
+    event.attempts = 1
+    event.last_error = "http_503"
+    event.updated_at = now - timedelta(hours=1)
+    await db.commit()
+
+    claimed = await webhook_tasks._claim_stale_pending_webhook_deliveries(now=now)
+
+    assert claimed == []
+    await db.refresh(event)
+    assert event.status == "pending"
+    assert event.attempts == 1
+    assert event.last_error == "http_503"
+
+
+@pytest.mark.asyncio
+async def test_replayed_delivery_is_recoverable_without_erasing_attempt_history(
+    db: AsyncSession,
+    tenant,
+    use_test_session_factory,
+):
+    _integration, event = await _seed_delivery(db, tenant.id)
+    now = datetime(2026, 8, 28, 12, 0, tzinfo=UTC)
+    event.attempts = 5
+    event.last_error = webhook_tasks.WEBHOOK_QUEUE_PENDING
+    event.updated_at = now - timedelta(hours=1)
+    await db.commit()
+
+    claimed = await webhook_tasks._claim_stale_pending_webhook_deliveries(now=now)
+
+    assert claimed == [(str(event.id), str(tenant.id))]
+    await db.refresh(event)
+    assert event.status == "pending"
+    assert event.attempts == 5
+    assert event.last_error == webhook_tasks.WEBHOOK_QUEUE_PENDING
+
+
+def test_pending_delivery_sweep_isolates_broker_failures(monkeypatch):
+    first = (str(uuid.uuid4()), str(uuid.uuid4()))
+    second = (str(uuid.uuid4()), str(uuid.uuid4()))
+    calls: list[tuple[str, str]] = []
+
+    def claimed_run(coro):
+        coro.close()
+        return [first, second]
+
+    def selective_delay(event_id: str, tenant_id: str):
+        calls.append((event_id, tenant_id))
+        if event_id == first[0]:
+            raise ConnectionError("broker unavailable")
+
+    monkeypatch.setattr(webhook_tasks, "_run_async", claimed_run)
+    monkeypatch.setattr(webhook_tasks.deliver_webhook_event, "delay", selective_delay)
+
+    assert webhook_tasks.sweep_pending_webhook_deliveries.run() == 1
+    assert calls == [first, second]

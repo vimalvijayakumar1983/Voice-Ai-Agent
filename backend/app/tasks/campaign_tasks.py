@@ -23,6 +23,7 @@ from app.models.campaign import (
 )
 from app.models.workflow import Workflow
 from app.providers.smallest import get_smallest_client
+from app.services.call_metadata import agent_configuration_snapshot
 from app.services.campaign_lifecycle import (
     ACTIVE_CONTACT_STATUSES,
     TERMINAL_CALL_STATUSES,
@@ -30,6 +31,7 @@ from app.services.campaign_lifecycle import (
     refresh_campaign_metrics,
     sync_campaign_call_lifecycle,
 )
+from app.services.compliance_policy import is_outbound_consent_revoked
 from app.services.phone_numbers import (
     is_number_on_tenant_dnc,
     normalize_e164,
@@ -70,6 +72,7 @@ class DispatchPayload:
     idempotency_key: str
     provider: str
     provider_agent_id: str | None
+    provider_revision_id: str | None
     phone_number: str
     from_number: str | None
     context_data: dict
@@ -462,6 +465,13 @@ async def _load_valid_campaign_agent(
             _record_campaign_issue(
                 campaign,
                 "Campaign agent has never completed its initial Smallest.ai publish",
+            )
+            return None
+        if agent.sync_status != "synced":
+            campaign.status = "paused"
+            _record_campaign_issue(
+                campaign,
+                "Campaign agent has unpublished or unverified provider changes",
             )
             return None
         if _has_unverified_smallest_resources(campaign):
@@ -1024,6 +1034,18 @@ async def _prepare_attempt_dispatch(
         )
         await db.commit()
         return DispatchPreparation()
+    if await is_outbound_consent_revoked(db, tenant_id, contact.phone_number):
+        await _cancel_unstarted_attempt(
+            db,
+            campaign,
+            contact,
+            attempt,
+            call,
+            contact_status="skipped",
+            reason="consent_revoked",
+        )
+        await db.commit()
+        return DispatchPreparation()
 
     if call is None:
         call_id = uuid.uuid4()
@@ -1040,6 +1062,7 @@ async def _prepare_attempt_dispatch(
             provider=attempt.provider,
             call_metadata={
                 **context_variables,
+                "agent_configuration": agent_configuration_snapshot(agent),
                 "campaign_dispatch": {
                     "attempt_id": str(attempt.id),
                     "contact_id": str(contact.id),
@@ -1070,6 +1093,7 @@ async def _prepare_attempt_dispatch(
             idempotency_key=attempt.idempotency_key,
             provider=attempt.provider,
             provider_agent_id=agent.provider_agent_id,
+            provider_revision_id=agent.provider_revision_id,
             phone_number=contact.phone_number,
             from_number=call.from_number,
             context_data=context_variables,
@@ -1099,10 +1123,13 @@ async def _call_provider(payload: DispatchPayload) -> str:
     if payload.provider == "smallest":
         if not payload.provider_agent_id:
             raise DefinitiveDispatchError("Smallest.ai agent has not been provisioned")
+        if not payload.provider_revision_id:
+            raise DefinitiveDispatchError("Smallest.ai agent has no verified provider revision")
         return await get_smallest_client().start_outbound_call(
             agent_id=payload.provider_agent_id,
             phone_number=payload.phone_number,
             variables=_smallest_variables(payload),
+            version_id=payload.provider_revision_id,
         )
     if payload.provider == "twilio":
         if not payload.from_number or payload.from_number == "provider-managed":
@@ -1273,7 +1300,10 @@ async def _call_provider_with_final_guard(
             and (
                 current_provider != payload.provider
                 or current_provider == "smallest"
-                and agent.provider_agent_id != payload.provider_agent_id
+                and (
+                    agent.provider_agent_id != payload.provider_agent_id
+                    or agent.provider_revision_id != payload.provider_revision_id
+                )
                 or current_provider == "twilio"
                 and current_from_number != payload.from_number
             )
@@ -1306,6 +1336,22 @@ async def _call_provider_with_final_guard(
                 call,
                 contact_status="dnc",
                 reason="do_not_call",
+            )
+            await db.commit()
+            return None
+        if await is_outbound_consent_revoked(
+            db,
+            payload.tenant_id,
+            payload.phone_number,
+        ):
+            await _cancel_unstarted_attempt(
+                db,
+                campaign,
+                contact,
+                attempt,
+                call,
+                contact_status="skipped",
+                reason="consent_revoked",
             )
             await db.commit()
             return None

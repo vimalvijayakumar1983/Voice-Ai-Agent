@@ -24,6 +24,22 @@ from app.models.audit import AuditEvent
 from app.models.tenant import Tenant
 from app.models.user import ApiKey, RefreshSession, User, UserInvitation
 
+AUTH_ORIGIN = settings.cors_origin_list[0]
+ORIGIN_HEADERS = {"Origin": AUTH_ORIGIN}
+
+
+def _refresh_cookie_from(response) -> str:
+    token = response.cookies.get(settings.refresh_cookie_name)
+    assert token
+    return token
+
+
+def _refresh_headers(token: str) -> dict[str, str]:
+    return {
+        **ORIGIN_HEADERS,
+        "Cookie": f"{settings.refresh_cookie_name}={token}",
+    }
+
 
 @pytest.mark.asyncio
 async def test_auth_rejects_declared_oversized_body_before_parsing(client: AsyncClient):
@@ -78,8 +94,14 @@ async def test_register(client: AsyncClient):
     assert response.status_code == 201
     data = response.json()
     assert "access_token" in data
-    assert "refresh_token" in data
+    assert "refresh_token" not in data
     assert data["role"] == "owner"
+    set_cookie = response.headers["set-cookie"]
+    assert f"{settings.refresh_cookie_name}=" in set_cookie
+    assert "HttpOnly" in set_cookie
+    assert "Path=/api/v1/auth" in set_cookie
+    assert "SameSite=lax" in set_cookie
+    assert "Secure" not in set_cookie
 
 
 @pytest.mark.asyncio
@@ -229,6 +251,199 @@ async def test_login(client: AsyncClient, user, tenant):
     data = response.json()
     assert data["user_id"] == str(user.id)
     assert data["tenant_id"] == str(tenant.id)
+    assert "refresh_token" not in data
+    assert _refresh_cookie_from(response)
+
+
+@pytest.mark.asyncio
+async def test_production_refresh_cookie_is_secure_cross_site_and_http_only(
+    client: AsyncClient,
+    user,
+    monkeypatch,
+):
+    async def bypass_rate_limit(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(auth_endpoint.settings, "app_env", "production")
+    monkeypatch.setattr(auth_endpoint, "enforce_rate_limit", bypass_rate_limit)
+
+    response = await client.post(
+        "/api/v1/auth/login",
+        headers=ORIGIN_HEADERS,
+        json={"email": user.email, "password": "testpassword"},
+    )
+
+    assert response.status_code == 200
+    assert "refresh_token" not in response.json()
+    set_cookie = response.headers["set-cookie"]
+    assert f"{settings.refresh_cookie_name}=" in set_cookie
+    assert "HttpOnly" in set_cookie
+    assert "Path=/api/v1/auth" in set_cookie
+    assert "SameSite=none" in set_cookie
+    assert "Secure" in set_cookie
+
+
+@pytest.mark.asyncio
+async def test_cookie_setting_endpoints_reject_a_supplied_untrusted_origin(
+    client: AsyncClient,
+    user,
+    db: AsyncSession,
+):
+    response = await client.post(
+        "/api/v1/auth/login",
+        headers={"Origin": "https://attacker.example"},
+        json={"email": user.email, "password": "testpassword"},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == auth_endpoint.INVALID_AUTH_ORIGIN_DETAIL
+    assert "set-cookie" not in response.headers
+    assert await db.scalar(select(func.count()).select_from(RefreshSession)) == 0
+
+
+@pytest.mark.asyncio
+async def test_refresh_is_cookie_only_and_requires_exact_allowed_origin(
+    client: AsyncClient,
+    user,
+):
+    login = await client.post(
+        "/api/v1/auth/login",
+        json={"email": user.email, "password": "testpassword"},
+    )
+    original = _refresh_cookie_from(login)
+
+    client.cookies.clear()
+    body_only = await client.post(
+        "/api/v1/auth/refresh",
+        headers=ORIGIN_HEADERS,
+        json={"refresh_token": original},
+    )
+    assert body_only.status_code == 401
+    assert "Max-Age=0" in body_only.headers["set-cookie"]
+
+    missing_origin = await client.post(
+        "/api/v1/auth/refresh",
+        headers={"Cookie": f"{settings.refresh_cookie_name}={original}"},
+    )
+    assert missing_origin.status_code == 403
+    assert "set-cookie" not in missing_origin.headers
+
+    untrusted_origin = await client.post(
+        "/api/v1/auth/refresh",
+        headers={
+            "Origin": f"{AUTH_ORIGIN}/",
+            "Cookie": f"{settings.refresh_cookie_name}={original}",
+        },
+    )
+    assert untrusted_origin.status_code == 403
+    assert "set-cookie" not in untrusted_origin.headers
+
+    allowed = await client.post(
+        "/api/v1/auth/refresh",
+        headers=_refresh_headers(original),
+        json={"refresh_token": "x" * 32},
+    )
+    assert allowed.status_code == 200
+    assert "refresh_token" not in allowed.json()
+    assert _refresh_cookie_from(allowed) != original
+
+
+@pytest.mark.asyncio
+async def test_logout_requires_origin_does_not_revoke_on_rejection_and_clears_on_success(
+    client: AsyncClient,
+    user,
+):
+    login = await client.post(
+        "/api/v1/auth/login",
+        json={"email": user.email, "password": "testpassword"},
+    )
+    original = _refresh_cookie_from(login)
+
+    rejected = await client.post(
+        "/api/v1/auth/logout",
+        headers={"Cookie": f"{settings.refresh_cookie_name}={original}"},
+    )
+    assert rejected.status_code == 403
+    assert "set-cookie" not in rejected.headers
+
+    still_active = await client.post(
+        "/api/v1/auth/refresh",
+        headers=_refresh_headers(original),
+    )
+    assert still_active.status_code == 200
+    successor = _refresh_cookie_from(still_active)
+
+    logout = await client.post(
+        "/api/v1/auth/logout",
+        headers=_refresh_headers(successor),
+    )
+    assert logout.status_code == 204
+    assert "Max-Age=0" in logout.headers["set-cookie"]
+
+
+@pytest.mark.asyncio
+async def test_legacy_session_migration_is_opt_in_origin_bound_and_access_only(
+    client: AsyncClient,
+    user,
+    monkeypatch,
+):
+    login = await client.post(
+        "/api/v1/auth/login",
+        json={"email": user.email, "password": "testpassword"},
+    )
+    legacy_token = _refresh_cookie_from(login)
+    client.cookies.clear()
+
+    disabled = await client.post(
+        "/api/v1/auth/migrate-session",
+        headers=ORIGIN_HEADERS,
+        json={"refresh_token": legacy_token},
+    )
+    assert disabled.status_code == 404
+    assert "set-cookie" not in disabled.headers
+
+    monkeypatch.setattr(auth_endpoint.settings, "legacy_session_migration_enabled", True)
+    untrusted = await client.post(
+        "/api/v1/auth/migrate-session",
+        headers={"Origin": "https://attacker.example"},
+        json={"refresh_token": legacy_token},
+    )
+    assert untrusted.status_code == 403
+    assert "set-cookie" not in untrusted.headers
+
+    migrated = await client.post(
+        "/api/v1/auth/migrate-session",
+        headers=ORIGIN_HEADERS,
+        json={"refresh_token": legacy_token},
+    )
+    assert migrated.status_code == 200
+    assert "access_token" in migrated.json()
+    assert "refresh_token" not in migrated.json()
+    migrated_token = _refresh_cookie_from(migrated)
+    assert migrated_token != legacy_token
+
+    refreshed = await client.post(
+        "/api/v1/auth/refresh",
+        headers=_refresh_headers(migrated_token),
+    )
+    assert refreshed.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_rejected_legacy_session_migration_clears_auth_cookie(
+    client: AsyncClient,
+    monkeypatch,
+):
+    monkeypatch.setattr(auth_endpoint.settings, "legacy_session_migration_enabled", True)
+
+    rejected = await client.post(
+        "/api/v1/auth/migrate-session",
+        headers=ORIGIN_HEADERS,
+        json={"refresh_token": "x" * 32},
+    )
+
+    assert rejected.status_code == 401
+    assert "Max-Age=0" in rejected.headers["set-cookie"]
 
 
 @pytest.mark.asyncio
@@ -325,7 +540,7 @@ async def test_refresh_rotation_is_hashed_race_safe_and_detects_late_reuse(
         "/api/v1/auth/login",
         json={"email": user.email, "password": "testpassword"},
     )
-    original = login.json()["refresh_token"]
+    original = _refresh_cookie_from(login)
     original_claims = decode_token(original)
     assert original_claims is not None
 
@@ -337,9 +552,13 @@ async def test_refresh_rotation_is_hashed_race_safe_and_detects_late_reuse(
     assert original_session.token_hash == hashlib.sha256(original.encode()).hexdigest()
     assert original not in original_session.token_hash
 
-    first_rotation = await client.post("/api/v1/auth/refresh", json={"refresh_token": original})
+    first_rotation = await client.post(
+        "/api/v1/auth/refresh",
+        headers=_refresh_headers(original),
+    )
     assert first_rotation.status_code == 200
-    successor = first_rotation.json()["refresh_token"]
+    assert "refresh_token" not in first_rotation.json()
+    successor = _refresh_cookie_from(first_rotation)
     successor_claims = decode_token(successor)
     assert successor_claims is not None
     assert successor_claims["jti"] != original_claims["jti"]
@@ -348,11 +567,18 @@ async def test_refresh_rotation_is_hashed_race_safe_and_detects_late_reuse(
 
     # An immediate loser in a normal multi-tab race is rejected without
     # destroying the winner's successor.
-    immediate_replay = await client.post("/api/v1/auth/refresh", json={"refresh_token": original})
+    immediate_replay = await client.post(
+        "/api/v1/auth/refresh",
+        headers=_refresh_headers(original),
+    )
     assert immediate_replay.status_code == 409
-    second_rotation = await client.post("/api/v1/auth/refresh", json={"refresh_token": successor})
+    assert "set-cookie" not in immediate_replay.headers
+    second_rotation = await client.post(
+        "/api/v1/auth/refresh",
+        headers=_refresh_headers(successor),
+    )
     assert second_rotation.status_code == 200
-    latest = second_rotation.json()["refresh_token"]
+    latest = _refresh_cookie_from(second_rotation)
 
     # Once the short coordination grace has elapsed, reuse is a theft signal
     # and revokes the still-active descendant in this family.
@@ -364,11 +590,15 @@ async def test_refresh_rotation_is_hashed_race_safe_and_detects_late_reuse(
     successor_session.revoked_at = datetime.now(UTC) - timedelta(seconds=10)
     await db.commit()
 
-    late_replay = await client.post("/api/v1/auth/refresh", json={"refresh_token": successor})
+    late_replay = await client.post(
+        "/api/v1/auth/refresh",
+        headers=_refresh_headers(successor),
+    )
     assert late_replay.status_code == 401
     assert "reuse detected" in late_replay.json()["detail"].lower()
+    assert "Max-Age=0" in late_replay.headers["set-cookie"]
     assert (
-        await client.post("/api/v1/auth/refresh", json={"refresh_token": latest})
+        await client.post("/api/v1/auth/refresh", headers=_refresh_headers(latest))
     ).status_code == 401
 
     audit = (
@@ -387,17 +617,18 @@ async def test_concurrent_refresh_race_preserves_the_winning_successor(
         "/api/v1/auth/login",
         json={"email": user.email, "password": "testpassword"},
     )
-    refresh_token = login.json()["refresh_token"]
+    refresh_token = _refresh_cookie_from(login)
 
     first, second = await asyncio.gather(
-        client.post("/api/v1/auth/refresh", json={"refresh_token": refresh_token}),
-        client.post("/api/v1/auth/refresh", json={"refresh_token": refresh_token}),
+        client.post("/api/v1/auth/refresh", headers=_refresh_headers(refresh_token)),
+        client.post("/api/v1/auth/refresh", headers=_refresh_headers(refresh_token)),
     )
     assert sorted([first.status_code, second.status_code]) == [200, 409]
     winner = first if first.status_code == 200 else second
+    winning_token = _refresh_cookie_from(winner)
     follow_up = await client.post(
         "/api/v1/auth/refresh",
-        json={"refresh_token": winner.json()["refresh_token"]},
+        headers=_refresh_headers(winning_token),
     )
     assert follow_up.status_code == 200
 
@@ -412,14 +643,21 @@ async def test_logout_revokes_family_without_access_token_and_is_idempotent(
         "/api/v1/auth/login",
         json={"email": user.email, "password": "testpassword"},
     )
-    refresh_token = login.json()["refresh_token"]
+    refresh_token = _refresh_cookie_from(login)
 
-    logout = await client.post("/api/v1/auth/logout", json={"refresh_token": refresh_token})
+    logout = await client.post(
+        "/api/v1/auth/logout",
+        headers=_refresh_headers(refresh_token),
+    )
     assert logout.status_code == 204
-    repeated = await client.post("/api/v1/auth/logout", json={"refresh_token": refresh_token})
+    assert "Max-Age=0" in logout.headers["set-cookie"]
+    repeated = await client.post(
+        "/api/v1/auth/logout",
+        headers=_refresh_headers(refresh_token),
+    )
     assert repeated.status_code == 204
     assert (
-        await client.post("/api/v1/auth/refresh", json={"refresh_token": refresh_token})
+        await client.post("/api/v1/auth/refresh", headers=_refresh_headers(refresh_token))
     ).status_code == 401
 
     events = (
@@ -431,7 +669,10 @@ async def test_logout_revokes_family_without_access_token_and_is_idempotent(
     assert events[0].actor_user_id == user.id
 
     # Unknown tokens receive the same response and do not reveal validity.
-    unknown = await client.post("/api/v1/auth/logout", json={"refresh_token": "x" * 32})
+    unknown = await client.post(
+        "/api/v1/auth/logout",
+        headers=_refresh_headers("x" * 32),
+    )
     assert unknown.status_code == 204
 
 
@@ -603,6 +844,8 @@ async def test_invitation_token_is_hashed_listed_without_secret_and_accepted_onc
     assert accept_response.status_code == 200
     assert accept_response.json()["tenant_id"] == str(tenant.id)
     assert accept_response.json()["role"] == "member"
+    assert "refresh_token" not in accept_response.json()
+    assert _refresh_cookie_from(accept_response)
 
     second_accept = await client.post(
         "/api/v1/auth/invitations/accept",

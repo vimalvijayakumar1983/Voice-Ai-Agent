@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useState } from 'react';
+import { FormEvent, Fragment, useEffect, useState } from 'react';
 import {
   CheckCircle2,
   CircleAlert,
@@ -13,7 +13,11 @@ import {
   X,
 } from 'lucide-react';
 import Layout from '@/components/Layout';
-import { api, Integration } from '@/lib/api';
+import { api, Integration, IntegrationDelivery } from '@/lib/api';
+import {
+  webhookReplayAvailability,
+  webhookUndeliveredResultLabel,
+} from '@/lib/webhook-delivery-actions.cjs';
 
 interface IntegrationForm {
   name: string;
@@ -86,6 +90,12 @@ function validatePublicHttpsUrl(value: string) {
   }
 }
 
+function deliveryBadge(status: IntegrationDelivery['status']) {
+  if (status === 'sent') return 'badge-success';
+  if (status === 'failed') return 'badge-danger';
+  return 'badge-warning';
+}
+
 export default function Integrations() {
   const [integrations, setIntegrations] = useState<Integration[]>([]);
   const [canManage, setCanManage] = useState(false);
@@ -98,15 +108,33 @@ export default function Integrations() {
   const [form, setForm] = useState<IntegrationForm>(EMPTY_FORM);
   const [formError, setFormError] = useState('');
   const [working, setWorking] = useState('');
+  const [deliveries, setDeliveries] = useState<Record<string, IntegrationDelivery[]>>({});
+  const [deliveryErrors, setDeliveryErrors] = useState<Record<string, string>>({});
+  const [expandedIntegrationId, setExpandedIntegrationId] = useState<string | null>(null);
 
   useEffect(() => {
     let active = true;
     Promise.all([api.listIntegrations(), api.getMe()])
       .then(([items, user]) => {
         if (!active) return;
-        setIntegrations(items.filter((item) => item.integration_type === 'webhook'));
+        const webhookIntegrations = items.filter((item) => item.integration_type === 'webhook');
+        setIntegrations(webhookIntegrations);
         setCanManage(user.role === 'owner' || user.role === 'admin');
         setLoadError('');
+        void Promise.allSettled(webhookIntegrations.map((integration) => (
+          api.listIntegrationDeliveries(integration.id)
+        ))).then((results) => {
+          if (!active) return;
+          const nextDeliveries: Record<string, IntegrationDelivery[]> = {};
+          const nextErrors: Record<string, string> = {};
+          results.forEach((result, index) => {
+            const integrationId = webhookIntegrations[index].id;
+            if (result.status === 'fulfilled') nextDeliveries[integrationId] = result.value;
+            else nextErrors[integrationId] = messageFrom(result.reason, 'Delivery history could not be loaded.');
+          });
+          setDeliveries(nextDeliveries);
+          setDeliveryErrors(nextErrors);
+        });
       })
       .catch((error) => {
         if (active) setLoadError(messageFrom(error, 'Could not load webhook integrations.'));
@@ -153,6 +181,8 @@ export default function Integrations() {
   const retryLoad = () => {
     setLoading(true);
     setLoadError('');
+    setDeliveries({});
+    setDeliveryErrors({});
     setReloadKey((current) => current + 1);
   };
 
@@ -203,7 +233,7 @@ export default function Integrations() {
         setIntegrations((current) => current.map((item) => (
           item.id === updated.id ? updated : item
         )));
-        setNotice({ type: 'success', text: `${updated.name} was updated securely.` });
+        setNotice({ type: 'success', text: `${updated.name} was saved. No test event was sent.` });
       } else {
         const staged = await api.createIntegration({
           name,
@@ -224,6 +254,7 @@ export default function Integrations() {
           });
         } catch (statusError) {
           setIntegrations((current) => [staged, ...current]);
+          setDeliveries((current) => ({ ...current, [staged.id]: [] }));
           setNotice({
             type: 'error',
             text: `${staged.name} was staged with no event subscriptions, but final setup failed: ${messageFrom(statusError, 'status update failed')}`,
@@ -232,9 +263,10 @@ export default function Integrations() {
           return;
         }
         setIntegrations((current) => [created, ...current]);
+        setDeliveries((current) => ({ ...current, [created.id]: [] }));
         setNotice({
           type: 'success',
-          text: `${created.name} was created${created.is_active ? ' and is ready for signed delivery' : ' as inactive'}.`,
+          text: `${created.name} was created${created.is_active ? ' as an active destination' : ' as inactive'}. No test event was sent.`,
         });
       }
       closeForm();
@@ -255,10 +287,66 @@ export default function Integrations() {
     try {
       await api.deleteIntegration(integration.id);
       setIntegrations((current) => current.filter((item) => item.id !== integration.id));
+      setDeliveries((current) => {
+        const next = { ...current };
+        delete next[integration.id];
+        return next;
+      });
       if (editingId === integration.id) closeForm();
       setNotice({ type: 'success', text: `${integration.name} was deleted.` });
     } catch (error) {
       setNotice({ type: 'error', text: messageFrom(error, 'Could not delete the destination.') });
+    } finally {
+      setWorking('');
+    }
+  };
+
+  const refreshDeliveries = async (integration: Integration) => {
+    setWorking(`deliveries-${integration.id}`);
+    setDeliveryErrors((current) => ({ ...current, [integration.id]: '' }));
+    try {
+      const items = await api.listIntegrationDeliveries(integration.id);
+      setDeliveries((current) => ({ ...current, [integration.id]: items }));
+    } catch (error) {
+      setDeliveryErrors((current) => ({
+        ...current,
+        [integration.id]: messageFrom(error, 'Delivery history could not be loaded.'),
+      }));
+    } finally {
+      setWorking('');
+    }
+  };
+
+  const testDestination = async (integration: Integration) => {
+    setWorking(`test-${integration.id}`);
+    setNotice(null);
+    try {
+      const delivery = await api.testIntegration(integration.id);
+      setDeliveries((current) => ({
+        ...current,
+        [integration.id]: [delivery, ...(current[integration.id] ?? []).filter((item) => item.id !== delivery.id)],
+      }));
+      setExpandedIntegrationId(integration.id);
+      setNotice({ type: 'success', text: `A signed test event for ${integration.name} was queued. Refresh the delivery log to confirm the result.` });
+    } catch (error) {
+      setNotice({ type: 'error', text: messageFrom(error, 'Could not queue the test event.') });
+    } finally {
+      setWorking('');
+    }
+  };
+
+  const replayDelivery = async (integration: Integration, delivery: IntegrationDelivery) => {
+    setWorking(`replay-${delivery.id}`);
+    setNotice(null);
+    try {
+      const updated = await api.replayIntegrationDelivery(integration.id, delivery.id);
+      setDeliveries((current) => ({
+        ...current,
+        [integration.id]: (current[integration.id] ?? []).map((item) => item.id === updated.id ? updated : item),
+      }));
+      setNotice({ type: 'success', text: `${delivery.event_type} was queued again with the same event ID.` });
+    } catch (error) {
+      setNotice({ type: 'error', text: messageFrom(error, 'Could not replay the failed delivery.') });
     } finally {
       setWorking('');
     }
@@ -445,9 +533,14 @@ export default function Integrations() {
             <div className="section-heading-row">
               <div>
                 <h2 id="webhook-destinations-title">Webhook destinations</h2>
-                <p>{integrations.length} configured · signed delivery retries transient failures</p>
+                <p>{integrations.length} configured · the server signs requests and retries eligible transient failures</p>
               </div>
-              <span className="badge badge-success">Available</span>
+              <span className="badge badge-neutral">Configuration</span>
+            </div>
+
+            <div className="integration-access-note" role="note">
+              <CircleAlert size={15} />
+              <span>Configured or active does not mean verified. Queue a signed test, then confirm its final status in the delivery log. Only failed deliveries can be replayed.</span>
             </div>
 
             {integrations.length === 0 ? (
@@ -461,40 +554,123 @@ export default function Integrations() {
               <div className="integration-list">
                 {integrations.map((integration) => {
                   const configuredEvents = configEvents(integration);
+                  const integrationDeliveries = deliveries[integration.id];
+                  const latestDelivery = integrationDeliveries?.[0];
+                  const isExpanded = expandedIntegrationId === integration.id;
                   return (
-                    <article className="integration-row" key={integration.id}>
-                      <span className="integration-row-icon"><Webhook size={17} /></span>
-                      <div className="integration-row-main">
-                        <div className="integration-row-title">
-                          <h3>{integration.name}</h3>
-                          <span className={`badge ${integration.is_active ? 'badge-success' : 'badge-neutral'}`}>
-                            {integration.is_active ? 'Active' : 'Inactive'}
-                          </span>
+                    <Fragment key={integration.id}>
+                      <article className="integration-row">
+                        <span className="integration-row-icon"><Webhook size={17} /></span>
+                        <div className="integration-row-main">
+                          <div className="integration-row-title">
+                            <h3>{integration.name}</h3>
+                            <span className={`badge ${integration.is_active ? 'badge-success' : 'badge-neutral'}`}>
+                              {integration.is_active ? 'Active config' : 'Inactive'}
+                            </span>
+                            {latestDelivery && (
+                              <span className={`badge ${deliveryBadge(latestDelivery.status)}`}>Latest delivery: {latestDelivery.status}</span>
+                            )}
+                          </div>
+                          <p className="integration-url" title={configString(integration, 'url')}>
+                            {configString(integration, 'url') || 'URL unavailable'}
+                          </p>
+                          <div className="integration-metadata">
+                            <span><ShieldCheck size={12} /> Signed secret {integration.secret_fields.includes('signing_secret') ? 'configured' : 'missing'}</span>
+                            <span>{configuredEvents.length} event{configuredEvents.length === 1 ? '' : 's'}</span>
+                            <span>{latestDelivery ? `Latest event ${new Date(latestDelivery.created_at).toLocaleString()}` : deliveryErrors[integration.id] ? 'Delivery status unavailable' : integrationDeliveries ? 'No delivery attempts recorded' : 'Loading delivery status…'}</span>
+                          </div>
                         </div>
-                        <p className="integration-url" title={configString(integration, 'url')}>
-                          {configString(integration, 'url') || 'URL unavailable'}
-                        </p>
-                        <div className="integration-metadata">
-                          <span><ShieldCheck size={12} /> Signed secret {integration.secret_fields.includes('signing_secret') ? 'configured' : 'missing'}</span>
-                          <span>{configuredEvents.length} event{configuredEvents.length === 1 ? '' : 's'}</span>
-                        </div>
-                      </div>
-                      {canManage && (
                         <div className="integration-row-actions">
-                          <button className="btn btn-secondary btn-sm" onClick={() => openEdit(integration)} disabled={Boolean(working)}>
-                            <Pencil size={12} /> Edit
-                          </button>
                           <button
-                            className="btn btn-danger btn-sm"
-                            onClick={() => deleteIntegration(integration)}
-                            disabled={Boolean(working)}
+                            className="btn btn-secondary btn-sm"
+                            type="button"
+                            aria-expanded={isExpanded}
+                            aria-controls={`integration-deliveries-${integration.id}`}
+                            onClick={() => setExpandedIntegrationId(isExpanded ? null : integration.id)}
                           >
-                            {working === `delete-${integration.id}` ? <Loader2 className="spin" size={12} /> : <Trash2 size={12} />}
-                            Delete
+                            Delivery log
                           </button>
+                          {canManage && (
+                            <button className="btn btn-secondary btn-sm" type="button" onClick={() => void testDestination(integration)} disabled={Boolean(working) || !integration.is_active} title={!integration.is_active ? 'Activate the destination before testing.' : undefined}>
+                              {working === `test-${integration.id}` ? <Loader2 className="spin" size={12} /> : <Webhook size={12} />} Test
+                            </button>
+                          )}
+                          {canManage && (
+                            <button className="btn btn-secondary btn-sm" onClick={() => openEdit(integration)} disabled={Boolean(working)}>
+                              <Pencil size={12} /> Edit
+                            </button>
+                          )}
+                          {canManage && (
+                            <button className="btn btn-danger btn-sm" onClick={() => deleteIntegration(integration)} disabled={Boolean(working)}>
+                              {working === `delete-${integration.id}` ? <Loader2 className="spin" size={12} /> : <Trash2 size={12} />} Delete
+                            </button>
+                          )}
                         </div>
+                      </article>
+
+                      {isExpanded && (
+                        <section id={`integration-deliveries-${integration.id}`} className="card" aria-label={`${integration.name} delivery log`}>
+                          <div className="card-title">
+                            <div><h3>Recent delivery log</h3><p>Safe metadata only; payloads and credentials are not returned.</p></div>
+                            <button className="btn btn-secondary btn-sm" type="button" onClick={() => void refreshDeliveries(integration)} disabled={Boolean(working)}>
+                              {working === `deliveries-${integration.id}` ? <Loader2 className="spin" size={12} /> : <RotateCw size={12} />} Refresh
+                            </button>
+                          </div>
+                          {deliveryErrors[integration.id] ? (
+                            <div className="provider-alert provider-alert-error" role="alert">
+                              <CircleAlert size={15} /><span>{deliveryErrors[integration.id]}</span>
+                            </div>
+                          ) : integrationDeliveries === undefined ? (
+                            <div className="page-loading" role="status"><Loader2 className="spin" size={14} /> Loading delivery history…</div>
+                          ) : integrationDeliveries.length === 0 ? (
+                            <div className="empty-state"><h3>No deliveries recorded</h3><p>Queue a test event or wait for a subscribed call event.</p></div>
+                          ) : (
+                            <div className="table-container" role="region" aria-label={`${integration.name} recent webhook deliveries`} tabIndex={0}>
+                              <table>
+                                <caption className="visually-hidden">Recent webhook delivery attempts for {integration.name}</caption>
+                                <thead><tr><th>Event</th><th>Status</th><th>Attempts</th><th>Created</th><th>Result</th><th><span className="visually-hidden">Actions</span></th></tr></thead>
+                                <tbody>{integrationDeliveries.map((delivery) => {
+                                  const replay = webhookReplayAvailability(
+                                    integration.is_active,
+                                    delivery.status,
+                                  );
+                                  const replayReasonId = `delivery-replay-reason-${delivery.id}`;
+                                  return (
+                                    <tr key={delivery.id}>
+                                      <td><strong>{delivery.event_type}</strong><span className="settings-secondary-value">ID: {delivery.id}</span></td>
+                                      <td><span className={`badge ${deliveryBadge(delivery.status)}`}>{delivery.status}</span></td>
+                                      <td>{delivery.attempts}</td>
+                                      <td>{new Date(delivery.created_at).toLocaleString()}</td>
+                                      <td>{delivery.delivered_at ? `Delivered ${new Date(delivery.delivered_at).toLocaleString()}` : webhookUndeliveredResultLabel(delivery.last_error)}</td>
+                                      <td>
+                                        {canManage && delivery.status === 'failed' ? (
+                                          <>
+                                            <button
+                                              className="btn btn-secondary btn-sm"
+                                              type="button"
+                                              onClick={() => void replayDelivery(integration, delivery)}
+                                              disabled={Boolean(working) || !replay.enabled}
+                                              aria-describedby={!replay.enabled ? replayReasonId : undefined}
+                                            >
+                                              {working === `replay-${delivery.id}` ? <Loader2 className="spin" size={12} /> : <RotateCw size={12} />} Replay
+                                            </button>
+                                            {!replay.enabled && (
+                                              <span id={replayReasonId} className="settings-secondary-value">
+                                                {replay.reason}
+                                              </span>
+                                            )}
+                                          </>
+                                        ) : <span className="table-muted">—</span>}
+                                      </td>
+                                    </tr>
+                                  );
+                                })}</tbody>
+                              </table>
+                            </div>
+                          )}
+                        </section>
                       )}
-                    </article>
+                    </Fragment>
                   );
                 })}
               </div>

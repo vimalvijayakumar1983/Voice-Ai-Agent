@@ -1,7 +1,6 @@
 export interface SessionBoundary {
   epoch: number;
   accessToken: string | null;
-  refreshToken: string | null;
 }
 
 export type RefreshResult =

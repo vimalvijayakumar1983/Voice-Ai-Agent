@@ -5,8 +5,7 @@ function sameSessionBoundary(left, right) {
     left
       && right
       && left.epoch === right.epoch
-      && left.accessToken === right.accessToken
-      && left.refreshToken === right.refreshToken,
+      && left.accessToken === right.accessToken,
   );
 }
 

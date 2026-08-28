@@ -6,6 +6,7 @@ import {
 } from './session-boundary.cjs';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+const SESSION_SIGNAL_KEY = 'vav:session-signal';
 
 function createIdempotencyKey() {
   if (typeof globalThis.crypto?.randomUUID === 'function') {
@@ -33,6 +34,8 @@ export interface VoiceAgent {
   voice_id: string;
   language: string;
   supported_languages: string[];
+  language_switching_enabled: boolean;
+  language_switching_mode: 'disabled' | 'automatic';
   speech_rate: number;
   temperature: number;
   greeting_message: string | null;
@@ -71,6 +74,7 @@ export interface VoiceCatalogItem {
   age: string | null;
   use_cases: string[];
   synthesizer_model: string | null;
+  voice_pool: 'standard' | 'pro' | 'cloned' | 'unknown';
   unavailability_reason: string | null;
   source: 'catalog' | 'cloned';
 }
@@ -168,7 +172,6 @@ export interface AuditEvent {
 
 interface AuthTokens {
   access_token: string;
-  refresh_token: string;
   tenant_id: string;
   user_id: string;
   role: string;
@@ -191,6 +194,8 @@ export interface CallRecord {
   to_number: string;
   provider: string;
   provider_call_sid: string | null;
+  recording_available: boolean;
+  call_metadata?: Record<string, unknown> | null;
   started_at: string | null;
   answered_at: string | null;
   ended_at: string | null;
@@ -377,11 +382,39 @@ export interface IntegrationUpdateRequest {
   clear_secrets?: string[];
 }
 
+export interface IntegrationDelivery {
+  id: string;
+  integration_id: string;
+  event_type: string;
+  status: 'pending' | 'sent' | 'failed';
+  attempts: number;
+  last_error: string | null;
+  delivered_at: string | null;
+  created_at: string;
+}
+
 export interface DncEntry {
   id: string;
   phone_number: string;
   reason: string | null;
   source: string | null;
+}
+
+export type ConsentType =
+  | 'outbound_call'
+  | 'marketing_call'
+  | 'recording'
+  | 'data_processing';
+
+export interface ConsentRecord {
+  id: string;
+  phone_number: string;
+  consent_type: ConsentType;
+  status: 'granted' | 'revoked';
+  evidence: Record<string, unknown> | null;
+  granted_at: string | null;
+  revoked_at: string | null;
+  created_at: string;
 }
 
 export interface UsageSummary {
@@ -414,6 +447,8 @@ class ApiClient {
   private sessionEpoch = 0;
   private sessionSyncInstalled = false;
   private sessionReloadScheduled = false;
+  private sessionChannel: BroadcastChannel | null = null;
+  private legacyRefreshToken: string | null = null;
   private readonly refreshLeaseOwner = typeof crypto !== 'undefined' && crypto.randomUUID
     ? crypto.randomUUID()
     : `${Date.now()}-${Math.random()}`;
@@ -507,32 +542,69 @@ class ApiClient {
     if (typeof window === 'undefined' || this.sessionSyncInstalled) return;
     this.sessionSyncInstalled = true;
 
-    window.addEventListener('storage', (event) => {
-      if (event.storageArea !== window.localStorage) return;
-      if (event.key !== null && event.key !== 'access_token' && event.key !== 'refresh_token') {
+    // Remove credentials written by releases before the HttpOnly-cookie
+    // migration. New credentials are never persisted in browser-readable
+    // storage; these removals are cleanup only.
+    try {
+      this.legacyRefreshToken = window.localStorage.getItem('refresh_token');
+      window.localStorage.removeItem('access_token');
+      window.localStorage.removeItem('refresh_token');
+    } catch {
+      // Storage may be disabled. The in-memory session still works.
+    }
+
+    const handleSignal = (value: unknown) => {
+      const type = typeof value === 'object' && value !== null
+        ? (value as { type?: unknown }).type
+        : undefined;
+      if (type !== 'changed' && type !== 'logout') return;
+
+      // A different tab changed the shared HttpOnly cookie. Invalidate every
+      // in-flight boundary before clearing local page identity.
+      this.beginSessionMutation();
+      this.token = null;
+      this.legacyRefreshToken = null;
+      if (type === 'logout') {
+        window.dispatchEvent(new Event('vav:auth-expired'));
         return;
       }
-
-      // Storage events are emitted only in other documents. Advancing the epoch
-      // makes every request/refresh started under the former tab session stale.
-      this.sessionEpoch += 1;
-      this.refreshPromise = null;
-      this.refreshPromiseBoundary = null;
-      this.currentUserPromise = null;
-      this.token = window.localStorage.getItem('access_token');
-
-      const refreshToken = window.localStorage.getItem('refresh_token');
-      if (!this.token && !refreshToken) {
-        window.dispatchEvent(new Event('vav:auth-expired'));
-      } else if (event.newValue !== null && !this.sessionReloadScheduled) {
-        // A token replacement may also represent a different tenant. Reloading
-        // remounts page state and Layout identity so data from the prior tenant
-        // cannot remain visible while requests use the new tab session.
+      if (!this.sessionReloadScheduled) {
         this.sessionReloadScheduled = true;
         window.dispatchEvent(new Event('vav:session-changed'));
         window.setTimeout(() => window.location.reload(), 0);
       }
+    };
+
+    window.addEventListener('storage', (event) => {
+      if (event.storageArea !== window.localStorage || event.key !== SESSION_SIGNAL_KEY) return;
+      try {
+        handleSignal(JSON.parse(event.newValue || '{}'));
+      } catch {
+        // Ignore malformed non-credential coordination messages.
+      }
     });
+
+    if (typeof BroadcastChannel !== 'undefined') {
+      this.sessionChannel = new BroadcastChannel('vav:auth-session');
+      this.sessionChannel.addEventListener('message', (event) => handleSignal(event.data));
+    }
+  }
+
+  private publishSessionSignal(type: 'changed' | 'logout') {
+    if (typeof window === 'undefined') return;
+    this.ensureSessionSync();
+    const signal = {
+      type,
+      id: typeof crypto.randomUUID === 'function'
+        ? crypto.randomUUID()
+        : `${Date.now()}-${Math.random()}`,
+    };
+    this.sessionChannel?.postMessage(signal);
+    try {
+      window.localStorage.setItem(SESSION_SIGNAL_KEY, JSON.stringify(signal));
+    } catch {
+      // BroadcastChannel remains the primary storage-free coordination path.
+    }
   }
 
   private beginSessionMutation() {
@@ -546,59 +618,41 @@ class ApiClient {
     return this.sessionEpoch;
   }
 
-  private commitSession(data: AuthTokens, expectedEpoch: number) {
+  private commitSession(data: AuthTokens, expectedEpoch: number, announceChange = false) {
     if (this.sessionEpoch !== expectedEpoch) return false;
 
     this.sessionEpoch += 1;
     this.refreshPromise = null;
     this.currentUserPromise = null;
     this.token = data.access_token;
-    if (typeof window !== 'undefined') {
-      this.ensureSessionSync();
-      localStorage.setItem('access_token', data.access_token);
-      localStorage.setItem('refresh_token', data.refresh_token);
+    if (typeof window !== 'undefined') this.ensureSessionSync();
+    if (announceChange && typeof window !== 'undefined') {
+      window.dispatchEvent(new Event('vav:session-committed'));
+      this.publishSessionSignal('changed');
     }
     return true;
   }
 
   getToken(): string | null {
-    if (typeof window !== 'undefined') {
-      this.ensureSessionSync();
-      this.token = window.localStorage.getItem('access_token');
-    }
+    if (typeof window !== 'undefined') this.ensureSessionSync();
     return this.token;
   }
 
   private readSessionBoundary(): SessionBoundary {
-    const accessToken = typeof window !== 'undefined'
-      ? window.localStorage.getItem('access_token')
-      : this.token;
-    const refreshToken = typeof window !== 'undefined'
-      ? window.localStorage.getItem('refresh_token')
-      : null;
-    this.token = accessToken;
-    return { epoch: this.sessionEpoch, accessToken, refreshToken };
-  }
-
-  hasSession(): boolean {
-    if (typeof window === 'undefined') return false;
-    this.ensureSessionSync();
-    return Boolean(localStorage.getItem('access_token') || localStorage.getItem('refresh_token'));
+    return { epoch: this.sessionEpoch, accessToken: this.token };
   }
 
   private clearSession() {
     this.beginSessionMutation();
     this.token = null;
-    if (typeof window !== 'undefined') {
-      this.ensureSessionSync();
-      localStorage.removeItem('access_token');
-      localStorage.removeItem('refresh_token');
-    }
+    this.legacyRefreshToken = null;
+    if (typeof window !== 'undefined') this.ensureSessionSync();
   }
 
-  private notifyAuthExpired() {
+  private notifyAuthExpired(announce = true) {
     this.clearSession();
     if (typeof window !== 'undefined') {
+      if (announce) this.publishSessionSignal('logout');
       window.dispatchEvent(new Event('vav:auth-expired'));
     }
   }
@@ -607,7 +661,6 @@ class ApiClient {
     expectedBoundary: SessionBoundary,
   ): Promise<RefreshResult> {
     this.ensureSessionSync();
-    if (!expectedBoundary.refreshToken) return { status: 'failed' };
     if (this.refreshPromise) {
       if (
         this.refreshPromiseBoundary
@@ -623,11 +676,19 @@ class ApiClient {
         return { status: 'session_changed' } as RefreshResult;
       }
 
-      const response = await fetch(`${API_URL}/api/v1/auth/refresh`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ refresh_token: expectedBoundary.refreshToken }),
-      });
+      const legacyRefreshToken = this.legacyRefreshToken;
+      this.legacyRefreshToken = null;
+      const response = await fetch(
+        `${API_URL}/api/v1/auth/${legacyRefreshToken ? 'migrate-session' : 'refresh'}`,
+        {
+          method: 'POST',
+          credentials: 'include',
+          headers: { 'Content-Type': 'application/json' },
+          ...(legacyRefreshToken
+            ? { body: JSON.stringify({ refresh_token: legacyRefreshToken }) }
+            : {}),
+        },
+      );
       if (!response.ok) {
         // A fallback-lease race returns 409 without revoking the winner. Give
         // its storage event a moment to publish the rotated pair. The loser
@@ -654,7 +715,6 @@ class ApiClient {
         result: {
           epoch: this.sessionEpoch,
           accessToken: data.access_token,
-          refreshToken: data.refresh_token,
         },
       } as RefreshResult;
     }).catch(() => (
@@ -699,6 +759,7 @@ class ApiClient {
 
     const response = await fetch(`${API_URL}${path}`, {
       ...options,
+      credentials: 'include',
       headers,
     });
 
@@ -739,6 +800,60 @@ class ApiClient {
     return response.json();
   }
 
+  private async requestBlob(
+    path: string,
+    options: RequestInit = {},
+    allowRefresh = true,
+    expectedBoundary: SessionBoundary | null = null,
+  ): Promise<Blob> {
+    this.ensureSessionSync();
+    const requestBoundary = this.readSessionBoundary();
+    if (expectedBoundary && !sameSessionBoundary(requestBoundary, expectedBoundary)) {
+      throw new Error('The browser session changed while this request was running.');
+    }
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      ...(options.headers as Record<string, string> || {}),
+    };
+    if (requestBoundary.accessToken) {
+      headers.Authorization = `Bearer ${requestBoundary.accessToken}`;
+    }
+
+    const response = await fetch(`${API_URL}${path}`, {
+      ...options,
+      credentials: 'include',
+      headers,
+    });
+    if (response.status === 401) {
+      if (!sameSessionBoundary(this.readSessionBoundary(), requestBoundary)) {
+        throw new Error('The browser session changed while this request was running.');
+      }
+      const refreshResult = allowRefresh
+        ? await this.refreshAccessToken(requestBoundary)
+        : { status: 'failed' } as RefreshResult;
+      const currentBoundary = this.readSessionBoundary();
+      if (
+        refreshResult.status === 'rotated'
+        && canReplayAfterRefresh(requestBoundary, refreshResult, currentBoundary)
+      ) {
+        return this.requestBlob(path, options, false, refreshResult.result);
+      }
+      if (
+        refreshResult.status === 'session_changed'
+        || !sameSessionBoundary(currentBoundary, requestBoundary)
+      ) {
+        throw new Error('The browser session changed while this request was running.');
+      }
+      this.notifyAuthExpired();
+      throw new Error('Your session has expired. Please sign in again.');
+    }
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({ detail: 'Audio request failed' }));
+      throw new Error(error.detail || 'Audio request failed');
+    }
+    return response.blob();
+  }
+
   // Auth
   async login(email: string, password: string) {
     const loginEpoch = this.beginSessionMutation();
@@ -746,7 +861,7 @@ class ApiClient {
       method: 'POST',
       body: JSON.stringify({ email, password }),
     }, false);
-    if (!this.commitSession(data, loginEpoch)) {
+    if (!this.commitSession(data, loginEpoch, true)) {
       throw new Error('A newer session action replaced this sign-in attempt.');
     }
     return data;
@@ -768,7 +883,7 @@ class ApiClient {
       method: 'POST',
       body: JSON.stringify(data),
     }, false);
-    if (!this.commitSession(result, registrationEpoch)) {
+    if (!this.commitSession(result, registrationEpoch, true)) {
       throw new Error('A newer session action replaced this registration attempt.');
     }
     return result;
@@ -786,21 +901,16 @@ class ApiClient {
   }
 
   logout() {
-    const refreshToken = typeof window !== 'undefined'
-      ? localStorage.getItem('refresh_token')
-      : null;
-    // Clear local credentials first. Remote revocation is deliberately
+    // Clear the in-memory credential first. Remote revocation is deliberately
     // best-effort so logout remains safe during an API outage or after the
     // short-lived access token has already expired.
     this.notifyAuthExpired();
-    if (refreshToken) {
-      void fetch(`${API_URL}/api/v1/auth/logout`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ refresh_token: refreshToken }),
-        keepalive: true,
-      }).catch(() => undefined);
-    }
+    void fetch(`${API_URL}/api/v1/auth/logout`, {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      keepalive: true,
+    }).catch(() => undefined);
   }
 
   async acceptInvitation(token: string, password: string) {
@@ -809,7 +919,7 @@ class ApiClient {
       method: 'POST',
       body: JSON.stringify({ token, password }),
     }, false);
-    if (!this.commitSession(data, invitationEpoch)) {
+    if (!this.commitSession(data, invitationEpoch, true)) {
       throw new Error('A newer session action replaced this invitation acceptance.');
     }
     return data;
@@ -900,6 +1010,13 @@ class ApiClient {
     return this.request<AgentProviderCatalog>('/api/v1/agents/provider/catalog');
   }
 
+  async previewVoice(voiceId: string) {
+    return this.requestBlob('/api/v1/agents/provider/voice-preview', {
+      method: 'POST',
+      body: JSON.stringify({ voice_id: voiceId }),
+    });
+  }
+
   async provisionSmallestAgent(id: string) {
     return this.request<VoiceAgent>(`/api/v1/agents/${id}/smallest/provision`, { method: 'POST' });
   }
@@ -957,6 +1074,10 @@ class ApiClient {
     return this.request<CallTranscript>(`/api/v1/calls/${callId}/transcript`);
   }
 
+  async getCallRecording(callId: string) {
+    return this.requestBlob(`/api/v1/calls/${callId}/recording`);
+  }
+
   async getCallSummary(callId: string) {
     return this.request<CallSummary>(`/api/v1/calls/${callId}/summary`);
   }
@@ -999,8 +1120,10 @@ class ApiClient {
     return this.request<AnalyticsOverview>(`/api/v1/analytics/overview?days=${days}`);
   }
 
-  async getTimeseries(days = 30) {
-    return this.request<AnalyticsTimeSeries>(`/api/v1/analytics/timeseries?days=${days}`);
+  async getTimeseries(days = 30, period: 'day' | 'week' | 'month' = 'day') {
+    return this.request<AnalyticsTimeSeries>(
+      `/api/v1/analytics/timeseries?days=${days}&period=${period}`,
+    );
   }
 
   // Workflows
@@ -1046,6 +1169,23 @@ class ApiClient {
     return this.request<void>(`/api/v1/integrations/${id}`, { method: 'DELETE' });
   }
 
+  async listIntegrationDeliveries(id: string) {
+    return this.request<IntegrationDelivery[]>(`/api/v1/integrations/${id}/deliveries`);
+  }
+
+  async testIntegration(id: string) {
+    return this.request<IntegrationDelivery>(`/api/v1/integrations/${id}/test`, {
+      method: 'POST',
+    });
+  }
+
+  async replayIntegrationDelivery(id: string, deliveryId: string) {
+    return this.request<IntegrationDelivery>(
+      `/api/v1/integrations/${id}/deliveries/${deliveryId}/replay`,
+      { method: 'POST' },
+    );
+  }
+
   // Compliance
   async checkDnc(phone: string) {
     return this.request<{ is_on_dnc: boolean }>(`/api/v1/compliance/dnc/check?phone_number=${encodeURIComponent(phone)}`);
@@ -1053,6 +1193,23 @@ class ApiClient {
 
   async addDnc(data: { phone_number: string; reason?: string }) {
     return this.request<DncEntry>('/api/v1/compliance/dnc', { method: 'POST', body: JSON.stringify(data) });
+  }
+
+  async listConsentRecords(phone?: string) {
+    const query = phone ? `?phone_number=${encodeURIComponent(phone)}` : '';
+    return this.request<ConsentRecord[]>(`/api/v1/compliance/consent${query}`);
+  }
+
+  async createConsentRecord(data: {
+    phone_number: string;
+    consent_type: ConsentType;
+    status: 'granted' | 'revoked';
+    evidence?: Record<string, string>;
+  }) {
+    return this.request<ConsentRecord>('/api/v1/compliance/consent', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    });
   }
 
   // Billing
