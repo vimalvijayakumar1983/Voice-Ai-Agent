@@ -59,6 +59,32 @@ MAX_KNOWLEDGE_BASE_DESCRIPTION_CHARS = 150
 _KNOWLEDGE_BINDING_UNSET = object()
 
 
+def _provider_error_message(details: Any, fallback: str) -> str:
+    """Extract a bounded human-readable message from provider error envelopes."""
+
+    def extract(value: Any, *, depth: int = 0) -> list[str]:
+        if depth > 4:
+            return []
+        if isinstance(value, str):
+            normalized = " ".join(value.split())
+            return [normalized] if normalized else []
+        if isinstance(value, list):
+            messages: list[str] = []
+            for item in value[:5]:
+                messages.extend(extract(item, depth=depth + 1))
+            return messages
+        if isinstance(value, dict):
+            for key in ("message", "error", "detail", "errors"):
+                if key in value:
+                    messages = extract(value[key], depth=depth + 1)
+                    if messages:
+                        return messages
+        return []
+
+    messages = list(dict.fromkeys(extract(details))) if isinstance(details, dict) else []
+    return ("; ".join(messages) or fallback)[:500]
+
+
 def _provider_knowledge_description(description: str) -> str:
     """Fit local governance notes into Smallest.ai's 150-character field."""
     return " ".join(description.split())[:MAX_KNOWLEDGE_BASE_DESCRIPTION_CHARS]
@@ -190,13 +216,7 @@ class SmallestAIClient:
                 path=path,
                 status_code=response.status_code,
             )
-            message = "Smallest.ai rejected the request."
-            if isinstance(details, dict):
-                provider_message = (
-                    details.get("message") or details.get("error") or details.get("detail")
-                )
-                if isinstance(provider_message, str) and provider_message.strip():
-                    message = provider_message.strip()[:500]
+            message = _provider_error_message(details, "Smallest.ai rejected the request.")
             public_status_code = response.status_code
             if response.status_code in {401, 403}:
                 # These credentials belong to our server, not the signed-in
@@ -267,9 +287,10 @@ class SmallestAIClient:
                             details: Any = jsonlib.loads(error_body)
                         except (UnicodeDecodeError, jsonlib.JSONDecodeError):
                             details = bytes(error_body[:500]).decode("utf-8", errors="replace")
-                        message = "Smallest.ai rejected the voice preview request."
-                        if isinstance(details, dict):
-                            message = str(details.get("message") or details.get("error") or message)
+                        message = _provider_error_message(
+                            details,
+                            "Smallest.ai rejected the voice preview request.",
+                        )
                         public_status_code = response.status_code
                         if response.status_code in {401, 403}:
                             public_status_code = 502
@@ -364,9 +385,10 @@ class SmallestAIClient:
                 details: Any = response.json()
             except ValueError:
                 details = response.text[:500]
-            message = "Smallest.ai rejected the knowledge source upload."
-            if isinstance(details, dict):
-                message = str(details.get("message") or details.get("error") or message)
+            message = _provider_error_message(
+                details,
+                "Smallest.ai rejected the knowledge source upload.",
+            )
             if response.status_code in {401, 403}:
                 message = "Smallest.ai rejected the configured server credentials or permissions."
             raise SmallestAIError(
@@ -547,6 +569,25 @@ class SmallestAIClient:
         if not isinstance(data, dict):
             raise SmallestAIError("Smallest.ai returned an invalid agent configuration.")
         return data
+
+    async def get_agent_knowledge_base_id(self, agent_id: str) -> str | None:
+        """Return the active provider KB binding without confusing absence with an empty ID."""
+        provider_agent = await self.get_agent(agent_id)
+        resolved = provider_agent.get("_resolvedConfig")
+        configurations = [provider_agent]
+        if isinstance(resolved, dict):
+            configurations.append(resolved)
+        for configuration in configurations:
+            for key in ("globalKnowledgeBaseId", "global_knowledge_base_id"):
+                if key not in configuration:
+                    continue
+                value = configuration[key]
+                if value is None or value == "":
+                    return None
+                if isinstance(value, str):
+                    return value
+                raise SmallestAIError("Smallest.ai returned an invalid knowledge-base binding.")
+        return None
 
     async def get_default_branch_id(self, agent_id: str) -> str:
         response = await self._request("GET", f"/agent/{agent_id}/branches")

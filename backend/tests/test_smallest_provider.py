@@ -203,6 +203,36 @@ async def test_provider_string_detail_is_preserved_for_safe_diagnostics():
 
 
 @pytest.mark.asyncio
+async def test_provider_error_list_is_preserved_for_safe_diagnostics():
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400,
+            json={"errors": ["Voice ID is not compatible", {"message": "Choose another voice"}]},
+        )
+
+    client = SmallestAIClient(api_key="sk_test", transport=httpx.MockTransport(handler))
+
+    with pytest.raises(SmallestAIError) as error:
+        await client.get_agent("agent_123")
+
+    assert error.value.status_code == 400
+    assert str(error.value) == "Voice ID is not compatible; Choose another voice"
+
+
+@pytest.mark.asyncio
+async def test_active_agent_knowledge_binding_is_read_from_provider_config():
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"status": True, "data": {"globalKnowledgeBaseId": "kb_123"}},
+        )
+
+    client = SmallestAIClient(api_key="sk_test", transport=httpx.MockTransport(handler))
+
+    assert await client.get_agent_knowledge_base_id("agent_123") == "kb_123"
+
+
+@pytest.mark.asyncio
 async def test_versioned_draft_contains_runtime_configuration():
     captured: dict = {}
 

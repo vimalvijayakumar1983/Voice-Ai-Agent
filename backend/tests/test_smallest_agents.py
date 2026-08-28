@@ -34,6 +34,8 @@ class FakeSmallestClient:
     security_status: str = "passed"
     preview_calls: list[dict] = field(default_factory=list)
     voice_catalog_calls: int = 0
+    active_knowledge_base_id: str | None = None
+    knowledge_binding_lookup_calls: int = 0
 
     async def create_agent(self, **_kwargs):
         self.create_calls += 1
@@ -41,6 +43,10 @@ class FakeSmallestClient:
 
     async def get_default_branch_id(self, _agent_id):
         return "main_branch_123"
+
+    async def get_agent_knowledge_base_id(self, _agent_id):
+        self.knowledge_binding_lookup_calls += 1
+        return self.active_knowledge_base_id
 
     async def set_agent_webhook_subscriptions(self, **_kwargs):
         self.webhook_calls += 1
@@ -241,6 +247,8 @@ async def test_provision_sync_and_mint_browser_session(
     assert provisioned.json()["provider_revision_id"] == "revision_123"
     assert provisioned.json()["sync_status"] == "synced"
     assert fake.draft_calls[0]["supported_languages"] == ["en", "hi"]
+    assert "global_knowledge_base_id" not in fake.draft_calls[0]
+    assert fake.knowledge_binding_lookup_calls == 1
     assert fake.webhook_calls == 1
     first_operation = provisioned.json()["provider_config"]["publish"]
     assert first_operation["id"] in first_operation["label"]
@@ -323,6 +331,61 @@ async def test_provision_sync_and_mint_browser_session(
     )
     assert conflicting_replay.status_code == 409
     assert fake.outbound_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_publish_clears_only_an_existing_provider_knowledge_binding(
+    client: AsyncClient,
+    auth_headers,
+    monkeypatch,
+):
+    fake = FakeSmallestClient(active_knowledge_base_id="provider_kb_123")
+    monkeypatch.setattr(agents_endpoint, "get_smallest_client", lambda: fake)
+    created = await client.post(
+        "/api/v1/agents",
+        headers=auth_headers,
+        json={"name": "Detached knowledge", "system_prompt": "Publish without stale knowledge."},
+    )
+
+    response = await client.post(
+        f"/api/v1/agents/{created.json()['id']}/smallest/provision",
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200
+    assert fake.draft_calls[0]["global_knowledge_base_id"] is None
+    assert response.json()["provider_config"]["publish"]["knowledge_binding_action"] == "clear"
+
+
+@pytest.mark.asyncio
+async def test_draft_rejection_reports_publish_phase(
+    client: AsyncClient,
+    auth_headers,
+    monkeypatch,
+):
+    class DraftRejectingClient(FakeSmallestClient):
+        async def update_agent_draft(self, **_kwargs):
+            raise SmallestAIError("Voice ID is not compatible", status_code=400)
+
+    fake = DraftRejectingClient()
+    monkeypatch.setattr(agents_endpoint, "get_smallest_client", lambda: fake)
+    created = await client.post(
+        "/api/v1/agents",
+        headers=auth_headers,
+        json={"name": "Rejected draft", "system_prompt": "Report the failed provider phase."},
+    )
+
+    response = await client.post(
+        f"/api/v1/agents/{created.json()['id']}/smallest/provision",
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == (
+        "Could not update the draft configuration on Smallest.ai: Voice ID is not compatible"
+    )
+    persisted = await client.get(f"/api/v1/agents/{created.json()['id']}", headers=auth_headers)
+    assert persisted.json()["provider_config"]["publish"]["phase"] == "draft_update_failed"
 
 
 @pytest.mark.asyncio

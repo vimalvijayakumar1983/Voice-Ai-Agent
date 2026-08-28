@@ -611,6 +611,7 @@ async def _mark_publish_failure(
     operation_id: str,
     sync_status: str,
     error: SmallestAIError,
+    phase: str | None = None,
 ) -> Agent:
     agent = await _tenant_agent(db, agent_id, tenant_id, for_update=True)
     operation = _publish_operation(agent)
@@ -619,13 +620,25 @@ async def _mark_publish_failure(
         _set_provider_operation(
             agent,
             "publish",
-            phase=sync_status,
+            phase=f"{phase}_failed" if phase else sync_status,
             lease_expires_at=None,
             last_error=str(error),
             last_checked_at=datetime.now(UTC).isoformat(),
         )
         await db.commit()
     return agent
+
+
+def _publish_error_detail(phase: str, error: SmallestAIError) -> str:
+    action = {
+        "webhook_subscriptions": "update webhook subscriptions",
+        "branch_lookup": "read the default branch",
+        "knowledge_binding_lookup": "read the active knowledge-base binding",
+        "draft_update": "update the draft configuration",
+        "baseline_revision": "read the current revision",
+        "publish_request": "publish the draft",
+    }.get(phase, "complete the publish operation")
+    return f"Could not {action} on Smallest.ai: {error}"
 
 
 async def _reconcile_smallest_publish(
@@ -1035,13 +1048,21 @@ async def _publish_smallest_agent(
     )
     await db.commit()
 
+    provider_phase = "webhook_subscriptions"
+    existing_remote_knowledge_id = None
     try:
         await client.set_agent_webhook_subscriptions(
             agent_id=provider_agent_id,
             webhook_id=settings.smallest_webhook_id,
         )
         if not branch_id:
+            provider_phase = "branch_lookup"
             branch_id = await client.get_default_branch_id(provider_agent_id)
+        if knowledge_binding is None:
+            provider_phase = "knowledge_binding_lookup"
+            existing_remote_knowledge_id = await client.get_agent_knowledge_base_id(
+                provider_agent_id
+            )
     except SmallestAIError as exc:
         await _mark_publish_failure(
             db,
@@ -1050,8 +1071,12 @@ async def _publish_smallest_agent(
             operation_id=operation_id,
             sync_status="dirty",
             error=exc,
+            phase=provider_phase,
         )
-        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail=_publish_error_detail(provider_phase, exc),
+        ) from exc
 
     agent = await _tenant_agent(db, agent_id, tenant_id, for_update=True)
     operation = _publish_operation(agent)
@@ -1059,24 +1084,35 @@ async def _publish_smallest_agent(
         raise HTTPException(status_code=409, detail="Provider operation was superseded")
     agent.provider_branch_id = branch_id
     snapshot = _publish_kwargs(agent, voice)
-    # Explicit null removes a previously published binding; omitting the field
-    # would let the provider retain stale knowledge after an operator unbinds it.
-    snapshot["global_knowledge_base_id"] = remote_knowledge_id
+    # The provider models this as an optional string. Omit it when both sides
+    # are already unbound; send an explicit null only when detaching a real
+    # active provider binding.
+    if remote_knowledge_id is not None or existing_remote_knowledge_id is not None:
+        snapshot["global_knowledge_base_id"] = remote_knowledge_id
     _set_provider_operation(
         agent,
         "publish",
         phase="draft_update",
         global_knowledge_base_id=remote_knowledge_id,
+        knowledge_binding_action=(
+            "set"
+            if remote_knowledge_id is not None
+            else "clear"
+            if existing_remote_knowledge_id is not None
+            else "unchanged"
+        ),
         lease_expires_at=(datetime.now(UTC) + PROVIDER_OPERATION_LEASE).isoformat(),
     )
     await db.commit()
 
+    provider_phase = "draft_update"
     try:
         await client.update_agent_draft(
             agent_id=provider_agent_id,
             branch_id=branch_id,
             **snapshot,
         )
+        provider_phase = "baseline_revision"
         baseline = await client.get_latest_branch_revision(
             agent_id=provider_agent_id,
             branch_id=branch_id,
@@ -1089,8 +1125,12 @@ async def _publish_smallest_agent(
             operation_id=operation_id,
             sync_status="dirty",
             error=exc,
+            phase=provider_phase,
         )
-        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail=_publish_error_detail(provider_phase, exc),
+        ) from exc
 
     baseline_revision_id = _revision_id(baseline)
     if baseline is not None and not baseline_revision_id:
@@ -1132,11 +1172,12 @@ async def _publish_smallest_agent(
             operation_id=operation_id,
             sync_status="publish_unknown" if exc.ambiguous else "error",
             error=exc,
+            phase="publish_request",
         )
         detail = (
             "Smallest.ai publish outcome is unknown; use Check status before any retry"
             if exc.ambiguous
-            else str(exc)
+            else _publish_error_detail("publish_request", exc)
         )
         raise HTTPException(status_code=exc.status_code, detail=detail) from exc
 
