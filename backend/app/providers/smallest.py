@@ -523,6 +523,7 @@ class SmallestAIClient:
         *,
         name: str,
         description: str | None = None,
+        global_knowledge_base_id: str | None = None,
     ) -> str:
         # Smallest.ai now defaults newly created agents to the single-prompt
         # workflow. Keep that choice explicit so the draft payload below and
@@ -531,6 +532,8 @@ class SmallestAIClient:
         payload: dict[str, Any] = {"name": name, "workflowType": "single_prompt"}
         if description:
             payload["description"] = description
+        if global_knowledge_base_id:
+            payload["globalKnowledgeBaseId"] = global_knowledge_base_id
         response = await self._request("POST", "/agent", json=payload)
         agent_id = response.get("data")
         if isinstance(agent_id, dict):

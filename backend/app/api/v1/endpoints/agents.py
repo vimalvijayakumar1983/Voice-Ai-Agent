@@ -375,6 +375,36 @@ def _apply_knowledge_binding_delta(
     return "set" if desired_knowledge_base_id is not None else "clear"
 
 
+async def _approved_bound_provider_knowledge_base_id(
+    db: AsyncSession,
+    *,
+    agent_id: UUID,
+    tenant_id: UUID,
+) -> str | None:
+    """Resolve one approved, provisioned KB bound to an agent."""
+    knowledge_binding = await db.scalar(
+        select(AgentKnowledgeBinding).where(
+            AgentKnowledgeBinding.agent_id == agent_id,
+            AgentKnowledgeBinding.tenant_id == tenant_id,
+        )
+    )
+    if not knowledge_binding:
+        return None
+    remote_knowledge_id = await db.scalar(
+        select(KnowledgeBase.provider_knowledge_base_id).where(
+            KnowledgeBase.id == knowledge_binding.knowledge_base_id,
+            KnowledgeBase.tenant_id == tenant_id,
+            KnowledgeBase.approval_status == "approved",
+        )
+    )
+    if not remote_knowledge_id:
+        raise HTTPException(
+            status_code=409,
+            detail="Bound knowledge must be approved and provisioned before publishing",
+        )
+    return remote_knowledge_id
+
+
 def _voice_configuration_snapshot(agent: Agent) -> tuple:
     return (
         agent.voice_id,
@@ -729,6 +759,26 @@ def _provider_tool_refs(provider_agent: dict) -> tuple[str, ...] | None:
     return ()
 
 
+def _created_agent_knowledge_tool_ref_matches(
+    original_provider_agent: dict,
+    published_provider_agent: dict,
+    active_provider_agent: dict,
+    *,
+    expected_knowledge_base_id: str | None,
+) -> bool:
+    """Verify the one KB tool created by an initial agent create request."""
+    original_refs = _provider_tool_refs(original_provider_agent)
+    published_refs = _provider_tool_refs(published_provider_agent)
+    active_refs = _provider_tool_refs(active_provider_agent)
+    if None in (original_refs, published_refs, active_refs):
+        return False
+    if original_refs != published_refs or published_refs != active_refs:
+        return False
+    if expected_knowledge_base_id is None:
+        return original_refs == ()
+    return len(original_refs) == 1
+
+
 def _verified_knowledge_tool_ref_delta(
     original_provider_agent: dict,
     published_provider_agent: dict,
@@ -852,6 +902,12 @@ async def _reconcile_smallest_publish(
     branch_id = agent.provider_branch_id
     baseline_known = "baseline_revision_id" in operation
     baseline_revision_id = operation.get("baseline_revision_id")
+    provision_operation = _provision_operation(agent)
+    provisioned_knowledge_base_id = (
+        provision_operation.get("global_knowledge_base_id")
+        if "global_knowledge_base_id" in provision_operation
+        else _MISSING
+    )
     await db.commit()
 
     try:
@@ -1079,18 +1135,33 @@ async def _reconcile_smallest_publish(
                         provider_agent_id,
                         version_id=baseline_revision_id,
                     )
+                    expected_knowledge_base_id = expected_configuration[
+                        "global_knowledge_base_id"
+                    ]
                     if _verified_knowledge_tool_ref_delta(
                         baseline_provider_agent,
                         published_provider_agent,
                         active_provider_agent,
-                        expected_knowledge_base_id=expected_configuration[
-                            "global_knowledge_base_id"
-                        ],
+                        expected_knowledge_base_id=expected_knowledge_base_id,
                     ):
                         configuration_mismatches = []
                         published_configuration_mismatches = []
                         active_configuration_mismatches = []
                         knowledge_binding_verification = "publish_tool_ref_delta"
+                    elif (
+                        provisioned_knowledge_base_id is not _MISSING
+                        and provisioned_knowledge_base_id == expected_knowledge_base_id
+                        and _created_agent_knowledge_tool_ref_matches(
+                            baseline_provider_agent,
+                            published_provider_agent,
+                            active_provider_agent,
+                            expected_knowledge_base_id=expected_knowledge_base_id,
+                        )
+                    ):
+                        configuration_mismatches = []
+                        published_configuration_mismatches = []
+                        active_configuration_mismatches = []
+                        knowledge_binding_verification = "create_tool_ref_binding"
             except SmallestAIError as exc:
                 agent = await _tenant_agent(db, agent_id, tenant_id, for_update=True)
                 if not _publish_reconciliation_is_current(agent, operation_id):
@@ -1432,26 +1503,11 @@ async def _publish_smallest_agent(
     if not provider_agent_id:
         raise HTTPException(status_code=409, detail="Provider mapping is incomplete")
 
-    remote_knowledge_id = None
-    knowledge_binding = await db.scalar(
-        select(AgentKnowledgeBinding).where(
-            AgentKnowledgeBinding.agent_id == agent.id,
-            AgentKnowledgeBinding.tenant_id == tenant_id,
-        )
+    remote_knowledge_id = await _approved_bound_provider_knowledge_base_id(
+        db,
+        agent_id=agent.id,
+        tenant_id=tenant_id,
     )
-    if knowledge_binding:
-        remote_knowledge_id = await db.scalar(
-            select(KnowledgeBase.provider_knowledge_base_id).where(
-                KnowledgeBase.id == knowledge_binding.knowledge_base_id,
-                KnowledgeBase.tenant_id == tenant_id,
-                KnowledgeBase.approval_status == "approved",
-            )
-        )
-        if not remote_knowledge_id:
-            raise HTTPException(
-                status_code=409,
-                detail="Bound knowledge must be approved and provisioned before publishing",
-            )
 
     agent.sync_status = "publishing"
     config = _provider_config(agent)
@@ -1813,6 +1869,11 @@ async def provision_smallest_agent(
         )
 
     client = get_smallest_client()
+    remote_knowledge_id = await _approved_bound_provider_knowledge_base_id(
+        db,
+        agent_id=agent.id,
+        tenant_id=current_user.tenant_id,
+    )
     voice_selection = _voice_configuration_snapshot(agent)
     # Never retain a row lock while waiting on the provider catalog. A second
     # provisioner can race here, so re-lock and revalidate before recording the
@@ -1838,6 +1899,16 @@ async def provision_smallest_agent(
                 "Agent voice configuration changed during provider validation; retry provisioning"
             ),
         )
+    current_remote_knowledge_id = await _approved_bound_provider_knowledge_base_id(
+        db,
+        agent_id=agent.id,
+        tenant_id=current_user.tenant_id,
+    )
+    if current_remote_knowledge_id != remote_knowledge_id:
+        raise HTTPException(
+            status_code=409,
+            detail="Agent knowledge binding changed during provider validation; retry provisioning",
+        )
 
     # Commit a durable lease before the external create. If the process dies
     # after Smallest.ai accepts the request, retries fail closed instead of
@@ -1854,6 +1925,7 @@ async def provision_smallest_agent(
         phase="create_request",
         started_at=now.isoformat(),
         lease_expires_at=(now + PROVIDER_OPERATION_LEASE).isoformat(),
+        global_knowledge_base_id=remote_knowledge_id,
     )
     await db.commit()
 
@@ -1861,6 +1933,7 @@ async def provision_smallest_agent(
         provider_agent_id = await client.create_agent(
             name=name,
             description=description,
+            global_knowledge_base_id=remote_knowledge_id,
         )
     except SmallestAIError as exc:
         agent = await _tenant_agent(db, agent_id, current_user.tenant_id, for_update=True)

@@ -30,6 +30,7 @@ async def test_create_agent_and_browser_session_contract():
     agent_id = await client.create_agent(
         name="Receptionist",
         description="Handles customer calls.",
+        global_knowledge_base_id="kb_123",
     )
     session = await client.create_browser_session(
         agent_id=agent_id, variables={"customer_name": "Vimal"}
@@ -42,6 +43,7 @@ async def test_create_agent_and_browser_session_contract():
         "name": "Receptionist",
         "description": "Handles customer calls.",
         "workflowType": "single_prompt",
+        "globalKnowledgeBaseId": "kb_123",
     }
     assert json.loads(requests[1].content)["variables"] == {"customer_name": "Vimal"}
 

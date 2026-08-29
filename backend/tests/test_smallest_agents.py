@@ -23,6 +23,7 @@ class FakeSmallestClient:
     is_configured: bool = True
     draft_calls: list[dict] = field(default_factory=list)
     create_calls: int = 0
+    create_payloads: list[dict] = field(default_factory=list)
     outbound_calls: int = 0
     outbound_payloads: list[dict] = field(default_factory=list)
     clone_catalog_calls: int = 0
@@ -37,8 +38,9 @@ class FakeSmallestClient:
     active_knowledge_base_id: str | None = None
     knowledge_binding_lookup_calls: int = 0
 
-    async def create_agent(self, **_kwargs):
+    async def create_agent(self, **kwargs):
         self.create_calls += 1
+        self.create_payloads.append(kwargs)
         return "smallest_agent_123"
 
     async def get_default_branch_id(self, _agent_id):
@@ -1924,6 +1926,36 @@ def test_prompt_verification_respects_provider_workflow_type():
     assert agents_endpoint._resolved_system_prompt({}, resolved) is agents_endpoint._MISSING
 
 
+def test_created_agent_knowledge_tool_ref_requires_one_stable_ref():
+    empty = {"_resolvedConfig": {"toolRefs": None}}
+    created = {"_resolvedConfig": {"toolRefs": ["tool_knowledge_123"]}}
+
+    assert agents_endpoint._created_agent_knowledge_tool_ref_matches(
+        created,
+        created,
+        created,
+        expected_knowledge_base_id="provider_kb_123",
+    )
+    assert not agents_endpoint._created_agent_knowledge_tool_ref_matches(
+        empty,
+        empty,
+        empty,
+        expected_knowledge_base_id="provider_kb_123",
+    )
+    assert not agents_endpoint._created_agent_knowledge_tool_ref_matches(
+        created,
+        {"_resolvedConfig": {"toolRefs": ["tool_other_456"]}},
+        created,
+        expected_knowledge_base_id="provider_kb_123",
+    )
+    assert agents_endpoint._created_agent_knowledge_tool_ref_matches(
+        empty,
+        empty,
+        empty,
+        expected_knowledge_base_id=None,
+    )
+
+
 def test_verified_knowledge_tool_ref_delta_requires_one_matching_change():
     original = {"_resolvedConfig": {"toolRefs": None}}
     corrected = {"_resolvedConfig": {"toolRefs": ["tool_knowledge_123"]}}
@@ -1971,10 +2003,10 @@ async def test_initial_publish_accepts_provider_kb_tool_ref_delta(
         async def get_agent(self, agent_id, **kwargs):
             provider_agent = await super().get_agent(agent_id, **kwargs)
             resolved = provider_agent["_resolvedConfig"]
-            if kwargs.get("version_id") == "revision_122":
-                resolved["toolRefs"] = None
-            else:
+            if self.create_payloads[-1].get("global_knowledge_base_id"):
                 resolved["toolRefs"] = ["tool_knowledge_123"]
+            else:
+                resolved["toolRefs"] = None
             return provider_agent
 
     fake = ToolRefKnowledgeClient()
@@ -2020,7 +2052,14 @@ async def test_initial_publish_accepts_provider_kb_tool_ref_delta(
     assert operation["configuration_mismatches"] == []
     assert operation["published_configuration_mismatches"] == []
     assert operation["active_configuration_mismatches"] == []
-    assert operation["knowledge_binding_verification"] == "publish_tool_ref_delta"
+    assert operation["knowledge_binding_verification"] == "create_tool_ref_binding"
+    assert fake.create_payloads == [
+        {
+            "name": "Provider tool-ref knowledge",
+            "description": None,
+            "global_knowledge_base_id": "provider_kb_123",
+        }
+    ]
     assert fake.publish_calls == 1
     persisted_binding = await db.scalar(
         select(AgentKnowledgeBinding)
