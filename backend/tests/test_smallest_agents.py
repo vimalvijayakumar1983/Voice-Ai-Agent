@@ -1924,40 +1924,111 @@ def test_prompt_verification_respects_provider_workflow_type():
     assert agents_endpoint._resolved_system_prompt({}, resolved) is agents_endpoint._MISSING
 
 
-def test_operator_verified_knowledge_tool_ref_delta_requires_one_matching_change():
+def test_verified_knowledge_tool_ref_delta_requires_one_matching_change():
     original = {"_resolvedConfig": {"toolRefs": None}}
     corrected = {"_resolvedConfig": {"toolRefs": ["tool_knowledge_123"]}}
 
-    assert agents_endpoint._operator_verified_knowledge_tool_ref_delta(
+    assert agents_endpoint._verified_knowledge_tool_ref_delta(
         original,
         corrected,
         corrected,
         expected_knowledge_base_id="provider_kb_123",
     )
-    assert not agents_endpoint._operator_verified_knowledge_tool_ref_delta(
+    assert not agents_endpoint._verified_knowledge_tool_ref_delta(
         original,
         corrected,
         {"_resolvedConfig": {"toolRefs": ["tool_other_456"]}},
         expected_knowledge_base_id="provider_kb_123",
     )
-    assert not agents_endpoint._operator_verified_knowledge_tool_ref_delta(
+    assert not agents_endpoint._verified_knowledge_tool_ref_delta(
         original,
         {"_resolvedConfig": {"toolRefs": ["tool_knowledge_123", "tool_other_456"]}},
         {"_resolvedConfig": {"toolRefs": ["tool_knowledge_123", "tool_other_456"]}},
         expected_knowledge_base_id="provider_kb_123",
     )
-    assert agents_endpoint._operator_verified_knowledge_tool_ref_delta(
+    assert agents_endpoint._verified_knowledge_tool_ref_delta(
         corrected,
         original,
         original,
         expected_knowledge_base_id=None,
     )
-    assert not agents_endpoint._operator_verified_knowledge_tool_ref_delta(
+    assert not agents_endpoint._verified_knowledge_tool_ref_delta(
         {"_resolvedConfig": {"toolRefs": [""]}},
         corrected,
         corrected,
         expected_knowledge_base_id="provider_kb_123",
     )
+
+
+@pytest.mark.asyncio
+async def test_initial_publish_accepts_provider_kb_tool_ref_delta(
+    client: AsyncClient,
+    auth_headers,
+    db,
+    monkeypatch,
+):
+    class ToolRefKnowledgeClient(FakeSmallestClient):
+        async def get_agent(self, agent_id, **kwargs):
+            provider_agent = await super().get_agent(agent_id, **kwargs)
+            resolved = provider_agent["_resolvedConfig"]
+            if kwargs.get("version_id") == "revision_122":
+                resolved["toolRefs"] = None
+            else:
+                resolved["toolRefs"] = ["tool_knowledge_123"]
+            return provider_agent
+
+    fake = ToolRefKnowledgeClient()
+    monkeypatch.setattr(agents_endpoint, "get_smallest_client", lambda: fake)
+    created = await client.post(
+        "/api/v1/agents",
+        headers=auth_headers,
+        json={
+            "name": "Provider tool-ref knowledge",
+            "system_prompt": "Use only the approved provider knowledge base.",
+        },
+    )
+    agent_id = UUID(created.json()["id"])
+    agent = await db.scalar(select(Agent).where(Agent.id == agent_id))
+    knowledge_base = KnowledgeBase(
+        tenant_id=agent.tenant_id,
+        name="Approved tool-ref knowledge",
+        provider_knowledge_base_id="provider_kb_123",
+        sync_status="ready",
+        approval_status="approved",
+    )
+    db.add(knowledge_base)
+    await db.flush()
+    db.add(
+        AgentKnowledgeBinding(
+            tenant_id=agent.tenant_id,
+            agent_id=agent.id,
+            knowledge_base_id=knowledge_base.id,
+            sync_status="pending",
+        )
+    )
+    await db.commit()
+
+    response = await client.post(
+        f"/api/v1/agents/{agent_id}/smallest/provision",
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200
+    assert response.json()["sync_status"] == "synced"
+    operation = response.json()["provider_config"]["publish"]
+    assert operation["phase"] == "complete"
+    assert operation["configuration_mismatches"] == []
+    assert operation["published_configuration_mismatches"] == []
+    assert operation["active_configuration_mismatches"] == []
+    assert operation["knowledge_binding_verification"] == "publish_tool_ref_delta"
+    assert fake.publish_calls == 1
+    persisted_binding = await db.scalar(
+        select(AgentKnowledgeBinding)
+        .where(AgentKnowledgeBinding.agent_id == agent_id)
+        .execution_options(populate_existing=True)
+    )
+    assert persisted_binding.sync_status == "synced"
+    assert persisted_binding.last_synced_at is not None
 
 
 @pytest.mark.asyncio
