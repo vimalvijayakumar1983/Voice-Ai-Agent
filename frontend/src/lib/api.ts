@@ -425,14 +425,12 @@ export interface Integration {
   is_active: boolean;
 }
 
+export type IntegrationType = 'webhook' | 'his_api' | 'vav_crm' | 'google_sheets';
+
 export interface IntegrationCreateRequest {
   name: string;
-  integration_type: 'webhook';
-  config: {
-    url: string;
-    events: string[];
-    signing_secret: string;
-  };
+  integration_type: IntegrationType;
+  config: Record<string, unknown>;
 }
 
 export interface IntegrationUpdateRequest {
