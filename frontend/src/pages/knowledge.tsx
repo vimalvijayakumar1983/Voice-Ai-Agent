@@ -37,6 +37,13 @@ import styles from '@/styles/Knowledge.module.css';
 
 type Notice = { type: 'success' | 'error' | 'info'; text: string };
 type SourceMode = 'urls' | 'sitemap' | 'pdf' | 'text';
+type KnowledgeActionOptions = {
+  syncAgentIds?: string[];
+  syncPendingBindings?: boolean;
+};
+
+const AGENT_SYNC_POLL_MS = 1500;
+const AGENT_SYNC_MAX_ATTEMPTS = 40;
 
 const scopeOptions: Array<{ value: KnowledgeScope; label: string }> = [
   { value: 'workspace', label: 'Whole workspace' },
@@ -104,15 +111,89 @@ export default function KnowledgeStudio() {
     setKnowledgeBases((current) => current.map((kb) => kb.id === updated.id ? updated : kb));
   };
 
-  const runAction = async (key: string, action: () => Promise<KnowledgeBase>, success: string) => {
+  const replaceAgent = (updated: VoiceAgent) => {
+    setAgents((current) => current.map((agent) => agent.id === updated.id ? updated : agent));
+  };
+
+  const syncAgentUntilSettled = async (agentId: string) => {
+    let latest = await api.getAgent(agentId);
+    replaceAgent(latest);
+    if (!latest.provider_agent_id) return latest;
+
+    for (let attempt = 0; attempt < AGENT_SYNC_MAX_ATTEMPTS; attempt += 1) {
+      if (latest.sync_status === 'synced') return latest;
+      try {
+        latest = await api.syncSmallestAgent(agentId);
+        replaceAgent(latest);
+      } catch (error) {
+        const message = errorMessage(error, 'Provider synchronization failed.');
+        if (!message.toLowerCase().includes('still in progress')) throw error;
+      }
+      if (latest.sync_status === 'synced') return latest;
+      if (latest.sync_status === 'error') {
+        throw new Error(`${latest.name} could not publish its knowledge-base revision.`);
+      }
+      await new Promise((resolve) => window.setTimeout(resolve, AGENT_SYNC_POLL_MS));
+      latest = await api.getAgent(agentId);
+      replaceAgent(latest);
+    }
+    throw new Error(`${latest.name} is still being reviewed by Smallest.ai. Check status shortly.`);
+  };
+
+  const synchronizeAgents = async (agentIds: string[]) => {
+    const uniqueAgentIds = Array.from(new Set(agentIds));
+    if (!uniqueAgentIds.length) return 0;
+    for (const agentId of uniqueAgentIds) await syncAgentUntilSettled(agentId);
+    return uniqueAgentIds.length;
+  };
+
+  const runAction = async (
+    key: string,
+    action: () => Promise<KnowledgeBase>,
+    success: string,
+    options: KnowledgeActionOptions = {},
+  ) => {
     setWorking(key);
     setNotice(null);
+    let updated: KnowledgeBase;
     try {
-      const updated = await action();
+      updated = await action();
       replaceKnowledgeBase(updated);
-      setNotice({ type: 'success', text: success });
     } catch (error) {
       setNotice({ type: 'error', text: errorMessage(error, 'The knowledge operation failed.') });
+      setWorking(null);
+      return;
+    }
+
+    const pendingAgentIds = options.syncAgentIds
+      || (options.syncPendingBindings && updated.approval_status === 'approved'
+        ? updated.agent_bindings
+          .filter((binding) => binding.sync_status !== 'synced')
+          .map((binding) => binding.agent_id)
+        : []);
+    if (!pendingAgentIds.length) {
+      setNotice({ type: 'success', text: success });
+      setWorking(null);
+      return;
+    }
+
+    setNotice({
+      type: 'info',
+      text: `${success} Publishing the updated knowledge tool to ${pendingAgentIds.length} bound agent${pendingAgentIds.length === 1 ? '' : 's'}…`,
+    });
+    try {
+      const syncedCount = await synchronizeAgents(pendingAgentIds);
+      const refreshed = await api.getKnowledgeBase(updated.id);
+      replaceKnowledgeBase(refreshed);
+      setNotice({
+        type: 'success',
+        text: `${success} ${syncedCount} bound agent${syncedCount === 1 ? ' is' : 's are'} published and verified.`,
+      });
+    } catch (error) {
+      setNotice({
+        type: 'error',
+        text: `${success} Automatic agent synchronization did not complete: ${errorMessage(error, 'Check the agent provider status.')}`,
+      });
     } finally {
       setWorking(null);
     }
@@ -179,6 +260,7 @@ export default function KnowledgeStudio() {
       'add-urls',
       () => api.addKnowledgeUrls(selected.id, urls),
       `${urls.length} website source${urls.length === 1 ? '' : 's'} queued for indexing.`,
+      { syncPendingBindings: true },
     );
     event.currentTarget.reset();
   };
@@ -207,6 +289,7 @@ export default function KnowledgeStudio() {
       'index-sitemap',
       () => api.addKnowledgeUrls(selected.id, Array.from(selectedSitemapUrls)),
       `${selectedSitemapUrls.size} curated pages queued for indexing.`,
+      { syncPendingBindings: true },
     );
     setSitemapUrls([]);
     setSelectedSitemapUrls(new Set());
@@ -218,7 +301,12 @@ export default function KnowledgeStudio() {
     const input = event.currentTarget.elements.namedItem('media') as HTMLInputElement;
     const file = input.files?.[0];
     if (!file) return;
-    await runAction('upload-pdf', () => api.uploadKnowledgePdf(selected.id, file), `${file.name} was queued for indexing.`);
+    await runAction(
+      'upload-pdf',
+      () => api.uploadKnowledgePdf(selected.id, file),
+      `${file.name} was queued for indexing.`,
+      { syncPendingBindings: true },
+    );
     event.currentTarget.reset();
   };
 
@@ -260,7 +348,7 @@ export default function KnowledgeStudio() {
           <p className="page-subtitle">Turn approved business content into traceable, provider-ready knowledge for every voice agent.</p>
         </div>
         <div className="header-actions">
-          <button type="button" className="btn btn-secondary" disabled={!selected || working !== null || !canEditKnowledge} onClick={() => selected && runAction('refresh', () => api.refreshKnowledgeBase(selected.id), 'Provider processing status refreshed.')}>
+          <button type="button" className="btn btn-secondary" disabled={!selected || working !== null || !canEditKnowledge} onClick={() => selected && runAction('refresh', () => api.refreshKnowledgeBase(selected.id), 'Provider processing status refreshed.', { syncPendingBindings: true })}>
             <RefreshCw size={14} className={working === 'refresh' ? 'spin' : undefined} /> Refresh status
           </button>
           {canEditKnowledge && <button type="button" className="btn btn-primary" onClick={() => { setShowEdit(false); setShowCreate((open) => !open); }}>
@@ -393,7 +481,7 @@ export default function KnowledgeStudio() {
                       {selected.approval_status === 'approved' ? <X size={12} /> : <Check size={12} />}{selected.approval_status === 'approved' ? 'Return to draft' : 'Approve knowledge'}
                     </button>}
                   </div>
-                  <AgentBinding selected={selected} agents={agents} busy={working !== null} canManage={canGovernKnowledge} onBind={(agentId) => runAction('bind', () => api.bindKnowledgeAgent(selected.id, agentId), 'Agent binding saved. Publish the agent to make it live.')} onUnbind={(agentId) => runAction('unbind', () => api.unbindKnowledgeAgent(selected.id, agentId), 'Agent was unbound; publish the agent to update the provider.')} />
+                  <AgentBinding selected={selected} agents={agents} busy={working !== null} canManage={canGovernKnowledge} onBind={(agentId) => runAction('bind', () => api.bindKnowledgeAgent(selected.id, agentId), 'Agent binding saved.', { syncAgentIds: [agentId] })} onUnbind={(agentId) => runAction('unbind', () => api.unbindKnowledgeAgent(selected.id, agentId), 'Agent was unbound.', { syncAgentIds: [agentId] })} />
                 </div>
               </section>
             </div>

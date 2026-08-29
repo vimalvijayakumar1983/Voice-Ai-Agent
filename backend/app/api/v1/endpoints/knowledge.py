@@ -41,6 +41,13 @@ PROVIDER_INDEXED_STATUSES = {
     "succeeded",
 }
 PROVIDER_FAILED_STATUSES = {"error", "failed", "failure"}
+BOUND_AGENT_PROVIDER_OPERATIONS = {
+    "provisioning",
+    "provision_unknown",
+    "publishing",
+    "provider_scanning",
+    "publish_unknown",
+}
 
 
 def _provider_error(exc: SmallestAIError) -> HTTPException:
@@ -85,6 +92,47 @@ def _knowledge_response(kb: KnowledgeBase) -> KnowledgeBaseResponse:
         created_at=kb.created_at,
         updated_at=kb.updated_at,
     )
+
+
+def _ensure_bound_agents_accept_knowledge_change(kb: KnowledgeBase) -> None:
+    """Reject a source mutation that could race an in-flight provider publish."""
+    busy_agents = [
+        binding.agent.name
+        for binding in kb.agent_bindings
+        if binding.agent.sync_status in BOUND_AGENT_PROVIDER_OPERATIONS
+    ]
+    if busy_agents:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Wait for the bound agent provider operation to finish before changing "
+                "knowledge: " + ", ".join(sorted(busy_agents))
+            ),
+        )
+
+
+def _invalidate_bound_agent_deployments(kb: KnowledgeBase) -> list[UUID]:
+    """Require provider-backed agents to publish the current knowledge tool.
+
+    A provider can finish indexing a new source without changing the active agent
+    revision. Marking both sides pending prevents a legacy or stale revision from
+    continuing to look synced merely because the ingestion job completed.
+    """
+    affected_agent_ids: list[UUID] = []
+    for binding in kb.agent_bindings:
+        binding.sync_status = "pending"
+        binding.last_synced_at = None
+        agent = binding.agent
+        if not agent.provider_agent_id:
+            continue
+        if agent.sync_status in BOUND_AGENT_PROVIDER_OPERATIONS:
+            # Source endpoints run the preflight above. Keep this guard so the
+            # helper remains safe if it is reused by another workflow.
+            continue
+        if agent.sync_status != "error":
+            agent.sync_status = "dirty"
+        affected_agent_ids.append(agent.id)
+    return affected_agent_ids
 
 
 def _knowledge_query(tenant_id: UUID):
@@ -448,6 +496,7 @@ async def add_url_sources(
     db: AsyncSession = Depends(get_db),
 ):
     kb = await _get_knowledge_base(db, current_user.tenant_id, kb_id)
+    _ensure_bound_agents_accept_knowledge_change(kb)
     urls = list(dict.fromkeys(str(url) for url in data.urls))
     existing = {source.location for source in kb.sources if source.location}
     new_urls = [url for url in urls if url not in existing]
@@ -474,6 +523,7 @@ async def add_url_sources(
         )
     _recount(kb)
     kb.last_synced_at = datetime.now(UTC)
+    affected_agent_ids = _invalidate_bound_agent_deployments(kb)
     await db.flush()
     await record_audit_event(
         db,
@@ -482,7 +532,10 @@ async def add_url_sources(
         action="knowledge_source.urls_added",
         resource_type="knowledge_base",
         resource_id=str(kb.id),
-        details={"count": len(new_urls)},
+        details={
+            "count": len(new_urls),
+            "agents_requiring_sync": [str(agent_id) for agent_id in affected_agent_ids],
+        },
     )
     return _knowledge_response(kb)
 
@@ -528,6 +581,7 @@ async def upload_pdf_source(
     db: AsyncSession = Depends(get_db),
 ):
     kb = await _get_knowledge_base(db, current_user.tenant_id, kb_id)
+    _ensure_bound_agents_accept_knowledge_change(kb)
     filename = PurePath(media.filename or "knowledge.pdf").name
     if media.content_type != "application/pdf" or not filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=422, detail="Only PDF documents are supported")
@@ -559,6 +613,7 @@ async def upload_pdf_source(
     )
     _recount(kb)
     kb.last_synced_at = datetime.now(UTC)
+    affected_agent_ids = _invalidate_bound_agent_deployments(kb)
     await db.flush()
     await record_audit_event(
         db,
@@ -567,7 +622,11 @@ async def upload_pdf_source(
         action="knowledge_source.pdf_added",
         resource_type="knowledge_base",
         resource_id=str(kb.id),
-        details={"name": filename, "bytes": len(content)},
+        details={
+            "name": filename,
+            "bytes": len(content),
+            "agents_requiring_sync": [str(agent_id) for agent_id in affected_agent_ids],
+        },
     )
     return _knowledge_response(kb)
 

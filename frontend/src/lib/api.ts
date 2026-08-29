@@ -1122,6 +1122,10 @@ class ApiClient {
     });
   }
 
+  async getKnowledgeBase(id: string) {
+    return this.request<KnowledgeBase>(`/api/v1/knowledge/${id}`);
+  }
+
   async updateKnowledgeBase(id: string, data: Partial<Pick<KnowledgeBase,
     'name' | 'description' | 'scope_type' | 'scope_label' | 'languages' | 'tags'>>) {
     return this.request<KnowledgeBase>(`/api/v1/knowledge/${id}`, {
