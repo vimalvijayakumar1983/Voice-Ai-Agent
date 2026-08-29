@@ -1924,6 +1924,42 @@ def test_prompt_verification_respects_provider_workflow_type():
     assert agents_endpoint._resolved_system_prompt({}, resolved) is agents_endpoint._MISSING
 
 
+def test_operator_verified_knowledge_tool_ref_delta_requires_one_matching_change():
+    original = {"_resolvedConfig": {"toolRefs": None}}
+    corrected = {"_resolvedConfig": {"toolRefs": ["tool_knowledge_123"]}}
+
+    assert agents_endpoint._operator_verified_knowledge_tool_ref_delta(
+        original,
+        corrected,
+        corrected,
+        expected_knowledge_base_id="provider_kb_123",
+    )
+    assert not agents_endpoint._operator_verified_knowledge_tool_ref_delta(
+        original,
+        corrected,
+        {"_resolvedConfig": {"toolRefs": ["tool_other_456"]}},
+        expected_knowledge_base_id="provider_kb_123",
+    )
+    assert not agents_endpoint._operator_verified_knowledge_tool_ref_delta(
+        original,
+        {"_resolvedConfig": {"toolRefs": ["tool_knowledge_123", "tool_other_456"]}},
+        {"_resolvedConfig": {"toolRefs": ["tool_knowledge_123", "tool_other_456"]}},
+        expected_knowledge_base_id="provider_kb_123",
+    )
+    assert agents_endpoint._operator_verified_knowledge_tool_ref_delta(
+        corrected,
+        original,
+        original,
+        expected_knowledge_base_id=None,
+    )
+    assert not agents_endpoint._operator_verified_knowledge_tool_ref_delta(
+        {"_resolvedConfig": {"toolRefs": [""]}},
+        corrected,
+        corrected,
+        expected_knowledge_base_id="provider_kb_123",
+    )
+
+
 @pytest.mark.asyncio
 async def test_provider_config_mismatch_accepts_manual_kb_fix_without_republishing(
     client: AsyncClient,
