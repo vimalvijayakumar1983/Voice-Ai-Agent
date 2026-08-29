@@ -430,11 +430,9 @@ def public_integration_config(
 ) -> tuple[dict[str, Any], list[str]]:
     """Return an allowlisted public projection and configured-secret paths.
 
-    Credential detection heuristics are useful for UI metadata but cannot prove
-    arbitrary provider fields are non-secret. Consequently, unknown config
-    values are never copied into JSONB or API responses. Webhooks expose only
-    controlled event identifiers and a constant destination sentinel; the full
-    URL (including host, path, and query) remains inside the encrypted envelope.
+    Unknown values never enter public JSONB or API responses. Destinations and
+    credentials are write-only; only controlled capability and routing metadata
+    is exposed to the VAV control plane.
     """
     secret_paths: list[str] = []
 
@@ -457,9 +455,10 @@ def public_integration_config(
 
     full_config = dict(config or {})
     detect(full_config, "")
-
+    normalized_type = integration_type.strip().lower()
     public_config: dict[str, Any] = {}
-    if integration_type.strip().lower() == "webhook":
+
+    if normalized_type == "webhook":
         events = full_config.get("events")
         if isinstance(events, list) and all(
             isinstance(event, str) and event in SUPPORTED_WEBHOOK_EVENTS for event in events
@@ -469,6 +468,58 @@ def public_integration_config(
         if isinstance(url, str) and url:
             public_config["url"] = PUBLIC_URL_REDACTION_PLACEHOLDER
             secret_paths.append("url")
+
+    elif normalized_type in {"his_api", "vav_crm"}:
+        base_url = full_config.get("base_url")
+        if isinstance(base_url, str) and base_url:
+            public_config["base_url"] = PUBLIC_URL_REDACTION_PLACEHOLDER
+            secret_paths.append("base_url")
+
+        auth_type = full_config.get("auth_type")
+        if auth_type in {"bearer", "api_key"}:
+            public_config["auth_type"] = auth_type
+        api_key_header = full_config.get("api_key_header")
+        if (
+            auth_type == "api_key"
+            and isinstance(api_key_header, str)
+            and re.fullmatch(r"[A-Za-z0-9-]{1,64}", api_key_header)
+        ):
+            public_config["api_key_header"] = api_key_header
+
+        capabilities: list[str] = []
+        for key, capability in (
+            ("availability_path", "live_availability"),
+            (
+                "create_path",
+                "create_appointment"
+                if normalized_type == "his_api"
+                else "create_appointment_request",
+            ),
+            ("reschedule_path", "reschedule_appointment"),
+            ("cancel_path", "cancel_appointment"),
+        ):
+            value = full_config.get(key)
+            if (
+                isinstance(value, str)
+                and value.startswith("/")
+                and "?" not in value
+                and "#" not in value
+            ):
+                public_config[key] = value
+                capabilities.append(capability)
+        public_config["capabilities"] = capabilities
+
+    elif normalized_type == "google_sheets":
+        sheet_name = full_config.get("sheet_name")
+        if isinstance(sheet_name, str) and sheet_name:
+            public_config["sheet_name"] = sheet_name
+        table_name = full_config.get("table_name")
+        if isinstance(table_name, str) and table_name:
+            public_config["table_name"] = table_name
+        if full_config.get("spreadsheet_id"):
+            public_config["spreadsheet_configured"] = True
+            secret_paths.append("spreadsheet_id")
+        public_config["capabilities"] = ["create_appointment_request"]
 
     return public_config, sorted(set(secret_paths))
 
