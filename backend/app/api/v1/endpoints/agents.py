@@ -2330,14 +2330,6 @@ async def delete_agent(
             status_code=409,
             detail="Agent cannot be deleted while its provider operation is unresolved",
         )
-    if agent.provider_agent_id:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "Provisioned agents cannot be deleted until provider deprovisioning "
-                "and archival are supported"
-            ),
-        )
     nonterminal_call_id = await db.scalar(
         select(Call.id)
         .where(
@@ -2369,6 +2361,34 @@ async def delete_agent(
             status_code=409,
             detail="Agent cannot be deleted while a campaign attempt is unresolved",
         )
+
+    provider_agent_id = agent.provider_agent_id
+    if provider_agent_id:
+        try:
+            await get_smallest_client().delete_agent(provider_agent_id)
+        except SmallestAIError as exc:
+            if exc.ambiguous:
+                detail = (
+                    "Smallest.ai deletion outcome is unknown. The VAV agent was kept; "
+                    "retry Delete to reconcile safely."
+                )
+            else:
+                detail = f"Could not delete the agent from Smallest.ai: {exc}"
+            raise HTTPException(status_code=exc.status_code, detail=detail) from exc
+
+    await record_audit_event(
+        db,
+        tenant_id=current_user.tenant_id,
+        actor_user_id=current_user.id,
+        action="agent.deleted",
+        resource_type="agent",
+        resource_id=str(agent.id),
+        details={
+            "provider": "smallest" if provider_agent_id else None,
+            "provider_agent_id": provider_agent_id,
+            "provider_deprovisioned": bool(provider_agent_id),
+        },
+    )
     await db.delete(agent)
 
 

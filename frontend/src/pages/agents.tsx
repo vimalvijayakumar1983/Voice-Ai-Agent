@@ -204,13 +204,21 @@ export default function Agents() {
   };
 
   const removeAgent = async (agent: VoiceAgent) => {
-    if (!window.confirm(`Delete ${agent.name} from this workspace? This does not archive the remote Smallest.ai agent.`)) return;
+    const providerNotice = agent.provider_agent_id
+      ? ' Its Smallest.ai agent will also be archived.'
+      : '';
+    if (!window.confirm(`Permanently delete ${agent.name}?${providerNotice} Its knowledge base will not be deleted.`)) return;
     setWorking(`delete-${agent.id}`);
     setNotice(null);
     try {
       await api.deleteAgent(agent.id);
       setAgents((current) => current.filter((item) => item.id !== agent.id));
-      setNotice({ type: 'success', text: `${agent.name} was deleted from this workspace.` });
+      setNotice({
+        type: 'success',
+        text: agent.provider_agent_id
+          ? `${agent.name} was deleted from VAV and archived on Smallest.ai.`
+          : `${agent.name} was deleted from this workspace.`,
+      });
     } catch (error) {
       setNotice({
         type: 'error',
@@ -462,7 +470,7 @@ export default function Agents() {
                 ) : (
                   <button className="btn btn-secondary btn-sm" disabled title={agentTestReadinessMessage(agent)}><FlaskConical size={12} /> Test</button>
                 )}
-                <button className="btn btn-ghost btn-sm" disabled={Boolean(agent.provider_agent_id) || providerOperationUnresolved(agent.sync_status) || working === `delete-${agent.id}`} onClick={() => removeAgent(agent)} aria-label={`Delete ${agent.name}`} title={agent.provider_agent_id ? 'Provisioned agents must be archived with their provider resource.' : undefined}><Trash2 size={12} /></button>
+                <button className="btn btn-ghost btn-sm" disabled={providerOperationUnresolved(agent.sync_status) || working === `delete-${agent.id}`} onClick={() => removeAgent(agent)} aria-label={`Delete ${agent.name}`} title={agent.provider_agent_id ? 'Delete from VAV and archive the Smallest.ai agent.' : 'Delete local draft.'}><Trash2 size={12} /></button>
               </div>
             </article>
           ))}

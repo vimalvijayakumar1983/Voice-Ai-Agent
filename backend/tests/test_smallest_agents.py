@@ -37,11 +37,15 @@ class FakeSmallestClient:
     voice_catalog_calls: int = 0
     active_knowledge_base_id: str | None = None
     knowledge_binding_lookup_calls: int = 0
+    deleted_agent_ids: list[str] = field(default_factory=list)
 
     async def create_agent(self, **kwargs):
         self.create_calls += 1
         self.create_payloads.append(kwargs)
         return "smallest_agent_123"
+
+    async def delete_agent(self, agent_id: str):
+        self.deleted_agent_ids.append(agent_id)
 
     async def get_default_branch_id(self, _agent_id):
         return "main_branch_123"
@@ -733,8 +737,106 @@ async def test_scanning_publish_is_reconciled_without_republishing(
         f"/api/v1/agents/{agent_id}",
         headers=auth_headers,
     )
-    assert provisioned_delete.status_code == 409
-    assert "Provisioned agents cannot be deleted" in provisioned_delete.json()["detail"]
+    assert provisioned_delete.status_code == 204
+    assert fake.deleted_agent_ids == ["smallest_agent_123"]
+
+    missing = await client.get(f"/api/v1/agents/{agent_id}", headers=auth_headers)
+    assert missing.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_provisioned_agent_delete_preserves_shared_knowledge_base(
+    client: AsyncClient,
+    auth_headers,
+    monkeypatch,
+    tenant,
+    db,
+):
+    fake = FakeSmallestClient()
+    monkeypatch.setattr(agents_endpoint, "get_smallest_client", lambda: fake)
+    created = await client.post(
+        "/api/v1/agents",
+        headers=auth_headers,
+        json={"name": "Bound agent", "system_prompt": "Use the approved knowledge base."},
+    )
+    agent_id = created.json()["id"]
+    agent_uuid = UUID(agent_id)
+    agent = await db.get(Agent, agent_uuid)
+    assert agent is not None
+    agent.provider_agent_id = "provider_agent_bound"
+    agent.provider_branch_id = "provider_branch_bound"
+    agent.provider_revision_id = "provider_revision_bound"
+    agent.sync_status = "synced"
+    agent.last_synced_at = datetime.now(UTC)
+    knowledge_base = KnowledgeBase(
+        tenant_id=tenant.id,
+        agent_id=None,
+        name="Shared medical knowledge",
+        provider="smallest",
+        provider_knowledge_base_id="provider_kb_shared",
+        sync_status="ready",
+        approval_status="approved",
+    )
+    db.add(knowledge_base)
+    await db.flush()
+    db.add(
+        AgentKnowledgeBinding(
+            tenant_id=tenant.id,
+            agent_id=agent_uuid,
+            knowledge_base_id=knowledge_base.id,
+            provider="smallest",
+            sync_status="synced",
+        )
+    )
+    await db.commit()
+    knowledge_base_id = knowledge_base.id
+
+    deleted = await client.delete(f"/api/v1/agents/{agent_id}", headers=auth_headers)
+
+    assert deleted.status_code == 204
+    assert fake.deleted_agent_ids == ["provider_agent_bound"]
+    db.expire_all()
+    assert await db.get(Agent, agent_uuid) is None
+    assert await db.get(KnowledgeBase, knowledge_base_id) is not None
+    binding = await db.scalar(
+        select(AgentKnowledgeBinding).where(AgentKnowledgeBinding.agent_id == agent_uuid)
+    )
+    assert binding is None
+
+
+@pytest.mark.asyncio
+async def test_provider_delete_failure_keeps_vav_agent(
+    client: AsyncClient,
+    auth_headers,
+    monkeypatch,
+    db,
+):
+    class FailingDeleteClient(FakeSmallestClient):
+        async def delete_agent(self, agent_id: str):
+            self.deleted_agent_ids.append(agent_id)
+            raise SmallestAIError("Provider refused archival", status_code=502)
+
+    fake = FailingDeleteClient()
+    monkeypatch.setattr(agents_endpoint, "get_smallest_client", lambda: fake)
+    created = await client.post(
+        "/api/v1/agents",
+        headers=auth_headers,
+        json={"name": "Retained agent", "system_prompt": "Remain local on provider failure."},
+    )
+    agent_id = created.json()["id"]
+    agent = await db.get(Agent, UUID(agent_id))
+    assert agent is not None
+    agent.provider_agent_id = "provider_agent_retained"
+    agent.sync_status = "synced"
+    await db.commit()
+
+    failed = await client.delete(f"/api/v1/agents/{agent_id}", headers=auth_headers)
+
+    assert failed.status_code == 502
+    assert "Could not delete the agent from Smallest.ai" in failed.json()["detail"]
+    assert fake.deleted_agent_ids == ["provider_agent_retained"]
+    retained = await client.get(f"/api/v1/agents/{agent_id}", headers=auth_headers)
+    assert retained.status_code == 200
 
 
 @pytest.mark.asyncio

@@ -545,6 +545,20 @@ class SmallestAIClient:
             )
         return agent_id
 
+    async def delete_agent(self, agent_id: str) -> None:
+        """Archive an Atoms agent, treating an absent agent as already deleted.
+
+        Smallest exposes agent deletion through the ``/archive`` action. A
+        provider 404 is the desired state for a retry: the remote agent no
+        longer exists, so VAV can safely finish its local cleanup.
+        """
+        try:
+            await self._request("DELETE", f"/agent/{quote(agent_id, safe='')}/archive")
+        except SmallestAIError as exc:
+            if exc.upstream_status_code == 404:
+                return
+            raise
+
     async def create_knowledge_base(self, *, name: str, description: str = "") -> str:
         payload: dict[str, Any] = {"name": name}
         if description:

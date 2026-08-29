@@ -49,6 +49,34 @@ async def test_create_agent_and_browser_session_contract():
 
 
 @pytest.mark.asyncio
+async def test_delete_agent_uses_archive_endpoint_and_is_idempotent_when_absent():
+    requests: list[httpx.Request] = []
+    responses = iter(
+        [
+            httpx.Response(204),
+            httpx.Response(404, json={"message": "Agent not found"}),
+        ]
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return next(responses)
+
+    client = SmallestAIClient(
+        api_key="sk_test",
+        base_url="https://api.smallest.ai/atoms/v1",
+        transport=httpx.MockTransport(handler),
+    )
+
+    await client.delete_agent("agent/with spaces")
+    await client.delete_agent("already_absent")
+
+    assert [request.method for request in requests] == ["DELETE", "DELETE"]
+    assert requests[0].url.raw_path == b"/atoms/v1/agent/agent%2Fwith%20spaces/archive"
+    assert requests[1].url.path == "/atoms/v1/agent/already_absent/archive"
+
+
+@pytest.mark.asyncio
 async def test_knowledge_base_url_ingestion_contract():
     requests: list[httpx.Request] = []
 
