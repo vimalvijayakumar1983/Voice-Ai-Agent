@@ -2,6 +2,9 @@
 
 from uuid import UUID, uuid4
 
+import json
+import re
+
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select, update
@@ -32,6 +35,104 @@ from app.services.integration_security import (
 
 router = APIRouter(prefix="/integrations", tags=["Integrations"])
 logger = structlog.get_logger()
+
+SUPPORTED_INTEGRATION_TYPES = {"webhook", "his_api", "vav_crm", "google_sheets"}
+_API_AUTH_TYPES = {"bearer", "api_key"}
+_API_PATH_FIELDS = ("availability_path", "create_path", "reschedule_path", "cancel_path")
+_SPREADSHEET_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{20,128}$")
+_INVALID_SHEET_NAME_PATTERN = re.compile(r"[\\/*?\\[\\]:]")
+
+
+def _require_text(config: dict, key: str, label: str, *, min_length: int = 1) -> str:
+    value = config.get(key)
+    if not isinstance(value, str) or len(value.strip()) < min_length:
+        raise HTTPException(status_code=422, detail=f"{label} is required")
+    return value.strip()
+
+
+def _validate_relative_api_path(config: dict, key: str, *, required: bool = False) -> None:
+    value = config.get(key)
+    if value is None and not required:
+        return
+    if not isinstance(value, str) or not value.startswith("/") or value.startswith("//"):
+        raise HTTPException(
+            status_code=422,
+            detail=f"{key} must be an absolute API path beginning with /",
+        )
+    if "?" in value or "#" in value:
+        raise HTTPException(status_code=422, detail=f"{key} must not contain a query or fragment")
+    if ".." in value.split("/"):
+        raise HTTPException(status_code=422, detail=f"{key} must not contain parent traversal")
+    if len(value) > 500:
+        raise HTTPException(status_code=422, detail=f"{key} is too long")
+
+
+def _validate_api_connector(config: dict, integration_type: str) -> None:
+    _require_text(config, "base_url", "A public HTTPS base URL")
+    auth_type = _require_text(config, "auth_type", "An authentication type").lower()
+    if auth_type not in _API_AUTH_TYPES:
+        raise HTTPException(
+            status_code=422,
+            detail="auth_type must be bearer or api_key",
+        )
+    _require_text(config, "credential", "An API credential", min_length=16)
+    if auth_type == "api_key":
+        header = config.get("api_key_header", "X-API-Key")
+        if not isinstance(header, str) or not re.fullmatch(r"[A-Za-z0-9-]{1,64}", header):
+            raise HTTPException(status_code=422, detail="api_key_header is invalid")
+
+    for key in _API_PATH_FIELDS:
+        _validate_relative_api_path(
+            config,
+            key,
+            required=key == "create_path" or (
+                key == "availability_path" and integration_type == "his_api"
+            ),
+        )
+
+
+def _validate_google_sheets_connector(config: dict) -> None:
+    spreadsheet_id = _require_text(config, "spreadsheet_id", "A Google spreadsheet ID")
+    if not _SPREADSHEET_ID_PATTERN.fullmatch(spreadsheet_id):
+        raise HTTPException(status_code=422, detail="Google spreadsheet ID is invalid")
+
+    sheet_name = _require_text(config, "sheet_name", "A Google sheet tab name")
+    if len(sheet_name) > 100 or _INVALID_SHEET_NAME_PATTERN.search(sheet_name):
+        raise HTTPException(status_code=422, detail="Google sheet tab name is invalid")
+
+    credentials_value = config.get("credentials")
+    if isinstance(credentials_value, str):
+        if len(credentials_value) > 100_000:
+            raise HTTPException(status_code=422, detail="Google credentials are too large")
+        try:
+            credentials = json.loads(credentials_value)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail="Google credentials must be valid service-account JSON",
+            ) from exc
+    elif isinstance(credentials_value, dict):
+        credentials = credentials_value
+    else:
+        raise HTTPException(
+            status_code=422,
+            detail="Google service-account credentials are required",
+        )
+
+    required_fields = ("type", "client_email", "private_key")
+    if (
+        credentials.get("type") != "service_account"
+        or any(
+            not isinstance(credentials.get(key), str) or not credentials[key].strip()
+            for key in required_fields
+        )
+        or "BEGIN PRIVATE KEY" not in credentials["private_key"]
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="Google credentials must be a service-account key",
+        )
+
 
 
 def _locked_tenant_integration_statement(integration_id: UUID, tenant_id: UUID):
@@ -92,6 +193,9 @@ def _integration_response(integration: Integration, config: dict) -> Integration
 
 
 def _validate_config(config: dict, integration_type: str) -> None:
+    if integration_type not in SUPPORTED_INTEGRATION_TYPES:
+        raise HTTPException(status_code=422, detail="Unsupported integration type")
+
     try:
         validate_integration_config_urls(config)
     except IntegrationConfigError as exc:
@@ -116,6 +220,10 @@ def _validate_config(config: dict, integration_type: str) -> None:
                 status_code=422,
                 detail="Webhook integrations contain an unsupported event type",
             )
+    elif integration_type in {"his_api", "vav_crm"}:
+        _validate_api_connector(config, integration_type)
+    elif integration_type == "google_sheets":
+        _validate_google_sheets_connector(config)
 
 
 @router.post(
