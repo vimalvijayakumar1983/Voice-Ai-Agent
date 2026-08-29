@@ -34,4 +34,18 @@ function agentUpdateNotice(name, syncStatus) {
   return `${name} was updated${syncStatus === 'dirty' ? ' and is ready to publish' : ''}.`;
 }
 
-module.exports = { agentEditorPatch, agentUpdateNotice, valuesEqual };
+function requiresSmallestDeprovision(agent, patch) {
+  return Boolean(
+    agent.provider_agent_id
+    && agent.voice_provider === 'smallest'
+    && patch.voice_provider
+    && patch.voice_provider !== 'smallest'
+  );
+}
+
+module.exports = {
+  agentEditorPatch,
+  agentUpdateNotice,
+  requiresSmallestDeprovision,
+  valuesEqual,
+};

@@ -1102,8 +1102,18 @@ class ApiClient {
     return this.request<VoiceAgent>(`/api/v1/agents/${id}`);
   }
 
-  async updateAgent(id: string, data: Partial<VoiceAgent>) {
-    return this.request<VoiceAgent>(`/api/v1/agents/${id}`, { method: 'PATCH', body: JSON.stringify(data) });
+  async updateAgent(
+    id: string,
+    data: Partial<VoiceAgent>,
+    options: { deprovisionExistingProvider?: boolean } = {},
+  ) {
+    const query = options.deprovisionExistingProvider
+      ? '?deprovision_existing_provider=true'
+      : '';
+    return this.request<VoiceAgent>(`/api/v1/agents/${id}${query}`, {
+      method: 'PATCH',
+      body: JSON.stringify(data),
+    });
   }
 
   async deleteAgent(id: string) {

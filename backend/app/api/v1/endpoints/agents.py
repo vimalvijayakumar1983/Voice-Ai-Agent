@@ -616,6 +616,47 @@ async def _tenant_agent(
     return agent
 
 
+async def _require_agent_idle_for_provider_removal(
+    db: AsyncSession,
+    *,
+    agent: Agent,
+    tenant_id: UUID,
+    action: str,
+) -> None:
+    """Block destructive provider removal while live work still references the agent."""
+    nonterminal_call_id = await db.scalar(
+        select(Call.id)
+        .where(
+            Call.tenant_id == tenant_id,
+            Call.agent_id == agent.id,
+            Call.status.notin_(TERMINAL_CALL_STATUSES),
+        )
+        .limit(1)
+    )
+    if nonterminal_call_id is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Agent cannot be {action} while a call is still nonterminal",
+        )
+    nonterminal_attempt_id = await db.scalar(
+        select(CampaignContactAttempt.id)
+        .join(Campaign, Campaign.id == CampaignContactAttempt.campaign_id)
+        .outerjoin(Call, Call.id == CampaignContactAttempt.call_id)
+        .where(
+            Campaign.tenant_id == tenant_id,
+            CampaignContactAttempt.tenant_id == tenant_id,
+            CampaignContactAttempt.state.notin_(TERMINAL_CAMPAIGN_ATTEMPT_STATES),
+            or_(Campaign.agent_id == agent.id, Call.agent_id == agent.id),
+        )
+        .limit(1)
+    )
+    if nonterminal_attempt_id is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Agent cannot be {action} while a campaign attempt is unresolved",
+        )
+
+
 async def _tenant_sarvam_credential(
     db: AsyncSession,
     tenant_id: UUID,
@@ -2901,6 +2942,7 @@ async def get_agent(
 async def update_agent(
     agent_id: UUID,
     data: AgentUpdate,
+    deprovision_existing_provider: bool = False,
     current_user: CurrentUser = Depends(require_role("owner", "admin", "member")),
     db: AsyncSession = Depends(get_db),
 ):
@@ -2950,16 +2992,17 @@ async def update_agent(
     # authoritative, so a full editor payload must behave like a semantic PATCH:
     # unchanged values neither trigger provider I/O nor dirty a published agent.
     effective_changes = _effective_agent_changes(agent, changes)
-    if (
+    provider_switch_requested = bool(
         "voice_provider" in effective_changes
         and agent.provider_agent_id
         and effective_changes["voice_provider"] != "smallest"
-    ):
+    )
+    if provider_switch_requested and not deprovision_existing_provider:
         raise HTTPException(
             status_code=409,
             detail=(
-                "Delete the existing Smallest.ai remote agent before switching this VAV "
-                "agent to Sarvam. This prevents an orphaned live provider agent."
+                "Confirm provider deprovisioning before switching this VAV agent to Sarvam. "
+                "The Smallest.ai remote agent must be archived first."
             ),
         )
     resulting_voice_id = effective_changes.get("voice_id", agent.voice_id)
@@ -2967,6 +3010,17 @@ async def update_agent(
     voice_inputs_changed = bool(VOICE_PREFLIGHT_FIELDS.intersection(effective_changes))
     if resulting_voice_id and voice_inputs_changed:
         baseline_fields = set(effective_changes) | VOICE_CONFIGURATION_FIELDS
+        if provider_switch_requested:
+            baseline_fields.update(
+                {
+                    "provider_agent_id",
+                    "provider_branch_id",
+                    "provider_revision_id",
+                    "provider_config",
+                    "sync_status",
+                    "last_synced_at",
+                }
+            )
         baseline = _agent_fields_snapshot(agent, baseline_fields)
         await db.rollback()
         await _require_provider_voice(
@@ -2988,11 +3042,55 @@ async def update_agent(
                 detail="Agent configuration changed during voice validation; retry the edit",
             )
 
+    deprovisioned_provider_agent_id: str | None = None
+    if provider_switch_requested:
+        await _require_agent_idle_for_provider_removal(
+            db,
+            agent=agent,
+            tenant_id=current_user.tenant_id,
+            action="switched to another provider",
+        )
+        deprovisioned_provider_agent_id = agent.provider_agent_id
+        try:
+            await get_smallest_client().delete_agent(deprovisioned_provider_agent_id)
+        except SmallestAIError as exc:
+            if exc.ambiguous:
+                detail = (
+                    "Smallest.ai archival outcome is unknown. The VAV agent kept its original "
+                    "provider mapping; retry the provider switch to reconcile safely."
+                )
+            else:
+                detail = f"Could not archive the Smallest.ai agent before switching: {exc}"
+            raise HTTPException(status_code=exc.status_code, detail=detail) from exc
+
+        agent.provider_agent_id = None
+        agent.provider_branch_id = None
+        agent.provider_revision_id = None
+        agent.provider_config = None
+        agent.sync_status = "local_only"
+        agent.last_synced_at = None
+
     for key, value in effective_changes.items():
         setattr(agent, key, value)
 
     if agent.provider_agent_id and SMALLEST_SYNC_FIELDS.intersection(effective_changes):
         agent.sync_status = "dirty"
+
+    if deprovisioned_provider_agent_id:
+        await record_audit_event(
+            db,
+            tenant_id=current_user.tenant_id,
+            actor_user_id=current_user.id,
+            action="agent.provider_switched",
+            resource_type="agent",
+            resource_id=str(agent.id),
+            details={
+                "from_provider": "smallest",
+                "to_provider": agent.voice_provider,
+                "provider_agent_id": deprovisioned_provider_agent_id,
+                "provider_deprovisioned": True,
+            },
+        )
 
     await db.flush()
     return AgentResponse.model_validate(agent)
@@ -3010,37 +3108,12 @@ async def delete_agent(
             status_code=409,
             detail="Agent cannot be deleted while its provider operation is unresolved",
         )
-    nonterminal_call_id = await db.scalar(
-        select(Call.id)
-        .where(
-            Call.tenant_id == current_user.tenant_id,
-            Call.agent_id == agent.id,
-            Call.status.notin_(TERMINAL_CALL_STATUSES),
-        )
-        .limit(1)
+    await _require_agent_idle_for_provider_removal(
+        db,
+        agent=agent,
+        tenant_id=current_user.tenant_id,
+        action="deleted",
     )
-    if nonterminal_call_id is not None:
-        raise HTTPException(
-            status_code=409,
-            detail="Agent cannot be deleted while a call is still nonterminal",
-        )
-    nonterminal_attempt_id = await db.scalar(
-        select(CampaignContactAttempt.id)
-        .join(Campaign, Campaign.id == CampaignContactAttempt.campaign_id)
-        .outerjoin(Call, Call.id == CampaignContactAttempt.call_id)
-        .where(
-            Campaign.tenant_id == current_user.tenant_id,
-            CampaignContactAttempt.tenant_id == current_user.tenant_id,
-            CampaignContactAttempt.state.notin_(TERMINAL_CAMPAIGN_ATTEMPT_STATES),
-            or_(Campaign.agent_id == agent.id, Call.agent_id == agent.id),
-        )
-        .limit(1)
-    )
-    if nonterminal_attempt_id is not None:
-        raise HTTPException(
-            status_code=409,
-            detail="Agent cannot be deleted while a campaign attempt is unresolved",
-        )
 
     provider_agent_id = agent.provider_agent_id
     if provider_agent_id:

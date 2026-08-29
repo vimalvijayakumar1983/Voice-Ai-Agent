@@ -19,7 +19,7 @@ import {
   X,
 } from 'lucide-react';
 import AgentEditor, { AgentEditorValues, defaultAgentValues } from '@/components/AgentEditor';
-import { agentEditorPatch, agentUpdateNotice } from '@/components/agent-editor-diff.cjs';
+import agentEditorDiff from '@/components/agent-editor-diff.cjs';
 import Layout from '@/components/Layout';
 import {
   agentTestReadinessMessage,
@@ -29,6 +29,8 @@ import {
   providerActionNotice,
 } from '@/lib/agent-readiness.cjs';
 import { api, AgentProviderCatalog, ProviderStatus, VoiceAgent } from '@/lib/api';
+
+const { agentEditorPatch, agentUpdateNotice, requiresSmallestDeprovision } = agentEditorDiff;
 
 type AgentLoadErrors = Partial<Record<'agents' | 'provider' | 'catalog', string>>;
 type DeploymentFilter = 'all' | 'local' | 'synced' | 'changes' | 'attention';
@@ -170,12 +172,20 @@ export default function Agents() {
           setNotice({ type: 'info', text: `${editingAgent.name} has no changes to save.` });
           return;
         }
-        const updated = await api.updateAgent(editingAgent.id, patch);
+        const deprovisionExistingProvider = requiresSmallestDeprovision(editingAgent, patch);
+        if (deprovisionExistingProvider && !window.confirm(
+          `Switch ${editingAgent.name} from Smallest.ai to Sarvam? The live Smallest.ai remote agent will be permanently archived first. The VAV agent and its knowledge base will be preserved.`,
+        )) return;
+        const updated = await api.updateAgent(editingAgent.id, patch, {
+          deprovisionExistingProvider,
+        });
         setAgents((current) => current.map((agent) => agent.id === updated.id ? updated : agent));
         setEditingAgentId(null);
         setNotice({
           type: 'success',
-          text: agentUpdateNotice(updated.name, updated.sync_status),
+          text: deprovisionExistingProvider
+            ? `${updated.name} was archived on Smallest.ai and switched to Sarvam. Its VAV configuration and knowledge binding were preserved.`
+            : agentUpdateNotice(updated.name, updated.sync_status),
         });
       } else {
         const created = await api.createAgent(values);

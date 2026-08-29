@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 
 import editorDiff from '../src/components/agent-editor-diff.cjs';
 
-const { agentEditorPatch, agentUpdateNotice } = editorDiff;
+const { agentEditorPatch, agentUpdateNotice, requiresSmallestDeprovision } = editorDiff;
 
 test('agent edit patch contains only fields whose persisted value changed', () => {
   const original = {
@@ -53,5 +53,26 @@ test('edit success invites publishing only when the saved agent is dirty', () =>
   assert.equal(
     agentUpdateNotice('Front desk', 'draft'),
     'Front desk was updated.',
+  );
+});
+
+test('provider switch requires remote deprovision only for a provisioned Smallest agent', () => {
+  const provisioned = {
+    voice_provider: 'smallest',
+    provider_agent_id: 'smallest-agent-123',
+  };
+
+  assert.equal(requiresSmallestDeprovision(provisioned, { voice_provider: 'sarvam' }), true);
+  assert.equal(requiresSmallestDeprovision(provisioned, { name: 'Renamed' }), false);
+  assert.equal(
+    requiresSmallestDeprovision({ ...provisioned, provider_agent_id: null }, { voice_provider: 'sarvam' }),
+    false,
+  );
+  assert.equal(
+    requiresSmallestDeprovision(
+      { ...provisioned, voice_provider: 'sarvam' },
+      { voice_provider: 'smallest' },
+    ),
+    false,
   );
 });
