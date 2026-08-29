@@ -716,14 +716,40 @@ class SmallestAIClient:
         )
         provider_timezone = _provider_timezone(timezone)
 
+        single_prompt_config: dict[str, Any] = {"prompt": global_prompt}
+        if global_knowledge_base_id is not _KNOWLEDGE_BINDING_UNSET:
+            tools: list[dict[str, Any]] = [
+                {
+                    "type": "end_call",
+                    "name": "end_call",
+                    "description": "Terminate the call when conversation is complete.",
+                    "enabled": True,
+                }
+            ]
+            if isinstance(global_knowledge_base_id, str) and global_knowledge_base_id:
+                tools.append(
+                    {
+                        "type": "knowledge_base_search",
+                        "name": "knowledge_base_search",
+                        "description": (
+                            "Search the approved knowledge base for verified information "
+                            "before answering."
+                        ),
+                        "enabled": True,
+                        "knowledgeBaseId": global_knowledge_base_id,
+                        "fillerPhrases": ["Let me check that for you."],
+                    }
+                )
+            single_prompt_config["tools"] = tools
+
         payload: dict[str, Any] = {
             # ``globalPrompt`` configures legacy workflow-graph agents, while
             # current agents created by POST /agent use ``single_prompt`` and
-            # read their system prompt from ``singlePromptConfig.prompt``.
+            # read their system prompt and native tools from ``singlePromptConfig``.
             # Sending both keeps existing provisioned agents compatible while
-            # ensuring new single-prompt agents receive the requested prompt.
+            # ensuring new single-prompt agents receive the requested runtime.
             "globalPrompt": global_prompt,
-            "singlePromptConfig": {"prompt": global_prompt},
+            "singlePromptConfig": single_prompt_config,
             "firstMessage": first_message or "",
             "slmModel": slm_model,
             "language": {
