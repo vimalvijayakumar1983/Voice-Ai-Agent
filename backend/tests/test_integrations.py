@@ -642,3 +642,167 @@ async def test_concurrent_stale_patch_cannot_restore_rotated_signing_secret(
         hydrated = load_integration_config(stored.config, stored.encrypted_config)
     assert hydrated["signing_secret"] == "rotated-signing-secret"
     assert hydrated["events"] == ["call.completed", "call.analytics_updated"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("integration_type", "config", "expected_capabilities"),
+    [
+        (
+            "his_api",
+            {
+                "base_url": "https://his.royalmedical.ae/api",
+                "auth_type": "bearer",
+                "credential": "his-production-token-value",
+                "availability_path": "/v1/appointments/availability",
+                "create_path": "/v1/appointments",
+                "reschedule_path": "/v1/appointments/{appointment_id}",
+                "cancel_path": "/v1/appointments/{appointment_id}/cancel",
+            },
+            [
+                "live_availability",
+                "create_appointment",
+                "reschedule_appointment",
+                "cancel_appointment",
+            ],
+        ),
+        (
+            "vav_crm",
+            {
+                "base_url": "https://crm.vav.ae/api",
+                "auth_type": "api_key",
+                "api_key_header": "X-VAV-API-Key",
+                "credential": "vav-crm-production-key",
+                "create_path": "/v1/appointment-requests",
+            },
+            ["create_appointment_request"],
+        ),
+    ],
+)
+async def test_appointment_api_connectors_are_validated_encrypted_and_redacted(
+    client: AsyncClient,
+    auth_headers,
+    db: AsyncSession,
+    integration_type: str,
+    config: dict,
+    expected_capabilities: list[str],
+):
+    response = await client.post(
+        "/api/v1/integrations",
+        headers=auth_headers,
+        json={
+            "name": f"Royal Medical {integration_type}",
+            "integration_type": integration_type,
+            "config": config,
+        },
+    )
+
+    assert response.status_code == 201
+    created = response.json()
+    assert created["config"]["base_url"] == PUBLIC_URL_REDACTION_PLACEHOLDER
+    assert created["config"]["capabilities"] == expected_capabilities
+    assert "credential" in created["secret_fields"]
+    assert "base_url" in created["secret_fields"]
+    assert config["credential"] not in str(created)
+
+    result = await db.execute(select(Integration).where(Integration.id == UUID(created["id"])))
+    stored = result.scalar_one()
+    assert config["credential"] not in json.dumps(stored.config)
+    assert config["credential"] not in stored.encrypted_config
+    hydrated = load_integration_config(stored.config, stored.encrypted_config)
+    assert hydrated["credential"] == config["credential"]
+    assert hydrated["base_url"] == config["base_url"]
+
+
+@pytest.mark.asyncio
+async def test_google_sheets_connector_accepts_only_service_account_credentials(
+    client: AsyncClient,
+    auth_headers,
+    db: AsyncSession,
+):
+    credentials = {
+        "type": "service_account",
+        "client_email": "vav-appointments@example.iam.gserviceaccount.com",
+        "private_key": "-----BEGIN PRIVATE KEY-----\nnot-a-real-key\n-----END PRIVATE KEY-----\n",
+    }
+    response = await client.post(
+        "/api/v1/integrations",
+        headers=auth_headers,
+        json={
+            "name": "Royal Medical appointment register",
+            "integration_type": "google_sheets",
+            "config": {
+                "spreadsheet_id": "1AG0C6nnyZjR2Oq5PSt8mKg8eauWfivl4s_qdUqdjFFI",
+                "sheet_name": "Appointment Requests",
+                "table_name": "AppointmentRequests",
+                "credentials": credentials,
+            },
+        },
+    )
+
+    assert response.status_code == 201
+    created = response.json()
+    assert created["config"] == {
+        "sheet_name": "Appointment Requests",
+        "table_name": "AppointmentRequests",
+        "spreadsheet_configured": True,
+        "capabilities": ["create_appointment_request"],
+    }
+    assert created["secret_fields"] == [
+        "credentials",
+        "spreadsheet_id",
+    ]
+    assert credentials["client_email"] not in str(created)
+
+    result = await db.execute(select(Integration).where(Integration.id == UUID(created["id"])))
+    stored = result.scalar_one()
+    assert credentials["client_email"] not in json.dumps(stored.config)
+    hydrated = load_integration_config(stored.config, stored.encrypted_config)
+    assert hydrated["credentials"]["client_email"] == credentials["client_email"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("integration_type", "config", "expected_detail"),
+    [
+        ("unsupported", {}, "Unsupported integration type"),
+        (
+            "his_api",
+            {
+                "base_url": "https://his.royalmedical.ae",
+                "auth_type": "bearer",
+                "credential": "long-enough-credential",
+                "create_path": "/v1/appointments",
+            },
+            "availability_path must be an absolute API path beginning with /",
+        ),
+        (
+            "google_sheets",
+            {
+                "spreadsheet_id": "not-valid",
+                "sheet_name": "Appointment Requests",
+                "credentials": {},
+            },
+            "Google spreadsheet ID is invalid",
+        ),
+    ],
+)
+async def test_appointment_connector_validation_fails_closed(
+    client: AsyncClient,
+    auth_headers,
+    integration_type: str,
+    config: dict,
+    expected_detail: str,
+):
+    response = await client.post(
+        "/api/v1/integrations",
+        headers=auth_headers,
+        json={
+            "name": "Invalid appointment connector",
+            "integration_type": integration_type,
+            "config": config,
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == expected_detail
