@@ -362,6 +362,19 @@ def _publish_kwargs(agent: Agent, voice: VoiceResolution) -> dict:
     }
 
 
+def _apply_knowledge_binding_delta(
+    snapshot: dict,
+    *,
+    desired_knowledge_base_id: str | None,
+    existing_knowledge_base_id: str | None,
+) -> str:
+    """Write the KB field only when the provider binding actually changes."""
+    if desired_knowledge_base_id == existing_knowledge_base_id:
+        return "unchanged"
+    snapshot["global_knowledge_base_id"] = desired_knowledge_base_id
+    return "set" if desired_knowledge_base_id is not None else "clear"
+
+
 def _voice_configuration_snapshot(agent: Agent) -> tuple:
     return (
         agent.voice_id,
@@ -1371,11 +1384,10 @@ async def _publish_smallest_agent(
         if not branch_id:
             provider_phase = "branch_lookup"
             branch_id = await client.get_default_branch_id(provider_agent_id)
-        if knowledge_binding is None:
-            provider_phase = "knowledge_binding_lookup"
-            existing_remote_knowledge_id = await client.get_agent_knowledge_base_id(
-                provider_agent_id
-            )
+        provider_phase = "knowledge_binding_lookup"
+        existing_remote_knowledge_id = await client.get_agent_knowledge_base_id(
+            provider_agent_id
+        )
     except SmallestAIError as exc:
         await _mark_publish_failure(
             db,
@@ -1397,23 +1409,21 @@ async def _publish_smallest_agent(
         raise HTTPException(status_code=409, detail="Provider operation was superseded")
     agent.provider_branch_id = branch_id
     snapshot = _publish_kwargs(agent, voice)
-    # The provider models this as an optional string. Omit it when both sides
-    # are already unbound; send an explicit null only when detaching a real
-    # active provider binding.
-    if remote_knowledge_id is not None or existing_remote_knowledge_id is not None:
-        snapshot["global_knowledge_base_id"] = remote_knowledge_id
+    # Smallest merges this partial draft payload. Replaying an unchanged
+    # globalKnowledgeBaseId can rematerialize the provider's KB tool, so only
+    # write the field when VAV's desired binding differs from the active one.
+    knowledge_binding_action = _apply_knowledge_binding_delta(
+        snapshot,
+        desired_knowledge_base_id=remote_knowledge_id,
+        existing_knowledge_base_id=existing_remote_knowledge_id,
+    )
     _set_provider_operation(
         agent,
         "publish",
         phase="draft_update",
         global_knowledge_base_id=remote_knowledge_id,
-        knowledge_binding_action=(
-            "set"
-            if remote_knowledge_id is not None
-            else "clear"
-            if existing_remote_knowledge_id is not None
-            else "unchanged"
-        ),
+        existing_global_knowledge_base_id=existing_remote_knowledge_id,
+        knowledge_binding_action=knowledge_binding_action,
         lease_expires_at=(datetime.now(UTC) + PROVIDER_OPERATION_LEASE).isoformat(),
     )
     await db.commit()
