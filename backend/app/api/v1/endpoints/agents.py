@@ -729,21 +729,21 @@ def _provider_tool_refs(provider_agent: dict) -> tuple[str, ...] | None:
     return ()
 
 
-def _operator_verified_knowledge_tool_ref_delta(
+def _verified_knowledge_tool_ref_delta(
     original_provider_agent: dict,
     published_provider_agent: dict,
     active_provider_agent: dict,
     *,
     expected_knowledge_base_id: str | None,
 ) -> bool:
-    """Accept one operator-created KB tool-ref delta when Smallest omits expansion.
+    """Accept one provider-created KB tool-ref delta when Smallest omits expansion.
 
     Smallest's current agent response can expose the live Knowledge Base system tool
     only through _resolvedConfig.toolRefs while omitting both the expanded
     knowledge_base_search tool and the documented top-level KB field. This fallback
-    is intentionally limited to configuration-recovery verification: published and
-    active refs must agree, every other field is checked separately, and exactly one
-    ref must have been added or removed from the failed revision.
+    is limited to a publish operation with a known baseline: published and active
+    refs must agree, every other field is checked separately, and exactly one ref
+    must have been added or removed from the baseline revision.
     """
     original_refs = _provider_tool_refs(original_provider_agent)
     published_refs = _provider_tool_refs(published_provider_agent)
@@ -1038,6 +1038,7 @@ async def _reconcile_smallest_publish(
     configuration_mismatches: list[str] = []
     published_configuration_mismatches: list[str] = []
     active_configuration_mismatches: list[str] = []
+    knowledge_binding_verification: str | None = None
     if revision_status == "published" and security_status == "passed":
         agent = await _tenant_agent(db, agent_id, tenant_id, for_update=True)
         if not _publish_reconciliation_is_current(agent, operation_id):
@@ -1057,6 +1058,39 @@ async def _reconcile_smallest_publish(
                     version_id=latest_revision_id,
                 )
                 active_provider_agent = await client.get_agent(provider_agent_id)
+                (
+                    configuration_mismatches,
+                    published_configuration_mismatches,
+                    active_configuration_mismatches,
+                ) = _provider_configuration_mismatch_sets(
+                    published_provider_agent,
+                    active_provider_agent,
+                    expected_configuration,
+                )
+                knowledge_only = {"global_knowledge_base_id"}
+                if (
+                    isinstance(baseline_revision_id, str)
+                    and baseline_revision_id
+                    and set(configuration_mismatches) == knowledge_only
+                    and set(published_configuration_mismatches) == knowledge_only
+                    and set(active_configuration_mismatches) == knowledge_only
+                ):
+                    baseline_provider_agent = await client.get_agent(
+                        provider_agent_id,
+                        version_id=baseline_revision_id,
+                    )
+                    if _verified_knowledge_tool_ref_delta(
+                        baseline_provider_agent,
+                        published_provider_agent,
+                        active_provider_agent,
+                        expected_knowledge_base_id=expected_configuration[
+                            "global_knowledge_base_id"
+                        ],
+                    ):
+                        configuration_mismatches = []
+                        published_configuration_mismatches = []
+                        active_configuration_mismatches = []
+                        knowledge_binding_verification = "publish_tool_ref_delta"
             except SmallestAIError as exc:
                 agent = await _tenant_agent(db, agent_id, tenant_id, for_update=True)
                 if not _publish_reconciliation_is_current(agent, operation_id):
@@ -1076,15 +1110,6 @@ async def _reconcile_smallest_publish(
                 )
                 await db.commit()
                 raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
-            (
-                configuration_mismatches,
-                published_configuration_mismatches,
-                active_configuration_mismatches,
-            ) = _provider_configuration_mismatch_sets(
-                published_provider_agent,
-                active_provider_agent,
-                expected_configuration,
-            )
 
     agent = await _tenant_agent(db, agent_id, tenant_id, for_update=True)
     if not _publish_reconciliation_is_current(agent, operation_id):
@@ -1134,6 +1159,7 @@ async def _reconcile_smallest_publish(
         configuration_mismatches=configuration_mismatches,
         published_configuration_mismatches=published_configuration_mismatches,
         active_configuration_mismatches=active_configuration_mismatches,
+        knowledge_binding_verification=knowledge_binding_verification,
         last_error=last_error,
         last_checked_at=datetime.now(UTC).isoformat(),
     )
@@ -1278,7 +1304,7 @@ async def _reconcile_smallest_config_mismatch(
                     provider_agent_id,
                     version_id=original_revision_id,
                 )
-                if _operator_verified_knowledge_tool_ref_delta(
+                if _verified_knowledge_tool_ref_delta(
                     original_provider_agent,
                     published_provider_agent,
                     active_provider_agent,
