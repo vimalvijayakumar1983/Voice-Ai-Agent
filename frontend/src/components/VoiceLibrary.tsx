@@ -23,6 +23,7 @@ import {
   voiceTier,
 } from './voice-library.cjs';
 import type { VoiceCompatibility, VoiceCompatibilityStatus } from './voice-library.cjs';
+import VoiceCloneStudio from './VoiceCloneStudio';
 import styles from './VoiceLibrary.module.css';
 
 type CatalogState = 'loading' | 'ready' | 'error';
@@ -54,6 +55,7 @@ interface VoiceLibraryProps {
   configurationLocked?: boolean;
   preservedVoiceId?: string;
   onSelect: (voiceId: string) => void;
+  onCatalogRefresh: () => Promise<void>;
 }
 
 const PAGE_SIZE = 18;
@@ -69,6 +71,7 @@ export default function VoiceLibrary({
   configurationLocked = false,
   preservedVoiceId,
   onSelect,
+  onCatalogRefresh,
 }: VoiceLibraryProps) {
   const searchId = useId();
   const tierId = useId();
@@ -300,6 +303,13 @@ export default function VoiceLibrary({
         compatibility={selectedCompatibility}
         configurationLocked={configurationLocked}
         preservedVoiceId={preservedVoiceId}
+      />
+      <VoiceCloneStudio
+        languages={languages}
+        selectedLanguages={selectedLanguages}
+        disabled={configurationLocked}
+        onCatalogRefresh={onCatalogRefresh}
+        onSelect={onSelect}
       />
       <PreviewAnnouncement preview={preview} />
       {libraryOpen && (

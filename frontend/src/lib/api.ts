@@ -87,6 +87,25 @@ export interface VoiceCatalogItem {
   source: 'catalog' | 'cloned';
 }
 
+export interface VoiceClone {
+  id: string;
+  provider: 'smallest';
+  provider_voice_id: string | null;
+  display_name: string;
+  description: string | null;
+  language: string;
+  accent: string | null;
+  gender: 'female' | 'male' | null;
+  model: 'lightning-v3.1' | 'lightning-v3.1-pro';
+  model_ids: string[];
+  status: 'creating' | 'pending' | 'processing' | 'completed' | 'creation_unknown' | 'error' | 'missing' | 'deletion_unknown' | 'delete_error';
+  last_error: string | null;
+  last_synced_at: string | null;
+  consent_confirmed_at: string;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface LanguageCatalogItem {
   code: string;
   name: string;
@@ -279,6 +298,15 @@ export interface AnalyticsOverview {
 export interface AnalyticsTimeSeries {
   period: string;
   data: Array<{ date: string; calls: number; minutes: number }>;
+}
+
+export interface AgentPerformance {
+  agent_id: string;
+  agent_name: string;
+  total_calls: number;
+  avg_duration_seconds: number;
+  success_rate: number;
+  avg_sentiment: number | null;
 }
 
 export interface CallTranscript {
@@ -1082,6 +1110,47 @@ class ApiClient {
     });
   }
 
+  async listVoiceClones() {
+    return this.request<VoiceClone[]>('/api/v1/agents/provider/voice-clones');
+  }
+
+  async createVoiceClone(data: {
+    displayName: string;
+    language: string;
+    accent: string;
+    gender: 'female' | 'male' | '';
+    description: string;
+    model: 'lightning-v3.1' | 'lightning-v3.1-pro';
+    consentConfirmed: boolean;
+    file: File;
+  }) {
+    const form = new FormData();
+    form.append('display_name', data.displayName);
+    form.append('language', data.language);
+    form.append('accent', data.accent);
+    form.append('gender', data.gender);
+    form.append('description', data.description);
+    form.append('model', data.model);
+    form.append('consent_confirmed', String(data.consentConfirmed));
+    form.append('media', data.file);
+    return this.request<VoiceClone>('/api/v1/agents/provider/voice-clones', {
+      method: 'POST',
+      body: form,
+    });
+  }
+
+  async refreshVoiceClone(id: string) {
+    return this.request<VoiceClone>(`/api/v1/agents/provider/voice-clones/${id}/refresh`, {
+      method: 'POST',
+    });
+  }
+
+  async deleteVoiceClone(id: string) {
+    return this.request<void>(`/api/v1/agents/provider/voice-clones/${id}`, {
+      method: 'DELETE',
+    });
+  }
+
   async provisionSmallestAgent(id: string) {
     return this.request<VoiceAgent>(`/api/v1/agents/${id}/smallest/provision`, { method: 'POST' });
   }
@@ -1293,14 +1362,22 @@ class ApiClient {
   }
 
   // Analytics
-  async getOverview(days = 30) {
-    return this.request<AnalyticsOverview>(`/api/v1/analytics/overview?days=${days}`);
+  async getOverview(days = 30, agentId?: string) {
+    const query = new URLSearchParams({ days: String(days) });
+    if (agentId) query.set('agent_id', agentId);
+    return this.request<AnalyticsOverview>(`/api/v1/analytics/overview?${query}`);
   }
 
-  async getTimeseries(days = 30, period: 'day' | 'week' | 'month' = 'day') {
+  async getTimeseries(days = 30, period: 'day' | 'week' | 'month' = 'day', agentId?: string) {
+    const query = new URLSearchParams({ days: String(days), period });
+    if (agentId) query.set('agent_id', agentId);
     return this.request<AnalyticsTimeSeries>(
-      `/api/v1/analytics/timeseries?days=${days}&period=${period}`,
+      `/api/v1/analytics/timeseries?${query}`,
     );
+  }
+
+  async getAgentPerformance(days = 30) {
+    return this.request<AgentPerformance[]>(`/api/v1/analytics/agents?days=${days}`);
   }
 
   // Workflows

@@ -50,6 +50,9 @@ function voicePreviewAvailability(voice) {
   if (voice.unavailability_reason) {
     return { available: false, reason: voice.unavailability_reason };
   }
+  if (voice.source === 'cloned') {
+    return { available: true, reason: null };
+  }
   const pool = String(voice.voice_pool || voice.voice_tier || voice.tier || '').trim().toLowerCase();
   if (!['standard', 'pro'].includes(pool)) {
     return {

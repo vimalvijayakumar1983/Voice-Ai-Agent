@@ -142,6 +142,22 @@ export default function Agents() {
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
 
+  const refreshVoiceCatalog = async () => {
+    try {
+      const refreshed = await api.getAgentProviderCatalog();
+      setCatalog(refreshed);
+      setLoadErrors((current) => {
+        const next = { ...current };
+        delete next.catalog;
+        return next;
+      });
+    } catch (error) {
+      const message = errorMessage(error, 'Could not refresh the voice catalog.');
+      setLoadErrors((current) => ({ ...current, catalog: message }));
+      throw error;
+    }
+  };
+
   const saveAgent = async (values: AgentEditorValues) => {
     const actionKey = editingAgent ? `save-${editingAgent.id}` : 'save-new';
     setWorking(actionKey);
@@ -363,6 +379,7 @@ export default function Agents() {
             busy={working === (editingAgent ? `save-${editingAgent.id}` : 'save-new')}
             onCancel={closeEditor}
             onSubmit={saveAgent}
+            onCatalogRefresh={refreshVoiceCatalog}
           />
         </section>
       )}

@@ -13,6 +13,7 @@ from app.models.compliance import ConsentRecord, DncEntry
 from app.models.integration import Integration, WebhookEvent
 from app.models.tenant import Tenant
 from app.models.user import ApiKey, RefreshSession, User, UserInvitation
+from app.models.voice import VoiceClone
 from app.models.workflow import Workflow, WorkflowNode
 
 __all__ = [
@@ -44,4 +45,5 @@ __all__ = [
     "BillingPlan",
     "TenantSubscription",
     "UsageRecord",
+    "VoiceClone",
 ]

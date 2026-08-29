@@ -490,6 +490,114 @@ class SmallestAIClient:
         voices = response.get("data") or response.get("voices") or []
         return voices if isinstance(voices, list) else []
 
+    async def create_voice_clone(
+        self,
+        *,
+        display_name: str,
+        file_name: str,
+        content: bytes,
+        content_type: str,
+        language: str,
+        accent: str | None,
+        description: str | None,
+        tags: list[str],
+        model: str,
+    ) -> dict[str, Any]:
+        """Create a current-generation Waves clone from one bounded audio sample."""
+        if not self.api_key:
+            raise SmallestAIError(
+                "Smallest.ai is not configured. Add SMALLEST_API_KEY to the backend environment.",
+                status_code=503,
+            )
+        if model not in {"lightning-v3.1", "lightning-v3.1-pro"}:
+            raise SmallestAIError("Unsupported voice cloning model.", status_code=422)
+
+        form = {
+            "displayName": display_name,
+            "language": language,
+            "model": model,
+            "tags": ",".join(dict.fromkeys(tag for tag in tags if tag)),
+        }
+        if accent:
+            form["accent"] = accent
+        if description:
+            form["description"] = description
+
+        async with httpx.AsyncClient(
+            base_url=self.waves_base_url,
+            timeout=self.timeout,
+            transport=self.transport,
+            headers={"Authorization": f"Bearer {self.api_key}", "Accept": "application/json"},
+        ) as client:
+            try:
+                response = await client.post(
+                    "/voice-cloning",
+                    data=form,
+                    files={"file": (file_name, content, content_type)},
+                )
+            except httpx.TimeoutException as exc:
+                raise SmallestAIError(
+                    "Smallest.ai timed out while creating the voice clone. "
+                    "Check status before retrying.",
+                    status_code=504,
+                    ambiguous=True,
+                ) from exc
+            except httpx.HTTPError as exc:
+                raise SmallestAIError(
+                    "Could not connect to Smallest.ai while creating the voice clone.",
+                    ambiguous=True,
+                ) from exc
+
+        if response.is_error:
+            try:
+                details: Any = response.json()
+            except ValueError:
+                details = response.text[:500]
+            message = _provider_error_message(details, "Smallest.ai rejected the voice clone.")
+            public_status = response.status_code
+            if response.status_code in {401, 403}:
+                public_status = 502
+                message = "Smallest.ai rejected the configured server credentials or permissions."
+            raise SmallestAIError(
+                message,
+                status_code=public_status,
+                upstream_status_code=response.status_code,
+                details=details,
+                ambiguous=response.status_code == 408 or response.status_code >= 500,
+            )
+
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise SmallestAIError(
+                "Smallest.ai returned an invalid voice clone response.", ambiguous=True
+            ) from exc
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(data, dict):
+            raise SmallestAIError(
+                "Smallest.ai returned an unexpected voice clone response.", ambiguous=True
+            )
+        voice_id = data.get("voiceId") or data.get("id") or data.get("_id")
+        if not isinstance(voice_id, str) or not voice_id.strip():
+            raise SmallestAIError(
+                "Smallest.ai created a voice clone without returning its ID.", ambiguous=True
+            )
+        return data
+
+    async def delete_voice_clone(self, voice_id: str) -> None:
+        """Delete one organization voice clone through Smallest's current public route."""
+        try:
+            await self._request(
+                "DELETE",
+                "/lightning-large",
+                json={"voiceId": voice_id},
+                base_url=self.waves_base_url,
+            )
+        except SmallestAIError as exc:
+            if exc.upstream_status_code == 404:
+                return
+            raise
+
     async def synthesize_voice_preview(
         self,
         *,
@@ -644,9 +752,7 @@ class SmallestAIClient:
                 return
             raise
 
-    async def delete_knowledge_item(
-        self, *, knowledge_base_id: str, item_id: str
-    ) -> None:
+    async def delete_knowledge_item(self, *, knowledge_base_id: str, item_id: str) -> None:
         """Delete one uploaded provider item, treating an absent item as deleted."""
         try:
             await self._request(

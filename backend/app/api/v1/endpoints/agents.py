@@ -2,9 +2,20 @@
 
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from pathlib import PurePath
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Request,
+    Response,
+    UploadFile,
+    status,
+)
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -14,6 +25,7 @@ from app.middleware.tenant import CurrentUser, get_current_user, require_role
 from app.models.agent import Agent, AgentKnowledgeBinding, KnowledgeBase
 from app.models.call import Call
 from app.models.campaign import Campaign, CampaignContactAttempt
+from app.models.voice import VoiceClone
 from app.providers.smallest import (
     SmallestAIError,
     get_smallest_client,
@@ -29,6 +41,7 @@ from app.schemas.agent import (
     SmallestProviderResolution,
     SmallestSessionRequest,
     SmallestSessionResponse,
+    VoiceCloneResponse,
     VoicePreviewRequest,
     validate_language_configuration,
 )
@@ -37,6 +50,7 @@ from app.services.agent_catalog import (
     LanguageCompatibilityStatus,
     VoiceModelPool,
     language_catalog,
+    language_code,
     normalize_voices,
     voice_language_compatibility,
 )
@@ -167,6 +181,19 @@ TERMINAL_CALL_STATUSES = frozenset(
     {"completed", "failed", "busy", "no_answer", "canceled", "cancelled"}
 )
 TERMINAL_CAMPAIGN_ATTEMPT_STATES = frozenset({"completed", "failed", "rejected", "cancelled"})
+MAX_VOICE_CLONE_BYTES = 5 * 1024 * 1024
+VOICE_CLONE_MEDIA_TYPES = {
+    "audio/mpeg": {".mp3"},
+    "audio/mpeg-3": {".mp3"},
+    "audio/wav": {".wav"},
+    "audio/wave": {".wav"},
+    "audio/x-wav": {".wav"},
+    "audio/webm": {".webm"},
+    "video/webm": {".webm"},
+    "audio/mp4": {".mp4"},
+    "video/mp4": {".mp4"},
+}
+VOICE_CLONE_MODELS = {"lightning-v3.1", "lightning-v3.1-pro"}
 
 
 @dataclass(frozen=True)
@@ -195,6 +222,109 @@ async def _public_voice_catalog(client) -> list[dict]:
         return normalized
     cached = public_agent_catalog_cache.get(PUBLIC_CATALOG_CACHE_KEY)
     return cached if cached is not None else normalized
+
+
+def _owned_clone_provider_shape(clone: VoiceClone) -> dict:
+    tags = [tag for tag in (clone.gender, "private") if tag]
+    return {
+        "voiceId": clone.provider_voice_id,
+        "displayName": clone.display_name,
+        "language": clone.language,
+        "accent": clone.accent,
+        "tags": tags,
+        "status": clone.status,
+        "modelIds": list(clone.model_ids),
+    }
+
+
+async def _tenant_voice_catalog(
+    client,
+    db: AsyncSession,
+    tenant_id: UUID,
+) -> list[dict]:
+    public_voices = await _public_voice_catalog(client)
+    result = await db.execute(
+        select(VoiceClone).where(
+            VoiceClone.tenant_id == tenant_id,
+            VoiceClone.provider_voice_id.is_not(None),
+            VoiceClone.status == "completed",
+        )
+    )
+    owned_clones = [_owned_clone_provider_shape(clone) for clone in result.scalars().all()]
+    normalized_clones = normalize_voices([], owned_clones)
+    return sorted(
+        [*normalized_clones, *public_voices],
+        key=lambda voice: (voice.get("source") != "cloned", str(voice.get("name") or "")),
+    )
+
+
+def _valid_voice_sample_signature(content: bytes, suffix: str) -> bool:
+    if suffix == ".wav":
+        return len(content) >= 12 and content[:4] == b"RIFF" and content[8:12] == b"WAVE"
+    if suffix == ".mp3":
+        return content.startswith(b"ID3") or (
+            len(content) >= 2 and content[0] == 0xFF and content[1] & 0xE0 == 0xE0
+        )
+    if suffix == ".webm":
+        return content.startswith(b"\x1aE\xdf\xa3")
+    if suffix == ".mp4":
+        return len(content) >= 12 and content[4:8] == b"ftyp"
+    return False
+
+
+async def _tenant_voice_clone(
+    db: AsyncSession,
+    tenant_id: UUID,
+    clone_id: UUID,
+    *,
+    for_update: bool = False,
+) -> VoiceClone:
+    query = select(VoiceClone).where(
+        VoiceClone.id == clone_id,
+        VoiceClone.tenant_id == tenant_id,
+    )
+    if for_update:
+        query = query.with_for_update().execution_options(populate_existing=True)
+    clone = await db.scalar(query)
+    if clone is None:
+        raise HTTPException(status_code=404, detail="Custom voice not found")
+    return clone
+
+
+def _clone_operation_tag(clone_id: UUID) -> str:
+    return f"vav-clone-{clone_id}"
+
+
+def _remote_clone_tags(remote: dict) -> set[str]:
+    tags = remote.get("tags")
+    if isinstance(tags, dict):
+        values = [*tags.keys(), *tags.values()]
+    elif isinstance(tags, list):
+        values = tags
+    elif isinstance(tags, str):
+        values = tags.split(",")
+    else:
+        values = []
+    return {str(value).strip() for value in values if str(value).strip()}
+
+
+def _apply_remote_clone(clone: VoiceClone, remote: dict) -> None:
+    voice_id = remote.get("voiceId") or remote.get("id") or remote.get("_id")
+    if not isinstance(voice_id, str) or not voice_id.strip():
+        raise HTTPException(status_code=502, detail="Smallest.ai returned a clone without an ID")
+    model_ids = remote.get("modelIds") or remote.get("model_ids") or []
+    if isinstance(model_ids, str):
+        model_ids = [model_ids]
+    clone.provider_voice_id = voice_id.strip()
+    clone.model_ids = [str(value).strip() for value in model_ids if str(value).strip()] or [
+        clone.model
+    ]
+    remote_status = str(remote.get("status") or "completed").strip().lower()
+    clone.status = (
+        remote_status if remote_status in {"pending", "processing", "completed"} else "processing"
+    )
+    clone.last_error = None
+    clone.last_synced_at = datetime.now(UTC)
 
 
 def _provider_config(agent: Agent) -> dict:
@@ -471,19 +601,21 @@ async def _tenant_agent(
     return agent
 
 
-async def _require_public_voice(
+async def _require_tenant_voice(
     client,
+    db: AsyncSession,
+    tenant_id: UUID,
     voice_id: str,
     selected_languages: list[str],
 ) -> VoiceResolution:
-    """Resolve one public voice proven to support every selected language.
+    """Resolve one public or tenant-owned voice for every selected language.
 
     A blank local voice is an app-managed platform default. It is resolved to
     an explicit compatible provider voice so clearing a previous custom voice
     cannot leave stale synthesizer configuration in Smallest's merged draft.
     """
     try:
-        normalized_voices = await _public_voice_catalog(client)
+        normalized_voices = await _tenant_voice_catalog(client, db, tenant_id)
     except SmallestAIError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
     by_id = {str(voice["id"]): voice for voice in normalized_voices}
@@ -493,7 +625,7 @@ async def _require_public_voice(
             status_code=422,
             detail=(
                 "Voice is not available in the shared public catalog. "
-                "Private voice clones require a tenant-owned entitlement."
+                "Private voice clones must belong to this workspace."
             ),
         )
 
@@ -501,6 +633,7 @@ async def _require_public_voice(
         candidates = [
             voice
             for voice in normalized_voices
+            if voice.get("source") == "catalog"
             if voice_language_compatibility(
                 normalized_voices,
                 str(voice.get("id") or ""),
@@ -1701,8 +1834,10 @@ async def create_agent(
     db: AsyncSession = Depends(get_db),
 ):
     if data.voice_id:
-        await _require_public_voice(
+        await _require_tenant_voice(
             get_smallest_client(),
+            db,
+            current_user.tenant_id,
             data.voice_id,
             list(data.supported_languages),
         )
@@ -1731,11 +1866,12 @@ async def get_provider_status(
 @router.get("/provider/catalog", response_model=AgentProviderCatalog)
 async def get_provider_catalog(
     current_user: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ):
-    """Return the current Waves voice catalog and local agent templates."""
+    """Return public voices plus only this tenant's completed private clones."""
     client = get_smallest_client()
     try:
-        voices = await _public_voice_catalog(client)
+        voices = await _tenant_voice_catalog(client, db, current_user.tenant_id)
     except SmallestAIError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
     except Exception as exc:
@@ -1743,14 +1879,281 @@ async def get_provider_catalog(
             status_code=502, detail="Could not load the Smallest.ai voice catalog"
         ) from exc
 
-    # The provider account is shared across tenants. Private clones must not be
-    # listed or selectable until a tenant-owned entitlement mapping exists.
     return AgentProviderCatalog(
         voices=voices,
         languages=language_catalog(voices),
         templates=AGENT_TEMPLATES,
         field_capabilities=PROVIDER_FIELD_CAPABILITIES,
     )
+
+
+@router.get("/provider/voice-clones", response_model=list[VoiceCloneResponse])
+async def list_voice_clones(
+    current_user: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(VoiceClone)
+        .where(VoiceClone.tenant_id == current_user.tenant_id)
+        .order_by(VoiceClone.created_at.desc())
+    )
+    return [VoiceCloneResponse.model_validate(clone) for clone in result.scalars().all()]
+
+
+@router.post(
+    "/provider/voice-clones",
+    response_model=VoiceCloneResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_voice_clone(
+    display_name: str = Form(...),
+    language: str = Form("en"),
+    accent: str = Form("indian"),
+    gender: str = Form(""),
+    description: str = Form(""),
+    model: str = Form("lightning-v3.1-pro"),
+    consent_confirmed: bool = Form(...),
+    media: UploadFile = File(...),
+    current_user: CurrentUser = Depends(require_role("owner", "admin", "member")),
+    db: AsyncSession = Depends(get_db),
+):
+    """Create a tenant-owned clone without retaining the reference recording."""
+    name = " ".join(display_name.split())
+    if not 1 <= len(name) <= 255:
+        raise HTTPException(status_code=422, detail="Voice name must be 1–255 characters")
+    normalized_language = language_code(language)
+    if not normalized_language:
+        raise HTTPException(status_code=422, detail="Language must be a valid provider code")
+    normalized_accent = " ".join(accent.split())[:100] or None
+    normalized_gender = gender.strip().lower() or None
+    if normalized_gender not in {None, "female", "male"}:
+        raise HTTPException(status_code=422, detail="Gender must be female or male")
+    normalized_description = " ".join(description.split()) or None
+    if normalized_description and len(normalized_description) > 1000:
+        raise HTTPException(status_code=422, detail="Description must be 1,000 characters or less")
+    if model not in VOICE_CLONE_MODELS:
+        raise HTTPException(status_code=422, detail="Unsupported voice cloning model")
+    if consent_confirmed is not True:
+        raise HTTPException(
+            status_code=422,
+            detail="Confirm that the speaker consented to creation and business use of this clone",
+        )
+
+    filename = PurePath(media.filename or "voice-sample.wav").name
+    suffix = PurePath(filename).suffix.lower()
+    content_type = (media.content_type or "").split(";", 1)[0].strip().lower()
+    if (
+        content_type not in VOICE_CLONE_MEDIA_TYPES
+        or suffix not in VOICE_CLONE_MEDIA_TYPES[content_type]
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="Use a WAV, MP3, WebM, or MP4 voice sample",
+        )
+    content = await media.read(MAX_VOICE_CLONE_BYTES + 1)
+    if not content:
+        raise HTTPException(status_code=422, detail="Voice sample is empty")
+    if len(content) > MAX_VOICE_CLONE_BYTES:
+        raise HTTPException(status_code=413, detail="Voice sample must be 5 MB or smaller")
+    if not _valid_voice_sample_signature(content, suffix):
+        raise HTTPException(
+            status_code=422,
+            detail="Voice sample content does not match its file type",
+        )
+
+    now = datetime.now(UTC)
+    clone = VoiceClone(
+        tenant_id=current_user.tenant_id,
+        display_name=name,
+        description=normalized_description,
+        language=normalized_language,
+        accent=normalized_accent,
+        gender=normalized_gender,
+        model=model,
+        model_ids=[model],
+        status="creating",
+        consent_confirmed_at=now,
+        consent_confirmed_by=current_user.id,
+    )
+    db.add(clone)
+    await db.flush()
+    await record_audit_event(
+        db,
+        tenant_id=current_user.tenant_id,
+        actor_user_id=current_user.id,
+        action="voice_clone.creation_started",
+        resource_type="voice_clone",
+        resource_id=str(clone.id),
+        details={
+            "display_name": name,
+            "language": normalized_language,
+            "accent": normalized_accent,
+            "model": model,
+            "reference_audio_retained": False,
+            "consent_confirmed": True,
+        },
+    )
+    # Persist the operation marker before the external mutation. A timeout can
+    # then be reconciled safely from the provider-side tag without re-uploading.
+    await db.commit()
+
+    client = get_smallest_client()
+    try:
+        remote = await client.create_voice_clone(
+            display_name=name,
+            file_name=filename,
+            content=content,
+            content_type=content_type,
+            language=normalized_language,
+            accent=normalized_accent,
+            description=normalized_description,
+            tags=[
+                _clone_operation_tag(clone.id),
+                "vav",
+                *([normalized_gender] if normalized_gender else []),
+            ],
+            model=model,
+        )
+    except SmallestAIError as exc:
+        clone = await _tenant_voice_clone(db, current_user.tenant_id, clone.id, for_update=True)
+        clone.status = "creation_unknown" if exc.ambiguous else "error"
+        clone.last_error = str(exc)
+        await record_audit_event(
+            db,
+            tenant_id=current_user.tenant_id,
+            actor_user_id=current_user.id,
+            action="voice_clone.creation_failed",
+            resource_type="voice_clone",
+            resource_id=str(clone.id),
+            details={"ambiguous": exc.ambiguous, "status": clone.status},
+        )
+        await db.commit()
+        detail = (
+            "Voice clone creation outcome is unknown. Use Check status before retrying."
+            if exc.ambiguous
+            else str(exc)
+        )
+        raise HTTPException(status_code=exc.status_code, detail=detail) from exc
+
+    clone = await _tenant_voice_clone(db, current_user.tenant_id, clone.id, for_update=True)
+    _apply_remote_clone(clone, remote)
+    await record_audit_event(
+        db,
+        tenant_id=current_user.tenant_id,
+        actor_user_id=current_user.id,
+        action="voice_clone.created",
+        resource_type="voice_clone",
+        resource_id=str(clone.id),
+        details={"provider_voice_id": clone.provider_voice_id, "status": clone.status},
+    )
+    await db.flush()
+    return VoiceCloneResponse.model_validate(clone)
+
+
+@router.post(
+    "/provider/voice-clones/{clone_id}/refresh",
+    response_model=VoiceCloneResponse,
+)
+async def refresh_voice_clone(
+    clone_id: UUID,
+    current_user: CurrentUser = Depends(require_role("owner", "admin", "member")),
+    db: AsyncSession = Depends(get_db),
+):
+    clone = await _tenant_voice_clone(db, current_user.tenant_id, clone_id)
+    try:
+        remote_clones = await get_smallest_client().list_voice_clones()
+    except SmallestAIError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    marker = _clone_operation_tag(clone.id)
+    remote = next(
+        (
+            item
+            for item in remote_clones
+            if (
+                clone.provider_voice_id
+                and str(item.get("voiceId") or item.get("id") or item.get("_id") or "")
+                == clone.provider_voice_id
+            )
+            or marker in _remote_clone_tags(item)
+        ),
+        None,
+    )
+    clone = await _tenant_voice_clone(db, current_user.tenant_id, clone_id, for_update=True)
+    if remote is None:
+        clone.status = "creation_unknown" if not clone.provider_voice_id else "missing"
+        clone.last_error = "The provider clone could not be found during reconciliation."
+        clone.last_synced_at = datetime.now(UTC)
+    else:
+        _apply_remote_clone(clone, remote)
+    await db.flush()
+    return VoiceCloneResponse.model_validate(clone)
+
+
+@router.delete(
+    "/provider/voice-clones/{clone_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def delete_voice_clone(
+    clone_id: UUID,
+    current_user: CurrentUser = Depends(require_role("owner", "admin")),
+    db: AsyncSession = Depends(get_db),
+):
+    clone = await _tenant_voice_clone(db, current_user.tenant_id, clone_id, for_update=True)
+    if clone.provider_voice_id:
+        agents = (
+            (
+                await db.execute(
+                    select(Agent.name).where(
+                        Agent.tenant_id == current_user.tenant_id,
+                        Agent.voice_id == clone.provider_voice_id,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if agents:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Replace this voice on these agents before deleting it: " + ", ".join(agents)
+                ),
+            )
+    elif clone.status == "creation_unknown":
+        raise HTTPException(
+            status_code=409,
+            detail="Check status before deleting a clone whose provider outcome is unknown",
+        )
+
+    if clone.provider_voice_id:
+        await db.commit()
+        try:
+            await get_smallest_client().delete_voice_clone(clone.provider_voice_id)
+        except SmallestAIError as exc:
+            clone = await _tenant_voice_clone(db, current_user.tenant_id, clone_id, for_update=True)
+            clone.status = "deletion_unknown" if exc.ambiguous else "delete_error"
+            clone.last_error = str(exc)
+            await db.commit()
+            detail = (
+                "Voice clone deletion outcome is unknown. Check Smallest.ai before retrying."
+                if exc.ambiguous
+                else str(exc)
+            )
+            raise HTTPException(status_code=exc.status_code, detail=detail) from exc
+
+    clone = await _tenant_voice_clone(db, current_user.tenant_id, clone_id, for_update=True)
+    await record_audit_event(
+        db,
+        tenant_id=current_user.tenant_id,
+        actor_user_id=current_user.id,
+        action="voice_clone.deleted",
+        resource_type="voice_clone",
+        resource_id=str(clone.id),
+        details={"provider_voice_id": clone.provider_voice_id},
+    )
+    await db.delete(clone)
+    await db.flush()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.post(
@@ -1767,6 +2170,7 @@ async def preview_provider_voice(
     data: VoicePreviewRequest,
     request: Request,
     current_user: CurrentUser = Depends(require_role("owner", "admin", "member")),
+    db: AsyncSession = Depends(get_db),
 ):
     """Proxy one bounded provider-owned phrase without exposing the server API key."""
     await enforce_rate_limit(
@@ -1779,13 +2183,13 @@ async def preview_provider_voice(
     )
     client = get_smallest_client()
     try:
-        voices = await _public_voice_catalog(client)
+        voices = await _tenant_voice_catalog(client, db, current_user.tenant_id)
     except SmallestAIError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
 
     voice = next((item for item in voices if item.get("id") == data.voice_id), None)
     if voice is None:
-        raise HTTPException(status_code=422, detail="Voice is not in the public catalog")
+        raise HTTPException(status_code=422, detail="Voice is not available to this workspace")
     if not voice.get("synthesizer_model"):
         raise HTTPException(status_code=422, detail="Voice is not available for preview")
 
@@ -1875,8 +2279,10 @@ async def provision_smallest_agent(
     # provisioner can race here, so re-lock and revalidate before recording the
     # durable create lease.
     await db.commit()
-    voice = await _require_public_voice(
+    voice = await _require_tenant_voice(
         client,
+        db,
+        current_user.tenant_id,
         agent.voice_id,
         list(agent.supported_languages),
     )
@@ -2028,8 +2434,10 @@ async def sync_smallest_agent(
     # Release the row lock around the provider catalog read, then re-lock and
     # prove no competing provider operation or voice edit superseded this sync.
     await db.commit()
-    voice = await _require_public_voice(
+    voice = await _require_tenant_voice(
         client,
+        db,
+        current_user.tenant_id,
         agent.voice_id,
         list(agent.supported_languages),
     )
@@ -2291,8 +2699,10 @@ async def update_agent(
         baseline_fields = set(effective_changes) | VOICE_CONFIGURATION_FIELDS
         baseline = _agent_fields_snapshot(agent, baseline_fields)
         await db.rollback()
-        await _require_public_voice(
+        await _require_tenant_voice(
             get_smallest_client(),
+            db,
+            current_user.tenant_id,
             resulting_voice_id,
             list(supported_languages),
         )

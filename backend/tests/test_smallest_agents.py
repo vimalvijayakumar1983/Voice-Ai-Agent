@@ -10,8 +10,11 @@ from sqlalchemy import event, select
 
 from app.api.v1.endpoints import agents as agents_endpoint
 from app.api.v1.endpoints import calls as calls_endpoint
+from app.core.security import create_access_token, hash_password
 from app.models.agent import Agent, AgentKnowledgeBinding, KnowledgeBase
 from app.models.call import Call, CallSummary, CallTranscript
+from app.models.tenant import Tenant
+from app.models.user import User
 from app.providers.smallest import BrowserSession, SmallestAIClient, SmallestAIError
 from app.services.agent_catalog_cache import public_agent_catalog_cache
 from app.tasks.call_tasks import reconcile_call_dispatch, reconcile_direct_call_terminal
@@ -28,6 +31,8 @@ class FakeSmallestClient:
     outbound_calls: int = 0
     outbound_payloads: list[dict] = field(default_factory=list)
     clone_catalog_calls: int = 0
+    voice_clone_create_calls: list[dict] = field(default_factory=list)
+    voice_clone_delete_ids: list[str] = field(default_factory=list)
     publish_calls: int = 0
     publish_labels: list[str] = field(default_factory=list)
     webhook_calls: int = 0
@@ -89,6 +94,21 @@ class FakeSmallestClient:
                 "modelIds": ["lightning-v3.1"],
             }
         ]
+
+    async def create_voice_clone(self, **kwargs):
+        self.voice_clone_create_calls.append(kwargs)
+        return {
+            "voiceId": "voice_vav_indian",
+            "displayName": kwargs["display_name"],
+            "status": "completed",
+            "language": kwargs["language"],
+            "accent": kwargs["accent"],
+            "tags": kwargs["tags"],
+            "modelIds": [kwargs["model"]],
+        }
+
+    async def delete_voice_clone(self, voice_id: str):
+        self.voice_clone_delete_ids.append(voice_id)
 
     async def synthesize_voice_preview(self, **kwargs):
         self.preview_calls.append(kwargs)
@@ -612,7 +632,7 @@ async def test_voice_preview_rejects_ids_outside_public_catalog(
     )
 
     assert response.status_code == 422
-    assert response.json()["detail"] == "Voice is not in the public catalog"
+    assert response.json()["detail"] == "Voice is not available to this workspace"
     assert fake.preview_calls == []
 
 
@@ -681,8 +701,157 @@ async def test_private_clone_id_cannot_be_saved_without_tenant_entitlement(
     )
 
     assert created.status_code == 422
-    assert "tenant-owned entitlement" in created.json()["detail"]
+    assert "must belong to this workspace" in created.json()["detail"]
     assert fake.create_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_tenant_can_create_select_and_safely_delete_owned_voice_clone(
+    client: AsyncClient,
+    auth_headers,
+    monkeypatch,
+):
+    fake = FakeSmallestClient()
+    monkeypatch.setattr(agents_endpoint, "get_smallest_client", lambda: fake)
+    audio = b"RIFF\x04\x00\x00\x00WAVE"
+
+    created_clone = await client.post(
+        "/api/v1/agents/provider/voice-clones",
+        headers=auth_headers,
+        data={
+            "display_name": "VAV Indian English",
+            "language": "en",
+            "accent": "indian",
+            "gender": "female",
+            "description": "Consented customer service voice",
+            "model": "lightning-v3.1-pro",
+            "consent_confirmed": "true",
+        },
+        files={"media": ("sample.wav", audio, "audio/wav")},
+    )
+
+    assert created_clone.status_code == 201
+    clone = created_clone.json()
+    assert clone["provider_voice_id"] == "voice_vav_indian"
+    assert clone["status"] == "completed"
+    assert clone["accent"] == "indian"
+    assert fake.voice_clone_create_calls[0]["content"] == audio
+    assert any(tag.startswith("vav-clone-") for tag in fake.voice_clone_create_calls[0]["tags"])
+
+    catalog = await client.get("/api/v1/agents/provider/catalog", headers=auth_headers)
+    assert catalog.status_code == 200
+    owned = next(voice for voice in catalog.json()["voices"] if voice["id"] == "voice_vav_indian")
+    assert owned["source"] == "cloned"
+    assert owned["voice_pool"] == "cloned"
+    assert owned["accent"] == "indian"
+
+    created_agent = await client.post(
+        "/api/v1/agents",
+        headers=auth_headers,
+        json={
+            "name": "Clone-backed receptionist",
+            "system_prompt": "Use the workspace-owned custom voice for every response.",
+            "voice_id": "voice_vav_indian",
+        },
+    )
+    assert created_agent.status_code == 201
+
+    blocked = await client.delete(
+        f"/api/v1/agents/provider/voice-clones/{clone['id']}",
+        headers=auth_headers,
+    )
+    assert blocked.status_code == 409
+    assert "Clone-backed receptionist" in blocked.json()["detail"]
+
+    replaced = await client.patch(
+        f"/api/v1/agents/{created_agent.json()['id']}",
+        headers=auth_headers,
+        json={"voice_id": "jordan"},
+    )
+    assert replaced.status_code == 200
+    deleted = await client.delete(
+        f"/api/v1/agents/provider/voice-clones/{clone['id']}",
+        headers=auth_headers,
+    )
+    assert deleted.status_code == 204
+    assert fake.voice_clone_delete_ids == ["voice_vav_indian"]
+
+
+@pytest.mark.asyncio
+async def test_voice_clone_requires_explicit_consent_and_valid_audio(
+    client: AsyncClient,
+    auth_headers,
+    monkeypatch,
+):
+    fake = FakeSmallestClient()
+    monkeypatch.setattr(agents_endpoint, "get_smallest_client", lambda: fake)
+
+    response = await client.post(
+        "/api/v1/agents/provider/voice-clones",
+        headers=auth_headers,
+        data={
+            "display_name": "Unconsented voice",
+            "language": "en",
+            "consent_confirmed": "false",
+        },
+        files={"media": ("sample.wav", b"RIFF\x04\x00\x00\x00WAVE", "audio/wav")},
+    )
+
+    assert response.status_code == 422
+    assert "consented" in response.json()["detail"]
+    assert fake.voice_clone_create_calls == []
+
+
+@pytest.mark.asyncio
+async def test_owned_voice_clone_is_not_selectable_by_another_tenant(
+    client: AsyncClient,
+    auth_headers,
+    monkeypatch,
+):
+    fake = FakeSmallestClient()
+    monkeypatch.setattr(agents_endpoint, "get_smallest_client", lambda: fake)
+    created_clone = await client.post(
+        "/api/v1/agents/provider/voice-clones",
+        headers=auth_headers,
+        data={
+            "display_name": "Private Indian voice",
+            "language": "en",
+            "consent_confirmed": "true",
+        },
+        files={"media": ("sample.wav", b"RIFF\x04\x00\x00\x00WAVE", "audio/wav")},
+    )
+    assert created_clone.status_code == 201
+
+    async with session_factory() as db:
+        other_tenant = Tenant(name="Other Corp", slug="other-corp")
+        db.add(other_tenant)
+        await db.flush()
+        other_user = User(
+            tenant_id=other_tenant.id,
+            email="owner@other.example",
+            hashed_password=hash_password("testpassword"),
+            full_name="Other Owner",
+            role="owner",
+        )
+        db.add(other_user)
+        await db.commit()
+        other_headers = {
+            "Authorization": (
+                "Bearer " + create_access_token(other_user.id, other_tenant.id, other_user.role)
+            )
+        }
+
+    unauthorized = await client.post(
+        "/api/v1/agents",
+        headers=other_headers,
+        json={
+            "name": "Cross-tenant clone attempt",
+            "system_prompt": "This request must not cross the tenant entitlement boundary.",
+            "voice_id": "voice_vav_indian",
+        },
+    )
+    assert unauthorized.status_code == 422
+    assert "this workspace" in unauthorized.json()["detail"]
 
 
 @pytest.mark.asyncio

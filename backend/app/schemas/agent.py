@@ -236,6 +236,27 @@ class VoicePreviewRequest(BaseModel):
         return _normalize_language(value) if value is not None else None
 
 
+class VoiceCloneResponse(BaseModel):
+    id: UUID
+    provider: str
+    provider_voice_id: str | None
+    display_name: str
+    description: str | None
+    language: str
+    accent: str | None
+    gender: str | None
+    model: str
+    model_ids: list[str]
+    status: str
+    last_error: str | None
+    last_synced_at: datetime | None
+    consent_confirmed_at: datetime
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
 class SmallestProviderResolution(BaseModel):
     action: Literal[
         "confirm_create_absent",
@@ -267,7 +288,7 @@ class VoiceCatalogItem(BaseModel):
     synthesizer_model: str | None = None
     unavailability_reason: str | None = None
     voice_pool: Literal["standard", "pro", "cloned", "unknown"] = "unknown"
-    source: str = "catalog"
+    source: Literal["catalog", "cloned"] = "catalog"
 
 
 class LanguageCatalogItem(BaseModel):

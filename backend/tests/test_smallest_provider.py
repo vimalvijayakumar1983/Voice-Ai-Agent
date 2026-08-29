@@ -732,6 +732,56 @@ async def test_waves_catalog_and_voice_clones_use_current_endpoints():
 
 
 @pytest.mark.asyncio
+async def test_voice_clone_create_and_delete_use_current_provider_contracts():
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method == "POST":
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "voiceId": "voice_indian_123",
+                        "displayName": "VAV Indian English",
+                        "status": "completed",
+                        "language": "en",
+                    }
+                },
+            )
+        return httpx.Response(204)
+
+    client = SmallestAIClient(
+        api_key="sk_test",
+        waves_base_url="https://api.smallest.ai/waves/v1",
+        transport=httpx.MockTransport(handler),
+    )
+    clone = await client.create_voice_clone(
+        display_name="VAV Indian English",
+        file_name="sample.wav",
+        content=b"RIFF\x04\x00\x00\x00WAVE",
+        content_type="audio/wav",
+        language="en",
+        accent="indian",
+        description="Consented Indian English voice",
+        tags=["vav", "female"],
+        model="lightning-v3.1-pro",
+    )
+    await client.delete_voice_clone("voice_indian_123")
+
+    assert clone["voiceId"] == "voice_indian_123"
+    create_request, delete_request = requests
+    assert create_request.url.path == "/waves/v1/voice-cloning"
+    assert create_request.headers["content-type"].startswith("multipart/form-data; boundary=")
+    assert b'name="displayName"' in create_request.content
+    assert b"VAV Indian English" in create_request.content
+    assert b'name="file"; filename="sample.wav"' in create_request.content
+    assert b"lightning-v3.1-pro" in create_request.content
+    assert delete_request.url.path == "/waves/v1/lightning-large"
+    assert json.loads(delete_request.content) == {"voiceId": "voice_indian_123"}
+
+
+@pytest.mark.asyncio
 async def test_voice_preview_uses_unified_tts_with_fixed_bounded_wav_contract():
     captured: dict = {}
     wav = b"RIFF\x04\x00\x00\x00WAVE"

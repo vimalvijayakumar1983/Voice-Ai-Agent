@@ -71,6 +71,7 @@ interface AgentEditorProps {
   busy?: boolean;
   onCancel: () => void;
   onSubmit: (values: AgentEditorValues) => Promise<void>;
+  onCatalogRefresh: () => Promise<void>;
 }
 
 export default function AgentEditor({
@@ -81,6 +82,7 @@ export default function AgentEditor({
   busy = false,
   onCancel,
   onSubmit,
+  onCatalogRefresh,
 }: AgentEditorProps) {
   const [originalConfiguration] = useState<AgentEditorValues>(() => normalizeLanguageSwitching(initialValues));
   const [form, setForm] = useState<AgentEditorValues>(originalConfiguration);
@@ -373,6 +375,7 @@ export default function AgentEditor({
             setForm((current) => ({ ...current, voice_id: voiceId }));
             setVoiceNotice(null);
           }}
+          onCatalogRefresh={onCatalogRefresh}
         />
       </section>
 

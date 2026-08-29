@@ -134,7 +134,7 @@ test('voice preview is enabled only for provider-verified standard or pro pools'
   assert.equal(voicePreviewAvailability(voice({ voice_pool: 'standard' })).available, true);
   assert.equal(voicePreviewAvailability(voice({ voice_pool: 'pro' })).available, true);
   assert.equal(voicePreviewAvailability(voice({ voice_pool: 'unknown' })).available, false);
-  assert.equal(voicePreviewAvailability(voice({ voice_pool: 'cloned', source: 'cloned' })).available, false);
+  assert.equal(voicePreviewAvailability(voice({ voice_pool: 'cloned', source: 'cloned' })).available, true);
   assert.equal(voicePreviewAvailability(voice({ voice_pool: 'standard', synthesizer_model: null })).available, false);
 });
 
