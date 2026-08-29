@@ -68,7 +68,7 @@ function voiceCompatibility(voice, selectedLanguages) {
     return {
       status: 'unknown',
       missingLanguages: [...selectedLanguages],
-      reason: 'This voice is not present in the current Smallest.ai catalog.',
+      reason: 'This voice is not present in the selected provider catalog.',
     };
   }
   if (!voice.synthesizer_model) {
@@ -82,7 +82,7 @@ function voiceCompatibility(voice, selectedLanguages) {
     return {
       status: 'unknown',
       missingLanguages: [...selectedLanguages],
-      reason: 'Smallest.ai does not provide language coverage for this voice.',
+      reason: 'The selected provider does not provide language coverage for this voice.',
     };
   }
   const missingLanguages = missingVoiceLanguages(voice, selectedLanguages);
@@ -135,6 +135,7 @@ function normalizedVoiceConfiguration(configuration) {
   )).sort();
   const switchingEnabled = Boolean(configuration?.language_switching_enabled);
   return {
+    voiceProvider: String(configuration?.voice_provider || 'smallest').trim().toLowerCase(),
     voiceId: String(configuration?.voice_id || '').trim(),
     language: normalizedLanguage(configuration?.language),
     supportedLanguages,
@@ -164,8 +165,8 @@ function voiceConfigurationGuard({ editorMode, catalogAvailable, original, curre
     allowed: false,
     changed,
     reason: editorMode === 'create'
-      ? 'Wait for the Smallest.ai catalog before creating a safely validated agent.'
-      : 'Voice or language changes cannot be validated while the Smallest.ai catalog is unavailable.',
+      ? 'Wait for the provider catalog before creating a safely validated agent.'
+      : 'Voice or language changes cannot be validated while the provider catalog is unavailable.',
   };
 }
 

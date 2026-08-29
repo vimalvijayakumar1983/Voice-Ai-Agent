@@ -60,7 +60,10 @@ async def health_check():
     return {
         "status": "healthy",
         "version": APP_VERSION,
-        "providers": {"smallest": bool(settings.smallest_api_key)},
+        "providers": {
+            "smallest": bool(settings.smallest_api_key),
+            "sarvam": bool(settings.sarvam_api_key),
+        },
     }
 
 

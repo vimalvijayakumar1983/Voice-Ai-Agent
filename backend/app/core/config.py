@@ -73,6 +73,12 @@ class Settings(BaseSettings):
     smallest_webhook_id: str = ""
     smallest_request_timeout_seconds: float = 30.0
 
+    # Sarvam AI speech. This is optional so existing Smallest-only production
+    # deployments continue to boot unchanged.
+    sarvam_api_key: str = ""
+    sarvam_base_url: str = "https://api.sarvam.ai"
+    sarvam_request_timeout_seconds: float = 30.0
+
     # AI Providers
     openai_api_key: str = ""
     anthropic_api_key: str = ""

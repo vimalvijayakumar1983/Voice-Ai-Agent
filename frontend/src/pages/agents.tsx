@@ -464,13 +464,16 @@ export default function Agents() {
                 <span className="meta-chip"><Globe2 size={9} /> Primary: {languageLabel(agent.language, catalog)}</span>
                 <span className="meta-chip">{languageConfigurationLabel(agent)}</span>
                 <span className="meta-chip">Voice: {voiceLabel(agent.voice_id, catalog)}</span>
+                <span className="meta-chip">Provider: {agent.voice_provider === 'sarvam' ? 'Sarvam AI' : 'Smallest.ai'}</span>
                 <span className={`badge ${syncBadge(agent.sync_status)}`}>{syncStatusLabel(agent.sync_status)}</span>
                 {agent.provider_revision_id && <span className="meta-chip">Revision: {agent.provider_revision_id.slice(0, 12)}…</span>}
                 {agent.last_synced_at && <span className="meta-chip">Last sync: {new Date(agent.last_synced_at).toLocaleString()}</span>}
               </div>
               <div className="agent-card-actions">
                 <button className="btn btn-secondary btn-sm" disabled={!catalogReady || providerOperationUnresolved(agent.sync_status)} onClick={() => openEdit(agent)}><Pencil size={12} /> Edit</button>
-                {agent.provider_agent_id ? (
+                {agent.voice_provider === 'sarvam' ? (
+                  <button className="btn btn-secondary btn-sm" disabled title="Sarvam live calls require the VAV realtime runtime."><Radio size={12} /> VAV runtime</button>
+                ) : agent.provider_agent_id ? (
                   <button className="btn btn-secondary btn-sm" disabled={working === `sync-${agent.id}` || agent.sync_status === 'synced'} onClick={() => runAgentAction(agent, 'sync')} title={isProviderConfigCorrection(agent) ? 'Recheck Smallest.ai without publishing another revision.' : undefined}><RefreshCw size={12} /> {providerActionLabel(agent)}</button>
                 ) : agent.sync_status === 'provision_unknown' ? (
                   <button className="btn btn-primary btn-sm" disabled={working === `resolve-${agent.id}`} onClick={() => resolveProviderOperation(agent)}><RefreshCw size={12} /> Resolve create</button>
@@ -555,6 +558,7 @@ function syncStatusLabel(status: VoiceAgent['sync_status']) {
 }
 
 function deploymentDescription(agent: VoiceAgent) {
+  if (agent.voice_provider === 'sarvam') return 'Sarvam AI · VAV realtime runtime';
   if (!agent.provider_agent_id) return 'Local draft · not provisioned';
   const providerId = `Atoms ID · ${agent.provider_agent_id.slice(0, 12)}…`;
   if (agent.sync_status === 'synced') return `${providerId} · published revision recorded`;

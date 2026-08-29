@@ -95,8 +95,20 @@ export default function AgentEditor({
   const modelId = useId();
   const timezoneId = useId();
   const speechRateId = useId();
-  const languages = catalog?.languages.length ? catalog.languages : fallbackLanguages;
-  const voices = useMemo(() => catalog?.voices ?? [], [catalog?.voices]);
+  const allVoices = useMemo(() => catalog?.voices ?? [], [catalog?.voices]);
+  const voices = useMemo(
+    () => allVoices.filter((voice) => voice.provider === form.voice_provider),
+    [allVoices, form.voice_provider],
+  );
+  const languages = useMemo(() => {
+    if (!catalog?.languages.length || voices.length === 0) return fallbackLanguages;
+    const supported = new Set(voices.flatMap((voice) => voice.languages));
+    return catalog.languages.filter((language) => supported.has(language.code));
+  }, [catalog, voices]);
+  const availableProviders = useMemo(
+    () => Array.from(new Set(allVoices.map((voice) => voice.provider))),
+    [allVoices],
+  );
   const catalogUsable = Boolean(catalog && !catalogError && voices.length > 0 && catalog.languages.length > 0);
   const configurationGuard = voiceConfigurationGuard({
     editorMode: mode,
@@ -151,6 +163,19 @@ export default function AgentEditor({
     );
   };
 
+  const updateVoiceProvider = (provider: AgentEditorValues['voice_provider']) => {
+    setForm((current) => ({
+      ...current,
+      voice_provider: provider,
+      voice_id: '',
+      language: 'en',
+      supported_languages: ['en'],
+      language_switching_enabled: false,
+      language_switching_mode: 'disabled',
+    }));
+    setVoiceNotice(`Voice and language selections were reset for the ${provider === 'sarvam' ? 'Sarvam AI' : 'Smallest.ai'} catalog.`);
+  };
+
   const toggleSupportedLanguage = (language: string) => {
     const selected = form.supported_languages.includes(language);
     if (selected && form.language === language) return;
@@ -187,6 +212,7 @@ export default function AgentEditor({
       description: template.description,
       system_prompt: template.system_prompt,
       greeting_message: template.greeting_message,
+      voice_provider: 'smallest',
       language: template.default_language,
       supported_languages: template.supported_languages,
       voice_id: template.voice_id,
@@ -283,6 +309,14 @@ export default function AgentEditor({
           <p>{form.supported_languages.length} selected · the agent starts in the primary language</p>
         </div>
         <div className="form-group language-primary">
+          <label htmlFor="voice-provider">Voice provider</label>
+          <select id="voice-provider" value={form.voice_provider} onChange={(event) => updateVoiceProvider(event.target.value as AgentEditorValues['voice_provider'])}>
+            {availableProviders.includes('smallest') ? <option value="smallest">Smallest.ai · Lightning</option> : null}
+            {availableProviders.includes('sarvam') ? <option value="sarvam">Sarvam AI · Bulbul v3 Indian voices</option> : null}
+          </select>
+          <p className="form-hint">Smallest agents publish to Atoms. Sarvam agents use the separate VAV realtime runtime.</p>
+        </div>
+        <div className="form-group language-primary">
           <label htmlFor={primaryLanguageId}>Primary language</label>
           <select id={primaryLanguageId} value={form.language} disabled={!catalogUsable} onChange={(event) => updatePrimaryLanguage(event.target.value)}>
             {languages.map((language) => <option value={language.code} key={language.code}>{language.name}</option>)}
@@ -312,7 +346,7 @@ export default function AgentEditor({
             <LockKeyhole size={15} aria-hidden="true" />
             <span>{mode === 'edit'
               ? 'The voice catalog is unavailable, so the stored voice, languages, and switching mode are locked. You can still save unrelated agent changes.'
-              : 'Connect to the Smallest.ai voice catalog before choosing languages or creating this agent.'}</span>
+              : 'Connect at least one voice provider before choosing languages or creating this agent.'}</span>
           </div>
         )}
         <fieldset className={styles.switchingFieldset}>
@@ -343,7 +377,7 @@ export default function AgentEditor({
               />
               <span>
                 <strong>Automatic same-call switching</strong>
-                <small>Smallest.ai can detect a caller changing languages when the exact combination is supported.</small>
+                <small>The selected runtime can detect a caller changing languages when the exact combination is supported.</small>
               </span>
             </label>
           </div>

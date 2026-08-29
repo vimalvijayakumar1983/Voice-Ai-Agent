@@ -123,6 +123,7 @@ export default function VoiceLibrary({
     [languages],
   );
   const selectedVoice = voices.find((voice) => voice.id === selectedVoiceId);
+  const providerName = voices[0]?.provider === 'sarvam' ? 'Sarvam AI' : 'Smallest.ai';
   const selectedCompatibility = selectedVoice
     ? voiceCompatibility(selectedVoice, selectedLanguages)
     : null;
@@ -204,7 +205,7 @@ export default function VoiceLibrary({
     setPreview({ voiceId: voice.id, voiceName: voice.name, status: 'loading', error: null });
 
     try {
-      const blob = await api.previewVoice(voice.id);
+      const blob = await api.previewVoice(voice.provider, voice.id, selectedLanguages[0]);
       if (previewOperationRef.current !== operation) return;
 
       const objectUrl = URL.createObjectURL(blob);
@@ -272,7 +273,7 @@ export default function VoiceLibrary({
           <LockKeyhole size={16} aria-hidden="true" />
           <span>{preservedVoiceId
             ? `Stored voice ${preservedVoiceId} is preserved. Voice and language controls unlock when the catalog is available.`
-            : 'Voice selection is locked until the Smallest.ai catalog is available.'}</span>
+            : 'Voice selection is locked until the selected provider catalog is available.'}</span>
         </div>
       )}
 
@@ -304,19 +305,21 @@ export default function VoiceLibrary({
         configurationLocked={configurationLocked}
         preservedVoiceId={preservedVoiceId}
       />
-      <VoiceCloneStudio
-        languages={languages}
-        selectedLanguages={selectedLanguages}
-        disabled={configurationLocked}
-        onCatalogRefresh={onCatalogRefresh}
-        onSelect={onSelect}
-      />
+      {voices[0]?.provider !== 'sarvam' ? (
+        <VoiceCloneStudio
+          languages={languages}
+          selectedLanguages={selectedLanguages}
+          disabled={configurationLocked}
+          onCatalogRefresh={onCatalogRefresh}
+          onSelect={onSelect}
+        />
+      ) : null}
       <PreviewAnnouncement preview={preview} />
       {libraryOpen && (
         <section className={styles.library} aria-labelledby={`${resultsId}-heading`}>
           <div className={styles.libraryHeading}>
             <div>
-              <span className={styles.eyebrow}>Smallest.ai voice catalog</span>
+              <span className={styles.eyebrow}>{providerName} voice catalog</span>
               <h4 id={`${resultsId}-heading`}>Choose a voice with coverage for every language</h4>
               <p>Compatibility uses the full set of published voice-language and Atoms model metadata. It does not prove same-call detection; test the exact combination before activation.</p>
             </div>

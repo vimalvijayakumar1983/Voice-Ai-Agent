@@ -8,6 +8,7 @@ import {
   Clock3,
   KeyRound,
   MailPlus,
+  Radio,
   RefreshCw,
   ShieldCheck,
   UserCog,
@@ -19,6 +20,7 @@ import {
   api,
   type AuditEvent,
   type CurrentUser,
+  type ProviderStatus,
   type WorkspaceApiKey,
   type WorkspaceInvitation,
   type WorkspaceRole,
@@ -134,6 +136,7 @@ export default function Settings() {
   const [invitations, setInvitations] = useState<WorkspaceInvitation[]>([]);
   const [apiKeys, setApiKeys] = useState<WorkspaceApiKey[]>([]);
   const [auditEvents, setAuditEvents] = useState<AuditEvent[]>([]);
+  const [providerStatus, setProviderStatus] = useState<ProviderStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState('');
   const [actionError, setActionError] = useState('');
@@ -148,6 +151,7 @@ export default function Settings() {
     role: 'member' as AssignableRole,
   });
   const [apiKeyName, setApiKeyName] = useState('');
+  const [sarvamApiKey, setSarvamApiKey] = useState('');
 
   useEffect(() => {
     let active = true;
@@ -162,17 +166,19 @@ export default function Settings() {
           setLoading(false);
           return;
         }
-        const [nextMembers, nextInvitations, nextApiKeys, nextAuditEvents] = await Promise.all([
+        const [nextMembers, nextInvitations, nextApiKeys, nextAuditEvents, nextProviderStatus] = await Promise.all([
           api.listWorkspaceUsers(),
           api.listInvitations(),
           api.listApiKeys(),
           api.listAuditEvents(12),
+          api.getProviderStatus(),
         ]);
         if (!active) return;
         setMembers(nextMembers);
         setInvitations(nextInvitations);
         setApiKeys(nextApiKeys);
         setAuditEvents(nextAuditEvents);
+        setProviderStatus(nextProviderStatus);
       } catch (caught: unknown) {
         if (active) {
           setLoadError(caught instanceof Error ? caught.message : 'Workspace settings could not be loaded.');
@@ -318,6 +324,47 @@ export default function Settings() {
       setNotice(`${key.name} was revoked.`);
     } catch (caught: unknown) {
       setActionError(caught instanceof Error ? caught.message : 'API key could not be revoked.');
+    } finally {
+      setBusyAction('');
+    }
+  };
+
+  const handleSaveSarvamKey = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    resetMessages();
+    setBusyAction('sarvam-key');
+    try {
+      await api.saveSarvamCredential(sarvamApiKey.trim());
+      setSarvamApiKey('');
+      const [nextProviderStatus, nextAuditEvents] = await Promise.all([
+        api.getProviderStatus(),
+        api.listAuditEvents(12),
+      ]);
+      setProviderStatus(nextProviderStatus);
+      setAuditEvents(nextAuditEvents);
+      setNotice('Sarvam AI credential saved securely. Sarvam voices are now available in the agent builder.');
+    } catch (caught: unknown) {
+      setActionError(caught instanceof Error ? caught.message : 'Sarvam credential could not be saved.');
+    } finally {
+      setBusyAction('');
+    }
+  };
+
+  const handleDeleteSarvamKey = async () => {
+    resetMessages();
+    if (!window.confirm('Remove the workspace Sarvam API key? Sarvam previews and new Sarvam calls will stop working.')) return;
+    setBusyAction('sarvam-delete');
+    try {
+      await api.deleteSarvamCredential();
+      const [nextProviderStatus, nextAuditEvents] = await Promise.all([
+        api.getProviderStatus(),
+        api.listAuditEvents(12),
+      ]);
+      setProviderStatus(nextProviderStatus);
+      setAuditEvents(nextAuditEvents);
+      setNotice('Workspace Sarvam credential removed.');
+    } catch (caught: unknown) {
+      setActionError(caught instanceof Error ? caught.message : 'Sarvam credential could not be removed.');
     } finally {
       setBusyAction('');
     }
@@ -479,6 +526,44 @@ export default function Settings() {
                 </table>
               </div>
             ) : <div className="settings-empty-row"><MailPlus size={18} /><span>No invitations have been created.</span></div>}
+          </section>
+
+          <section className="settings-section" aria-labelledby="provider-credentials-heading">
+            <div className="settings-section-heading">
+              <div className="settings-section-icon"><Radio size={18} /></div>
+              <div>
+                <h2 id="provider-credentials-heading">Voice AI providers</h2>
+                <p>Connect provider credentials for this workspace. Keys are encrypted on the server and are never returned to the browser.</p>
+              </div>
+              <span className={`badge ${providerStatus?.providers?.sarvam.configured ? 'badge-success' : 'badge-warning'}`}>
+                Sarvam {providerStatus?.providers?.sarvam.configured ? 'connected' : 'not connected'}
+              </span>
+            </div>
+            <form className="api-key-form" onSubmit={handleSaveSarvamKey}>
+              <div className="form-group">
+                <label htmlFor="sarvam-api-key">Sarvam API key</label>
+                <input
+                  id="sarvam-api-key"
+                  type="password"
+                  autoComplete="new-password"
+                  placeholder={providerStatus?.providers?.sarvam.configured ? 'Enter a new key to rotate' : 'sk_…'}
+                  value={sarvamApiKey}
+                  onChange={(event) => setSarvamApiKey(event.target.value)}
+                  minLength={20}
+                  maxLength={512}
+                  required
+                />
+                <p className="form-hint">The saved value is write-only. Entering another key rotates it immediately for this workspace.</p>
+              </div>
+              <button type="submit" className="btn btn-primary" disabled={busyAction === 'sarvam-key'}>
+                <KeyRound size={14} /> {busyAction === 'sarvam-key' ? 'Saving…' : providerStatus?.providers?.sarvam.configured ? 'Rotate Sarvam key' : 'Connect Sarvam'}
+              </button>
+              {providerStatus?.providers?.sarvam.source === 'workspace' ? (
+                <button type="button" className="btn btn-danger" disabled={busyAction === 'sarvam-delete'} onClick={() => void handleDeleteSarvamKey()}>
+                  {busyAction === 'sarvam-delete' ? 'Removing…' : 'Remove workspace key'}
+                </button>
+              ) : null}
+            </form>
           </section>
 
           <div className="settings-two-column">

@@ -25,7 +25,14 @@ from app.middleware.tenant import CurrentUser, get_current_user, require_role
 from app.models.agent import Agent, AgentKnowledgeBinding, KnowledgeBase
 from app.models.call import Call
 from app.models.campaign import Campaign, CampaignContactAttempt
+from app.models.provider_credential import ProviderCredential
 from app.models.voice import VoiceClone
+from app.providers.sarvam import (
+    SarvamAIClient,
+    SarvamAIError,
+    get_sarvam_client,
+    sarvam_voice_catalog,
+)
 from app.providers.smallest import (
     SmallestAIError,
     get_smallest_client,
@@ -38,6 +45,8 @@ from app.schemas.agent import (
     AgentUpdate,
     KnowledgeBaseCreate,
     KnowledgeBaseResponse,
+    ProviderCredentialStatus,
+    SarvamCredentialRequest,
     SmallestProviderResolution,
     SmallestSessionRequest,
     SmallestSessionResponse,
@@ -59,6 +68,11 @@ from app.services.agent_catalog_cache import (
     public_agent_catalog_cache,
 )
 from app.services.audit import record_audit_event
+from app.services.integration_security import (
+    IntegrationConfigUnavailableError,
+    decrypt_integration_config,
+    encrypt_integration_config,
+)
 from app.services.rate_limit import enforce_rate_limit
 
 router = APIRouter(prefix="/agents", tags=["Agents"])
@@ -78,6 +92,7 @@ SMALLEST_SYNC_FIELDS = {
 }
 
 VOICE_PREFLIGHT_FIELDS = {
+    "voice_provider",
     "voice_id",
     "language",
     "supported_languages",
@@ -601,6 +616,42 @@ async def _tenant_agent(
     return agent
 
 
+async def _tenant_sarvam_credential(
+    db: AsyncSession,
+    tenant_id: UUID,
+    *,
+    for_update: bool = False,
+) -> ProviderCredential | None:
+    query = select(ProviderCredential).where(
+        ProviderCredential.tenant_id == tenant_id,
+        ProviderCredential.provider == "sarvam",
+    )
+    if for_update:
+        query = query.with_for_update().execution_options(populate_existing=True)
+    return (await db.execute(query)).scalar_one_or_none()
+
+
+async def _tenant_sarvam_client(
+    db: AsyncSession,
+    tenant_id: UUID,
+) -> tuple[SarvamAIClient, str, datetime | None]:
+    credential = await _tenant_sarvam_credential(db, tenant_id)
+    if credential is not None and credential.is_active:
+        try:
+            config = decrypt_integration_config(credential.encrypted_config)
+        except IntegrationConfigUnavailableError as exc:
+            raise HTTPException(
+                status_code=500,
+                detail="Sarvam credential is unavailable; ask an administrator to rotate it",
+            ) from exc
+        api_key = config.get("api_key")
+        if not isinstance(api_key, str) or not api_key:
+            raise HTTPException(status_code=500, detail="Sarvam credential is invalid")
+        return SarvamAIClient(api_key=api_key), "workspace", credential.updated_at
+    client = get_sarvam_client()
+    return client, "platform" if client.is_configured else "none", None
+
+
 async def _require_tenant_voice(
     client,
     db: AsyncSession,
@@ -693,6 +744,55 @@ async def _require_tenant_voice(
         synthesizer_model=voice_model,
         source="operator" if voice_id else "platform_default",
     )
+
+
+async def _require_sarvam_voice(
+    voice_id: str,
+    selected_languages: list[str],
+) -> VoiceResolution:
+    voices = sarvam_voice_catalog()
+    selected_voice = next((voice for voice in voices if voice["id"] == voice_id), None)
+    if selected_voice is None:
+        raise HTTPException(
+            status_code=422,
+            detail="Voice is not available in the Sarvam Bulbul v3 catalog",
+        )
+    compatibility, unsupported = voice_language_compatibility(
+        voices,
+        voice_id,
+        selected_languages,
+    )
+    if compatibility != LanguageCompatibilityStatus.COMPATIBLE:
+        detail = "Selected Sarvam voice does not support every agent language"
+        if unsupported:
+            detail += ": " + ", ".join(unsupported)
+        raise HTTPException(status_code=422, detail=detail)
+    return VoiceResolution(
+        requested_voice_id=voice_id,
+        resolved_voice_id=voice_id,
+        synthesizer_model="bulbul:v3",
+        source="operator",
+    )
+
+
+async def _require_provider_voice(
+    provider: str,
+    db: AsyncSession,
+    tenant_id: UUID,
+    voice_id: str,
+    selected_languages: list[str],
+) -> VoiceResolution:
+    if provider == "smallest":
+        return await _require_tenant_voice(
+            get_smallest_client(),
+            db,
+            tenant_id,
+            voice_id,
+            selected_languages,
+        )
+    if provider == "sarvam":
+        return await _require_sarvam_voice(voice_id, selected_languages)
+    raise HTTPException(status_code=422, detail="Unsupported voice provider")
 
 
 _MISSING = object()
@@ -1834,8 +1934,8 @@ async def create_agent(
     db: AsyncSession = Depends(get_db),
 ):
     if data.voice_id:
-        await _require_tenant_voice(
-            get_smallest_client(),
+        await _require_provider_voice(
+            data.voice_provider,
             db,
             current_user.tenant_id,
             data.voice_id,
@@ -1850,9 +1950,14 @@ async def create_agent(
 @router.get("/provider/status")
 async def get_provider_status(
     current_user: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ):
     """Return non-sensitive provider readiness for the operator console."""
     client = get_smallest_client()
+    sarvam, sarvam_source, sarvam_updated_at = await _tenant_sarvam_client(
+        db,
+        current_user.tenant_id,
+    )
     return {
         "provider": "smallest",
         "configured": client.is_configured,
@@ -1860,7 +1965,108 @@ async def get_provider_status(
             settings.smallest_webhook_secret and settings.smallest_webhook_id
         ),
         "base_url": settings.smallest_base_url,
+        "providers": {
+            "smallest": {
+                "configured": client.is_configured,
+                "agent_runtime": True,
+                "voice_preview": client.is_configured,
+            },
+            "sarvam": {
+                "configured": sarvam.is_configured,
+                "agent_runtime": False,
+                "voice_preview": sarvam.is_configured,
+                "source": sarvam_source,
+                "updated_at": sarvam_updated_at.isoformat() if sarvam_updated_at else None,
+            },
+        },
     }
+
+
+@router.put(
+    "/provider/sarvam/credential",
+    response_model=ProviderCredentialStatus,
+)
+async def save_sarvam_credential(
+    data: SarvamCredentialRequest,
+    current_user: CurrentUser = Depends(require_role("owner", "admin")),
+    db: AsyncSession = Depends(get_db),
+):
+    """Store a write-only tenant Sarvam key in an authenticated envelope."""
+    try:
+        encrypted = encrypt_integration_config({"api_key": data.api_key})
+    except IntegrationConfigUnavailableError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail="Credential encryption is unavailable",
+        ) from exc
+
+    credential = await _tenant_sarvam_credential(
+        db,
+        current_user.tenant_id,
+        for_update=True,
+    )
+    action = "provider_credential.rotated" if credential else "provider_credential.created"
+    if credential is None:
+        credential = ProviderCredential(
+            tenant_id=current_user.tenant_id,
+            provider="sarvam",
+            encrypted_config=encrypted,
+            encryption_version=1,
+            is_active=True,
+        )
+        db.add(credential)
+    else:
+        credential.encrypted_config = encrypted
+        credential.encryption_version = 1
+        credential.is_active = True
+    await db.flush()
+    await record_audit_event(
+        db,
+        tenant_id=current_user.tenant_id,
+        actor_user_id=current_user.id,
+        action=action,
+        resource_type="provider_credential",
+        resource_id=str(credential.id),
+        details={"provider": "sarvam"},
+    )
+    return ProviderCredentialStatus(
+        configured=True,
+        source="workspace",
+        updated_at=credential.updated_at,
+    )
+
+
+@router.delete(
+    "/provider/sarvam/credential",
+    response_model=ProviderCredentialStatus,
+)
+async def delete_sarvam_credential(
+    current_user: CurrentUser = Depends(require_role("owner", "admin")),
+    db: AsyncSession = Depends(get_db),
+):
+    credential = await _tenant_sarvam_credential(
+        db,
+        current_user.tenant_id,
+        for_update=True,
+    )
+    if credential is not None:
+        credential_id = str(credential.id)
+        await db.delete(credential)
+        await db.flush()
+        await record_audit_event(
+            db,
+            tenant_id=current_user.tenant_id,
+            actor_user_id=current_user.id,
+            action="provider_credential.deleted",
+            resource_type="provider_credential",
+            resource_id=credential_id,
+            details={"provider": "sarvam"},
+        )
+    platform = get_sarvam_client()
+    return ProviderCredentialStatus(
+        configured=platform.is_configured,
+        source="platform" if platform.is_configured else "none",
+    )
 
 
 @router.get("/provider/catalog", response_model=AgentProviderCatalog)
@@ -1870,18 +2076,31 @@ async def get_provider_catalog(
 ):
     """Return public voices plus only this tenant's completed private clones."""
     client = get_smallest_client()
+    smallest_error: HTTPException | None = None
     try:
         voices = await _tenant_voice_catalog(client, db, current_user.tenant_id)
     except SmallestAIError as exc:
-        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
-    except Exception as exc:
-        raise HTTPException(
+        voices = []
+        smallest_error = HTTPException(status_code=exc.status_code, detail=str(exc))
+    except Exception:
+        voices = []
+        smallest_error = HTTPException(
             status_code=502, detail="Could not load the Smallest.ai voice catalog"
-        ) from exc
+        )
+
+    combined_voices = [
+        {"provider": "smallest", **voice}
+        for voice in voices
+    ]
+    sarvam, _, _ = await _tenant_sarvam_client(db, current_user.tenant_id)
+    if sarvam.is_configured:
+        combined_voices.extend(sarvam_voice_catalog())
+    if not combined_voices and smallest_error is not None:
+        raise smallest_error
 
     return AgentProviderCatalog(
-        voices=voices,
-        languages=language_catalog(voices),
+        voices=combined_voices,
+        languages=language_catalog(combined_voices),
         templates=AGENT_TEMPLATES,
         field_capabilities=PROVIDER_FIELD_CAPABILITIES,
     )
@@ -2181,6 +2400,34 @@ async def preview_provider_voice(
         subject=str(current_user.id),
         bind_to_client=False,
     )
+    if data.provider == "sarvam":
+        sarvam, _, _ = await _tenant_sarvam_client(db, current_user.tenant_id)
+        voice = next(
+            (item for item in sarvam_voice_catalog() if item["id"] == data.voice_id),
+            None,
+        )
+        if voice is None:
+            raise HTTPException(status_code=422, detail="Voice is not available in Sarvam")
+        advertised_languages = voice.get("languages") or []
+        preview_language = data.language or (
+            str(advertised_languages[0]) if advertised_languages else "en"
+        )
+        try:
+            audio = await sarvam.synthesize_voice_preview(
+                speaker=data.voice_id.removeprefix("sarvam:"),
+                language=preview_language,
+            )
+        except SarvamAIError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+        return Response(
+            content=audio,
+            media_type="audio/wav",
+            headers={
+                "Cache-Control": "private, no-store",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+
     client = get_smallest_client()
     try:
         voices = await _tenant_voice_catalog(client, db, current_user.tenant_id)
@@ -2252,6 +2499,14 @@ async def provision_smallest_agent(
 ):
     """Create the remote Atoms agent only after an operator explicitly requests it."""
     agent = await _tenant_agent(db, agent_id, current_user.tenant_id, for_update=True)
+    if agent.voice_provider != "smallest":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This agent uses Sarvam and cannot be provisioned into Smallest.ai. "
+                "It must be activated on the VAV realtime runtime."
+            ),
+        )
     if _expire_stale_provisioning(agent):
         await db.commit()
         return AgentResponse.model_validate(agent)
@@ -2392,6 +2647,11 @@ async def sync_smallest_agent(
 ):
     """Publish a dirty draft, or read-only verify an unresolved provider result."""
     agent = await _tenant_agent(db, agent_id, current_user.tenant_id, for_update=True)
+    if agent.voice_provider != "smallest":
+        raise HTTPException(
+            status_code=409,
+            detail="Sarvam agents are synchronized by the VAV realtime runtime, not Smallest.ai.",
+        )
     if _expire_stale_provisioning(agent):
         await db.commit()
         return AgentResponse.model_validate(agent)
@@ -2693,14 +2953,27 @@ async def update_agent(
     # authoritative, so a full editor payload must behave like a semantic PATCH:
     # unchanged values neither trigger provider I/O nor dirty a published agent.
     effective_changes = _effective_agent_changes(agent, changes)
+    if (
+        "voice_provider" in effective_changes
+        and agent.provider_agent_id
+        and effective_changes["voice_provider"] != "smallest"
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Delete the existing Smallest.ai remote agent before switching this VAV "
+                "agent to Sarvam. This prevents an orphaned live provider agent."
+            ),
+        )
     resulting_voice_id = effective_changes.get("voice_id", agent.voice_id)
+    resulting_voice_provider = effective_changes.get("voice_provider", agent.voice_provider)
     voice_inputs_changed = bool(VOICE_PREFLIGHT_FIELDS.intersection(effective_changes))
     if resulting_voice_id and voice_inputs_changed:
         baseline_fields = set(effective_changes) | VOICE_CONFIGURATION_FIELDS
         baseline = _agent_fields_snapshot(agent, baseline_fields)
         await db.rollback()
-        await _require_tenant_voice(
-            get_smallest_client(),
+        await _require_provider_voice(
+            resulting_voice_provider,
             db,
             current_user.tenant_id,
             resulting_voice_id,

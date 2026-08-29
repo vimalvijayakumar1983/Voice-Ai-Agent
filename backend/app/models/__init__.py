@@ -11,6 +11,7 @@ from app.models.campaign import (
 from app.models.commerce import CommerceAction, CommerceSession
 from app.models.compliance import ConsentRecord, DncEntry
 from app.models.integration import Integration, WebhookEvent
+from app.models.provider_credential import ProviderCredential
 from app.models.tenant import Tenant
 from app.models.user import ApiKey, RefreshSession, User, UserInvitation
 from app.models.voice import VoiceClone
@@ -38,6 +39,7 @@ __all__ = [
     "ProviderCallbackOutbox",
     "Integration",
     "WebhookEvent",
+    "ProviderCredential",
     "DncEntry",
     "ConsentRecord",
     "CommerceSession",

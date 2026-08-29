@@ -54,7 +54,7 @@ class AgentCreate(BaseModel):
     model_name: Literal["electron"] = "electron"
     temperature: float = Field(0.7, ge=0, le=2)
     max_tokens: int = Field(500, ge=32, le=8192)
-    voice_provider: Literal["smallest"] = "smallest"
+    voice_provider: Literal["smallest", "sarvam"] = "smallest"
     voice_id: str = Field("", max_length=100)
     language: str = Field("en", min_length=2, max_length=63)
     supported_languages: list[str] = Field(default_factory=lambda: ["en"], min_length=1)
@@ -112,7 +112,7 @@ class AgentUpdate(BaseModel):
     model_name: Literal["electron"] | None = None
     temperature: float | None = Field(None, ge=0, le=2)
     max_tokens: int | None = Field(None, ge=32, le=8192)
-    voice_provider: Literal["smallest"] | None = None
+    voice_provider: Literal["smallest", "sarvam"] | None = None
     voice_id: str | None = Field(None, max_length=100)
     language: str | None = Field(None, min_length=2, max_length=63)
     supported_languages: list[str] | None = Field(None, min_length=1)
@@ -225,6 +225,7 @@ class SmallestSessionResponse(BaseModel):
 
 
 class VoicePreviewRequest(BaseModel):
+    provider: Literal["smallest", "sarvam"] = "smallest"
     voice_id: str = Field(min_length=1, max_length=100)
     language: str | None = Field(None, min_length=2, max_length=63)
 
@@ -234,6 +235,26 @@ class VoicePreviewRequest(BaseModel):
     @classmethod
     def normalize_language(cls, value: str | None) -> str | None:
         return _normalize_language(value) if value is not None else None
+
+
+class SarvamCredentialRequest(BaseModel):
+    api_key: str = Field(min_length=20, max_length=512)
+
+    model_config = {"extra": "forbid", "str_strip_whitespace": True}
+
+    @field_validator("api_key")
+    @classmethod
+    def validate_api_key(cls, value: str) -> str:
+        if any(character.isspace() for character in value):
+            raise ValueError("Sarvam API key must not contain whitespace")
+        return value
+
+
+class ProviderCredentialStatus(BaseModel):
+    provider: Literal["sarvam"] = "sarvam"
+    configured: bool
+    source: Literal["workspace", "platform", "none"]
+    updated_at: datetime | None = None
 
 
 class VoiceCloneResponse(BaseModel):
@@ -278,6 +299,7 @@ class SmallestProviderResolution(BaseModel):
 
 
 class VoiceCatalogItem(BaseModel):
+    provider: Literal["smallest", "sarvam"] = "smallest"
     id: str
     name: str
     languages: list[str]
@@ -318,8 +340,8 @@ class ProviderFieldCapability(BaseModel):
 
 
 class AgentProviderCatalog(BaseModel):
-    provider: str = "smallest"
-    voice_model: str = "waves_lightning_v3_1"
+    provider: str = "multi"
+    voice_model: str = "provider-specific"
     voices: list[VoiceCatalogItem]
     languages: list[LanguageCatalogItem]
     templates: list[AgentTemplate]

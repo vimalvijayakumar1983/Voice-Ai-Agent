@@ -71,9 +71,24 @@ export interface ProviderStatus {
   configured: boolean;
   webhook_configured: boolean;
   base_url: string;
+  providers?: Record<'smallest' | 'sarvam', {
+    configured: boolean;
+    agent_runtime: boolean;
+    voice_preview: boolean;
+    source?: 'workspace' | 'platform' | 'none';
+    updated_at?: string | null;
+  }>;
+}
+
+export interface ProviderCredentialStatus {
+  provider: 'sarvam';
+  configured: boolean;
+  source: 'workspace' | 'platform' | 'none';
+  updated_at: string | null;
 }
 
 export interface VoiceCatalogItem {
+  provider: 'smallest' | 'sarvam';
   id: string;
   name: string;
   languages: string[];
@@ -127,7 +142,7 @@ export interface AgentTemplate {
 }
 
 export interface AgentProviderCatalog {
-  provider: 'smallest';
+  provider: 'multi';
   voice_model: string;
   voices: VoiceCatalogItem[];
   languages: LanguageCatalogItem[];
@@ -1099,14 +1114,27 @@ class ApiClient {
     return this.request<ProviderStatus>('/api/v1/agents/provider/status');
   }
 
+  async saveSarvamCredential(apiKey: string) {
+    return this.request<ProviderCredentialStatus>('/api/v1/agents/provider/sarvam/credential', {
+      method: 'PUT',
+      body: JSON.stringify({ api_key: apiKey }),
+    });
+  }
+
+  async deleteSarvamCredential() {
+    return this.request<ProviderCredentialStatus>('/api/v1/agents/provider/sarvam/credential', {
+      method: 'DELETE',
+    });
+  }
+
   async getAgentProviderCatalog() {
     return this.request<AgentProviderCatalog>('/api/v1/agents/provider/catalog');
   }
 
-  async previewVoice(voiceId: string) {
+  async previewVoice(provider: 'smallest' | 'sarvam', voiceId: string, language?: string) {
     return this.requestBlob('/api/v1/agents/provider/voice-preview', {
       method: 'POST',
-      body: JSON.stringify({ voice_id: voiceId }),
+      body: JSON.stringify({ provider, voice_id: voiceId, language }),
     });
   }
 
