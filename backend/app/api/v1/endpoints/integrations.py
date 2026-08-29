@@ -190,15 +190,15 @@ def _integration_response(integration: Integration, config: dict) -> Integration
 
 
 def _validate_config(config: dict, integration_type: str) -> None:
-    if integration_type not in SUPPORTED_INTEGRATION_TYPES:
-        raise HTTPException(status_code=422, detail="Unsupported integration type")
-
     try:
         validate_integration_config_urls(config)
     except IntegrationConfigError as exc:
         # Do not include the submitted config in validation responses; it can
         # contain credentials that are intentionally write-only.
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    if integration_type not in SUPPORTED_INTEGRATION_TYPES:
+        raise HTTPException(status_code=422, detail="Unsupported integration type")
 
     if integration_type == "webhook":
         if not isinstance(config.get("url"), str):
