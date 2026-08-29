@@ -84,9 +84,8 @@ def _validate_api_connector(config: dict, integration_type: str) -> None:
         _validate_relative_api_path(
             config,
             key,
-            required=key == "create_path" or (
-                key == "availability_path" and integration_type == "his_api"
-            ),
+            required=key == "create_path"
+            or (key == "availability_path" and integration_type == "his_api"),
         )
 
 
