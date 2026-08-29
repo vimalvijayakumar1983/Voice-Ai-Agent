@@ -1135,9 +1135,7 @@ async def _reconcile_smallest_publish(
                         provider_agent_id,
                         version_id=baseline_revision_id,
                     )
-                    expected_knowledge_base_id = expected_configuration[
-                        "global_knowledge_base_id"
-                    ]
+                    expected_knowledge_base_id = expected_configuration["global_knowledge_base_id"]
                     if _verified_knowledge_tool_ref_delta(
                         baseline_provider_agent,
                         published_provider_agent,
@@ -1538,9 +1536,7 @@ async def _publish_smallest_agent(
             provider_phase = "branch_lookup"
             branch_id = await client.get_default_branch_id(provider_agent_id)
         provider_phase = "knowledge_binding_lookup"
-        existing_remote_knowledge_id = await client.get_agent_knowledge_base_id(
-            provider_agent_id
-        )
+        existing_remote_knowledge_id = await client.get_agent_knowledge_base_id(provider_agent_id)
     except SmallestAIError as exc:
         await _mark_publish_failure(
             db,
