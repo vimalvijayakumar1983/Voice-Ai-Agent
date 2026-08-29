@@ -191,9 +191,7 @@ def test_new_provider_source_keeps_unprovisioned_bound_agent_local():
         last_synced_at=datetime.now(UTC),
     )
 
-    affected = _invalidate_bound_agent_deployments(
-        SimpleNamespace(agent_bindings=[binding])
-    )
+    affected = _invalidate_bound_agent_deployments(SimpleNamespace(agent_bindings=[binding]))
 
     assert affected == []
     assert agent.sync_status == "local_only"
@@ -275,9 +273,7 @@ async def test_pdf_upload_marks_existing_provider_binding_for_publish(
     assert response.status_code == 200
     assert response.json()["agent_bindings"][0]["sync_status"] == "pending"
     persisted_agent = await db.scalar(
-        select(Agent)
-        .where(Agent.id == agent.id)
-        .execution_options(populate_existing=True)
+        select(Agent).where(Agent.id == agent.id).execution_options(populate_existing=True)
     )
     persisted_binding = await db.scalar(
         select(AgentKnowledgeBinding)

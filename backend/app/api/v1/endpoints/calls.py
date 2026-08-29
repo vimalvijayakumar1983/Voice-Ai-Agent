@@ -378,9 +378,7 @@ async def register_browser_conversation(
     agent_id = agent.id
     agent_snapshot = agent_configuration_snapshot(agent)
 
-    existing = await db.scalar(
-        select(Call).where(Call.provider_call_sid == data.provider_call_id)
-    )
+    existing = await db.scalar(select(Call).where(Call.provider_call_sid == data.provider_call_id))
     if existing:
         _ensure_browser_conversation_identity(
             existing,
