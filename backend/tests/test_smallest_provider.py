@@ -452,7 +452,27 @@ async def test_versioned_draft_contains_runtime_configuration():
     )
 
     assert captured["globalPrompt"] == "Be concise and helpful."
-    assert captured["singlePromptConfig"] == {"prompt": "Be concise and helpful."}
+    assert captured["singlePromptConfig"] == {
+        "prompt": "Be concise and helpful.",
+        "tools": [
+            {
+                "type": "end_call",
+                "name": "end_call",
+                "description": "Terminate the call when conversation is complete.",
+                "enabled": True,
+            },
+            {
+                "type": "knowledge_base_search",
+                "name": "knowledge_base_search",
+                "description": (
+                    "Search the approved knowledge base for verified information before answering."
+                ),
+                "enabled": True,
+                "knowledgeBaseId": "kb_123",
+                "fillerPhrases": ["Let me check that for you."],
+            },
+        ],
+    }
     assert captured["slmModel"] == "electron"
     assert captured["language"] == {
         "default": "en",
@@ -492,6 +512,41 @@ async def test_versioned_draft_can_explicitly_clear_knowledge_binding():
 
     assert "globalKnowledgeBaseId" in captured
     assert captured["globalKnowledgeBaseId"] is None
+    assert captured["singlePromptConfig"] == {
+        "prompt": "Be concise and helpful.",
+        "tools": [
+            {
+                "type": "end_call",
+                "name": "end_call",
+                "description": "Terminate the call when conversation is complete.",
+                "enabled": True,
+            }
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_versioned_draft_omits_tools_when_knowledge_binding_is_unchanged():
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content))
+        return httpx.Response(200, json={"status": True, "data": {"status": "draft"}})
+
+    client = SmallestAIClient(api_key="sk_test", transport=httpx.MockTransport(handler))
+    await client.update_agent_draft(
+        agent_id="agent_123",
+        branch_id="branch_123",
+        global_prompt="Be concise and helpful.",
+        first_message="Welcome.",
+        slm_model="electron",
+        language="en",
+        supported_languages=["en"],
+        timezone="Asia/Dubai",
+    )
+
+    assert captured["singlePromptConfig"] == {"prompt": "Be concise and helpful."}
+    assert "globalKnowledgeBaseId" not in captured
 
 
 @pytest.mark.asyncio
