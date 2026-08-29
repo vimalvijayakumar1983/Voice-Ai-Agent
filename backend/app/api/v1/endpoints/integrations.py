@@ -132,7 +132,6 @@ def _validate_google_sheets_connector(config: dict) -> None:
         )
 
 
-
 def _locked_tenant_integration_statement(integration_id: UUID, tenant_id: UUID):
     """Build the mutation lookup that serializes one tenant-owned integration.
 
