@@ -28,6 +28,7 @@ async def test_viewer_can_read_but_cannot_mutate_agents_calls_or_compliance(
 
     agent_id = uuid4()
     knowledge_id = uuid4()
+    knowledge_source_id = uuid4()
     dnc_id = uuid4()
     mutations = [
         (
@@ -44,6 +45,11 @@ async def test_viewer_can_read_but_cannot_mutate_agents_calls_or_compliance(
             {"name": "Private KB", "content_type": "text", "content": "secret"},
         ),
         ("DELETE", f"/api/v1/agents/{agent_id}/knowledge/{knowledge_id}", None),
+        (
+            "DELETE",
+            f"/api/v1/knowledge/{knowledge_id}/sources/{knowledge_source_id}",
+            None,
+        ),
         (
             "POST",
             "/api/v1/calls",

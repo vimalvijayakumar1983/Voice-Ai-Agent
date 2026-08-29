@@ -183,7 +183,7 @@
 .sourceEmpty strong { color: var(--text-secondary); font-size: 11px; }
 .sourceEmpty p { margin-top: 2px; font-size: 10px; }
 .sourceList { border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
-.sourceRow { min-height: 63px; padding: 10px 12px; display: grid; grid-template-columns: 34px minmax(0, 1fr) auto 110px; align-items: center; gap: 10px; border-bottom: 1px solid var(--border); }
+.sourceRow { min-height: 63px; padding: 10px 12px; display: grid; grid-template-columns: 34px minmax(0, 1fr) auto 110px auto; align-items: center; gap: 10px; border-bottom: 1px solid var(--border); }
 .sourceRow:last-child { border-bottom: 0; }
 .sourceRow:hover { background: #fcfcfe; }
 .sourceTypeIcon { width: 34px; height: 34px; display: grid; place-items: center; color: var(--accent); background: var(--accent-soft); border-radius: 9px; }
@@ -259,7 +259,7 @@
   .uploadForm { align-items: stretch; flex-direction: column; }
   .uploadDrop { grid-template-columns: 28px 1fr; }
   .uploadDrop input { grid-column: 1 / -1; }
-  .sourceRow { grid-template-columns: 32px minmax(0, 1fr) auto; }
+  .sourceRow { grid-template-columns: 32px minmax(0, 1fr) auto auto; }
   .sourceRow time { display: none; }
   .inlineForm > div:last-child { align-items: stretch; flex-direction: column; }
   .emptySteps { align-items: stretch; flex-direction: column; }

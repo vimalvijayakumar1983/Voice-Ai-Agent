@@ -198,7 +198,10 @@ async def _ensure_remote(
 def _recount(kb: KnowledgeBase) -> None:
     kb.source_count = len(kb.sources)
     kb.indexed_source_count = sum(source.status == "indexed" for source in kb.sources)
-    if kb.source_count and kb.indexed_source_count == kb.source_count:
+    if not kb.source_count:
+        kb.sync_status = "local_only"
+        kb.sync_error = None
+    elif kb.indexed_source_count == kb.source_count:
         kb.sync_status = "ready"
         kb.sync_error = None
     elif any(source.status == "failed" for source in kb.sources):
@@ -359,6 +362,55 @@ def _reconcile_provider_sources(
             source.last_synced_at = now
 
     _recount(kb)
+
+
+def _provider_source_delete_target(
+    source: KnowledgeSource,
+    *,
+    scraped: list[dict],
+    items: list[dict],
+) -> tuple[str, str] | None:
+    """Resolve the provider collection and ID used to delete one local source."""
+    expanded_scraped = _expand_scraped_provider_items(scraped)
+    scraped_by_id = {
+        str(item.get("_id") or item.get("id")): item
+        for item in expanded_scraped
+        if item.get("_id") or item.get("id")
+    }
+    items_by_id = {
+        str(item.get("_id") or item.get("id")): item
+        for item in items
+        if item.get("_id") or item.get("id")
+    }
+    if source.provider_item_id in scraped_by_id:
+        return "scraped", source.provider_item_id
+    if source.provider_item_id in items_by_id:
+        return "item", source.provider_item_id
+
+    if source.location:
+        source_key = _provider_url_key(source.location)
+        for item in expanded_scraped:
+            if source_key and any(
+                _provider_url_key(value) == source_key for value in _provider_item_urls(item)
+            ):
+                provider_id = str(item.get("_id") or item.get("id") or "")
+                if provider_id:
+                    return "scraped", provider_id
+        for item in items:
+            if source_key and any(
+                _provider_url_key(value) == source_key for value in _provider_item_urls(item)
+            ):
+                provider_id = str(item.get("_id") or item.get("id") or "")
+                if provider_id:
+                    return "item", provider_id
+
+    if source.source_type == "file":
+        for item in items:
+            if _provider_file_name(item) == source.name:
+                provider_id = str(item.get("_id") or item.get("id") or "")
+                if provider_id:
+                    return "item", provider_id
+    return None
 
 
 @router.get("", response_model=list[KnowledgeBaseResponse])
@@ -625,6 +677,99 @@ async def upload_pdf_source(
         details={
             "name": filename,
             "bytes": len(content),
+            "agents_requiring_sync": [str(agent_id) for agent_id in affected_agent_ids],
+        },
+    )
+    return _knowledge_response(kb)
+
+
+@router.delete("/{kb_id}/sources/{source_id}", response_model=KnowledgeBaseResponse)
+async def delete_knowledge_source(
+    kb_id: UUID,
+    source_id: UUID,
+    current_user: CurrentUser = Depends(require_role("owner", "admin")),
+    db: AsyncSession = Depends(get_db),
+):
+    """Permanently remove a source from VAV and its Smallest knowledge base."""
+    kb = await _get_knowledge_base(db, current_user.tenant_id, kb_id)
+    _ensure_bound_agents_accept_knowledge_change(kb)
+    source = next((item for item in kb.sources if item.id == source_id), None)
+    if source is None:
+        raise HTTPException(status_code=404, detail="Knowledge source not found")
+
+    provider_target: tuple[str, str] | None = None
+    scraped: list[dict] = []
+    items: list[dict] = []
+    if kb.provider_knowledge_base_id and source.source_type != "text":
+        client = get_smallest_client()
+        try:
+            scraped = await client.list_scraped_knowledge_urls(kb.provider_knowledge_base_id)
+            items = await client.list_knowledge_items(kb.provider_knowledge_base_id)
+            provider_target = _provider_source_delete_target(
+                source,
+                scraped=scraped,
+                items=items,
+            )
+            if provider_target:
+                collection, provider_item_id = provider_target
+                if collection == "scraped":
+                    await client.delete_scraped_knowledge_url(
+                        knowledge_base_id=kb.provider_knowledge_base_id,
+                        scraped_url_id=provider_item_id,
+                    )
+                else:
+                    await client.delete_knowledge_item(
+                        knowledge_base_id=kb.provider_knowledge_base_id,
+                        item_id=provider_item_id,
+                    )
+        except SmallestAIError as exc:
+            await _mark_provider_error(db, kb, exc)
+            raise _provider_error(exc) from exc
+
+    removed_sources = [source]
+    if provider_target:
+        collection, provider_item_id = provider_target
+        grouped_url_keys: set[str] = set()
+        if collection == "scraped":
+            grouped_url_keys = {
+                key
+                for item in _expand_scraped_provider_items(scraped)
+                if str(item.get("_id") or item.get("id") or "") == provider_item_id
+                for value in _provider_item_urls(item)
+                if (key := _provider_url_key(value))
+            }
+        removed_sources = [
+            candidate
+            for candidate in kb.sources
+            if candidate is source
+            or candidate.provider_item_id == provider_item_id
+            or (
+                collection == "scraped"
+                and candidate.location is not None
+                and _provider_url_key(candidate.location) in grouped_url_keys
+            )
+        ]
+
+    removed_ids = {candidate.id for candidate in removed_sources}
+    kb.sources[:] = [candidate for candidate in kb.sources if candidate.id not in removed_ids]
+    _recount(kb)
+    affected_agent_ids = (
+        _invalidate_bound_agent_deployments(kb) if source.source_type != "text" else []
+    )
+    await db.flush()
+    await record_audit_event(
+        db,
+        tenant_id=current_user.tenant_id,
+        actor_user_id=current_user.id,
+        action="knowledge_source.deleted",
+        resource_type="knowledge_base",
+        resource_id=str(kb.id),
+        details={
+            "requested_source_id": str(source_id),
+            "removed_source_ids": [str(candidate.id) for candidate in removed_sources],
+            "removed_source_names": [candidate.name for candidate in removed_sources],
+            "provider_collection": provider_target[0] if provider_target else None,
+            "provider_item_id": provider_target[1] if provider_target else None,
             "agents_requiring_sync": [str(agent_id) for agent_id in affected_agent_ids],
         },
     )

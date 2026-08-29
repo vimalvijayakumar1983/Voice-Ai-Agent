@@ -14,7 +14,7 @@ from app.api.v1.endpoints.knowledge import (
     _provider_url_key,
     _reconcile_provider_sources,
 )
-from app.models.agent import Agent, AgentKnowledgeBinding, KnowledgeBase
+from app.models.agent import Agent, AgentKnowledgeBinding, KnowledgeBase, KnowledgeSource
 
 
 def _knowledge(source):
@@ -287,3 +287,120 @@ async def test_pdf_upload_marks_existing_provider_binding_for_publish(
     assert persisted_agent.sync_status == "dirty"
     assert persisted_binding.sync_status == "pending"
     assert persisted_binding.last_synced_at is None
+
+
+@pytest.mark.asyncio
+async def test_delete_grouped_url_source_removes_provider_and_local_group(
+    client,
+    auth_headers,
+    tenant,
+    db,
+    monkeypatch,
+):
+    deleted: list[tuple[str, str]] = []
+
+    class KnowledgeClient:
+        async def list_scraped_knowledge_urls(self, knowledge_base_id):
+            assert knowledge_base_id == "provider-kb-1"
+            return [
+                {
+                    "_id": "provider-scrape-batch-1",
+                    "hostUrl": "https://aecmc.com/",
+                    "scrapedUrls": [
+                        "https://aecmc.com/doctors",
+                        "https://aecmc.com/treatments/botox/en",
+                    ],
+                    "processingStatus": "completed",
+                }
+            ]
+
+        async def list_knowledge_items(self, knowledge_base_id):
+            assert knowledge_base_id == "provider-kb-1"
+            return [
+                {
+                    "_id": "provider-pdf-1",
+                    "fileName": "doctors.pdf",
+                    "processingStatus": "completed",
+                }
+            ]
+
+        async def delete_scraped_knowledge_url(self, **kwargs):
+            deleted.append((kwargs["knowledge_base_id"], kwargs["scraped_url_id"]))
+
+        async def delete_knowledge_item(self, **kwargs):
+            raise AssertionError("The PDF must be retained")
+
+    monkeypatch.setattr(knowledge_endpoint, "get_smallest_client", KnowledgeClient)
+    created = await client.post(
+        "/api/v1/agents",
+        headers=auth_headers,
+        json={"name": "Adam and Eve Concierge", "system_prompt": "Use approved knowledge."},
+    )
+    agent = await db.get(Agent, UUID(created.json()["id"]))
+    agent.provider_agent_id = "provider-agent-1"
+    agent.sync_status = "synced"
+    knowledge = KnowledgeBase(
+        tenant_id=tenant.id,
+        name="Adam and Eve Medical Knowledge",
+        provider="smallest",
+        provider_knowledge_base_id="provider-kb-1",
+        sync_status="ready",
+        approval_status="approved",
+    )
+    db.add(knowledge)
+    await db.flush()
+    url_sources = [
+        KnowledgeSource(
+            tenant_id=tenant.id,
+            knowledge_base_id=knowledge.id,
+            source_type="url",
+            name=url,
+            location=url,
+            status="indexed",
+            provider_item_id="provider-scrape-batch-1",
+        )
+        for url in (
+            "https://aecmc.com/doctors",
+            "https://aecmc.com/treatments/botox/en",
+        )
+    ]
+    pdf_source = KnowledgeSource(
+        tenant_id=tenant.id,
+        knowledge_base_id=knowledge.id,
+        source_type="file",
+        name="doctors.pdf",
+        status="indexed",
+        provider_item_id="provider-pdf-1",
+    )
+    db.add_all([*url_sources, pdf_source])
+    knowledge.source_count = 3
+    knowledge.indexed_source_count = 3
+    db.add(
+        AgentKnowledgeBinding(
+            tenant_id=tenant.id,
+            agent_id=agent.id,
+            knowledge_base_id=knowledge.id,
+            provider="smallest",
+            sync_status="synced",
+            last_synced_at=datetime.now(UTC),
+        )
+    )
+    await db.commit()
+
+    response = await client.delete(
+        f"/api/v1/knowledge/{knowledge.id}/sources/{url_sources[0].id}",
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200
+    assert deleted == [("provider-kb-1", "provider-scrape-batch-1")]
+    assert [source["name"] for source in response.json()["sources"]] == ["doctors.pdf"]
+    assert response.json()["source_count"] == 1
+    assert response.json()["indexed_source_count"] == 1
+    assert response.json()["agent_bindings"][0]["sync_status"] == "pending"
+    remaining = (
+        await db.scalars(
+            select(KnowledgeSource).where(KnowledgeSource.knowledge_base_id == knowledge.id)
+        )
+    ).all()
+    assert [source.name for source in remaining] == ["doctors.pdf"]

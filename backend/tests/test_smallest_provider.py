@@ -113,6 +113,47 @@ async def test_knowledge_base_url_ingestion_contract():
 
 
 @pytest.mark.asyncio
+async def test_knowledge_source_deletion_contracts_are_idempotent():
+    requests: list[httpx.Request] = []
+    responses = iter(
+        [
+            httpx.Response(200, json={"status": True}),
+            httpx.Response(200, json={"status": True}),
+            httpx.Response(404, json={"message": "Already deleted"}),
+        ]
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return next(responses)
+
+    client = SmallestAIClient(
+        api_key="sk_test",
+        base_url="https://api.smallest.ai/atoms/v1",
+        transport=httpx.MockTransport(handler),
+    )
+
+    await client.delete_scraped_knowledge_url(
+        knowledge_base_id="kb/123",
+        scraped_url_id="scrape/456",
+    )
+    await client.delete_knowledge_item(
+        knowledge_base_id="kb/123",
+        item_id="item/789",
+    )
+    await client.delete_knowledge_item(
+        knowledge_base_id="kb/123",
+        item_id="already-absent",
+    )
+
+    assert [request.method for request in requests] == ["DELETE", "DELETE", "DELETE"]
+    assert requests[0].url.raw_path == (
+        b"/atoms/v1/knowledgebase/kb%2F123/scraped-urls/scrape%2F456"
+    )
+    assert requests[1].url.raw_path == b"/atoms/v1/knowledgebase/kb%2F123/items/item%2F789"
+
+
+@pytest.mark.asyncio
 async def test_get_knowledge_base_contract():
     requests: list[httpx.Request] = []
 

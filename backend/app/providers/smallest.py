@@ -626,6 +626,40 @@ class SmallestAIClient:
         data = response.get("data")
         return [item for item in data if isinstance(item, dict)] if isinstance(data, list) else []
 
+    async def delete_scraped_knowledge_url(
+        self, *, knowledge_base_id: str, scraped_url_id: str
+    ) -> None:
+        """Delete one provider scrape record, treating an absent record as deleted."""
+        try:
+            await self._request(
+                "DELETE",
+                (
+                    f"/knowledgebase/{quote(knowledge_base_id, safe='')}/scraped-urls/"
+                    f"{quote(scraped_url_id, safe='')}"
+                ),
+            )
+        except SmallestAIError as exc:
+            if exc.upstream_status_code == 404:
+                return
+            raise
+
+    async def delete_knowledge_item(
+        self, *, knowledge_base_id: str, item_id: str
+    ) -> None:
+        """Delete one uploaded provider item, treating an absent item as deleted."""
+        try:
+            await self._request(
+                "DELETE",
+                (
+                    f"/knowledgebase/{quote(knowledge_base_id, safe='')}/items/"
+                    f"{quote(item_id, safe='')}"
+                ),
+            )
+        except SmallestAIError as exc:
+            if exc.upstream_status_code == 404:
+                return
+            raise
+
     async def upload_knowledge_pdf(
         self, *, knowledge_base_id: str, file_name: str, content: bytes
     ) -> None:

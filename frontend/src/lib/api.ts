@@ -1168,6 +1168,12 @@ class ApiClient {
     });
   }
 
+  async deleteKnowledgeSource(id: string, sourceId: string) {
+    return this.request<KnowledgeBase>(`/api/v1/knowledge/${id}/sources/${sourceId}`, {
+      method: 'DELETE',
+    });
+  }
+
   async refreshKnowledgeBase(id: string) {
     return this.request<KnowledgeBase>(`/api/v1/knowledge/${id}/refresh`, { method: 'POST' });
   }

@@ -322,6 +322,18 @@ export default function KnowledgeStudio() {
     event.currentTarget.reset();
   };
 
+  const removeSource = async (source: KnowledgeSource) => {
+    if (!selected || !window.confirm(
+      `Remove ${source.name}? This permanently removes it from VAV and Smallest.ai. If Smallest grouped multiple URLs into one crawl, those grouped URLs will also be removed.`,
+    )) return;
+    await runAction(
+      `delete-source-${source.id}`,
+      () => api.deleteKnowledgeSource(selected.id, source.id),
+      `${source.name} was removed from VAV and Smallest.ai.`,
+      { syncPendingBindings: true },
+    );
+  };
+
   const deleteSelected = async () => {
     if (!selected || !window.confirm(`Delete ${selected.name}? This permanently removes its provider copy and sources.`)) return;
     setWorking('delete');
@@ -466,7 +478,12 @@ export default function KnowledgeStudio() {
                 </div>
               </section>}
 
-              <SourcesSection sources={selected.sources} />
+              <SourcesSection
+                sources={selected.sources}
+                canRemove={canGovernKnowledge}
+                busy={working !== null}
+                onRemove={removeSource}
+              />
 
               <section className={styles.section} aria-labelledby="governance-heading">
                 <div className={styles.sectionHeading}>
@@ -536,8 +553,8 @@ function TextForm({ busy, onSubmit }: { busy: boolean; onSubmit: (event: FormEve
   return <form onSubmit={onSubmit} className={styles.builderForm}><div><label htmlFor="text-name">Internal text note</label><p>Saved with clear “local only” status until the selected provider supports text ingestion.</p></div><input id="text-name" name="text_name" required maxLength={255} placeholder="Approved returns FAQ" /><textarea id="text-content" name="text_content" required minLength={20} maxLength={100000} placeholder="Paste approved question-and-answer content here…" /><button type="submit" className="btn btn-secondary" disabled={busy}>{busy ? <Loader2 className="spin" size={14} /> : <Plus size={14} />} Save local source</button></form>;
 }
 
-function SourcesSection({ sources }: { sources: KnowledgeSource[] }) {
-  return <section className={styles.section} aria-labelledby="sources-heading"><div className={styles.sectionHeading}><div><span className={styles.sectionIcon}><Layers3 size={15} /></span><div><h3 id="sources-heading">Source inventory</h3><p>Provider status is authoritative. “Processing” content is not yet available to callers.</p></div></div><span className="badge badge-neutral">{sources.length} sources</span></div>{sources.length === 0 ? <div className={styles.sourceEmpty}><FileText size={20} /><div><strong>No sources yet</strong><p>Add curated web pages or an approved PDF to begin indexing.</p></div></div> : <div className={styles.sourceList}>{sources.map((source) => <article className={styles.sourceRow} key={source.id}><span className={styles.sourceTypeIcon}>{source.source_type === 'file' ? <FileText size={16} /> : source.source_type === 'text' ? <Layers3 size={16} /> : <Globe2 size={16} />}</span><div className={styles.sourceIdentity}><strong>{source.name}</strong><span>{source.location || (source.size_bytes ? formatBytes(source.size_bytes) : source.source_type)}</span>{source.error_message && <p>{source.error_message}</p>}</div><span className={`badge ${sourceBadge(source.status)}`}>{source.status.replace('_', ' ')}</span><time>{formatDate(source.last_synced_at || source.updated_at)}</time></article>)}</div>}</section>;
+function SourcesSection({ sources, canRemove, busy, onRemove }: { sources: KnowledgeSource[]; canRemove: boolean; busy: boolean; onRemove: (source: KnowledgeSource) => void }) {
+  return <section className={styles.section} aria-labelledby="sources-heading"><div className={styles.sectionHeading}><div><span className={styles.sectionIcon}><Layers3 size={15} /></span><div><h3 id="sources-heading">Source inventory</h3><p>Provider status is authoritative. Remove and re-add a source to replace its indexed content.</p></div></div><span className="badge badge-neutral">{sources.length} sources</span></div>{sources.length === 0 ? <div className={styles.sourceEmpty}><FileText size={20} /><div><strong>No sources yet</strong><p>Add curated web pages or an approved PDF to begin indexing.</p></div></div> : <div className={styles.sourceList}>{sources.map((source) => <article className={styles.sourceRow} key={source.id}><span className={styles.sourceTypeIcon}>{source.source_type === 'file' ? <FileText size={16} /> : source.source_type === 'text' ? <Layers3 size={16} /> : <Globe2 size={16} />}</span><div className={styles.sourceIdentity}><strong>{source.name}</strong><span>{source.location || (source.size_bytes ? formatBytes(source.size_bytes) : source.source_type)}</span>{source.error_message && <p>{source.error_message}</p>}</div><span className={`badge ${sourceBadge(source.status)}`}>{source.status.replace('_', ' ')}</span><time>{formatDate(source.last_synced_at || source.updated_at)}</time>{canRemove && <button type="button" className="icon-button" disabled={busy} onClick={() => onRemove(source)} aria-label={`Remove ${source.name} from VAV and Smallest.ai`} title="Remove from VAV and Smallest.ai"><Trash2 size={14} /></button>}</article>)}</div>}</section>;
 }
 
 function AgentBinding({ selected, agents, busy, canManage, onBind, onUnbind }: { selected: KnowledgeBase; agents: VoiceAgent[]; busy: boolean; canManage: boolean; onBind: (agentId: string) => void; onUnbind: (agentId: string) => void }) {
