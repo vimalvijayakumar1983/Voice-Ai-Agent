@@ -151,6 +151,8 @@ async def test_knowledge_source_deletion_contracts_are_idempotent():
         b"/atoms/v1/knowledgebase/kb%2F123/scraped-urls/scrape%2F456"
     )
     assert requests[1].url.raw_path == b"/atoms/v1/knowledgebase/kb%2F123/items/item%2F789"
+    assert [json.loads(request.content) for request in requests] == [{}, {}, {}]
+    assert all(request.headers["content-type"] == "application/json" for request in requests)
 
 
 @pytest.mark.asyncio

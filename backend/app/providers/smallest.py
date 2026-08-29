@@ -637,6 +637,7 @@ class SmallestAIClient:
                     f"/knowledgebase/{quote(knowledge_base_id, safe='')}/scraped-urls/"
                     f"{quote(scraped_url_id, safe='')}"
                 ),
+                json={},
             )
         except SmallestAIError as exc:
             if exc.upstream_status_code == 404:
@@ -654,6 +655,7 @@ class SmallestAIClient:
                     f"/knowledgebase/{quote(knowledge_base_id, safe='')}/items/"
                     f"{quote(item_id, safe='')}"
                 ),
+                json={},
             )
         except SmallestAIError as exc:
             if exc.upstream_status_code == 404:
