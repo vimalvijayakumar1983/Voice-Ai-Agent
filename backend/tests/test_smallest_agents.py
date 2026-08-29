@@ -198,6 +198,34 @@ def test_provider_publish_label_is_bounded_and_provider_safe():
     )
 
 
+def test_knowledge_binding_delta_only_writes_changed_provider_state():
+    snapshot: dict = {}
+    action = agents_endpoint._apply_knowledge_binding_delta(
+        snapshot,
+        desired_knowledge_base_id="provider_kb_123",
+        existing_knowledge_base_id="provider_kb_123",
+    )
+    assert action == "unchanged"
+    assert "global_knowledge_base_id" not in snapshot
+
+    action = agents_endpoint._apply_knowledge_binding_delta(
+        snapshot,
+        desired_knowledge_base_id="provider_kb_456",
+        existing_knowledge_base_id="provider_kb_123",
+    )
+    assert action == "set"
+    assert snapshot["global_knowledge_base_id"] == "provider_kb_456"
+
+    snapshot = {}
+    action = agents_endpoint._apply_knowledge_binding_delta(
+        snapshot,
+        desired_knowledge_base_id=None,
+        existing_knowledge_base_id="provider_kb_123",
+    )
+    assert action == "clear"
+    assert snapshot["global_knowledge_base_id"] is None
+
+
 async def _provision_editor_regression_agent(
     client: AsyncClient,
     auth_headers: dict,
