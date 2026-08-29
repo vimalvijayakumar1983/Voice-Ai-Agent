@@ -516,10 +516,7 @@ def public_integration_config(
         table_name = full_config.get("table_name")
         if isinstance(table_name, str) and table_name:
             public_config["table_name"] = table_name
-        if (
-            full_config.get("spreadsheet_id")
-            or full_config.get("spreadsheet_configured") is True
-        ):
+        if full_config.get("spreadsheet_id") or full_config.get("spreadsheet_configured") is True:
             public_config["spreadsheet_configured"] = True
         if full_config.get("spreadsheet_id"):
             secret_paths.append("spreadsheet_id")
