@@ -15,7 +15,9 @@ const apiProxyTarget = normalizeApiProxyTarget(
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   reactStrictMode: true,
-  output: 'standalone',
+  // Next.js 16.3 does not emit the root NFT files when Vercel injects its
+  // build adapter. Vercel does not use the standalone bundle; Railway does.
+  output: process.env.VERCEL ? undefined : 'standalone',
   async rewrites() {
     return [
       {
