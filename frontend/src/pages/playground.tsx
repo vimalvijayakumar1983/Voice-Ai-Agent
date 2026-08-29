@@ -237,6 +237,14 @@ export default function Playground() {
           eventCount: current.eventCount + 1,
           lastEvent: 'Session started',
         }));
+        void api.registerBrowserConversation(selected.id, event.call_id).catch((registrationError) => {
+          setDiagnostics((current) => ({
+            ...current,
+            lastEvent: registrationError instanceof Error
+              ? `Session started; history registration failed: ${registrationError.message}`
+              : 'Session started; history registration failed',
+          }));
+        });
       });
       voiceAgent.on('agent_start_talking', () => {
         setState('speaking');

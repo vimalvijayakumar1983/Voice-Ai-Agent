@@ -21,6 +21,8 @@ def test_call_response_projects_only_safe_agent_configuration_metadata():
             "provider_call_sid": "provider-call-id",
             "provider_recording_url": "https://provider.example/private-recording.mp3?secret=1",
             "call_metadata": {
+                "conversation_type": "webcall",
+                "channel": "browser",
                 "request": {"context": {"account_secret": "do-not-expose"}},
                 "smallest_variables": {"private": "do-not-expose"},
                 "smallest_analytics": {"internal": "do-not-expose"},
@@ -45,6 +47,8 @@ def test_call_response_projects_only_safe_agent_configuration_metadata():
     )
 
     assert response.call_metadata == {
+        "conversation_type": "webcall",
+        "channel": "browser",
         "provider_revision_id": "revision-42",
         "language": "en",
         "supported_languages": ["en", "hi", "ta"],

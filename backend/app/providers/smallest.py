@@ -936,6 +936,40 @@ class SmallestAIClient:
             sample_rate=int(data.get("sample_rate", 24000)),
         )
 
+    async def list_web_conversation_logs(
+        self,
+        *,
+        agent_id: str,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """Return one bounded, provider-sorted page for history reconciliation."""
+        response = await self._request(
+            "GET",
+            "/analytics/call-counts-log",
+            params={
+                "page": 1,
+                "limit": min(max(limit, 1), 100),
+                "agentId": agent_id,
+                "callType": "webcall",
+            },
+        )
+        data = response.get("data")
+        if isinstance(data, dict) and isinstance(data.get("data"), dict):
+            data = data["data"]
+        calls = data.get("calls") if isinstance(data, dict) else None
+        if not isinstance(calls, list) or any(not isinstance(call, dict) for call in calls):
+            raise SmallestAIError("Smallest.ai returned invalid conversation history.")
+        return calls[:100]
+
+    async def get_conversation_log(self, *, call_id: str) -> dict[str, Any]:
+        """Return one provider conversation including transcript and analytics."""
+        encoded_call_id = quote(call_id, safe="")
+        response = await self._request("GET", f"/conversation/{encoded_call_id}")
+        data = response.get("data")
+        if not isinstance(data, dict):
+            raise SmallestAIError("Smallest.ai returned an invalid conversation log.")
+        return data
+
     async def start_outbound_call(
         self,
         *,

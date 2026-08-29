@@ -23,6 +23,12 @@ def public_call_metadata(value: Any) -> dict[str, Any] | None:
         return None
 
     result: dict[str, Any] = {}
+    conversation_type = value.get("conversation_type")
+    if conversation_type in {"webcall", "chat", "telephonyInbound", "telephonyOutbound"}:
+        result["conversation_type"] = conversation_type
+    channel = value.get("channel")
+    if channel in {"browser", "chat", "phone"}:
+        result["channel"] = channel
     revision_id = snapshot.get("provider_revision_id")
     if isinstance(revision_id, str) and revision_id:
         result["provider_revision_id"] = revision_id

@@ -297,6 +297,13 @@ export interface CallSummary {
   sentiment: string | null;
 }
 
+export interface ProviderHistorySyncResult {
+  scanned: number;
+  imported: number;
+  updated: number;
+  failed: number;
+}
+
 export interface Campaign {
   id: string;
   tenant_id: string;
@@ -1206,6 +1213,19 @@ class ApiClient {
   async listCalls(params?: Record<string, string>) {
     const query = params ? '?' + new URLSearchParams(params).toString() : '';
     return this.request<CallRecord[]>(`/api/v1/calls${query}`);
+  }
+
+  async registerBrowserConversation(agentId: string, providerCallId: string) {
+    return this.request<CallRecord>('/api/v1/calls/browser-sessions', {
+      method: 'POST',
+      body: JSON.stringify({ agent_id: agentId, provider_call_id: providerCallId }),
+    });
+  }
+
+  async syncProviderConversationHistory() {
+    return this.request<ProviderHistorySyncResult>('/api/v1/calls/sync-provider-history', {
+      method: 'POST',
+    });
   }
 
   async getCall(id: string) {

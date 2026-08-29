@@ -119,6 +119,11 @@ function configuredLanguages(call: CallRecord | null) {
   return Array.from(languages);
 }
 
+function isBrowserConversation(call: CallRecord | null) {
+  const metadata = callMetadata(call);
+  return metadata.channel === 'browser' || metadata.conversation_type === 'webcall';
+}
+
 function languageName(code: string) {
   try {
     return new Intl.DisplayNames(['en'], { type: 'language' }).of(code) || code.toUpperCase();
@@ -158,6 +163,8 @@ export default function Calls() {
   const [calls, setCalls] = useState<CallRecord[]>([]);
   const [loading, setLoading] = useState(true);
   const [listError, setListError] = useState('');
+  const [historySyncing, setHistorySyncing] = useState(false);
+  const [historySyncNotice, setHistorySyncNotice] = useState('');
   const [selectedCall, setSelectedCall] = useState<CallRecord | null>(null);
   const [transcript, setTranscript] = useState<CallTranscript | null>(null);
   const [summary, setSummary] = useState<CallSummary | null>(null);
@@ -251,6 +258,26 @@ export default function Calls() {
     }
     setDetailLoading(false);
   }, []);
+
+  const syncProviderHistory = async () => {
+    setHistorySyncing(true);
+    setHistorySyncNotice('');
+    try {
+      const result = await api.syncProviderConversationHistory();
+      await loadCallsAndAgents();
+      setHistorySyncNotice(
+        result.failed
+          ? `Recovered ${result.imported} conversations; ${result.failed} provider records could not be imported.`
+          : `Provider history checked: ${result.imported} recovered, ${result.updated} refreshed.`,
+      );
+    } catch (error) {
+      setHistorySyncNotice(
+        error instanceof Error ? error.message : 'Provider conversation history could not be synced.',
+      );
+    } finally {
+      setHistorySyncing(false);
+    }
+  };
 
   const releaseRecording = useCallback(() => {
     if (recordingAudioRef.current) {
@@ -416,6 +443,7 @@ export default function Calls() {
         call.direction,
         call.disposition || '',
         call.provider,
+        isBrowserConversation(call) ? 'browser test voice playground' : 'phone',
         agentName,
         ...languages,
       ].some((value) => value.toLowerCase().includes(query));
@@ -440,6 +468,7 @@ export default function Calls() {
           <p className="page-subtitle">Place controlled outbound calls and inspect recordings, transcripts, configured languages, outcomes, and provider details when the provider reports them.</p>
         </div>
         <div className="header-actions">
+          <button type="button" className="btn btn-secondary" disabled={historySyncing} onClick={() => void syncProviderHistory()}><RefreshCw size={14} /> {historySyncing ? 'Syncing history…' : 'Sync provider history'}</button>
           <button type="button" className="btn btn-secondary" disabled={loading} onClick={() => void loadCallsAndAgents()}><RefreshCw size={14} /> Refresh</button>
           <button type="button" className="btn btn-primary" aria-expanded={showDialer} onClick={toggleDialer}>
             {showDialer ? <X size={14} /> : <Plus size={14} />}
@@ -447,6 +476,8 @@ export default function Calls() {
           </button>
         </div>
       </div>
+
+      {historySyncNotice ? <div className={styles.recoveryNotice} role="status"><div><strong>Provider history</strong><p>{historySyncNotice}</p></div></div> : null}
 
       {showDialer ? (
         <form className="card call-dialer" onSubmit={initiateCall}>
@@ -512,7 +543,7 @@ export default function Calls() {
       ) : listError ? (
         <div className={styles.recoveryNotice} role="alert"><div><strong>Conversations could not be loaded</strong><p>{listError}</p></div><button type="button" className="btn btn-secondary btn-sm" onClick={() => void loadCallsAndAgents()}><RefreshCw size={12} /> Retry</button></div>
       ) : calls.length === 0 ? (
-        <div className="empty-state"><h3>No conversations yet</h3><p>Calls will appear here once agents start making or receiving calls.</p></div>
+        <div className="empty-state"><h3>No conversations yet</h3><p>Phone calls and Voice Playground browser tests will appear here after a session starts.</p></div>
       ) : visibleCalls.length === 0 ? (
         <div className={`empty-state ${styles.resultEmpty}`}><h3>No conversations match</h3><p>Adjust or clear the current search and filters.</p><button type="button" className="btn btn-secondary" onClick={() => setFilters(EMPTY_FILTERS)}>Clear filters</button></div>
       ) : (
@@ -523,9 +554,10 @@ export default function Calls() {
               {visibleCalls.map((call) => {
                 const languages = configuredLanguages(call);
                 const agent = call.agent_id ? agentMap.get(call.agent_id) : undefined;
+                const browserConversation = isBrowserConversation(call);
                 return (
                   <tr key={call.id}>
-                    <td><span className={`${styles.tablePrimary} phone-value`}>{call.to_number}</span><span className={styles.tableSecondary}>From {call.from_number}</span></td>
+                    <td><span className={`${styles.tablePrimary} phone-value`}>{browserConversation ? 'Voice Playground' : call.to_number}</span><span className={styles.tableSecondary}>{browserConversation ? 'Browser test' : `From ${call.from_number}`}</span></td>
                     <td>{agent?.name || (call.agent_id ? 'Deleted or unavailable agent' : 'No agent linked')}</td>
                     <td><span className={`badge ${call.direction === 'inbound' ? 'badge-info' : 'badge-warning'}`}>{call.direction}</span></td>
                     <td><span className={`badge ${statusBadge(call.status)}`}>{call.status.replace(/_/g, ' ')}</span></td>
@@ -550,7 +582,7 @@ export default function Calls() {
               <div>
                 <span className="page-kicker">Conversation intelligence</span>
                 <h2 id="call-detail-title">Call details</h2>
-                <p id="call-detail-description">{selectedCall.from_number} to {selectedCall.to_number}</p>
+                <p id="call-detail-description">{isBrowserConversation(selectedCall) ? 'Voice Playground browser test' : `${selectedCall.from_number} to ${selectedCall.to_number}`}</p>
                 <div className={styles.detailStatus}>
                   <span className={`badge ${statusBadge(selectedCall.status)}`}>{selectedCall.status.replace(/_/g, ' ')}</span>
                   {metadataLanguages.map((language) => <span className="badge badge-info" key={language}><Globe2 size={10} /> Configured {languageName(language)}</span>)}
@@ -570,6 +602,7 @@ export default function Calls() {
                   <div><dt>Direction</dt><dd>{selectedCall.direction}</dd></div>
                   <div><dt>Duration</dt><dd>{formatDuration(selectedCall.duration_seconds)}</dd></div>
                   <div><dt>Provider</dt><dd>{selectedCall.provider}</dd></div>
+                  <div><dt>Channel</dt><dd>{isBrowserConversation(selectedCall) ? 'Browser test' : 'Phone'}</dd></div>
                   <div><dt>Started</dt><dd>{formatDate(selectedCall.started_at)}</dd></div>
                   <div><dt>Answered</dt><dd>{formatDate(selectedCall.answered_at)}</dd></div>
                   <div><dt>Ended</dt><dd>{formatDate(selectedCall.ended_at)}</dd></div>

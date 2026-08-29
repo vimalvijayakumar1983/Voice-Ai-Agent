@@ -95,7 +95,47 @@ def _parse_timestamp(value: object) -> datetime | None:
 
 
 def _smallest_direction(conversation_type: str) -> str:
-    return "inbound" if "Inbound" in conversation_type else "outbound"
+    normalized = "".join(
+        character for character in conversation_type.lower() if character.isalnum()
+    )
+    if normalized in {"webcall", "web", "chat"}:
+        return "inbound"
+    return "inbound" if "inbound" in normalized else "outbound"
+
+
+def _smallest_conversation_type(metadata: dict, variables: dict) -> str:
+    """Resolve the provider channel, including its reserved web-call variable."""
+    raw_value = next(
+        (
+            value.strip()
+            for value in (
+                metadata.get("conversationType"),
+                variables.get("conversation_type"),
+            )
+            if isinstance(value, str) and value.strip()
+        ),
+        "telephonyOutbound",
+    )
+    normalized = "".join(character for character in raw_value.lower() if character.isalnum())
+    canonical = {
+        "telephonyinbound": "telephonyInbound",
+        "telephonyoutbound": "telephonyOutbound",
+        "web": "webcall",
+        "webcall": "webcall",
+        "chat": "chat",
+    }
+    return canonical.get(normalized, raw_value.strip()[:100])
+
+
+def _smallest_channel(conversation_type: str) -> str:
+    normalized = "".join(
+        character for character in conversation_type.lower() if character.isalnum()
+    )
+    if normalized in {"web", "webcall"}:
+        return "browser"
+    if normalized == "chat":
+        return "chat"
+    return "phone"
 
 
 async def _acquire_provider_callback_db_lock(db: AsyncSession, identity: str) -> None:
@@ -541,7 +581,7 @@ async def _process_smallest_webhook(
     call_data = metadata.get("callData") or {}
     if not isinstance(call_data, dict):
         call_data = {}
-    conversation_type = str(metadata.get("conversationType") or "telephonyOutbound")
+    conversation_type = _smallest_conversation_type(metadata, variables)
 
     # Smallest pre-conversation webhooks do not include variables. If this
     # event wins the race with our outbound API response, creating a second
@@ -597,6 +637,8 @@ async def _process_smallest_webhook(
 
     call_metadata = dict(call.call_metadata or {})
     call_metadata.setdefault("agent_configuration", agent_configuration_snapshot(agent))
+    call_metadata.setdefault("conversation_type", conversation_type)
+    call_metadata.setdefault("channel", _smallest_channel(conversation_type))
     deliveries = list(call_metadata.get("smallest_webhook_deliveries", []))
     delivery_id = payload.get("id")
     if delivery_id and delivery_id not in deliveries:

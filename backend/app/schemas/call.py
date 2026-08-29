@@ -87,6 +87,24 @@ class CallOutbound(BaseModel):
         return validate_provider_variables(value, label="Call context") or {}
 
 
+class BrowserConversationRegister(BaseModel):
+    agent_id: UUID
+    provider_call_id: str = Field(
+        min_length=1,
+        max_length=100,
+        pattern=r"^[A-Za-z0-9._:-]+$",
+    )
+
+    model_config = {"extra": "forbid"}
+
+
+class ProviderHistorySyncResponse(BaseModel):
+    scanned: int
+    imported: int
+    updated: int
+    failed: int
+
+
 class CallTranscriptResponse(BaseModel):
     id: UUID
     call_id: UUID

@@ -11,6 +11,7 @@ from sqlalchemy import event, select
 from app.api.v1.endpoints import agents as agents_endpoint
 from app.api.v1.endpoints import calls as calls_endpoint
 from app.models.agent import Agent, AgentKnowledgeBinding, KnowledgeBase
+from app.models.call import Call, CallSummary, CallTranscript
 from app.providers.smallest import BrowserSession, SmallestAIClient, SmallestAIError
 from app.services.agent_catalog_cache import public_agent_catalog_cache
 from app.tasks.call_tasks import reconcile_call_dispatch, reconcile_direct_call_terminal
@@ -2382,3 +2383,117 @@ async def test_cross_region_language_set_is_not_rejected_without_voice_evidence(
     assert response.status_code == 201
     assert response.json()["supported_languages"] == ["en", "ml", "fr"]
     assert response.json()["language_switching_enabled"] is True
+
+
+@pytest.mark.asyncio
+async def test_browser_session_start_is_registered_once_in_conversation_history(
+    client: AsyncClient,
+    auth_headers,
+    tenant,
+    db,
+):
+    agent = Agent(
+        tenant_id=tenant.id,
+        name="Browser conversation agent",
+        system_prompt="Use approved doctor information.",
+        voice_provider="smallest",
+        provider_agent_id="browser-conversation-agent",
+    )
+    db.add(agent)
+    await db.commit()
+
+    payload = {
+        "agent_id": str(agent.id),
+        "provider_call_id": "browser-session-call-123",
+    }
+    created = await client.post(
+        "/api/v1/calls/browser-sessions",
+        headers=auth_headers,
+        json=payload,
+    )
+    replay = await client.post(
+        "/api/v1/calls/browser-sessions",
+        headers=auth_headers,
+        json=payload,
+    )
+
+    assert created.status_code == 200
+    assert replay.status_code == 200
+    assert replay.json()["id"] == created.json()["id"]
+    assert created.json()["direction"] == "inbound"
+    assert created.json()["status"] == "in_progress"
+    assert created.json()["call_metadata"]["conversation_type"] == "webcall"
+    assert created.json()["call_metadata"]["channel"] == "browser"
+    calls = (await db.scalars(select(Call))).all()
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_provider_history_sync_backfills_browser_transcript_and_summary(
+    client: AsyncClient,
+    auth_headers,
+    tenant,
+    db,
+    monkeypatch,
+):
+    class FakeHistoryClient:
+        async def list_web_conversation_logs(self, *, agent_id: str, limit: int):
+            assert agent_id == "history-provider-agent"
+            assert limit == 50
+            return [
+                {
+                    "callId": "CALL-history-123",
+                    "callType": "webcall",
+                    "callStatus": "completed",
+                    "callDurationMs": 19000,
+                    "agentId": agent_id,
+                    "timestamp": "2026-08-29T11:00:00Z",
+                }
+            ]
+
+        async def get_conversation_log(self, *, call_id: str):
+            assert call_id == "CALL-history-123"
+            return {
+                "callId": call_id,
+                "type": "webcall",
+                "status": "completed",
+                "duration": 19,
+                "transcript": [
+                    {"role": "user", "content": "Tell me about the doctors."},
+                    {"role": "agent", "content": "I can share the doctor directory."},
+                ],
+                "postCallAnalytics": {
+                    "summary": "The caller requested doctor information.",
+                    "dispositionMetrics": [{"value": "answered"}],
+                },
+            }
+
+    monkeypatch.setattr(calls_endpoint, "get_smallest_client", lambda: FakeHistoryClient())
+    agent = Agent(
+        tenant_id=tenant.id,
+        name="History agent",
+        system_prompt="Use approved doctor information.",
+        voice_provider="smallest",
+        provider_agent_id="history-provider-agent",
+    )
+    db.add(agent)
+    await db.commit()
+
+    first = await client.post("/api/v1/calls/sync-provider-history", headers=auth_headers)
+    second = await client.post("/api/v1/calls/sync-provider-history", headers=auth_headers)
+
+    assert first.status_code == 200
+    assert first.json() == {"scanned": 1, "imported": 1, "updated": 0, "failed": 0}
+    assert second.status_code == 200
+    assert second.json() == {"scanned": 1, "imported": 0, "updated": 1, "failed": 0}
+    call = await db.scalar(select(Call).where(Call.provider_call_sid == "CALL-history-123"))
+    assert call is not None
+    assert call.status == "completed"
+    assert call.duration_seconds == 19
+    assert call.disposition == "answered"
+    transcript = await db.scalar(select(CallTranscript).where(CallTranscript.call_id == call.id))
+    summary = await db.scalar(select(CallSummary).where(CallSummary.call_id == call.id))
+    assert transcript is not None
+    assert "Tell me about the doctors." in transcript.full_text
+    assert summary is not None
+    assert summary.summary == "The caller requested doctor information."

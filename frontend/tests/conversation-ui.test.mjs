@@ -69,3 +69,16 @@ test('conversation recording UI uses authenticated blobs with explicit cleanup',
   assert.doesNotMatch(callsPage, /provider_recording_url/);
   assert.doesNotMatch(apiSource, /provider_recording_url:\s*string/);
 });
+
+test('started browser sessions are registered in conversation history', () => {
+  const playgroundPage = readFileSync(new URL('../src/pages/playground.tsx', import.meta.url), 'utf8');
+  const apiSource = readFileSync(new URL('../src/lib/api.ts', import.meta.url), 'utf8');
+
+  assert.match(playgroundPage, /registerBrowserConversation\(selected\.id, event\.call_id\)/);
+  assert.match(apiSource, /\/api\/v1\/calls\/browser-sessions/);
+  assert.match(apiSource, /\/api\/v1\/calls\/sync-provider-history/);
+  assert.match(
+    readFileSync(new URL('../src/pages/calls.tsx', import.meta.url), 'utf8'),
+    /Sync provider history/,
+  );
+});

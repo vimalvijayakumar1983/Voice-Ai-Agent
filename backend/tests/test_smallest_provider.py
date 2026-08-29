@@ -49,6 +49,39 @@ async def test_create_agent_and_browser_session_contract():
 
 
 @pytest.mark.asyncio
+async def test_conversation_history_contract_is_bounded_and_fetches_details():
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path.endswith("/analytics/call-counts-log"):
+            return httpx.Response(
+                200,
+                json={"data": {"calls": [{"callId": "CALL-123", "callType": "webcall"}]}},
+            )
+        return httpx.Response(
+            200,
+            json={"data": {"callId": "CALL-123", "type": "webcall", "status": "completed"}},
+        )
+
+    client = SmallestAIClient(
+        api_key="sk_test",
+        base_url="https://api.smallest.ai/atoms/v1",
+        transport=httpx.MockTransport(handler),
+    )
+
+    logs = await client.list_web_conversation_logs(agent_id="agent-123", limit=500)
+    detail = await client.get_conversation_log(call_id="CALL-123")
+
+    assert logs == [{"callId": "CALL-123", "callType": "webcall"}]
+    assert detail["status"] == "completed"
+    assert requests[0].url.params["agentId"] == "agent-123"
+    assert requests[0].url.params["callType"] == "webcall"
+    assert requests[0].url.params["limit"] == "100"
+    assert requests[1].url.path == "/atoms/v1/conversation/CALL-123"
+
+
+@pytest.mark.asyncio
 async def test_delete_agent_uses_archive_endpoint_and_is_idempotent_when_absent():
     requests: list[httpx.Request] = []
     responses = iter(
