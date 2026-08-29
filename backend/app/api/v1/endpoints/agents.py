@@ -711,6 +711,55 @@ def _provider_configuration_mismatch_sets(
     )
 
 
+def _provider_tool_refs(provider_agent: dict) -> tuple[str, ...] | None:
+    """Return published tool references, preserving invalid state as None."""
+    resolved = provider_agent.get("_resolvedConfig")
+    configurations = [resolved, provider_agent] if isinstance(resolved, dict) else [provider_agent]
+    for configuration in configurations:
+        if "toolRefs" not in configuration:
+            continue
+        raw_refs = configuration["toolRefs"]
+        if raw_refs is None:
+            return ()
+        if not isinstance(raw_refs, list) or any(
+            not isinstance(ref, str) or not ref.strip() for ref in raw_refs
+        ):
+            return None
+        return tuple(dict.fromkeys(raw_refs))
+    return ()
+
+
+def _operator_verified_knowledge_tool_ref_delta(
+    original_provider_agent: dict,
+    published_provider_agent: dict,
+    active_provider_agent: dict,
+    *,
+    expected_knowledge_base_id: str | None,
+) -> bool:
+    """Accept one operator-created KB tool-ref delta when Smallest omits expansion.
+
+    Smallest's current agent response can expose the live Knowledge Base system tool
+    only through _resolvedConfig.toolRefs while omitting both the expanded
+    knowledge_base_search tool and the documented top-level KB field. This fallback
+    is intentionally limited to configuration-recovery verification: published and
+    active refs must agree, every other field is checked separately, and exactly one
+    ref must have been added or removed from the failed revision.
+    """
+    original_refs = _provider_tool_refs(original_provider_agent)
+    published_refs = _provider_tool_refs(published_provider_agent)
+    active_refs = _provider_tool_refs(active_provider_agent)
+    if None in (original_refs, published_refs, active_refs):
+        return False
+    if published_refs != active_refs:
+        return False
+
+    original_set = set(original_refs)
+    current_set = set(published_refs)
+    if expected_knowledge_base_id is None:
+        return current_set < original_set and len(original_set - current_set) == 1
+    return original_set < current_set and len(current_set - original_set) == 1
+
+
 async def _mark_publish_failure(
     db: AsyncSession,
     *,
@@ -1203,6 +1252,7 @@ async def _reconcile_smallest_config_mismatch(
         configuration_mismatches: list[str] = []
         published_configuration_mismatches: list[str] = []
         active_configuration_mismatches: list[str] = []
+        knowledge_binding_verification: str | None = None
         if revision_status == "published" and security_status == "passed":
             published_provider_agent = await client.get_agent(
                 provider_agent_id,
@@ -1218,6 +1268,26 @@ async def _reconcile_smallest_config_mismatch(
                 active_provider_agent,
                 expected_configuration,
             )
+            knowledge_only = {"global_knowledge_base_id"}
+            if (
+                set(configuration_mismatches) == knowledge_only
+                and set(published_configuration_mismatches) == knowledge_only
+                and set(active_configuration_mismatches) == knowledge_only
+            ):
+                original_provider_agent = await client.get_agent(
+                    provider_agent_id,
+                    version_id=original_revision_id,
+                )
+                if _operator_verified_knowledge_tool_ref_delta(
+                    original_provider_agent,
+                    published_provider_agent,
+                    active_provider_agent,
+                    expected_knowledge_base_id=expected_knowledge_base_id,
+                ):
+                    configuration_mismatches = []
+                    published_configuration_mismatches = []
+                    active_configuration_mismatches = []
+                    knowledge_binding_verification = "operator_tool_ref_delta"
     except SmallestAIError as exc:
         agent = await _tenant_agent(db, agent_id, tenant_id, for_update=True)
         if _provider_config_recovery_is_current(agent, operation_id):
@@ -1308,6 +1378,7 @@ async def _reconcile_smallest_config_mismatch(
         configuration_mismatches=configuration_mismatches,
         published_configuration_mismatches=published_configuration_mismatches,
         active_configuration_mismatches=active_configuration_mismatches,
+        knowledge_binding_verification=knowledge_binding_verification,
         recovery_last_error=None,
         last_error=last_error,
         last_checked_at=now.isoformat(),
