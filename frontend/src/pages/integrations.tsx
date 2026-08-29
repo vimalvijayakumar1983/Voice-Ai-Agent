@@ -2,6 +2,8 @@ import { FormEvent, Fragment, useEffect, useState } from 'react';
 import {
   CheckCircle2,
   CircleAlert,
+  Database,
+  FileSpreadsheet,
   KeyRound,
   Loader2,
   Pencil,
@@ -28,10 +30,74 @@ interface IntegrationForm {
   isActive: boolean;
 }
 
+type AppointmentIntegrationType = 'his_api' | 'vav_crm' | 'google_sheets';
+
+interface AppointmentConnectorForm {
+  integrationType: AppointmentIntegrationType;
+  name: string;
+  baseUrl: string;
+  authType: 'bearer' | 'api_key';
+  apiKeyHeader: string;
+  credential: string;
+  availabilityPath: string;
+  createPath: string;
+  reschedulePath: string;
+  cancelPath: string;
+  spreadsheetId: string;
+  sheetName: string;
+  tableName: string;
+  credentials: string;
+  isActive: boolean;
+}
+
 interface PageNotice {
   type: 'success' | 'error';
   text: string;
 }
+
+const EMPTY_APPOINTMENT_FORM: AppointmentConnectorForm = {
+  integrationType: 'his_api',
+  name: '',
+  baseUrl: '',
+  authType: 'bearer',
+  apiKeyHeader: 'X-API-Key',
+  credential: '',
+  availabilityPath: '',
+  createPath: '',
+  reschedulePath: '',
+  cancelPath: '',
+  spreadsheetId: '',
+  sheetName: 'Appointment Requests',
+  tableName: 'AppointmentRequests',
+  credentials: '',
+  isActive: true,
+};
+
+const APPOINTMENT_CONNECTORS: Array<{
+  type: AppointmentIntegrationType;
+  name: string;
+  description: string;
+  semantics: string;
+}> = [
+  {
+    type: 'his_api',
+    name: 'Hospital HIS API',
+    description: 'Check live schedules and create, reschedule, or cancel appointments.',
+    semantics: 'May confirm a slot only after the HIS returns a booking confirmation.',
+  },
+  {
+    type: 'vav_crm',
+    name: 'VAV CRM API',
+    description: 'Create appointment requests or confirmations through your CRM API.',
+    semantics: 'Confirmation depends on the capabilities exposed by the configured CRM paths.',
+  },
+  {
+    type: 'google_sheets',
+    name: 'Google Sheets',
+    description: 'Write a minimum-data appointment request for staff follow-up.',
+    semantics: 'Request register only. It never locks or confirms a clinical appointment slot.',
+  },
+];
 
 const EMPTY_FORM: IntegrationForm = {
   name: '',
@@ -60,7 +126,6 @@ const PLANNED_INTEGRATIONS = [
   { name: 'Salesforce', description: 'Account, lead, and activity synchronization.' },
   { name: 'Zapier', description: 'No-code automation across connected business apps.' },
   { name: 'Slack', description: 'Operational alerts and review notifications.' },
-  { name: 'Google Sheets', description: 'Governed call-data exports for operations teams.' },
 ];
 
 function messageFrom(error: unknown, fallback: string) {
@@ -98,12 +163,16 @@ function deliveryBadge(status: IntegrationDelivery['status']) {
 
 export default function Integrations() {
   const [integrations, setIntegrations] = useState<Integration[]>([]);
+  const [appointmentIntegrations, setAppointmentIntegrations] = useState<Integration[]>([]);
   const [canManage, setCanManage] = useState(false);
   const [loading, setLoading] = useState(true);
   const [reloadKey, setReloadKey] = useState(0);
   const [loadError, setLoadError] = useState('');
   const [notice, setNotice] = useState<PageNotice | null>(null);
   const [showForm, setShowForm] = useState(false);
+  const [showAppointmentForm, setShowAppointmentForm] = useState(false);
+  const [appointmentForm, setAppointmentForm] = useState<AppointmentConnectorForm>(EMPTY_APPOINTMENT_FORM);
+  const [appointmentFormError, setAppointmentFormError] = useState('');
   const [editingId, setEditingId] = useState<string | null>(null);
   const [form, setForm] = useState<IntegrationForm>(EMPTY_FORM);
   const [formError, setFormError] = useState('');
@@ -119,6 +188,7 @@ export default function Integrations() {
         if (!active) return;
         const webhookIntegrations = items.filter((item) => item.integration_type === 'webhook');
         setIntegrations(webhookIntegrations);
+        setAppointmentIntegrations(items.filter((item) => item.integration_type !== 'webhook'));
         setCanManage(user.role === 'owner' || user.role === 'admin');
         setLoadError('');
         void Promise.allSettled(webhookIntegrations.map((integration) => (
@@ -137,7 +207,7 @@ export default function Integrations() {
         });
       })
       .catch((error) => {
-        if (active) setLoadError(messageFrom(error, 'Could not load webhook integrations.'));
+        if (active) setLoadError(messageFrom(error, 'Could not load integrations.'));
       })
       .finally(() => {
         if (active) setLoading(false);
@@ -146,6 +216,140 @@ export default function Integrations() {
       active = false;
     };
   }, [reloadKey]);
+
+  const openAppointmentCreate = (integrationType: AppointmentIntegrationType) => {
+    const connector = APPOINTMENT_CONNECTORS.find((item) => item.type === integrationType);
+    setAppointmentForm({
+      ...EMPTY_APPOINTMENT_FORM,
+      integrationType,
+      name: connector?.name ?? '',
+    });
+    setAppointmentFormError('');
+    setNotice(null);
+    setShowAppointmentForm(true);
+    setShowForm(false);
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+
+  const closeAppointmentForm = () => {
+    setShowAppointmentForm(false);
+    setAppointmentForm(EMPTY_APPOINTMENT_FORM);
+    setAppointmentFormError('');
+  };
+
+  const saveAppointmentIntegration = async (event: FormEvent) => {
+    event.preventDefault();
+    setAppointmentFormError('');
+    setNotice(null);
+
+    const name = appointmentForm.name.trim();
+    if (!name) {
+      setAppointmentFormError('Give this connector a recognizable name.');
+      return;
+    }
+
+    let config: Record<string, unknown>;
+    if (appointmentForm.integrationType === 'google_sheets') {
+      if (!appointmentForm.spreadsheetId.trim() || !appointmentForm.sheetName.trim()) {
+        setAppointmentFormError('Enter the spreadsheet ID and appointment-request tab name.');
+        return;
+      }
+      let credentials: Record<string, unknown>;
+      try {
+        credentials = JSON.parse(appointmentForm.credentials);
+      } catch {
+        setAppointmentFormError('Paste valid Google service-account JSON.');
+        return;
+      }
+      config = {
+        spreadsheet_id: appointmentForm.spreadsheetId.trim(),
+        sheet_name: appointmentForm.sheetName.trim(),
+        table_name: appointmentForm.tableName.trim() || 'AppointmentRequests',
+        credentials,
+      };
+    } else {
+      const baseUrl = validatePublicHttpsUrl(appointmentForm.baseUrl.trim());
+      if (!baseUrl) {
+        setAppointmentFormError('Enter a public HTTPS API base URL.');
+        return;
+      }
+      if (appointmentForm.credential.trim().length < 16) {
+        setAppointmentFormError('The API credential must contain at least 16 characters.');
+        return;
+      }
+      if (
+        !appointmentForm.createPath.startsWith('/')
+        || (
+          appointmentForm.integrationType === 'his_api'
+          && !appointmentForm.availabilityPath.startsWith('/')
+        )
+      ) {
+        setAppointmentFormError(
+          appointmentForm.integrationType === 'his_api'
+            ? 'HIS availability and create paths must begin with /.'
+            : 'The CRM create path must begin with /.',
+        );
+        return;
+      }
+      config = {
+        base_url: baseUrl,
+        auth_type: appointmentForm.authType,
+        credential: appointmentForm.credential,
+        create_path: appointmentForm.createPath.trim(),
+      };
+      if (appointmentForm.authType === 'api_key') {
+        config.api_key_header = appointmentForm.apiKeyHeader.trim() || 'X-API-Key';
+      }
+      if (appointmentForm.availabilityPath.trim()) {
+        config.availability_path = appointmentForm.availabilityPath.trim();
+      }
+      if (appointmentForm.reschedulePath.trim()) {
+        config.reschedule_path = appointmentForm.reschedulePath.trim();
+      }
+      if (appointmentForm.cancelPath.trim()) {
+        config.cancel_path = appointmentForm.cancelPath.trim();
+      }
+    }
+
+    setWorking('create-appointment-connector');
+    try {
+      const staged = await api.createIntegration({
+        name,
+        integration_type: appointmentForm.integrationType,
+        config,
+      });
+      const created = appointmentForm.isActive
+        ? staged
+        : await api.updateIntegration(staged.id, { is_active: false });
+      setAppointmentIntegrations((current) => [created, ...current]);
+      setNotice({
+        type: 'success',
+        text: `${created.name} was saved securely. It is not assigned to an agent until the appointment tool is enabled for that agent.`,
+      });
+      closeAppointmentForm();
+    } catch (error) {
+      setAppointmentFormError(messageFrom(error, 'Could not save the appointment connector.'));
+    } finally {
+      setWorking('');
+    }
+  };
+
+  const deleteAppointmentIntegration = async (integration: Integration) => {
+    if (!window.confirm(`Delete ${integration.name}? Agents using it must be reassigned.`)) return;
+    setWorking(`delete-${integration.id}`);
+    setNotice(null);
+    try {
+      await api.deleteIntegration(integration.id);
+      setAppointmentIntegrations((current) => (
+        current.filter((item) => item.id !== integration.id)
+      ));
+      setNotice({ type: 'success', text: `${integration.name} was deleted.` });
+    } catch (error) {
+      setNotice({ type: 'error', text: messageFrom(error, 'Could not delete the connector.') });
+    } finally {
+      setWorking('');
+    }
+  };
 
   const openCreate = () => {
     setEditingId(null);
@@ -362,7 +566,7 @@ export default function Integrations() {
           <span className="page-kicker">Connect & automate</span>
           <h1>Integrations</h1>
           <p className="page-subtitle">
-            Deliver signed post-call events to your systems without exposing stored credentials.
+            Connect appointment systems and deliver signed post-call events without exposing credentials.
           </p>
         </div>
         {canManage && (
@@ -391,6 +595,275 @@ export default function Integrations() {
           <ShieldCheck size={15} />
           <span>You can review destinations. An owner or admin can create, edit, or delete them.</span>
         </div>
+      )}
+
+      {showAppointmentForm && canManage && (
+        <section className="card integration-form-panel" aria-labelledby="appointment-form-title">
+          <div className="integration-form-heading">
+            <span className="integration-heading-icon">
+              {appointmentForm.integrationType === 'google_sheets'
+                ? <FileSpreadsheet size={18} />
+                : <Database size={18} />}
+            </span>
+            <div>
+              <span className="page-kicker">Appointment destination</span>
+              <h2 id="appointment-form-title">
+                Connect {APPOINTMENT_CONNECTORS.find(
+                  (item) => item.type === appointmentForm.integrationType,
+                )?.name}
+              </h2>
+              <p>Credentials and destination identifiers are encrypted and write-only.</p>
+            </div>
+          </div>
+
+          {appointmentFormError && (
+            <div className="auth-error integration-form-error" role="alert">
+              {appointmentFormError}
+            </div>
+          )}
+
+          <form onSubmit={saveAppointmentIntegration}>
+            <fieldset className="integration-fieldset" disabled={Boolean(working)}>
+              <div className="form-group">
+                <label htmlFor="appointment-connector-name">Connector name</label>
+                <input
+                  id="appointment-connector-name"
+                  required
+                  maxLength={255}
+                  autoComplete="off"
+                  value={appointmentForm.name}
+                  onChange={(event) => setAppointmentForm({
+                    ...appointmentForm,
+                    name: event.target.value,
+                  })}
+                />
+              </div>
+
+              {appointmentForm.integrationType === 'google_sheets' ? (
+                <>
+                  <div className="form-grid">
+                    <div className="form-group">
+                      <label htmlFor="spreadsheet-id">Spreadsheet ID</label>
+                      <input
+                        id="spreadsheet-id"
+                        required
+                        autoComplete="off"
+                        value={appointmentForm.spreadsheetId}
+                        placeholder="From the Google Sheets URL"
+                        onChange={(event) => setAppointmentForm({
+                          ...appointmentForm,
+                          spreadsheetId: event.target.value,
+                        })}
+                      />
+                    </div>
+                    <div className="form-group">
+                      <label htmlFor="sheet-name">Appointment tab</label>
+                      <input
+                        id="sheet-name"
+                        required
+                        value={appointmentForm.sheetName}
+                        onChange={(event) => setAppointmentForm({
+                          ...appointmentForm,
+                          sheetName: event.target.value,
+                        })}
+                      />
+                    </div>
+                    <div className="form-group">
+                      <label htmlFor="table-name">Table name</label>
+                      <input
+                        id="table-name"
+                        value={appointmentForm.tableName}
+                        onChange={(event) => setAppointmentForm({
+                          ...appointmentForm,
+                          tableName: event.target.value,
+                        })}
+                      />
+                    </div>
+                  </div>
+                  <div className="form-group integration-secret-field">
+                    <label htmlFor="google-credentials">
+                      Service-account JSON <span>write-only</span>
+                    </label>
+                    <textarea
+                      id="google-credentials"
+                      required
+                      rows={7}
+                      autoComplete="off"
+                      value={appointmentForm.credentials}
+                      placeholder='{"type":"service_account",...}'
+                      onChange={(event) => setAppointmentForm({
+                        ...appointmentForm,
+                        credentials: event.target.value,
+                      })}
+                    />
+                    <p className="form-hint">
+                      Share only the appointment sheet with this service account. Do not grant
+                      access to other Drive files.
+                    </p>
+                  </div>
+                  <div className="integration-access-note" role="note">
+                    <CircleAlert size={15} />
+                    <span>
+                      Google Sheets stores a request for staff review. The agent must not say a
+                      slot is confirmed.
+                    </span>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div className="form-grid">
+                    <div className="form-group">
+                      <label htmlFor="appointment-base-url">Public HTTPS API base URL</label>
+                      <input
+                        id="appointment-base-url"
+                        required
+                        type="url"
+                        value={appointmentForm.baseUrl}
+                        placeholder="https://api.example.com"
+                        onChange={(event) => setAppointmentForm({
+                          ...appointmentForm,
+                          baseUrl: event.target.value,
+                        })}
+                      />
+                    </div>
+                    <div className="form-group">
+                      <label htmlFor="appointment-auth-type">Authentication</label>
+                      <select
+                        id="appointment-auth-type"
+                        value={appointmentForm.authType}
+                        onChange={(event) => setAppointmentForm({
+                          ...appointmentForm,
+                          authType: event.target.value as 'bearer' | 'api_key',
+                        })}
+                      >
+                        <option value="bearer">Bearer token</option>
+                        <option value="api_key">API key header</option>
+                      </select>
+                    </div>
+                    {appointmentForm.authType === 'api_key' && (
+                      <div className="form-group">
+                        <label htmlFor="appointment-key-header">API key header</label>
+                        <input
+                          id="appointment-key-header"
+                          value={appointmentForm.apiKeyHeader}
+                          onChange={(event) => setAppointmentForm({
+                            ...appointmentForm,
+                            apiKeyHeader: event.target.value,
+                          })}
+                        />
+                      </div>
+                    )}
+                    <div className="form-group integration-secret-field">
+                      <label htmlFor="appointment-credential">
+                        API credential <span>write-only</span>
+                      </label>
+                      <input
+                        id="appointment-credential"
+                        required
+                        type="password"
+                        minLength={16}
+                        autoComplete="new-password"
+                        value={appointmentForm.credential}
+                        onChange={(event) => setAppointmentForm({
+                          ...appointmentForm,
+                          credential: event.target.value,
+                        })}
+                      />
+                    </div>
+                  </div>
+                  <div className="form-grid">
+                    <div className="form-group">
+                      <label htmlFor="availability-path">
+                        Availability path
+                        {appointmentForm.integrationType === 'his_api' ? ' (required)' : ''}
+                      </label>
+                      <input
+                        id="availability-path"
+                        required={appointmentForm.integrationType === 'his_api'}
+                        value={appointmentForm.availabilityPath}
+                        placeholder="/v1/appointments/availability"
+                        onChange={(event) => setAppointmentForm({
+                          ...appointmentForm,
+                          availabilityPath: event.target.value,
+                        })}
+                      />
+                    </div>
+                    <div className="form-group">
+                      <label htmlFor="create-path">Create appointment/request path</label>
+                      <input
+                        id="create-path"
+                        required
+                        value={appointmentForm.createPath}
+                        placeholder="/v1/appointments"
+                        onChange={(event) => setAppointmentForm({
+                          ...appointmentForm,
+                          createPath: event.target.value,
+                        })}
+                      />
+                    </div>
+                    <div className="form-group">
+                      <label htmlFor="reschedule-path">Reschedule path (optional)</label>
+                      <input
+                        id="reschedule-path"
+                        value={appointmentForm.reschedulePath}
+                        placeholder="/v1/appointments/{appointment_id}"
+                        onChange={(event) => setAppointmentForm({
+                          ...appointmentForm,
+                          reschedulePath: event.target.value,
+                        })}
+                      />
+                    </div>
+                    <div className="form-group">
+                      <label htmlFor="cancel-path">Cancel path (optional)</label>
+                      <input
+                        id="cancel-path"
+                        value={appointmentForm.cancelPath}
+                        placeholder="/v1/appointments/{appointment_id}/cancel"
+                        onChange={(event) => setAppointmentForm({
+                          ...appointmentForm,
+                          cancelPath: event.target.value,
+                        })}
+                      />
+                    </div>
+                  </div>
+                </>
+              )}
+
+              <label className="toggle-control">
+                <input
+                  type="checkbox"
+                  checked={appointmentForm.isActive}
+                  onChange={(event) => setAppointmentForm({
+                    ...appointmentForm,
+                    isActive: event.target.checked,
+                  })}
+                />
+                <span aria-hidden="true" />
+                <div>
+                  <strong>Active configuration</strong>
+                  <small>
+                    Agent assignment is a separate step; saving does not silently enable calls.
+                  </small>
+                </div>
+              </label>
+            </fieldset>
+
+            <div className="integration-form-actions">
+              <button
+                type="button"
+                className="btn btn-secondary"
+                onClick={closeAppointmentForm}
+                disabled={Boolean(working)}
+              >
+                Cancel
+              </button>
+              <button type="submit" className="btn btn-primary" disabled={Boolean(working)}>
+                {working ? <Loader2 className="spin" size={14} /> : <ShieldCheck size={14} />}
+                {working ? 'Saving…' : 'Save connector'}
+              </button>
+            </div>
+          </form>
+        </section>
       )}
 
       {showForm && canManage && (
@@ -529,6 +1002,93 @@ export default function Integrations() {
         </div>
       ) : (
         <>
+          <section
+            className="integration-section"
+            aria-labelledby="appointment-connectors-title"
+          >
+            <div className="section-heading-row">
+              <div>
+                <h2 id="appointment-connectors-title">Appointment connectors</h2>
+                <p>
+                  Choose the system of record. VAV keeps credentials encrypted and assigns the
+                  connector to an agent in a separate, explicit step.
+                </p>
+              </div>
+              <span className="badge badge-info">Healthcare workflow</span>
+            </div>
+
+            <div className="planned-integration-grid">
+              {APPOINTMENT_CONNECTORS.map((connector) => (
+                <article className="planned-integration-card" key={connector.type}>
+                  <div>
+                    <h3>{connector.name}</h3>
+                    <span className="badge badge-success">Available</span>
+                  </div>
+                  <p>{connector.description}</p>
+                  <p className="form-hint">{connector.semantics}</p>
+                  {canManage && (
+                    <button
+                      className="btn btn-secondary btn-sm"
+                      type="button"
+                      onClick={() => openAppointmentCreate(connector.type)}
+                    >
+                      <Plus size={13} /> Configure
+                    </button>
+                  )}
+                </article>
+              ))}
+            </div>
+
+            {appointmentIntegrations.length > 0 && (
+              <div className="integration-list">
+                {appointmentIntegrations.map((integration) => (
+                  <article className="integration-row" key={integration.id}>
+                    <span className="integration-row-icon">
+                      {integration.integration_type === 'google_sheets'
+                        ? <FileSpreadsheet size={17} />
+                        : <Database size={17} />}
+                    </span>
+                    <div className="integration-row-main">
+                      <div className="integration-row-title">
+                        <h3>{integration.name}</h3>
+                        <span
+                          className={`badge ${
+                            integration.is_active ? 'badge-success' : 'badge-neutral'
+                          }`}
+                        >
+                          {integration.is_active ? 'Active config' : 'Inactive'}
+                        </span>
+                      </div>
+                      <p>
+                        {integration.integration_type === 'google_sheets'
+                          ? `Request register · ${configString(integration, 'sheet_name')}`
+                          : `API connector · ${configString(integration, 'auth_type')}`}
+                      </p>
+                      <span className="settings-secondary-value">
+                        Saved securely · not assigned to an agent automatically
+                      </span>
+                    </div>
+                    {canManage && (
+                      <div className="integration-row-actions">
+                        <button
+                          className="btn btn-danger btn-sm"
+                          type="button"
+                          disabled={Boolean(working)}
+                          onClick={() => void deleteAppointmentIntegration(integration)}
+                        >
+                          {working === `delete-${integration.id}`
+                            ? <Loader2 className="spin" size={12} />
+                            : <Trash2 size={12} />}
+                          Delete
+                        </button>
+                      </div>
+                    )}
+                  </article>
+                ))}
+              </div>
+            )}
+          </section>
+
           <section className="integration-section" aria-labelledby="webhook-destinations-title">
             <div className="section-heading-row">
               <div>
