@@ -307,8 +307,14 @@ async def test_delete_grouped_url_source_removes_provider_and_local_group(
                     "_id": "provider-scrape-batch-1",
                     "hostUrl": "https://aecmc.com/",
                     "scrapedUrls": [
-                        "https://aecmc.com/doctors",
-                        "https://aecmc.com/treatments/botox/en",
+                        {
+                            "_id": "provider-scraped-page-1",
+                            "url": "https://aecmc.com/doctors",
+                        },
+                        {
+                            "_id": "provider-scraped-page-2",
+                            "url": "https://aecmc.com/treatments/botox/en",
+                        },
                     ],
                     "processingStatus": "completed",
                 }
@@ -357,11 +363,11 @@ async def test_delete_grouped_url_source_removes_provider_and_local_group(
             name=url,
             location=url,
             status="indexed",
-            provider_item_id="provider-scrape-batch-1",
+            provider_item_id=provider_item_id,
         )
-        for url in (
-            "https://aecmc.com/doctors",
-            "https://aecmc.com/treatments/botox/en",
+        for url, provider_item_id in (
+            ("https://aecmc.com/doctors", "provider-scraped-page-1"),
+            ("https://aecmc.com/treatments/botox/en", "provider-scraped-page-2"),
         )
     ]
     pdf_source = KnowledgeSource(

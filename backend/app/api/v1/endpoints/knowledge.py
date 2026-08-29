@@ -371,31 +371,43 @@ def _provider_source_delete_target(
     items: list[dict],
 ) -> tuple[str, str] | None:
     """Resolve the provider collection and ID used to delete one local source."""
-    expanded_scraped = _expand_scraped_provider_items(scraped)
-    scraped_by_id = {
-        str(item.get("_id") or item.get("id")): item
-        for item in expanded_scraped
-        if item.get("_id") or item.get("id")
+    scraped_batches_by_id = {
+        str(batch.get("_id") or batch.get("id")): batch
+        for batch in scraped
+        if batch.get("_id") or batch.get("id")
     }
+    scraped_parent_by_child_id: dict[str, str] = {}
+    for batch_id, batch in scraped_batches_by_id.items():
+        nested = batch.get("scrapedUrls")
+        if not isinstance(nested, list):
+            continue
+        for child in nested:
+            if not isinstance(child, dict):
+                continue
+            child_id = str(child.get("_id") or child.get("id") or "")
+            if child_id:
+                scraped_parent_by_child_id[child_id] = batch_id
     items_by_id = {
         str(item.get("_id") or item.get("id")): item
         for item in items
         if item.get("_id") or item.get("id")
     }
-    if source.provider_item_id in scraped_by_id:
+    if source.provider_item_id in scraped_batches_by_id:
         return "scraped", source.provider_item_id
+    if source.provider_item_id in scraped_parent_by_child_id:
+        return "scraped", scraped_parent_by_child_id[source.provider_item_id]
     if source.provider_item_id in items_by_id:
         return "item", source.provider_item_id
 
     if source.location:
         source_key = _provider_url_key(source.location)
-        for item in expanded_scraped:
+        for batch_id, batch in scraped_batches_by_id.items():
             if source_key and any(
-                _provider_url_key(value) == source_key for value in _provider_item_urls(item)
+                _provider_url_key(value) == source_key
+                for item in _expand_scraped_provider_items([batch])
+                for value in _provider_item_urls(item)
             ):
-                provider_id = str(item.get("_id") or item.get("id") or "")
-                if provider_id:
-                    return "scraped", provider_id
+                return "scraped", batch_id
         for item in items:
             if source_key and any(
                 _provider_url_key(value) == source_key for value in _provider_item_urls(item)
@@ -733,8 +745,9 @@ async def delete_knowledge_source(
         if collection == "scraped":
             grouped_url_keys = {
                 key
-                for item in _expand_scraped_provider_items(scraped)
-                if str(item.get("_id") or item.get("id") or "") == provider_item_id
+                for batch in scraped
+                if str(batch.get("_id") or batch.get("id") or "") == provider_item_id
+                for item in _expand_scraped_provider_items([batch])
                 for value in _provider_item_urls(item)
                 if (key := _provider_url_key(value))
             }
