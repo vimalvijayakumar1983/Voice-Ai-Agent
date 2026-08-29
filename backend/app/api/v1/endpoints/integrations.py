@@ -1,9 +1,8 @@
 """Integration management endpoints."""
 
-from uuid import UUID, uuid4
-
 import json
 import re
+from uuid import UUID, uuid4
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, status
