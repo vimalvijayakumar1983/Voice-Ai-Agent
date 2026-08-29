@@ -2088,10 +2088,7 @@ async def get_provider_catalog(
             status_code=502, detail="Could not load the Smallest.ai voice catalog"
         )
 
-    combined_voices = [
-        {"provider": "smallest", **voice}
-        for voice in voices
-    ]
+    combined_voices = [{"provider": "smallest", **voice} for voice in voices]
     sarvam, _, _ = await _tenant_sarvam_client(db, current_user.tenant_id)
     if sarvam.is_configured:
         combined_voices.extend(sarvam_voice_catalog())
