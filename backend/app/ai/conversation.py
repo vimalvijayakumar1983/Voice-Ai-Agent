@@ -1,11 +1,24 @@
 """AI conversation engine - abstraction over LLM providers."""
 
+import inspect
+from collections.abc import AsyncIterator
+from dataclasses import dataclass
+
 import structlog
 from openai import AsyncOpenAI
 
 from app.core.config import settings
 
 logger = structlog.get_logger()
+
+
+@dataclass(frozen=True)
+class ResponseStreamEvent:
+    """One text delta, or the terminal usage event, from an LLM stream."""
+
+    text: str = ""
+    tokens_used: int = 0
+    is_final: bool = False
 
 
 class ConversationEngine:
@@ -63,6 +76,65 @@ class ConversationEngine:
         )
 
         return content, tokens_used
+
+    async def stream_response(
+        self,
+        system_prompt: str,
+        conversation_history: list[dict],
+        model: str = "gpt-4o",
+        temperature: float = 0.7,
+        max_tokens: int = 500,
+        knowledge_context: str | None = None,
+    ) -> AsyncIterator[ResponseStreamEvent]:
+        """Yield response text as OpenAI produces it, followed by usage.
+
+        The terminal event is always emitted after a successful stream, even
+        when the provider omits token usage. Cancelling a voice turn closes
+        the upstream HTTP stream promptly instead of continuing billable work.
+        """
+        messages = [{"role": "system", "content": system_prompt}]
+        if knowledge_context:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": f"Relevant knowledge base context:\n{knowledge_context}",
+                }
+            )
+        messages.extend(conversation_history)
+
+        stream = await self.openai.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            stream=True,
+            stream_options={"include_usage": True},
+        )
+        response_length = 0
+        tokens_used = 0
+        try:
+            async for chunk in stream:
+                usage = getattr(chunk, "usage", None)
+                if usage is not None:
+                    tokens_used = int(getattr(usage, "total_tokens", 0) or 0)
+                for choice in getattr(chunk, "choices", []) or []:
+                    delta = getattr(getattr(choice, "delta", None), "content", None)
+                    if isinstance(delta, str) and delta:
+                        response_length += len(delta)
+                        yield ResponseStreamEvent(text=delta)
+            logger.info(
+                "ai_response_streamed",
+                model=model,
+                tokens=tokens_used,
+                response_length=response_length,
+            )
+            yield ResponseStreamEvent(tokens_used=tokens_used, is_final=True)
+        finally:
+            close = getattr(stream, "close", None)
+            if callable(close):
+                result = close()
+                if inspect.isawaitable(result):
+                    await result
 
     async def generate_call_summary(self, transcript_text: str, model: str = "gpt-4o") -> dict:
         """Generate a structured summary from a call transcript."""

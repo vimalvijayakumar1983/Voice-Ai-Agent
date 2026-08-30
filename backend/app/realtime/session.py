@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
+import re
 import time
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from uuid import UUID
@@ -20,14 +23,17 @@ from app.models.agent import Agent, AgentRuntimeProfile
 from app.models.call import Call, CallTranscript
 from app.realtime.sarvam_stream import (
     SarvamSTTStream,
+    SarvamTTSStream,
+    is_speech_end,
     is_speech_start,
     parse_transcript_event,
-    stream_tts_audio,
 )
 from app.services.knowledge_retrieval import retrieve_knowledge_context
 from app.services.provider_credentials import load_provider_config
 
 logger = structlog.get_logger()
+TTS_MAX_FRAGMENT_CHARS = 120
+_TTS_SENTENCE_BOUNDARY = re.compile(r"(?<=[.!?।])(?:\s+|$)")
 
 
 @dataclass(frozen=True)
@@ -56,6 +62,42 @@ def _language_code(language: str) -> str:
     aliases = {"or": "od"}
     base = aliases.get(normalized.split("-", 1)[0].lower(), normalized.split("-", 1)[0].lower())
     return f"{base}-IN"
+
+
+def split_tts_buffer(value: str, *, final: bool = False) -> tuple[list[str], str]:
+    """Extract sentence-aware low-latency fragments from streamed LLM text."""
+    fragments: list[str] = []
+    remaining = value
+    while remaining:
+        window = remaining[:TTS_MAX_FRAGMENT_CHARS]
+        boundary = _TTS_SENTENCE_BOUNDARY.search(window)
+        if boundary is not None:
+            fragments.append(remaining[: boundary.end()])
+            remaining = remaining[boundary.end() :]
+            continue
+        if len(remaining) >= TTS_MAX_FRAGMENT_CHARS:
+            split_at = window.rfind(" ")
+            if split_at < TTS_MAX_FRAGMENT_CHARS // 2:
+                split_at = TTS_MAX_FRAGMENT_CHARS
+                separator = ""
+            else:
+                separator = " "
+            fragments.append(remaining[:split_at] + separator)
+            remaining = remaining[split_at:].lstrip()
+            continue
+        if final:
+            fragments.append(remaining)
+            remaining = ""
+        break
+    return fragments, remaining
+
+
+def latency_percentile(values: list[int], percentile: float) -> int | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    index = max(0, math.ceil(len(ordered) * percentile) - 1)
+    return ordered[min(index, len(ordered) - 1)]
 
 
 async def load_runtime_session(call_id: UUID) -> RuntimeSessionConfig | None:
@@ -160,7 +202,12 @@ async def _store_metrics(config: RuntimeSessionConfig, metrics: dict) -> None:
             "outbound_audio_bytes": metrics.get("outbound_audio_bytes", 0),
             "barge_in_count": metrics.get("barge_in_count", 0),
             "last_llm_latency_ms": metrics.get("last_llm_latency_ms"),
+            "last_llm_first_token_ms": metrics.get("last_llm_first_token_ms"),
             "last_tts_first_byte_ms": metrics.get("last_tts_first_byte_ms"),
+            "last_transcript_to_first_audio_ms": metrics.get("last_transcript_to_first_audio_ms"),
+            "last_speech_end_to_first_audio_ms": metrics.get("last_speech_end_to_first_audio_ms"),
+            "turn_latency_p50_ms": metrics.get("turn_latency_p50_ms"),
+            "turn_latency_p95_ms": metrics.get("turn_latency_p95_ms"),
             "cost_state": "pending_provider_billing_sync",
         }
         call.call_metadata = metadata
@@ -196,9 +243,19 @@ async def run_twilio_media_session(websocket: WebSocket, config: RuntimeSessionC
     stream_sid: str | None = None
     stop_event = asyncio.Event()
     send_lock = asyncio.Lock()
-    utterances: asyncio.Queue[tuple[str, str | None]] = asyncio.Queue(maxsize=8)
+    utterances: asyncio.Queue[tuple[str, str | None, float, float | None]] = asyncio.Queue(
+        maxsize=8
+    )
     history: list[dict[str, str]] = []
     current_response: asyncio.Task | None = None
+    last_speech_end_at: float | None = None
+    turn_latency_samples: list[int] = []
+    tts = SarvamTTSStream(
+        api_key=config.sarvam_api_key,
+        base_url=settings.sarvam_base_url,
+        speaker=config.speaker,
+        pace=config.speech_rate,
+    )
     metrics: dict[str, int | float | None] = {
         "turn_count": 0,
         "llm_tokens": 0,
@@ -206,7 +263,12 @@ async def run_twilio_media_session(websocket: WebSocket, config: RuntimeSessionC
         "outbound_audio_bytes": 0,
         "barge_in_count": 0,
         "last_llm_latency_ms": None,
+        "last_llm_first_token_ms": None,
         "last_tts_first_byte_ms": None,
+        "last_transcript_to_first_audio_ms": None,
+        "last_speech_end_to_first_audio_ms": None,
+        "turn_latency_p50_ms": None,
+        "turn_latency_p95_ms": None,
     }
 
     async def send_json(payload: dict) -> None:
@@ -217,23 +279,35 @@ async def run_twilio_media_session(websocket: WebSocket, config: RuntimeSessionC
         if stream_sid:
             await send_json({"event": "clear", "streamSid": stream_sid})
 
-    async def play_text(text: str, language_code: str) -> None:
-        first_byte_started = time.perf_counter()
+    async def play_fragments(
+        fragments: AsyncIterator[str],
+        language_code: str,
+        *,
+        first_input_at: Callable[[], float | None],
+        transcript_at: float | None = None,
+        speech_end_at: float | None = None,
+        on_first_audio: Callable[[float], None] | None = None,
+    ) -> None:
         first = True
-        async for audio in stream_tts_audio(
-            api_key=config.sarvam_api_key,
-            base_url=settings.sarvam_base_url,
-            text=text,
-            speaker=config.speaker,
-            language_code=language_code,
-            pace=config.speech_rate,
-        ):
+        async for audio in tts.audio_for(fragments, language_code=language_code):
             if stop_event.is_set() or not stream_sid:
                 return
             if first:
-                metrics["last_tts_first_byte_ms"] = round(
-                    (time.perf_counter() - first_byte_started) * 1000
-                )
+                first_audio_at = time.perf_counter()
+                if on_first_audio is not None:
+                    on_first_audio(first_audio_at)
+                input_at = first_input_at() or first_audio_at
+                metrics["last_tts_first_byte_ms"] = round((first_audio_at - input_at) * 1000)
+                if transcript_at is not None:
+                    metrics["last_transcript_to_first_audio_ms"] = round(
+                        (first_audio_at - transcript_at) * 1000
+                    )
+                if speech_end_at is not None:
+                    speech_latency = round((first_audio_at - speech_end_at) * 1000)
+                    metrics["last_speech_end_to_first_audio_ms"] = speech_latency
+                    turn_latency_samples.append(speech_latency)
+                    metrics["turn_latency_p50_ms"] = latency_percentile(turn_latency_samples, 0.5)
+                    metrics["turn_latency_p95_ms"] = latency_percentile(turn_latency_samples, 0.95)
                 first = False
             metrics["outbound_audio_bytes"] = int(metrics["outbound_audio_bytes"] or 0) + (
                 len(audio) * 3 // 4
@@ -250,7 +324,20 @@ async def run_twilio_media_session(websocket: WebSocket, config: RuntimeSessionC
                 }
             )
 
-    async def handle_turn(text: str, detected_language: str | None) -> None:
+    async def play_text(text: str, language_code: str) -> None:
+        input_at = time.perf_counter()
+
+        async def fragments() -> AsyncIterator[str]:
+            yield text
+
+        await play_fragments(fragments(), language_code, first_input_at=lambda: input_at)
+
+    async def handle_turn(
+        text: str,
+        detected_language: str | None,
+        transcript_at: float,
+        speech_end_at: float | None,
+    ) -> None:
         await _append_turn(config, "user", text)
         history.append({"role": "user", "content": text})
         async with async_session_factory() as db:
@@ -260,30 +347,91 @@ async def run_twilio_media_session(websocket: WebSocket, config: RuntimeSessionC
                 agent_id=config.agent_id,
                 query=text,
             )
-        started = time.perf_counter()
-        try:
-            response, tokens = await conversation_engine.generate_response(
+        llm_started = time.perf_counter()
+        first_tts_input_at: float | None = None
+        response_parts: list[str] = []
+        tokens = 0
+        persisted = False
+        audio_started = False
+        language = (
+            detected_language
+            if detected_language and detected_language != "auto"
+            else config.language_code
+        )
+
+        async def response_fragments() -> AsyncIterator[str]:
+            nonlocal first_tts_input_at, tokens
+            buffer = ""
+            first_token = True
+            async for event in conversation_engine.stream_response(
                 config.system_prompt,
                 history[-12:],
                 model=config.llm_model,
                 temperature=config.temperature,
                 max_tokens=config.max_tokens,
                 knowledge_context=knowledge,
+            ):
+                if event.is_final:
+                    tokens = event.tokens_used
+                    metrics["last_llm_latency_ms"] = round(
+                        (time.perf_counter() - llm_started) * 1000
+                    )
+                    ready, buffer = split_tts_buffer(buffer, final=True)
+                else:
+                    if first_token:
+                        metrics["last_llm_first_token_ms"] = round(
+                            (time.perf_counter() - llm_started) * 1000
+                        )
+                        first_token = False
+                    response_parts.append(event.text)
+                    buffer += event.text
+                    ready, buffer = split_tts_buffer(buffer)
+                for fragment in ready:
+                    if first_tts_input_at is None:
+                        first_tts_input_at = time.perf_counter()
+                    yield fragment
+            if not response_parts:
+                response_parts.append(config.fallback_message)
+                if first_tts_input_at is None:
+                    first_tts_input_at = time.perf_counter()
+                yield config.fallback_message
+
+        async def persist_response() -> None:
+            nonlocal persisted
+            response = "".join(response_parts).strip()
+            if persisted or not response:
+                return
+            history.append({"role": "assistant", "content": response})
+            await _append_turn(config, "assistant", response)
+            persisted = True
+
+        def mark_audio_started(_started_at: float) -> None:
+            nonlocal audio_started
+            audio_started = True
+
+        try:
+            await play_fragments(
+                response_fragments(),
+                language,
+                first_input_at=lambda: first_tts_input_at,
+                transcript_at=transcript_at,
+                speech_end_at=speech_end_at,
+                on_first_audio=mark_audio_started,
             )
+        except asyncio.CancelledError:
+            await persist_response()
+            await _store_metrics(config, metrics)
+            raise
         except Exception:
-            logger.exception("realtime_llm_failed", call_id=str(config.call_id))
-            response, tokens = config.fallback_message, 0
-        metrics["last_llm_latency_ms"] = round((time.perf_counter() - started) * 1000)
+            logger.exception("realtime_streamed_response_failed", call_id=str(config.call_id))
+            metrics["last_llm_latency_ms"] = round((time.perf_counter() - llm_started) * 1000)
+            if not audio_started:
+                response_parts.clear()
+                response_parts.append(config.fallback_message)
+                await play_text(config.fallback_message, language)
         metrics["llm_tokens"] = int(metrics["llm_tokens"] or 0) + int(tokens)
         metrics["turn_count"] = int(metrics["turn_count"] or 0) + 1
-        history.append({"role": "assistant", "content": response})
-        await _append_turn(config, "assistant", response)
-        language = (
-            detected_language
-            if detected_language and detected_language != "auto"
-            else config.language_code
-        )
-        await play_text(response, language)
+        await persist_response()
         await _store_metrics(config, metrics)
 
     async def receive_twilio(stt: SarvamSTTStream) -> None:
@@ -315,34 +463,50 @@ async def run_twilio_media_session(websocket: WebSocket, config: RuntimeSessionC
             stop_event.set()
 
     async def receive_sarvam(stt: SarvamSTTStream) -> None:
-        nonlocal current_response
+        nonlocal current_response, last_speech_end_at
         async for payload in stt.events():
             if stop_event.is_set():
                 return
             if is_speech_start(payload):
+                last_speech_end_at = None
                 if current_response is not None and not current_response.done():
                     current_response.cancel()
                     metrics["barge_in_count"] = int(metrics["barge_in_count"] or 0) + 1
                 await clear_playback()
                 continue
+            if is_speech_end(payload):
+                last_speech_end_at = time.perf_counter()
+                continue
             transcript = parse_transcript_event(payload)
             if transcript and transcript.is_final:
+                transcript_at = time.perf_counter()
+                speech_end_at = last_speech_end_at
+                last_speech_end_at = None
                 try:
-                    utterances.put_nowait((transcript.text, transcript.language_code))
+                    utterances.put_nowait(
+                        (
+                            transcript.text,
+                            transcript.language_code,
+                            transcript_at,
+                            speech_end_at,
+                        )
+                    )
                 except asyncio.QueueFull:
                     logger.warning("realtime_utterance_queue_full", call_id=str(config.call_id))
 
     async def response_worker() -> None:
         nonlocal current_response
         while not stop_event.is_set():
-            text, language = await utterances.get()
+            text, language, transcript_at, speech_end_at = await utterances.get()
             if current_response is not None and not current_response.done():
                 current_response.cancel()
                 try:
                     await current_response
                 except asyncio.CancelledError:
                     pass
-            current_response = asyncio.create_task(handle_turn(text, language))
+            current_response = asyncio.create_task(
+                handle_turn(text, language, transcript_at, speech_end_at)
+            )
             try:
                 await current_response
             except asyncio.CancelledError:
@@ -350,11 +514,14 @@ async def run_twilio_media_session(websocket: WebSocket, config: RuntimeSessionC
             except Exception:
                 logger.exception("realtime_turn_failed", call_id=str(config.call_id))
 
-    async with SarvamSTTStream(
-        api_key=config.sarvam_api_key,
-        base_url=settings.sarvam_base_url,
-        language_code=config.stt_language,
-    ) as stt:
+    async with (
+        SarvamSTTStream(
+            api_key=config.sarvam_api_key,
+            base_url=settings.sarvam_base_url,
+            language_code=config.stt_language,
+        ) as stt,
+        tts,
+    ):
         tasks = [
             asyncio.create_task(receive_twilio(stt)),
             asyncio.create_task(receive_sarvam(stt)),
@@ -370,6 +537,9 @@ async def run_twilio_media_session(websocket: WebSocket, config: RuntimeSessionC
                 task.cancel()
             if current_response is not None:
                 current_response.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            pending = [*tasks]
+            if current_response is not None:
+                pending.append(current_response)
+            await asyncio.gather(*pending, return_exceptions=True)
             await _store_metrics(config, metrics)
             await _finalize_inbound_call(config)

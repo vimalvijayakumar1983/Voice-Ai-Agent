@@ -623,6 +623,11 @@ export default function Calls() {
                   {selectedCall.cost_cents !== null ? <div><dt>Provider cost</dt><dd>{selectedCall.cost_cents} cents</dd></div> : null}
                   {selectedCall.sentiment_score !== null ? <div><dt>Sentiment score</dt><dd>{selectedCall.sentiment_score.toFixed(2)}</dd></div> : null}
                   {typeof selectedMetadata.provider_latency_ms === 'number' ? <div><dt>Provider latency</dt><dd>{selectedMetadata.provider_latency_ms} ms</dd></div> : null}
+                  {typeof selectedRuntime.last_speech_end_to_first_audio_ms === 'number' ? <div><dt>Speech end → first audio</dt><dd>{selectedRuntime.last_speech_end_to_first_audio_ms} ms</dd></div> : null}
+                  {typeof selectedRuntime.turn_latency_p50_ms === 'number' ? <div><dt>Turn latency p50</dt><dd>{selectedRuntime.turn_latency_p50_ms} ms</dd></div> : null}
+                  {typeof selectedRuntime.turn_latency_p95_ms === 'number' ? <div><dt>Turn latency p95</dt><dd>{selectedRuntime.turn_latency_p95_ms} ms</dd></div> : null}
+                  {typeof selectedRuntime.last_transcript_to_first_audio_ms === 'number' ? <div><dt>Transcript → first audio</dt><dd>{selectedRuntime.last_transcript_to_first_audio_ms} ms</dd></div> : null}
+                  {typeof selectedRuntime.last_llm_first_token_ms === 'number' ? <div><dt>LLM first token</dt><dd>{selectedRuntime.last_llm_first_token_ms} ms</dd></div> : null}
                   {typeof selectedRuntime.last_llm_latency_ms === 'number' ? <div><dt>Last LLM latency</dt><dd>{selectedRuntime.last_llm_latency_ms} ms</dd></div> : null}
                   {typeof selectedRuntime.last_tts_first_byte_ms === 'number' ? <div><dt>Last TTS first byte</dt><dd>{selectedRuntime.last_tts_first_byte_ms} ms</dd></div> : null}
                   {typeof selectedRuntime.llm_tokens === 'number' ? <div><dt>LLM tokens</dt><dd>{selectedRuntime.llm_tokens}</dd></div> : null}
