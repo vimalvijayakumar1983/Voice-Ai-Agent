@@ -50,7 +50,11 @@ class TelephonyProvider(ABC):
         ...
 
     @abstractmethod
-    def generate_connect_stream(self, websocket_url: str) -> TwiMLResponse:
+    def generate_connect_stream(
+        self,
+        websocket_url: str,
+        parameters: dict[str, str] | None = None,
+    ) -> TwiMLResponse:
         """Generate TwiML to connect a media stream (for real-time AI)."""
         ...
 

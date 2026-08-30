@@ -7,6 +7,7 @@ import json
 import math
 import re
 import time
+from collections import deque
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -247,7 +248,12 @@ async def _finalize_inbound_call(config: RuntimeSessionConfig) -> None:
         await db.commit()
 
 
-async def run_twilio_media_session(websocket: WebSocket, config: RuntimeSessionConfig) -> None:
+async def run_twilio_media_session(
+    websocket: WebSocket,
+    config: RuntimeSessionConfig,
+    *,
+    initial_messages: list[str] | None = None,
+) -> None:
     stream_sid: str | None = None
     stop_event = asyncio.Event()
     send_lock = asyncio.Lock()
@@ -279,6 +285,7 @@ async def run_twilio_media_session(websocket: WebSocket, config: RuntimeSessionC
         "turn_latency_p50_ms": None,
         "turn_latency_p95_ms": None,
     }
+    pending_twilio_messages = deque(initial_messages or [])
 
     async def send_json(payload: dict) -> None:
         async with send_lock:
@@ -447,7 +454,11 @@ async def run_twilio_media_session(websocket: WebSocket, config: RuntimeSessionC
         nonlocal stream_sid, current_response
         try:
             while not stop_event.is_set():
-                message = await websocket.receive_text()
+                message = (
+                    pending_twilio_messages.popleft()
+                    if pending_twilio_messages
+                    else await websocket.receive_text()
+                )
                 payload = json.loads(message)
                 event = payload.get("event")
                 if event == "start":

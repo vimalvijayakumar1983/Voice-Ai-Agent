@@ -34,11 +34,18 @@ def test_twiml_helpers_escape_attributes_and_nested_values():
     assert gather.find("Say").text == "Choose sales & support"
 
     stream_root = _xml(
-        provider.generate_connect_stream("wss://voice.example.com/live?agent=a&tenant=b").xml
+        provider.generate_connect_stream(
+            "wss://voice.example.com/live",
+            {"token": "safe&scoped", "tenant": "a</Parameter><Dial>bad</Dial>"},
+        ).xml
     )
-    assert stream_root.find("./Connect/Stream").attrib["url"] == (
-        "wss://voice.example.com/live?agent=a&tenant=b"
-    )
+    stream = stream_root.find("./Connect/Stream")
+    assert stream.attrib["url"] == "wss://voice.example.com/live"
+    assert [(item.attrib["name"], item.attrib["value"]) for item in stream] == [
+        ("token", "safe&scoped"),
+        ("tenant", "a</Parameter><Dial>bad</Dial>"),
+    ]
+    assert stream_root.find(".//Dial") is None
 
     number = "+15551234567</Number><Sip>attacker@example.com</Sip><Number>"
     transfer_root = _xml(provider.generate_transfer(number, "+15557654321").xml)

@@ -1,4 +1,5 @@
 from uuid import UUID
+from xml.etree import ElementTree
 
 import pytest
 from sqlalchemy import select
@@ -11,6 +12,7 @@ from app.models.agent import Agent, AgentRuntimeProfile
 from app.models.call import Call
 from app.models.provider_credential import ProviderCredential
 from app.models.tenant import Tenant
+from app.realtime.auth import verify_media_token
 from tests.conftest import test_session_factory as session_factory
 
 
@@ -232,6 +234,12 @@ async def test_inbound_twilio_webhook_accepts_the_workspace_auth_token(
     call = await db.scalar(select(Call).where(Call.provider_call_sid == "CAworkspace123"))
     assert call is not None
     assert call.tenant_id == tenant.id
+    stream = ElementTree.fromstring(response.text).find("./Connect/Stream")
+    assert stream is not None
+    assert "?" not in stream.attrib["url"]
+    token_parameter = stream.find("./Parameter[@name='token']")
+    assert token_parameter is not None
+    assert verify_media_token(token_parameter.attrib["value"], call.id)
 
 
 @pytest.mark.asyncio

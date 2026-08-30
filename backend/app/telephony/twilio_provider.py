@@ -74,10 +74,16 @@ class TwilioProvider(TelephonyProvider):
         response.say("We didn't receive any input. Goodbye!", voice=voice)
         return TwiMLResponse(xml=str(response))
 
-    def generate_connect_stream(self, websocket_url: str) -> TwiMLResponse:
+    def generate_connect_stream(
+        self,
+        websocket_url: str,
+        parameters: dict[str, str] | None = None,
+    ) -> TwiMLResponse:
         response = VoiceResponse()
         connect = Connect()
-        connect.stream(url=websocket_url)
+        stream = connect.stream(url=websocket_url)
+        for name, value in (parameters or {}).items():
+            stream.parameter(name=name, value=value)
         response.append(connect)
         return TwiMLResponse(xml=str(response))
 

@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 import pytest
 from httpx import AsyncClient
 
+from app.api.v1.endpoints.realtime import _twilio_start_token
 from app.core.config import settings
 from app.models.agent import Agent
 from app.realtime.auth import create_media_token, verify_media_token
@@ -22,6 +23,19 @@ def test_media_token_is_call_scoped_and_expires():
     assert not verify_media_token(token, uuid4(), now=1001)
     assert not verify_media_token(token, call_id, now=2000)
     assert not verify_media_token(token + "tampered", call_id, now=1001)
+
+
+def test_twilio_media_token_is_read_from_start_custom_parameters():
+    assert (
+        _twilio_start_token(
+            {
+                "event": "start",
+                "start": {"customParameters": {"token": "scoped-media-capability"}},
+            }
+        )
+        == "scoped-media-capability"
+    )
+    assert _twilio_start_token({"event": "connected"}) is None
 
 
 def test_sarvam_events_support_documented_and_nested_transcripts():

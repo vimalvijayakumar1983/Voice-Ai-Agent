@@ -568,8 +568,13 @@ def _runtime_stream_url(call_id: UUID) -> str:
     websocket_origin = urlunsplit(
         ("wss" if public.scheme == "https" else "ws", public.netloc, "", "", "")
     )
-    token = create_media_token(call_id)
-    return f"{websocket_origin}/api/v1/realtime/twilio/{call_id}?token={token}"
+    return f"{websocket_origin}/api/v1/realtime/twilio/{call_id}"
+
+
+def _runtime_stream_parameters(call_id: UUID) -> dict[str, str]:
+    # Twilio does not forward query strings on <Stream> URLs. Custom
+    # parameters arrive in the signed stream's `start` event instead.
+    return {"token": create_media_token(call_id)}
 
 
 async def _process_smallest_webhook(
@@ -920,7 +925,10 @@ async def twilio_inbound_webhook(request: Request):
             raise HTTPException(status_code=409, detail="Conflicting inbound call identity")
         await db.commit()
 
-    twiml = get_telephony_provider().generate_connect_stream(_runtime_stream_url(call.id))
+    twiml = get_telephony_provider().generate_connect_stream(
+        _runtime_stream_url(call.id),
+        _runtime_stream_parameters(call.id),
+    )
     return Response(content=twiml.xml, media_type="application/xml")
 
 
@@ -981,7 +989,10 @@ async def twilio_voice_webhook(call_id: UUID, request: Request):
             and runtime_profile.status == "active"
             and runtime_profile.telephony_provider == "twilio"
         ):
-            twiml = provider.generate_connect_stream(_runtime_stream_url(call.id))
+            twiml = provider.generate_connect_stream(
+                _runtime_stream_url(call.id),
+                _runtime_stream_parameters(call.id),
+            )
             metadata = dict(call.call_metadata or {})
             metadata["runtime_route"] = {
                 "telephony_provider": "twilio",
