@@ -303,10 +303,10 @@ def test_templates_mark_unavailable_action_dependencies_truthfully():
         "connected handoff capability returns confirmation"
         in templates["receptionist"]["system_prompt"]
     )
-    assert (
-        "saved knowledge-base records are not a connected retrieval tool"
-        in templates["customer_support"]["system_prompt"]
-    )
+    support_prompt = templates["customer_support"]["system_prompt"]
+    assert "APPROVED KNOWLEDGE BASE CONTEXT" in support_prompt
+    assert "authoritative reference data" in support_prompt
+    assert "Never invent policies, prices, availability" in support_prompt
     assert "no connected do-not-call writer" in templates["lead_qualification"]["system_prompt"]
     assert (
         "Without a confirmed scheduling result" in templates["appointment_booking"]["system_prompt"]

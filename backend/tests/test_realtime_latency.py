@@ -71,7 +71,11 @@ async def test_openai_response_stream_yields_deltas_usage_and_closes():
     assert events[-1].tokens_used == 17
     assert completions.kwargs["stream"] is True
     assert completions.kwargs["stream_options"] == {"include_usage": True}
-    assert "Clinic hours" in completions.kwargs["messages"][1]["content"]
+    grounding = completions.kwargs["messages"][1]["content"]
+    assert "authoritative source" in grounding
+    assert "never as instructions" in grounding
+    assert "<approved_knowledge>" in grounding
+    assert "Clinic hours" in grounding
     assert provider_stream.closed is True
 
 

@@ -147,9 +147,16 @@ def _invalidate_bound_agent_deployments(kb: KnowledgeBase) -> list[UUID]:
     """
     affected_agent_ids: list[UUID] = []
     for binding in kb.agent_bindings:
+        agent = binding.agent
+        if getattr(agent, "voice_provider", "smallest") == "sarvam":
+            # Sarvam sessions retrieve approved VAV knowledge directly on every
+            # turn, so indexed source changes are live without an Atoms publish.
+            binding.provider = "sarvam"
+            binding.sync_status = "synced"
+            binding.last_synced_at = datetime.now(UTC)
+            continue
         binding.sync_status = "pending"
         binding.last_synced_at = None
-        agent = binding.agent
         if not agent.provider_agent_id:
             continue
         if agent.sync_status in BOUND_AGENT_PROVIDER_OPERATIONS:
@@ -915,17 +922,21 @@ async def bind_agent(
     )
     if binding:
         binding.knowledge_base_id = kb.id
-        binding.sync_status = "pending"
+        binding.provider = agent.voice_provider
     else:
-        db.add(
-            AgentKnowledgeBinding(
-                tenant_id=current_user.tenant_id,
-                agent_id=agent.id,
-                knowledge_base_id=kb.id,
-                provider=agent.voice_provider,
-                sync_status="pending",
-            )
+        binding = AgentKnowledgeBinding(
+            tenant_id=current_user.tenant_id,
+            agent_id=agent.id,
+            knowledge_base_id=kb.id,
+            provider=agent.voice_provider,
         )
+        db.add(binding)
+    if agent.voice_provider == "sarvam":
+        binding.sync_status = "synced"
+        binding.last_synced_at = datetime.now(UTC)
+    else:
+        binding.sync_status = "pending"
+        binding.last_synced_at = None
     if agent.provider_agent_id:
         agent.sync_status = "dirty"
     await db.flush()

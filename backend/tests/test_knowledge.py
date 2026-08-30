@@ -199,6 +199,30 @@ def test_new_provider_source_keeps_unprovisioned_bound_agent_local():
     assert binding.last_synced_at is None
 
 
+def test_new_provider_source_is_immediately_live_for_sarvam_runtime():
+    agent = SimpleNamespace(
+        id=uuid4(),
+        name="Sarvam concierge",
+        provider_agent_id=None,
+        voice_provider="sarvam",
+        sync_status="local_only",
+    )
+    binding = SimpleNamespace(
+        agent=agent,
+        provider="smallest",
+        sync_status="pending",
+        last_synced_at=None,
+    )
+
+    affected = _invalidate_bound_agent_deployments(SimpleNamespace(agent_bindings=[binding]))
+
+    assert affected == []
+    assert binding.provider == "sarvam"
+    assert binding.sync_status == "synced"
+    assert binding.last_synced_at is not None
+    assert agent.sync_status == "local_only"
+
+
 def test_source_change_rejects_race_with_agent_publish():
     knowledge = SimpleNamespace(
         agent_bindings=[
