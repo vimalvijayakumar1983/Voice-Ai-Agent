@@ -160,4 +160,3 @@ async def test_ready_runtime_can_be_activated(
     assert retested.json()["ready"] is True
     assert active_profile.json()["enabled"] is True
     assert active_profile.json()["status"] == "active"
-

@@ -528,4 +528,3 @@ async def delete_sip_credential(
             details={"provider": "livekit_sip"},
         )
     return SipCredentialStatus(configured=False)
-
