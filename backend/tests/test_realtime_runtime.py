@@ -148,9 +148,16 @@ async def test_ready_runtime_can_be_activated(
     activated = await client.post(
         f"/api/v1/runtime/agents/{agent.id}/activate", headers=auth_headers
     )
+    retested = await client.post(f"/api/v1/runtime/agents/{agent.id}/test", headers=auth_headers)
+    active_profile = await client.get(f"/api/v1/runtime/agents/{agent.id}", headers=auth_headers)
 
     assert configured.json()["ready"] is True
     assert tested.json()["ready"] is True
     assert activated.status_code == 200
     assert activated.json()["enabled"] is True
     assert activated.json()["status"] == "active"
+    assert retested.status_code == 200
+    assert retested.json()["ready"] is True
+    assert active_profile.json()["enabled"] is True
+    assert active_profile.json()["status"] == "active"
+

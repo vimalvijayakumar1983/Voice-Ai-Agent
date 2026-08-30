@@ -235,7 +235,15 @@ async def test_runtime_profile(
     blockers, checks = await runtime_readiness(db, agent, profile)
     tested_at = datetime.now(UTC)
     profile.last_tested_at = tested_at
-    profile.status = "ready" if not blockers else "blocked"
+    if blockers:
+        # A failed production readiness check must fail closed. Keeping enabled
+        # while changing only the status leaves the control plane inconsistent.
+        profile.enabled = False
+        profile.status = "blocked"
+    else:
+        # Testing an already-active runtime is observational; it must not demote
+        # the profile to "ready" and silently remove it from inbound routing.
+        profile.status = "active" if profile.enabled else "ready"
     await record_audit_event(
         db,
         tenant_id=current_user.tenant_id,
@@ -520,3 +528,4 @@ async def delete_sip_credential(
             details={"provider": "livekit_sip"},
         )
     return SipCredentialStatus(configured=False)
+
