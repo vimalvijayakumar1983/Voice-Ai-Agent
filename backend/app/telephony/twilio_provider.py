@@ -17,20 +17,27 @@ logger = structlog.get_logger()
 
 
 class TwilioProvider(TelephonyProvider):
-    def __init__(self):
+    def __init__(
+        self,
+        *,
+        account_sid: str | None = None,
+        auth_token: str | None = None,
+    ):
+        self._account_sid = account_sid or settings.twilio_account_sid
+        self._auth_token = auth_token or settings.twilio_auth_token
         self._client: Client | None = None
         self._validator: RequestValidator | None = None
 
     @property
     def client(self) -> Client:
         if not self._client:
-            self._client = Client(settings.twilio_account_sid, settings.twilio_auth_token)
+            self._client = Client(self._account_sid, self._auth_token)
         return self._client
 
     @property
     def validator(self) -> RequestValidator:
         if not self._validator:
-            self._validator = RequestValidator(settings.twilio_auth_token)
+            self._validator = RequestValidator(self._auth_token)
         return self._validator
 
     async def make_call(self, request: CallRequest) -> CallResult:
@@ -85,6 +92,10 @@ class TwilioProvider(TelephonyProvider):
         return self.validator.validate(url, params, signature)
 
 
-def get_telephony_provider() -> TelephonyProvider:
+def get_telephony_provider(
+    *,
+    account_sid: str | None = None,
+    auth_token: str | None = None,
+) -> TelephonyProvider:
     """Factory to get the configured telephony provider."""
-    return TwilioProvider()
+    return TwilioProvider(account_sid=account_sid, auth_token=auth_token)

@@ -28,6 +28,7 @@ from app.schemas.campaign import (
 )
 from app.services.audit import record_audit_event
 from app.services.campaign_lifecycle import refresh_campaign_metrics, sync_campaign_call_lifecycle
+from app.services.provider_credentials import load_provider_config
 
 router = APIRouter(prefix="/campaigns", tags=["Campaigns"])
 
@@ -109,7 +110,12 @@ def _validate_effective_schedule(campaign: Campaign, data: CampaignUpdate) -> No
             )
 
 
-def _validate_campaign_dispatch_provider(campaign: Campaign, agent: Agent) -> None:
+def _validate_campaign_dispatch_provider(
+    campaign: Campaign,
+    agent: Agent,
+    *,
+    twilio_default_from_number: str = "",
+) -> None:
     provider = (agent.voice_provider or "").strip().lower()
     if provider not in {"smallest", "twilio"}:
         raise HTTPException(status_code=409, detail="Campaign voice provider is not supported")
@@ -139,7 +145,7 @@ def _validate_campaign_dispatch_provider(campaign: Campaign, agent: Agent) -> No
             )
     if provider == "twilio":
         configured_number = (campaign.settings or {}).get("from_number")
-        if not configured_number and not settings.twilio_default_from_number:
+        if not configured_number and not twilio_default_from_number:
             raise HTTPException(
                 status_code=409,
                 detail="Configure a Twilio from number before starting the campaign",
@@ -298,7 +304,14 @@ async def start_campaign(
     )
     if not agent.is_active:
         raise HTTPException(status_code=409, detail="Campaign agent is inactive")
-    _validate_campaign_dispatch_provider(campaign, agent)
+    twilio_config = await load_provider_config(db, current_user.tenant_id, "twilio")
+    _validate_campaign_dispatch_provider(
+        campaign,
+        agent,
+        twilio_default_from_number=str(
+            (twilio_config or {}).get("default_from_number") or settings.twilio_default_from_number
+        ).strip(),
+    )
     if workflow is not None and not workflow.is_active:
         raise HTTPException(status_code=409, detail="Campaign workflow is inactive")
     if campaign.scheduled_end is not None:

@@ -15,9 +15,13 @@ when Sarvam reports speech start, providing barge-in behavior.
 
 ## Required serving configuration
 
-- A Sarvam key saved in Workspace Settings or `SARVAM_API_KEY` on the API.
-- `OPENAI_API_KEY` on the API.
-- `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, and a public HTTPS `BASE_URL`.
+- Sarvam and OpenAI keys saved in Workspace Settings, with
+  `SARVAM_API_KEY` and `OPENAI_API_KEY` retained only as optional platform
+  fallbacks.
+- A Twilio Account SID, Auth Token, and default number saved in Workspace
+  Settings, with the matching environment variables retained as optional
+  platform fallbacks.
+- A public HTTPS `BASE_URL`.
 - The Twilio number's inbound voice webhook set to
   `POST {BASE_URL}/api/v1/webhooks/twilio/voice/inbound`.
 - At least one E.164 number assigned in the agent's Runtime panel.
@@ -26,6 +30,8 @@ when Sarvam reports speech start, providing barge-in behavior.
 
 Save the runtime policy, run **Test readiness**, and only then activate it.
 Direct and inbound calls fail closed when the runtime is inactive or ambiguous.
+Provider credentials are write-only, tenant-scoped, encrypted at rest, and
+resolved workspace-first for API, worker, webhook, and realtime operations.
 
 ## Knowledge migration
 

@@ -31,6 +31,7 @@ from app.schemas.knowledge import (
     UrlSourceCreate,
 )
 from app.services.audit import record_audit_event
+from app.services.provider_credentials import load_provider_config
 
 router = APIRouter(prefix="/knowledge", tags=["Knowledge Studio"])
 MAX_KNOWLEDGE_PDF_BYTES = 8 * 1024 * 1024
@@ -44,6 +45,14 @@ PROVIDER_INDEXED_STATUSES = {
     "success",
     "succeeded",
 }
+
+
+async def _tenant_smallest_client(db: AsyncSession, tenant_id: UUID) -> SmallestAIClient:
+    config = await load_provider_config(db, tenant_id, "smallest")
+    api_key = str((config or {}).get("api_key") or "").strip()
+    return SmallestAIClient(api_key=api_key) if api_key else get_smallest_client()
+
+
 PROVIDER_FAILED_STATUSES = {"error", "failed", "failure"}
 BOUND_AGENT_PROVIDER_OPERATIONS = {
     "provisioning",
@@ -509,7 +518,8 @@ async def update_knowledge_base(
         setattr(kb, key, value)
     if kb.provider_knowledge_base_id and ({"name", "description"} & updates.keys()):
         try:
-            await get_smallest_client().update_knowledge_base(
+            client = await _tenant_smallest_client(db, current_user.tenant_id)
+            await client.update_knowledge_base(
                 knowledge_base_id=kb.provider_knowledge_base_id,
                 name=kb.name,
                 description=kb.description or "",
@@ -536,7 +546,8 @@ async def provision_knowledge_base(
     db: AsyncSession = Depends(get_db),
 ):
     kb = await _get_knowledge_base(db, current_user.tenant_id, kb_id)
-    await _ensure_remote(db, kb, get_smallest_client())
+    client = await _tenant_smallest_client(db, current_user.tenant_id)
+    await _ensure_remote(db, kb, client)
     await record_audit_event(
         db,
         tenant_id=current_user.tenant_id,
@@ -557,7 +568,7 @@ async def discover_sitemap(
     db: AsyncSession = Depends(get_db),
 ):
     kb = await _get_knowledge_base(db, current_user.tenant_id, kb_id)
-    client = get_smallest_client()
+    client = await _tenant_smallest_client(db, current_user.tenant_id)
     remote_id = await _ensure_remote(db, kb, client)
     try:
         urls = await client.discover_sitemap_urls(
@@ -586,7 +597,7 @@ async def add_url_sources(
         raise HTTPException(
             status_code=409, detail="Every selected URL is already in this knowledge base"
         )
-    client = get_smallest_client()
+    client = await _tenant_smallest_client(db, current_user.tenant_id)
     remote_id = await _ensure_remote(db, kb, client)
     try:
         await client.scrape_knowledge_urls(knowledge_base_id=remote_id, urls=new_urls)
@@ -673,7 +684,7 @@ async def upload_pdf_source(
     if not content.startswith(b"%PDF-"):
         raise HTTPException(status_code=422, detail="The uploaded file is not a valid PDF")
     extracted_text = await asyncio.to_thread(_extract_pdf_text, content)
-    client = get_smallest_client()
+    client = await _tenant_smallest_client(db, current_user.tenant_id)
     remote_id = await _ensure_remote(db, kb, client)
     try:
         await client.upload_knowledge_pdf(
@@ -734,7 +745,7 @@ async def delete_knowledge_source(
     scraped: list[dict] = []
     items: list[dict] = []
     if kb.provider_knowledge_base_id and source.source_type != "text":
-        client = get_smallest_client()
+        client = await _tenant_smallest_client(db, current_user.tenant_id)
         try:
             scraped = await client.list_scraped_knowledge_urls(kb.provider_knowledge_base_id)
             items = await client.list_knowledge_items(kb.provider_knowledge_base_id)
@@ -819,7 +830,7 @@ async def refresh_knowledge_base(
     kb = await _get_knowledge_base(db, current_user.tenant_id, kb_id)
     if not kb.provider_knowledge_base_id:
         return _knowledge_response(kb)
-    client = get_smallest_client()
+    client = await _tenant_smallest_client(db, current_user.tenant_id)
     try:
         provider_knowledge_base = await client.get_knowledge_base(kb.provider_knowledge_base_id)
         scraped = await client.list_scraped_knowledge_urls(kb.provider_knowledge_base_id)
@@ -980,7 +991,8 @@ async def delete_knowledge_base(
         )
     if kb.provider_knowledge_base_id:
         try:
-            await get_smallest_client().delete_knowledge_base(kb.provider_knowledge_base_id)
+            client = await _tenant_smallest_client(db, current_user.tenant_id)
+            await client.delete_knowledge_base(kb.provider_knowledge_base_id)
         except SmallestAIError as exc:
             raise _provider_error(exc) from exc
     await record_audit_event(

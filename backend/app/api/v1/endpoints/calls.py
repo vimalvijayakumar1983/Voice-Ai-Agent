@@ -16,7 +16,7 @@ from app.core.database import get_db
 from app.middleware.tenant import CurrentUser, get_current_user, require_role
 from app.models.agent import Agent, AgentRuntimeProfile
 from app.models.call import Call, CallSummary, CallTranscript
-from app.providers.smallest import SmallestAIError, get_smallest_client
+from app.providers.smallest import SmallestAIClient, SmallestAIError, get_smallest_client
 from app.schemas.call import (
     BrowserConversationRegister,
     CallOutbound,
@@ -33,6 +33,7 @@ from app.services.compliance_policy import (
     is_recording_consent_revoked,
 )
 from app.services.phone_numbers import is_number_on_tenant_dnc, tenant_phone_dnc_lock
+from app.services.provider_credentials import load_provider_config
 from app.services.recordings import RecordingError, fetch_call_recording
 from app.telephony.base import CallRequest
 from app.telephony.twilio_provider import get_telephony_provider
@@ -224,7 +225,12 @@ async def sync_provider_history(
             )
         )
     ).all()
-    client = get_smallest_client()
+    smallest_config = await load_provider_config(db, current_user.tenant_id, "smallest")
+    client = (
+        SmallestAIClient(api_key=str(smallest_config.get("api_key")).strip())
+        if smallest_config and smallest_config.get("api_key")
+        else get_smallest_client()
+    )
     scanned = imported = updated = failed = 0
 
     for agent in agents:
@@ -496,6 +502,17 @@ async def initiate_outbound_call(
         )
 
     is_smallest = agent.voice_provider == "smallest"
+    smallest_config = (
+        await load_provider_config(db, current_user.tenant_id, "smallest") if is_smallest else None
+    )
+    twilio_config = (
+        await load_provider_config(db, current_user.tenant_id, "twilio")
+        if not is_smallest
+        else None
+    )
+    twilio_default_from_number = str(
+        (twilio_config or {}).get("default_from_number") or settings.twilio_default_from_number
+    ).strip()
     runtime_profile = None
     if agent.voice_provider == "sarvam":
         runtime_profile = await db.scalar(
@@ -589,7 +606,7 @@ async def initiate_outbound_call(
         else (
             data.from_number
             or (assigned_numbers[0] if assigned_numbers else None)
-            or settings.twilio_default_from_number
+            or twilio_default_from_number
         )
     )
     if not from_number and not is_smallest:
@@ -719,7 +736,7 @@ async def initiate_outbound_call(
             if current_agent and current_agent.voice_provider == "smallest"
             else data.from_number
             or (current_assigned_numbers[0] if current_assigned_numbers else None)
-            or settings.twilio_default_from_number
+            or twilio_default_from_number
         )
         provider_identity_changed = bool(
             current_agent
@@ -780,14 +797,28 @@ async def initiate_outbound_call(
 
         try:
             if is_smallest:
-                provider_call_sid = await get_smallest_client().start_outbound_call(
+                smallest_client = (
+                    SmallestAIClient(api_key=str(smallest_config.get("api_key")).strip())
+                    if smallest_config and smallest_config.get("api_key")
+                    else get_smallest_client()
+                )
+                provider_call_sid = await smallest_client.start_outbound_call(
                     agent_id=current_agent.provider_agent_id,
                     phone_number=data.to_number,
                     variables={**data.context, "_vav_call_id": str(call.id)},
                     version_id=current_agent.provider_revision_id,
                 )
             else:
-                provider = get_telephony_provider()
+                provider = (
+                    get_telephony_provider(
+                        account_sid=str(twilio_config.get("account_sid")).strip(),
+                        auth_token=str(twilio_config.get("auth_token")).strip(),
+                    )
+                    if twilio_config
+                    and twilio_config.get("account_sid")
+                    and twilio_config.get("auth_token")
+                    else get_telephony_provider()
+                )
                 webhook_url = f"{settings.base_url}/api/v1/webhooks/twilio/voice/{call.id}"
                 status_url = f"{settings.base_url}/api/v1/webhooks/twilio/status/{call.id}"
                 provider_result = await provider.make_call(
@@ -939,7 +970,18 @@ async def get_call_recording(
         await reject_revoked_recording_access()
 
     try:
-        recording = await fetch_call_recording(call)
+        smallest_client = None
+        if call.provider == "smallest":
+            smallest_config = await load_provider_config(db, current_user.tenant_id, "smallest")
+            if smallest_config and smallest_config.get("api_key"):
+                smallest_client = SmallestAIClient(
+                    api_key=str(smallest_config.get("api_key")).strip()
+                )
+        recording = (
+            await fetch_call_recording(call, smallest_client=smallest_client)
+            if smallest_client is not None
+            else await fetch_call_recording(call)
+        )
     except RecordingError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
 

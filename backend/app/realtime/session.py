@@ -16,7 +16,7 @@ import structlog
 from fastapi import WebSocket, WebSocketDisconnect
 from sqlalchemy import select
 
-from app.ai.conversation import conversation_engine
+from app.ai.conversation import ConversationEngine
 from app.core.config import settings
 from app.core.database import async_session_factory
 from app.models.agent import Agent, AgentRuntimeProfile
@@ -53,6 +53,7 @@ class RuntimeSessionConfig:
     llm_model: str
     max_duration_seconds: int
     sarvam_api_key: str
+    openai_api_key: str
 
 
 def _language_code(language: str) -> str:
@@ -125,6 +126,12 @@ async def load_runtime_session(call_id: UUID) -> RuntimeSessionConfig | None:
         api_key = str((tenant_config or {}).get("api_key") or settings.sarvam_api_key).strip()
         if not api_key:
             return None
+        openai_config = await load_provider_config(db, agent.tenant_id, "openai")
+        openai_api_key = str(
+            (openai_config or {}).get("api_key") or settings.openai_api_key
+        ).strip()
+        if not openai_api_key:
+            return None
         speaker = agent.voice_id.removeprefix("sarvam:") or "ishita"
         primary_language = _language_code(agent.language)
         stt_language = "auto" if agent.language_switching_enabled else profile.stt_language
@@ -148,6 +155,7 @@ async def load_runtime_session(call_id: UUID) -> RuntimeSessionConfig | None:
             llm_model=profile.llm_model,
             max_duration_seconds=agent.max_call_duration_seconds,
             sarvam_api_key=api_key,
+            openai_api_key=openai_api_key,
         )
 
 
@@ -250,6 +258,7 @@ async def run_twilio_media_session(websocket: WebSocket, config: RuntimeSessionC
     current_response: asyncio.Task | None = None
     last_speech_end_at: float | None = None
     turn_latency_samples: list[int] = []
+    conversation_engine = ConversationEngine(api_key=config.openai_api_key)
     tts = SarvamTTSStream(
         api_key=config.sarvam_api_key,
         base_url=settings.sarvam_base_url,

@@ -22,7 +22,7 @@ from app.models.campaign import (
     ProviderCallbackOutbox,
 )
 from app.models.workflow import Workflow
-from app.providers.smallest import get_smallest_client
+from app.providers.smallest import SmallestAIClient, get_smallest_client
 from app.services.call_metadata import agent_configuration_snapshot
 from app.services.campaign_lifecycle import (
     ACTIVE_CONTACT_STATUSES,
@@ -37,6 +37,7 @@ from app.services.phone_numbers import (
     normalize_e164,
     tenant_phone_dnc_lock,
 )
+from app.services.provider_credentials import load_provider_config
 from app.tasks.worker import celery_app
 from app.telephony.base import CallRequest
 from app.telephony.twilio_provider import get_telephony_provider
@@ -359,14 +360,27 @@ def _validated_provider_variables(value: object) -> dict[str, str | int | float 
     return variables
 
 
-def _provider_from_number(campaign: Campaign, agent: Agent) -> str | None:
+async def _provider_from_number(
+    db: AsyncSession,
+    tenant_id: uuid.UUID,
+    campaign: Campaign,
+    agent: Agent,
+) -> str | None:
     provider = (agent.voice_provider or "").strip().lower()
     if provider == "smallest":
         return "provider-managed"
     if provider == "twilio":
         configured = (campaign.settings or {}).get("from_number")
         configured_number = configured if isinstance(configured, str) and configured else None
-        return configured_number or settings.twilio_default_from_number
+        if configured_number:
+            return configured_number
+        config = await load_provider_config(db, tenant_id, "twilio")
+        return (
+            str(
+                (config or {}).get("default_from_number") or settings.twilio_default_from_number
+            ).strip()
+            or None
+        )
     return "provider-managed"
 
 
@@ -481,7 +495,7 @@ async def _load_valid_campaign_agent(
                 "Smallest.ai campaign resources require tenant-owned inventory",
             )
             return None
-    if provider == "twilio" and not _provider_from_number(campaign, agent):
+    if provider == "twilio" and not await _provider_from_number(db, tenant_id, campaign, agent):
         campaign.status = "paused"
         _record_campaign_issue(campaign, "Twilio campaign has no configured from number")
         return None
@@ -1049,7 +1063,7 @@ async def _prepare_attempt_dispatch(
 
     if call is None:
         call_id = uuid.uuid4()
-        from_number = _provider_from_number(campaign, agent)
+        from_number = await _provider_from_number(db, tenant_id, campaign, agent)
         call = Call(
             id=call_id,
             tenant_id=tenant_id,
@@ -1119,13 +1133,19 @@ def _smallest_variables(payload: DispatchPayload) -> dict:
     return variables
 
 
-async def _call_provider(payload: DispatchPayload) -> str:
+async def _call_provider(db: AsyncSession, payload: DispatchPayload) -> str:
     if payload.provider == "smallest":
         if not payload.provider_agent_id:
             raise DefinitiveDispatchError("Smallest.ai agent has not been provisioned")
         if not payload.provider_revision_id:
             raise DefinitiveDispatchError("Smallest.ai agent has no verified provider revision")
-        return await get_smallest_client().start_outbound_call(
+        config = await load_provider_config(db, payload.tenant_id, "smallest")
+        client = (
+            SmallestAIClient(api_key=str(config.get("api_key")).strip())
+            if config and config.get("api_key")
+            else get_smallest_client()
+        )
+        return await client.start_outbound_call(
             agent_id=payload.provider_agent_id,
             phone_number=payload.phone_number,
             variables=_smallest_variables(payload),
@@ -1137,7 +1157,16 @@ async def _call_provider(payload: DispatchPayload) -> str:
         # Twilio's existing adapter has no idempotency primitive. The durable
         # local call id in both callback URLs is therefore the reconciliation
         # identity and ambiguous dispatches are never automatically retried.
-        result = await get_telephony_provider().make_call(
+        config = await load_provider_config(db, payload.tenant_id, "twilio")
+        provider = (
+            get_telephony_provider(
+                account_sid=str(config.get("account_sid")).strip(),
+                auth_token=str(config.get("auth_token")).strip(),
+            )
+            if config and config.get("account_sid") and config.get("auth_token")
+            else get_telephony_provider()
+        )
+        result = await provider.make_call(
             CallRequest(
                 to_number=payload.phone_number,
                 from_number=payload.from_number,
@@ -1294,7 +1323,9 @@ async def _call_provider_with_final_guard(
         current_provider = (
             (agent.voice_provider or "").strip().lower() if agent is not None else None
         )
-        current_from_number = _provider_from_number(campaign, agent) if agent else None
+        current_from_number = (
+            await _provider_from_number(db, payload.tenant_id, campaign, agent) if agent else None
+        )
         provider_identity_changed = bool(
             agent
             and (
@@ -1356,7 +1387,7 @@ async def _call_provider_with_final_guard(
             await db.commit()
             return None
 
-        provider_call_sid = await _call_provider(payload)
+        provider_call_sid = await _call_provider(db, payload)
         # Release the transaction-scoped advisory and campaign locks before the
         # provider response is reconciled in its own durable transaction.
         await db.commit()

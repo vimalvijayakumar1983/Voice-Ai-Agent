@@ -87,6 +87,21 @@ export interface ProviderCredentialStatus {
   updated_at: string | null;
 }
 
+export type WorkspaceProviderName = 'smallest' | 'sarvam' | 'openai' | 'twilio';
+
+export interface WorkspaceCredentialStatus {
+  provider: WorkspaceProviderName;
+  configured: boolean;
+  source: 'workspace' | 'platform' | 'none';
+  updated_at: string | null;
+  account_sid_hint: string | null;
+  default_from_number: string | null;
+}
+
+export interface WorkspaceCredentialStatuses {
+  providers: Record<WorkspaceProviderName, WorkspaceCredentialStatus>;
+}
+
 export interface RuntimeProfile {
   id: string | null;
   agent_id: string;
@@ -1169,6 +1184,34 @@ class ApiClient {
 
   async deleteSarvamCredential() {
     return this.request<ProviderCredentialStatus>('/api/v1/agents/provider/sarvam/credential', {
+      method: 'DELETE',
+    });
+  }
+
+  async listProviderCredentials() {
+    return this.request<WorkspaceCredentialStatuses>('/api/v1/runtime/credentials');
+  }
+
+  async saveProviderApiKey(provider: Exclude<WorkspaceProviderName, 'twilio'>, apiKey: string) {
+    return this.request<WorkspaceCredentialStatus>(`/api/v1/runtime/credentials/${provider}`, {
+      method: 'PUT',
+      body: JSON.stringify({ api_key: apiKey }),
+    });
+  }
+
+  async saveTwilioCredential(data: {
+    account_sid: string;
+    auth_token: string;
+    default_from_number: string | null;
+  }) {
+    return this.request<WorkspaceCredentialStatus>('/api/v1/runtime/credentials/twilio/account', {
+      method: 'PUT',
+      body: JSON.stringify(data),
+    });
+  }
+
+  async deleteProviderCredential(provider: WorkspaceProviderName) {
+    return this.request<WorkspaceCredentialStatus>(`/api/v1/runtime/credentials/${provider}`, {
       method: 'DELETE',
     });
   }

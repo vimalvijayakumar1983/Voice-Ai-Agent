@@ -20,10 +20,11 @@ import {
   api,
   type AuditEvent,
   type CurrentUser,
-  type ProviderStatus,
   type SipCredentialStatus,
   type WorkspaceApiKey,
+  type WorkspaceCredentialStatuses,
   type WorkspaceInvitation,
+  type WorkspaceProviderName,
   type WorkspaceRole,
 } from '@/lib/api';
 
@@ -137,7 +138,7 @@ export default function Settings() {
   const [invitations, setInvitations] = useState<WorkspaceInvitation[]>([]);
   const [apiKeys, setApiKeys] = useState<WorkspaceApiKey[]>([]);
   const [auditEvents, setAuditEvents] = useState<AuditEvent[]>([]);
-  const [providerStatus, setProviderStatus] = useState<ProviderStatus | null>(null);
+  const [credentialStatuses, setCredentialStatuses] = useState<WorkspaceCredentialStatuses | null>(null);
   const [sipStatus, setSipStatus] = useState<SipCredentialStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState('');
@@ -153,7 +154,16 @@ export default function Settings() {
     role: 'member' as AssignableRole,
   });
   const [apiKeyName, setApiKeyName] = useState('');
-  const [sarvamApiKey, setSarvamApiKey] = useState('');
+  const [providerKeys, setProviderKeys] = useState({
+    smallest: '',
+    sarvam: '',
+    openai: '',
+  });
+  const [twilioForm, setTwilioForm] = useState({
+    account_sid: '',
+    auth_token: '',
+    default_from_number: '',
+  });
   const [sipForm, setSipForm] = useState({
     sip_uri: '',
     username: '',
@@ -177,12 +187,12 @@ export default function Settings() {
           setLoading(false);
           return;
         }
-        const [nextMembers, nextInvitations, nextApiKeys, nextAuditEvents, nextProviderStatus, nextSipStatus] = await Promise.all([
+        const [nextMembers, nextInvitations, nextApiKeys, nextAuditEvents, nextCredentialStatuses, nextSipStatus] = await Promise.all([
           api.listWorkspaceUsers(),
           api.listInvitations(),
           api.listApiKeys(),
           api.listAuditEvents(12),
-          api.getProviderStatus(),
+          api.listProviderCredentials(),
           api.getSipCredentialStatus(),
         ]);
         if (!active) return;
@@ -190,7 +200,7 @@ export default function Settings() {
         setInvitations(nextInvitations);
         setApiKeys(nextApiKeys);
         setAuditEvents(nextAuditEvents);
-        setProviderStatus(nextProviderStatus);
+        setCredentialStatuses(nextCredentialStatuses);
         setSipStatus(nextSipStatus);
       } catch (caught: unknown) {
         if (active) {
@@ -214,6 +224,9 @@ export default function Settings() {
   const canAdminister = isOwner || currentUser?.role === 'admin';
   const pendingInvitations = invitations.filter((invitation) => invitation.status === 'pending').length;
   const activeKeys = apiKeys.filter((key) => key.is_active).length;
+  const connectedProviders = credentialStatuses
+    ? Object.values(credentialStatuses.providers).filter((provider) => provider.configured).length
+    : 0;
 
   const resetMessages = () => {
     setActionError('');
@@ -342,42 +355,70 @@ export default function Settings() {
     }
   };
 
-  const handleSaveSarvamKey = async (event: FormEvent<HTMLFormElement>) => {
+  const handleSaveProviderKey = async (
+    provider: Exclude<WorkspaceProviderName, 'twilio'>,
+    event: FormEvent<HTMLFormElement>,
+  ) => {
     event.preventDefault();
     resetMessages();
-    setBusyAction('sarvam-key');
+    setBusyAction(`${provider}-key`);
     try {
-      await api.saveSarvamCredential(sarvamApiKey.trim());
-      setSarvamApiKey('');
-      const [nextProviderStatus, nextAuditEvents] = await Promise.all([
-        api.getProviderStatus(),
+      await api.saveProviderApiKey(provider, providerKeys[provider].trim());
+      setProviderKeys((current) => ({ ...current, [provider]: '' }));
+      const [nextCredentialStatuses, nextAuditEvents] = await Promise.all([
+        api.listProviderCredentials(),
         api.listAuditEvents(12),
       ]);
-      setProviderStatus(nextProviderStatus);
+      setCredentialStatuses(nextCredentialStatuses);
       setAuditEvents(nextAuditEvents);
-      setNotice('Sarvam AI credential saved securely. Sarvam voices are now available in the agent builder.');
+      setNotice(`${provider === 'openai' ? 'OpenAI' : provider === 'sarvam' ? 'Sarvam AI' : 'Smallest.ai'} credential saved securely.`);
     } catch (caught: unknown) {
-      setActionError(caught instanceof Error ? caught.message : 'Sarvam credential could not be saved.');
+      setActionError(caught instanceof Error ? caught.message : 'Provider credential could not be saved.');
     } finally {
       setBusyAction('');
     }
   };
 
-  const handleDeleteSarvamKey = async () => {
+  const handleDeleteProviderCredential = async (provider: WorkspaceProviderName) => {
     resetMessages();
-    if (!window.confirm('Remove the workspace Sarvam API key? Sarvam previews and new Sarvam calls will stop working.')) return;
-    setBusyAction('sarvam-delete');
+    if (!window.confirm(`Remove the workspace ${provider} credential? Active operations may fall back to the platform credential or stop working.`)) return;
+    setBusyAction(`${provider}-delete`);
     try {
-      await api.deleteSarvamCredential();
-      const [nextProviderStatus, nextAuditEvents] = await Promise.all([
-        api.getProviderStatus(),
+      await api.deleteProviderCredential(provider);
+      const [nextCredentialStatuses, nextAuditEvents] = await Promise.all([
+        api.listProviderCredentials(),
         api.listAuditEvents(12),
       ]);
-      setProviderStatus(nextProviderStatus);
+      setCredentialStatuses(nextCredentialStatuses);
       setAuditEvents(nextAuditEvents);
-      setNotice('Workspace Sarvam credential removed.');
+      setNotice(`Workspace ${provider} credential removed.`);
     } catch (caught: unknown) {
-      setActionError(caught instanceof Error ? caught.message : 'Sarvam credential could not be removed.');
+      setActionError(caught instanceof Error ? caught.message : 'Provider credential could not be removed.');
+    } finally {
+      setBusyAction('');
+    }
+  };
+
+  const handleSaveTwilioCredential = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    resetMessages();
+    setBusyAction('twilio-key');
+    try {
+      await api.saveTwilioCredential({
+        account_sid: twilioForm.account_sid.trim(),
+        auth_token: twilioForm.auth_token.trim(),
+        default_from_number: twilioForm.default_from_number.trim() || null,
+      });
+      setTwilioForm({ account_sid: '', auth_token: '', default_from_number: '' });
+      const [nextCredentialStatuses, nextAuditEvents] = await Promise.all([
+        api.listProviderCredentials(),
+        api.listAuditEvents(12),
+      ]);
+      setCredentialStatuses(nextCredentialStatuses);
+      setAuditEvents(nextAuditEvents);
+      setNotice('Twilio credentials saved securely for this workspace.');
+    } catch (caught: unknown) {
+      setActionError(caught instanceof Error ? caught.message : 'Twilio credentials could not be saved.');
     } finally {
       setBusyAction('');
     }
@@ -583,34 +624,51 @@ export default function Settings() {
                 <h2 id="provider-credentials-heading">Voice AI providers</h2>
                 <p>Connect provider credentials for this workspace. Keys are encrypted on the server and are never returned to the browser.</p>
               </div>
-              <span className={`badge ${providerStatus?.providers?.sarvam.configured ? 'badge-success' : 'badge-warning'}`}>
-                Sarvam {providerStatus?.providers?.sarvam.configured ? 'connected' : 'not connected'}
+              <span className={`badge ${connectedProviders ? 'badge-success' : 'badge-warning'}`}>
+                {connectedProviders}/4 connected
               </span>
             </div>
-            <form className="api-key-form" onSubmit={handleSaveSarvamKey}>
-              <div className="form-group">
-                <label htmlFor="sarvam-api-key">Sarvam API key</label>
-                <input
-                  id="sarvam-api-key"
-                  type="password"
-                  autoComplete="new-password"
-                  placeholder={providerStatus?.providers?.sarvam.configured ? 'Enter a new key to rotate' : 'sk_…'}
-                  value={sarvamApiKey}
-                  onChange={(event) => setSarvamApiKey(event.target.value)}
-                  minLength={20}
-                  maxLength={512}
-                  required
-                />
-                <p className="form-hint">The saved value is write-only. Entering another key rotates it immediately for this workspace.</p>
+            {(['smallest', 'sarvam', 'openai'] as const).map((provider) => {
+              const providerName = provider === 'smallest' ? 'Smallest.ai' : provider === 'sarvam' ? 'Sarvam AI' : 'OpenAI';
+              const status = credentialStatuses?.providers[provider];
+              return (
+                <div className="settings-subtable" key={provider}>
+                  <div className="settings-section-heading">
+                    <div className="settings-section-icon"><KeyRound size={18} /></div>
+                    <div>
+                      <h3>{providerName}</h3>
+                      <p>{status?.source === 'workspace' ? 'Workspace credential · encrypted and write-only' : status?.source === 'platform' ? 'Using the VAV platform fallback' : 'No credential configured'}</p>
+                    </div>
+                    <span className={`badge ${status?.configured ? 'badge-success' : 'badge-warning'}`}>{status?.configured ? 'Connected' : 'Not connected'}</span>
+                  </div>
+                  <form className="api-key-form" onSubmit={(event) => void handleSaveProviderKey(provider, event)}>
+                    <div className="form-group">
+                      <label htmlFor={`${provider}-api-key`}>{providerName} API key</label>
+                      <input id={`${provider}-api-key`} type="password" autoComplete="new-password" placeholder={status?.configured ? 'Enter a new key to rotate' : 'Paste API key'} value={providerKeys[provider]} onChange={(event) => setProviderKeys((current) => ({ ...current, [provider]: event.target.value }))} minLength={20} maxLength={512} required />
+                      <p className="form-hint">The saved value is never returned to the browser. A new value rotates the workspace credential.</p>
+                    </div>
+                    <button type="submit" className="btn btn-primary" disabled={busyAction === `${provider}-key`}><KeyRound size={14} /> {busyAction === `${provider}-key` ? 'Saving…' : status?.source === 'workspace' ? 'Rotate key' : 'Connect'}</button>
+                    {status?.source === 'workspace' ? <button type="button" className="btn btn-danger" disabled={busyAction === `${provider}-delete`} onClick={() => void handleDeleteProviderCredential(provider)}>{busyAction === `${provider}-delete` ? 'Removing…' : 'Remove workspace key'}</button> : null}
+                  </form>
+                </div>
+              );
+            })}
+            <div className="settings-section-heading settings-subtable">
+              <div className="settings-section-icon"><Radio size={18} /></div>
+              <div>
+                <h3>Twilio</h3>
+                <p>{credentialStatuses?.providers.twilio.source === 'workspace' ? `Workspace account ${credentialStatuses.providers.twilio.account_sid_hint ?? ''}` : credentialStatuses?.providers.twilio.source === 'platform' ? 'Using the VAV platform fallback' : 'Connect telephony for inbound and outbound calls'}</p>
               </div>
-              <button type="submit" className="btn btn-primary" disabled={busyAction === 'sarvam-key'}>
-                <KeyRound size={14} /> {busyAction === 'sarvam-key' ? 'Saving…' : providerStatus?.providers?.sarvam.configured ? 'Rotate Sarvam key' : 'Connect Sarvam'}
-              </button>
-              {providerStatus?.providers?.sarvam.source === 'workspace' ? (
-                <button type="button" className="btn btn-danger" disabled={busyAction === 'sarvam-delete'} onClick={() => void handleDeleteSarvamKey()}>
-                  {busyAction === 'sarvam-delete' ? 'Removing…' : 'Remove workspace key'}
-                </button>
-              ) : null}
+              <span className={`badge ${credentialStatuses?.providers.twilio.configured ? 'badge-success' : 'badge-warning'}`}>Twilio {credentialStatuses?.providers.twilio.configured ? 'connected' : 'not connected'}</span>
+            </div>
+            <form className="api-key-form" onSubmit={handleSaveTwilioCredential}>
+              <div className="form-grid">
+                <div className="form-group"><label htmlFor="twilio-account-sid">Account SID</label><input id="twilio-account-sid" type="password" autoComplete="new-password" placeholder="AC…" value={twilioForm.account_sid} onChange={(event) => setTwilioForm({ ...twilioForm, account_sid: event.target.value })} pattern="AC[a-fA-F0-9]{32}" required /></div>
+                <div className="form-group"><label htmlFor="twilio-auth-token">Auth Token</label><input id="twilio-auth-token" type="password" autoComplete="new-password" value={twilioForm.auth_token} onChange={(event) => setTwilioForm({ ...twilioForm, auth_token: event.target.value })} minLength={20} maxLength={512} required /></div>
+                <div className="form-group"><label htmlFor="twilio-from-number">Default calling number</label><input id="twilio-from-number" placeholder="+1…" value={twilioForm.default_from_number} onChange={(event) => setTwilioForm({ ...twilioForm, default_from_number: event.target.value })} pattern="\+[1-9][0-9]{7,14}" /></div>
+              </div>
+              <button type="submit" className="btn btn-primary" disabled={busyAction === 'twilio-key'}><KeyRound size={14} /> {busyAction === 'twilio-key' ? 'Saving…' : credentialStatuses?.providers.twilio.source === 'workspace' ? 'Rotate Twilio credentials' : 'Connect Twilio'}</button>
+              {credentialStatuses?.providers.twilio.source === 'workspace' ? <button type="button" className="btn btn-danger" disabled={busyAction === 'twilio-delete'} onClick={() => void handleDeleteProviderCredential('twilio')}>{busyAction === 'twilio-delete' ? 'Removing…' : 'Remove workspace credentials'}</button> : null}
             </form>
             <div className="settings-section-heading settings-subtable">
               <div className="settings-section-icon"><Radio size={18} /></div>

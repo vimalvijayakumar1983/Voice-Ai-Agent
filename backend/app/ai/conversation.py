@@ -24,13 +24,14 @@ class ResponseStreamEvent:
 class ConversationEngine:
     """Manages AI-driven voice conversations."""
 
-    def __init__(self):
+    def __init__(self, *, api_key: str | None = None):
+        self._api_key = api_key
         self._openai: AsyncOpenAI | None = None
 
     @property
     def openai(self) -> AsyncOpenAI:
         if not self._openai:
-            self._openai = AsyncOpenAI(api_key=settings.openai_api_key)
+            self._openai = AsyncOpenAI(api_key=self._api_key or settings.openai_api_key)
         return self._openai
 
     async def generate_response(

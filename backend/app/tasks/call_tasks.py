@@ -371,8 +371,13 @@ async def _process_completed_call_async(call_id: str, tenant_id: str):
     tenant_uuid = uuid.UUID(tenant_id)
     transcript_text: str | None = None
     should_generate_summary = False
+    openai_api_key: str | None = None
 
     async with async_session_factory() as db:
+        from app.services.provider_credentials import load_provider_config
+
+        openai_config = await load_provider_config(db, tenant_uuid, "openai")
+        openai_api_key = str((openai_config or {}).get("api_key") or "").strip() or None
         # Persist billing and capture optional summary input under a short row
         # lock. No network operation is allowed inside this transaction: a
         # slow LLM must never block terminal provider analytics/callbacks.
@@ -443,10 +448,15 @@ async def _process_completed_call_async(call_id: str, tenant_id: str):
     summary_data = None
     if should_generate_summary and transcript_text:
         try:
-            from app.ai.conversation import conversation_engine
+            from app.ai.conversation import ConversationEngine, conversation_engine
 
             # Deliberately outside every database transaction/row lock.
-            summary_data = await conversation_engine.generate_call_summary(transcript_text)
+            engine = (
+                ConversationEngine(api_key=openai_api_key)
+                if openai_api_key
+                else conversation_engine
+            )
+            summary_data = await engine.generate_call_summary(transcript_text)
         except Exception as exc:
             # Billing and lifecycle delivery should still complete when an
             # optional LLM summary provider is unavailable.

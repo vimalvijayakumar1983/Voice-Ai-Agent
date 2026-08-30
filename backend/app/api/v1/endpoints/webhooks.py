@@ -30,6 +30,7 @@ from app.services.campaign_lifecycle import (
     sync_campaign_call_lifecycle,
 )
 from app.services.provider_callback_outbox import persist_provider_callback_actions
+from app.services.provider_credentials import load_provider_config
 from app.telephony.twilio_provider import get_telephony_provider
 
 router = APIRouter(prefix="/webhooks", tags=["Webhooks"])
@@ -503,12 +504,10 @@ def _twilio_validation_url(request: Request) -> str:
     return url
 
 
-async def _verify_twilio_request(request: Request) -> dict[str, str]:
-    """Reject callbacks that are not signed with the Twilio auth token."""
-    if not settings.twilio_auth_token:
-        raise HTTPException(status_code=503, detail="Twilio webhook validation is not configured")
-
-    signature = request.headers.get("X-Twilio-Signature", "")
+async def _parse_twilio_request(request: Request) -> dict[str, str]:
+    cached = getattr(request.state, "twilio_params", None)
+    if isinstance(cached, dict):
+        return cached
     raw_body = await _read_bounded_webhook_body(request)
     try:
         pairs = parse_qsl(
@@ -519,12 +518,38 @@ async def _verify_twilio_request(request: Request) -> dict[str, str]:
     except (UnicodeDecodeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail="Invalid Twilio webhook form") from exc
     params = dict(pairs)
-    provider = get_telephony_provider()
+    request.state.twilio_params = params
+    return params
+
+
+def _validate_twilio_request(
+    request: Request,
+    params: dict[str, str],
+    auth_token: str,
+) -> None:
+    """Reject callbacks that are not signed for the resolved workspace."""
+    if not auth_token:
+        raise HTTPException(status_code=503, detail="Twilio webhook validation is not configured")
+    signature = request.headers.get("X-Twilio-Signature", "")
+    provider = get_telephony_provider(auth_token=auth_token)
     if not signature or not provider.validate_webhook(
         _twilio_validation_url(request), params, signature
     ):
         raise HTTPException(status_code=401, detail="Invalid Twilio webhook signature")
+
+
+async def _verify_twilio_request(
+    request: Request,
+    *,
+    auth_token: str | None = None,
+) -> dict[str, str]:
+    params = await _parse_twilio_request(request)
+    _validate_twilio_request(request, params, auth_token or settings.twilio_auth_token)
     return params
+
+
+async def _tenant_twilio_config(db: AsyncSession, tenant_id: UUID) -> dict:
+    return await load_provider_config(db, tenant_id, "twilio") or {}
 
 
 def _runtime_stream_url(call_id: UUID) -> str:
@@ -778,11 +803,12 @@ async def smallest_webhook(request: Request):
 @router.post("/twilio/voice/inbound")
 async def twilio_inbound_webhook(request: Request):
     """Route an inbound DID only through an explicit, unique runtime assignment."""
-    params = await _verify_twilio_request(request)
+    params = await _parse_twilio_request(request)
     to_number = params.get("To", "")
     from_number = params.get("From", "")
     call_sid = params.get("CallSid", "")
     if not to_number or not from_number or not call_sid:
+        _validate_twilio_request(request, params, settings.twilio_auth_token)
         raise HTTPException(status_code=400, detail="Missing Twilio inbound call identity")
 
     async with async_session_factory() as db:
@@ -808,6 +834,14 @@ async def twilio_inbound_webhook(request: Request):
             for profile, agent in candidates
             if to_number in (profile.assigned_numbers or [])
         ]
+        twilio_config = (
+            await _tenant_twilio_config(db, matches[0][1].tenant_id) if len(matches) == 1 else {}
+        )
+        _validate_twilio_request(
+            request,
+            params,
+            str(twilio_config.get("auth_token") or settings.twilio_auth_token),
+        )
         if len(matches) != 1:
             logger.warning(
                 "twilio_inbound_number_unroutable",
@@ -857,16 +891,27 @@ async def twilio_inbound_webhook(request: Request):
 @router.post("/twilio/voice/{call_id}")
 async def twilio_voice_webhook(call_id: UUID, request: Request):
     """Handle Twilio voice webhook - called when outbound call connects."""
-    await _verify_twilio_request(request)
-
+    untrusted_params = await _parse_twilio_request(request)
+    if not untrusted_params.get("AccountSid"):
+        _validate_twilio_request(
+            request,
+            untrusted_params,
+            settings.twilio_auth_token,
+        )
     async with async_session_factory() as db:
         result = await db.execute(select(Call).where(Call.id == call_id))
         call_probe = result.scalar_one_or_none()
         if not call_probe:
+            await _verify_twilio_request(request)
             return Response(
                 content='<?xml version="1.0"?><Response><Hangup/></Response>',
                 media_type="application/xml",
             )
+        twilio_config = await _tenant_twilio_config(db, call_probe.tenant_id)
+        await _verify_twilio_request(
+            request,
+            auth_token=str(twilio_config.get("auth_token") or settings.twilio_auth_token),
+        )
         call, _attempt = await _lock_callback_call_graph(db, call_probe)
 
         if call.status not in TERMINAL_CALL_STATUSES:
@@ -933,17 +978,28 @@ async def twilio_status_callback(
     request: Request,
 ):
     """Handle Twilio status callbacks for call state changes."""
-    params = await _verify_twilio_request(request)
-    call_sid = params.get("CallSid", "")
-    call_status = params.get("CallStatus", "")
-    call_duration = params.get("CallDuration", "0")
-    recording_url = params.get("RecordingUrl", "")
-
+    untrusted_params = await _parse_twilio_request(request)
+    if not untrusted_params.get("AccountSid"):
+        _validate_twilio_request(
+            request,
+            untrusted_params,
+            settings.twilio_auth_token,
+        )
     async with async_session_factory() as db:
         result = await db.execute(select(Call).where(Call.id == call_id))
         call_probe = result.scalar_one_or_none()
         if not call_probe:
+            await _verify_twilio_request(request)
             return {"status": "not_found"}
+        twilio_config = await _tenant_twilio_config(db, call_probe.tenant_id)
+        params = await _verify_twilio_request(
+            request,
+            auth_token=str(twilio_config.get("auth_token") or settings.twilio_auth_token),
+        )
+        call_sid = params.get("CallSid", "")
+        call_status = params.get("CallStatus", "")
+        call_duration = params.get("CallDuration", "0")
+        recording_url = params.get("RecordingUrl", "")
         call, _attempt = await _lock_callback_call_graph(db, call_probe)
 
         status_map = {

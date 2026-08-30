@@ -34,6 +34,7 @@ from app.providers.sarvam import (
     sarvam_voice_catalog,
 )
 from app.providers.smallest import (
+    SmallestAIClient,
     SmallestAIError,
     get_smallest_client,
     resolve_active_knowledge_base_id,
@@ -672,6 +673,34 @@ async def _tenant_sarvam_credential(
     return (await db.execute(query)).scalar_one_or_none()
 
 
+async def _tenant_smallest_client(
+    db: AsyncSession,
+    tenant_id: UUID,
+) -> tuple[SmallestAIClient, str, datetime | None]:
+    credential = await db.scalar(
+        select(ProviderCredential).where(
+            ProviderCredential.tenant_id == tenant_id,
+            ProviderCredential.provider == "smallest",
+            ProviderCredential.is_active.is_(True),
+        )
+    )
+    if credential is not None:
+        try:
+            config = decrypt_integration_config(credential.encrypted_config)
+        except IntegrationConfigUnavailableError as exc:
+            raise HTTPException(
+                status_code=500,
+                detail="Smallest.ai credential is unavailable; ask an administrator to rotate it",
+            ) from exc
+        api_key = config.get("api_key")
+        if not isinstance(api_key, str) or not api_key:
+            raise HTTPException(status_code=500, detail="Smallest.ai credential is invalid")
+        return SmallestAIClient(api_key=api_key), "workspace", credential.updated_at
+    client = get_smallest_client()
+    configured = bool(getattr(client, "is_configured", True))
+    return client, "platform" if configured else "none", None
+
+
 async def _tenant_sarvam_client(
     db: AsyncSession,
     tenant_id: UUID,
@@ -824,8 +853,9 @@ async def _require_provider_voice(
     selected_languages: list[str],
 ) -> VoiceResolution:
     if provider == "smallest":
+        client, _, _ = await _tenant_smallest_client(db, tenant_id)
         return await _require_tenant_voice(
-            get_smallest_client(),
+            client,
             db,
             tenant_id,
             voice_id,
@@ -1994,7 +2024,9 @@ async def get_provider_status(
     db: AsyncSession = Depends(get_db),
 ):
     """Return non-sensitive provider readiness for the operator console."""
-    client = get_smallest_client()
+    client, smallest_source, smallest_updated_at = await _tenant_smallest_client(
+        db, current_user.tenant_id
+    )
     sarvam, sarvam_source, sarvam_updated_at = await _tenant_sarvam_client(
         db,
         current_user.tenant_id,
@@ -2011,6 +2043,8 @@ async def get_provider_status(
                 "configured": client.is_configured,
                 "agent_runtime": True,
                 "voice_preview": client.is_configured,
+                "source": smallest_source,
+                "updated_at": (smallest_updated_at.isoformat() if smallest_updated_at else None),
             },
             "sarvam": {
                 "configured": sarvam.is_configured,
@@ -2116,7 +2150,7 @@ async def get_provider_catalog(
     db: AsyncSession = Depends(get_db),
 ):
     """Return public voices plus only this tenant's completed private clones."""
-    client = get_smallest_client()
+    client, _, _ = await _tenant_smallest_client(db, current_user.tenant_id)
     smallest_error: HTTPException | None = None
     try:
         voices = await _tenant_voice_catalog(client, db, current_user.tenant_id)
@@ -2254,7 +2288,7 @@ async def create_voice_clone(
     # then be reconciled safely from the provider-side tag without re-uploading.
     await db.commit()
 
-    client = get_smallest_client()
+    client, _, _ = await _tenant_smallest_client(db, current_user.tenant_id)
     try:
         remote = await client.create_voice_clone(
             display_name=name,
@@ -2318,7 +2352,8 @@ async def refresh_voice_clone(
 ):
     clone = await _tenant_voice_clone(db, current_user.tenant_id, clone_id)
     try:
-        remote_clones = await get_smallest_client().list_voice_clones()
+        client, _, _ = await _tenant_smallest_client(db, current_user.tenant_id)
+        remote_clones = await client.list_voice_clones()
     except SmallestAIError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
     marker = _clone_operation_tag(clone.id)
@@ -2385,7 +2420,8 @@ async def delete_voice_clone(
     if clone.provider_voice_id:
         await db.commit()
         try:
-            await get_smallest_client().delete_voice_clone(clone.provider_voice_id)
+            client, _, _ = await _tenant_smallest_client(db, current_user.tenant_id)
+            await client.delete_voice_clone(clone.provider_voice_id)
         except SmallestAIError as exc:
             clone = await _tenant_voice_clone(db, current_user.tenant_id, clone_id, for_update=True)
             clone.status = "deletion_unknown" if exc.ambiguous else "delete_error"
@@ -2466,7 +2502,7 @@ async def preview_provider_voice(
             },
         )
 
-    client = get_smallest_client()
+    client, _, _ = await _tenant_smallest_client(db, current_user.tenant_id)
     try:
         voices = await _tenant_voice_catalog(client, db, current_user.tenant_id)
     except SmallestAIError as exc:
@@ -2561,7 +2597,7 @@ async def provision_smallest_agent(
             detail="SMALLEST_WEBHOOK_ID must be configured before provisioning agents",
         )
 
-    client = get_smallest_client()
+    client, _, _ = await _tenant_smallest_client(db, current_user.tenant_id)
     remote_knowledge_id = await _approved_bound_provider_knowledge_base_id(
         db,
         agent_id=agent.id,
@@ -2703,7 +2739,7 @@ async def sync_smallest_agent(
     if agent.sync_status == "synced":
         raise HTTPException(status_code=409, detail="Agent is already in sync")
 
-    client = get_smallest_client()
+    client, _, _ = await _tenant_smallest_client(db, current_user.tenant_id)
     if _provider_config_mismatch_pending(agent):
         agent = await _reconcile_smallest_config_mismatch(
             db,
@@ -2771,7 +2807,7 @@ async def resolve_smallest_provider_operation(
 ):
     """Resolve a provider-verified ambiguous create or publish outcome."""
     agent = await _tenant_agent(db, agent_id, current_user.tenant_id, for_update=True)
-    client = get_smallest_client()
+    client, _, _ = await _tenant_smallest_client(db, current_user.tenant_id)
 
     if data.action == "confirm_create_absent":
         if agent.sync_status != "provision_unknown":
@@ -2907,7 +2943,8 @@ async def create_smallest_browser_session(
             detail="Agent cannot take calls until its current provider revision is fully synced",
         )
     try:
-        session = await get_smallest_client().create_browser_session(
+        client, _, _ = await _tenant_smallest_client(db, current_user.tenant_id)
+        session = await client.create_browser_session(
             agent_id=agent.provider_agent_id,
             variables=data.variables,
         )
@@ -3052,7 +3089,8 @@ async def update_agent(
         )
         deprovisioned_provider_agent_id = agent.provider_agent_id
         try:
-            await get_smallest_client().delete_agent(deprovisioned_provider_agent_id)
+            client, _, _ = await _tenant_smallest_client(db, current_user.tenant_id)
+            await client.delete_agent(deprovisioned_provider_agent_id)
         except SmallestAIError as exc:
             if exc.ambiguous:
                 detail = (
@@ -3118,7 +3156,8 @@ async def delete_agent(
     provider_agent_id = agent.provider_agent_id
     if provider_agent_id:
         try:
-            await get_smallest_client().delete_agent(provider_agent_id)
+            client, _, _ = await _tenant_smallest_client(db, current_user.tenant_id)
+            await client.delete_agent(provider_agent_id)
         except SmallestAIError as exc:
             if exc.ambiguous:
                 detail = (

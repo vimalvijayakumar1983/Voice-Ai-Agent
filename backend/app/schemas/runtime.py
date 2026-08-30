@@ -85,3 +85,47 @@ class SipCredentialRequest(BaseModel):
 class SipCredentialStatus(BaseModel):
     configured: bool
     updated_at: datetime | None = None
+
+
+class ApiKeyCredentialRequest(BaseModel):
+    api_key: str = Field(min_length=20, max_length=512)
+
+    model_config = {"extra": "forbid", "str_strip_whitespace": True}
+
+    @field_validator("api_key")
+    @classmethod
+    def validate_api_key(cls, value: str) -> str:
+        if any(character.isspace() for character in value):
+            raise ValueError("API key must not contain whitespace")
+        return value
+
+
+class TwilioCredentialRequest(BaseModel):
+    account_sid: str = Field(pattern=r"^AC[a-fA-F0-9]{32}$")
+    auth_token: str = Field(min_length=20, max_length=512)
+    default_from_number: str | None = Field(
+        default=None,
+        pattern=r"^\+[1-9]\d{7,14}$",
+    )
+
+    model_config = {"extra": "forbid", "str_strip_whitespace": True}
+
+    @field_validator("auth_token")
+    @classmethod
+    def validate_auth_token(cls, value: str) -> str:
+        if any(character.isspace() for character in value):
+            raise ValueError("Twilio auth token must not contain whitespace")
+        return value
+
+
+class WorkspaceCredentialStatus(BaseModel):
+    provider: str
+    configured: bool
+    source: str
+    updated_at: datetime | None = None
+    account_sid_hint: str | None = None
+    default_from_number: str | None = None
+
+
+class WorkspaceCredentialStatuses(BaseModel):
+    providers: dict[str, WorkspaceCredentialStatus]
