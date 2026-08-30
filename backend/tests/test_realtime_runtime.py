@@ -144,9 +144,7 @@ async def test_ready_runtime_can_be_activated(
     configured = await client.put(
         f"/api/v1/runtime/agents/{agent.id}", headers=auth_headers, json=payload
     )
-    tested = await client.post(
-        f"/api/v1/runtime/agents/{agent.id}/test", headers=auth_headers
-    )
+    tested = await client.post(f"/api/v1/runtime/agents/{agent.id}/test", headers=auth_headers)
     activated = await client.post(
         f"/api/v1/runtime/agents/{agent.id}/activate", headers=auth_headers
     )

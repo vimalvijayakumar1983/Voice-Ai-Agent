@@ -60,9 +60,7 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("agent_id", name="uq_agent_runtime_profiles_agent_id"),
     )
-    op.create_index(
-        "ix_agent_runtime_profiles_tenant_id", "agent_runtime_profiles", ["tenant_id"]
-    )
+    op.create_index("ix_agent_runtime_profiles_tenant_id", "agent_runtime_profiles", ["tenant_id"])
     op.create_index("ix_agent_runtime_profiles_agent_id", "agent_runtime_profiles", ["agent_id"])
 
 

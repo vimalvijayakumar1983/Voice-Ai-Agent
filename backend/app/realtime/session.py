@@ -172,12 +172,17 @@ async def _finalize_inbound_call(config: RuntimeSessionConfig) -> None:
         call = await db.scalar(
             select(Call).where(Call.id == config.call_id, Call.tenant_id == config.tenant_id)
         )
-        if call is None or call.direction != "inbound" or call.status in {
-            "completed",
-            "failed",
-            "busy",
-            "no_answer",
-        }:
+        if (
+            call is None
+            or call.direction != "inbound"
+            or call.status
+            in {
+                "completed",
+                "failed",
+                "busy",
+                "no_answer",
+            }
+        ):
             return
         now = datetime.now(UTC)
         call.status = "completed"

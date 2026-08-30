@@ -371,6 +371,7 @@ export default function Agents() {
 
       {runtimeAgent && runtimeProfile ? (
         <RuntimeControlPanel
+          key={`${runtimeProfile.agent_id}:${runtimeProfile.updated_at ?? 'draft'}`}
           agent={runtimeAgent}
           profile={runtimeProfile}
           onClose={() => setRuntimeAgentId(null)}

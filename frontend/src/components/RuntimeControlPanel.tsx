@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import {
   Activity,
   CheckCircle2,
@@ -25,11 +25,6 @@ export default function RuntimeControlPanel({ agent, profile, onClose, onChange 
   const [numbers, setNumbers] = useState(profile.assigned_numbers.join('\n'));
   const [working, setWorking] = useState('');
   const [notice, setNotice] = useState<{ type: 'success' | 'error' | 'info'; text: string } | null>(null);
-
-  useEffect(() => {
-    setForm(profile);
-    setNumbers(profile.assigned_numbers.join('\n'));
-  }, [profile]);
 
   const payload = () => ({
     telephony_provider: form.telephony_provider,

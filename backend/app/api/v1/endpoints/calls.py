@@ -522,14 +522,18 @@ async def initiate_outbound_call(
         day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         month_start = day_start.replace(day=1)
         daily_calls = await db.scalar(
-            select(func.count()).select_from(Call).where(
+            select(func.count())
+            .select_from(Call)
+            .where(
                 Call.tenant_id == current_user.tenant_id,
                 Call.agent_id == agent.id,
                 Call.created_at >= day_start,
             )
         )
         active_calls = await db.scalar(
-            select(func.count()).select_from(Call).where(
+            select(func.count())
+            .select_from(Call)
+            .where(
                 Call.tenant_id == current_user.tenant_id,
                 Call.agent_id == agent.id,
                 Call.status.notin_(TERMINAL_CALL_STATUSES),
@@ -579,10 +583,14 @@ async def initiate_outbound_call(
     assigned_numbers = runtime_profile.assigned_numbers if runtime_profile else []
     if data.from_number and assigned_numbers and data.from_number not in assigned_numbers:
         raise HTTPException(status_code=422, detail="from_number is not assigned to this runtime")
-    from_number = "provider-managed" if is_smallest else (
-        data.from_number
-        or (assigned_numbers[0] if assigned_numbers else None)
-        or settings.twilio_default_from_number
+    from_number = (
+        "provider-managed"
+        if is_smallest
+        else (
+            data.from_number
+            or (assigned_numbers[0] if assigned_numbers else None)
+            or settings.twilio_default_from_number
+        )
     )
     if not from_number and not is_smallest:
         raise HTTPException(

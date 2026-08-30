@@ -32,9 +32,7 @@ router = APIRouter(prefix="/runtime", tags=["Realtime Runtime"])
 
 
 async def _agent(db: AsyncSession, tenant_id: UUID, agent_id: UUID) -> Agent:
-    agent = await db.scalar(
-        select(Agent).where(Agent.id == agent_id, Agent.tenant_id == tenant_id)
-    )
+    agent = await db.scalar(select(Agent).where(Agent.id == agent_id, Agent.tenant_id == tenant_id))
     if agent is None:
         raise HTTPException(status_code=404, detail="Agent not found")
     return agent
@@ -136,12 +134,7 @@ def _response(
         "assigned_numbers": [],
     }
     if profile is not None:
-        values.update(
-            {
-                key: getattr(profile, key)
-                for key in values
-            }
-        )
+        values.update({key: getattr(profile, key) for key in values})
     return RuntimeProfileResponse(
         id=profile.id if profile else None,
         agent_id=agent_id,
