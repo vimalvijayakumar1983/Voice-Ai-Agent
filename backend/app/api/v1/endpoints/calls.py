@@ -7,14 +7,14 @@ from uuid import UUID, uuid5
 
 import structlog
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.database import get_db
 from app.middleware.tenant import CurrentUser, get_current_user, require_role
-from app.models.agent import Agent
+from app.models.agent import Agent, AgentRuntimeProfile
 from app.models.call import Call, CallSummary, CallTranscript
 from app.providers.smallest import SmallestAIError, get_smallest_client
 from app.schemas.call import (
@@ -481,7 +481,7 @@ async def initiate_outbound_call(
         raise HTTPException(status_code=404, detail="Agent not found")
     if not agent.is_active:
         raise HTTPException(status_code=409, detail="Agent is inactive")
-    if agent.voice_provider not in {"smallest", "twilio"}:
+    if agent.voice_provider not in {"smallest", "sarvam", "twilio"}:
         raise HTTPException(status_code=422, detail="Agent voice provider is not supported")
 
     if await is_number_on_tenant_dnc(db, current_user.tenant_id, data.to_number):
@@ -496,6 +496,64 @@ async def initiate_outbound_call(
         )
 
     is_smallest = agent.voice_provider == "smallest"
+    runtime_profile = None
+    if agent.voice_provider == "sarvam":
+        runtime_profile = await db.scalar(
+            select(AgentRuntimeProfile).where(
+                AgentRuntimeProfile.agent_id == agent.id,
+                AgentRuntimeProfile.tenant_id == current_user.tenant_id,
+            )
+        )
+        if (
+            runtime_profile is None
+            or not runtime_profile.enabled
+            or runtime_profile.status != "active"
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Activate and pass the VAV runtime readiness test before placing a call",
+            )
+        if runtime_profile.telephony_provider != "twilio":
+            raise HTTPException(
+                status_code=409,
+                detail="Outbound LiveKit SIP dispatch requires the provisioned SIP edge",
+            )
+        now = datetime.now(UTC)
+        day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        month_start = day_start.replace(day=1)
+        daily_calls = await db.scalar(
+            select(func.count()).select_from(Call).where(
+                Call.tenant_id == current_user.tenant_id,
+                Call.agent_id == agent.id,
+                Call.created_at >= day_start,
+            )
+        )
+        active_calls = await db.scalar(
+            select(func.count()).select_from(Call).where(
+                Call.tenant_id == current_user.tenant_id,
+                Call.agent_id == agent.id,
+                Call.status.notin_(TERMINAL_CALL_STATUSES),
+            )
+        )
+        monthly_cost = await db.scalar(
+            select(func.coalesce(func.sum(Call.cost_cents), 0)).where(
+                Call.tenant_id == current_user.tenant_id,
+                Call.agent_id == agent.id,
+                Call.created_at >= month_start,
+            )
+        )
+        if int(daily_calls or 0) >= runtime_profile.daily_call_limit:
+            raise HTTPException(status_code=429, detail="Agent daily call limit has been reached")
+        if int(active_calls or 0) >= runtime_profile.max_concurrent_calls:
+            raise HTTPException(
+                status_code=429,
+                detail="Agent concurrent call limit has been reached",
+            )
+        if int(monthly_cost or 0) >= runtime_profile.monthly_budget_cents:
+            raise HTTPException(
+                status_code=402,
+                detail="Agent monthly call budget has been reached",
+            )
     if is_smallest and not agent.provider_agent_id:
         raise HTTPException(
             status_code=409,
@@ -518,10 +576,13 @@ async def initiate_outbound_call(
                 "Smallest.ai caller identity is server-managed and cannot be supplied by clients"
             ),
         )
-    from_number = (
-        "provider-managed"
-        if is_smallest
-        else data.from_number or settings.twilio_default_from_number
+    assigned_numbers = runtime_profile.assigned_numbers if runtime_profile else []
+    if data.from_number and assigned_numbers and data.from_number not in assigned_numbers:
+        raise HTTPException(status_code=422, detail="from_number is not assigned to this runtime")
+    from_number = "provider-managed" if is_smallest else (
+        data.from_number
+        or (assigned_numbers[0] if assigned_numbers else None)
+        or settings.twilio_default_from_number
     )
     if not from_number and not is_smallest:
         raise HTTPException(
@@ -534,6 +595,8 @@ async def initiate_outbound_call(
         agent.provider_agent_id,
         agent.provider_revision_id,
         from_number,
+        str(runtime_profile.id) if runtime_profile else None,
+        runtime_profile.updated_at.isoformat() if runtime_profile else None,
     )
 
     # Create call record
@@ -549,6 +612,8 @@ async def initiate_outbound_call(
         call_metadata={
             "request": request_identity,
             "agent_configuration": agent_configuration_snapshot(agent),
+            "runtime_profile_id": str(runtime_profile.id) if runtime_profile else None,
+            "speech_provider": agent.voice_provider,
         },
     )
     db.add(call)
@@ -628,10 +693,25 @@ async def initiate_outbound_call(
                 .execution_options(populate_existing=True)
             )
         ).scalar_one_or_none()
+        current_runtime_profile = None
+        if current_agent and current_agent.voice_provider == "sarvam":
+            current_runtime_profile = await db.scalar(
+                select(AgentRuntimeProfile)
+                .where(
+                    AgentRuntimeProfile.agent_id == current_agent.id,
+                    AgentRuntimeProfile.tenant_id == current_user.tenant_id,
+                )
+                .with_for_update()
+            )
+        current_assigned_numbers = (
+            current_runtime_profile.assigned_numbers if current_runtime_profile else []
+        )
         current_from_number = (
             "provider-managed"
             if current_agent and current_agent.voice_provider == "smallest"
-            else data.from_number or settings.twilio_default_from_number
+            else data.from_number
+            or (current_assigned_numbers[0] if current_assigned_numbers else None)
+            or settings.twilio_default_from_number
         )
         provider_identity_changed = bool(
             current_agent
@@ -640,6 +720,12 @@ async def initiate_outbound_call(
                 current_agent.provider_agent_id,
                 current_agent.provider_revision_id,
                 current_from_number,
+                str(current_runtime_profile.id) if current_runtime_profile else None,
+                (
+                    current_runtime_profile.updated_at.isoformat()
+                    if current_runtime_profile
+                    else None
+                ),
             )
             != provider_identity
         )
@@ -653,16 +739,31 @@ async def initiate_outbound_call(
                 or current_agent.sync_status != "synced"
             )
         )
+        runtime_not_ready = bool(
+            current_agent
+            and current_agent.voice_provider == "sarvam"
+            and (
+                current_runtime_profile is None
+                or not current_runtime_profile.enabled
+                or current_runtime_profile.status != "active"
+                or current_runtime_profile.telephony_provider != "twilio"
+            )
+        )
         if (
             current_agent is None
             or not current_agent.is_active
             or provider_identity_changed
             or provider_not_ready
+            or runtime_not_ready
         ):
             reason = (
                 "agent_inactive"
                 if current_agent is not None and not current_agent.is_active
-                else ("agent_not_synced" if provider_not_ready else "agent_provider_changed")
+                else (
+                    "agent_not_synced"
+                    if provider_not_ready
+                    else ("runtime_not_ready" if runtime_not_ready else "agent_provider_changed")
+                )
             )
             call.status = "failed"
             call.call_metadata = {**(call.call_metadata or {}), "dispatch_error": reason}

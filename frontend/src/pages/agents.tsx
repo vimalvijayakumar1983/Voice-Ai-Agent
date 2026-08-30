@@ -19,6 +19,7 @@ import {
   X,
 } from 'lucide-react';
 import AgentEditor, { AgentEditorValues, defaultAgentValues } from '@/components/AgentEditor';
+import RuntimeControlPanel from '@/components/RuntimeControlPanel';
 import agentEditorDiff from '@/components/agent-editor-diff.cjs';
 import Layout from '@/components/Layout';
 import {
@@ -28,11 +29,11 @@ import {
   providerActionLabel,
   providerActionNotice,
 } from '@/lib/agent-readiness.cjs';
-import { api, AgentProviderCatalog, ProviderStatus, VoiceAgent } from '@/lib/api';
+import { api, AgentProviderCatalog, ProviderStatus, RuntimeProfile, VoiceAgent } from '@/lib/api';
 
 const { agentEditorPatch, agentUpdateNotice, requiresSmallestDeprovision } = agentEditorDiff;
 
-type AgentLoadErrors = Partial<Record<'agents' | 'provider' | 'catalog', string>>;
+type AgentLoadErrors = Partial<Record<'agents' | 'provider' | 'catalog' | 'runtime', string>>;
 type DeploymentFilter = 'all' | 'local' | 'synced' | 'changes' | 'attention';
 type AgentSort = 'updated' | 'created' | 'name-asc' | 'name-desc';
 
@@ -40,6 +41,8 @@ export default function Agents() {
   const [agents, setAgents] = useState<VoiceAgent[]>([]);
   const [provider, setProvider] = useState<ProviderStatus | null>(null);
   const [catalog, setCatalog] = useState<AgentProviderCatalog | null>(null);
+  const [runtimeProfiles, setRuntimeProfiles] = useState<Record<string, RuntimeProfile>>({});
+  const [runtimeAgentId, setRuntimeAgentId] = useState<string | null>(null);
   const [showCreate, setShowCreate] = useState(false);
   const [editingAgentId, setEditingAgentId] = useState<string | null>(null);
   const [working, setWorking] = useState<string | null>(null);
@@ -58,7 +61,8 @@ export default function Agents() {
       api.listAgents(),
       api.getProviderStatus(),
       api.getAgentProviderCatalog(),
-    ]).then(([agentResult, providerResult, catalogResult]) => {
+      api.listRuntimeProfiles(),
+    ]).then(([agentResult, providerResult, catalogResult, runtimeResult]) => {
       if (!active) return;
       const errors: AgentLoadErrors = {};
       if (agentResult.status === 'fulfilled') setAgents(agentResult.value);
@@ -76,6 +80,12 @@ export default function Agents() {
         setCatalog(null);
         errors.catalog = errorMessage(catalogResult.reason, 'Could not load the current voice and language catalog.');
       }
+      if (runtimeResult.status === 'fulfilled') {
+        setRuntimeProfiles(Object.fromEntries(runtimeResult.value.map((profile) => [profile.agent_id, profile])));
+      } else {
+        setRuntimeProfiles({});
+        errors.runtime = errorMessage(runtimeResult.reason, 'Could not load VAV runtime controls.');
+      }
       setLoadErrors(errors);
       setLoading(false);
     });
@@ -83,6 +93,8 @@ export default function Agents() {
   }, [reloadKey]);
 
   const editingAgent = agents.find((agent) => agent.id === editingAgentId) ?? null;
+  const runtimeAgent = agents.find((agent) => agent.id === runtimeAgentId) ?? null;
+  const runtimeProfile = runtimeAgentId ? runtimeProfiles[runtimeAgentId] ?? null : null;
   const languageOptions = useMemo(() => {
     const codes = new Set(agents.flatMap((agent) => agent.supported_languages));
     return Array.from(codes).sort((left, right) => languageLabel(left, catalog).localeCompare(languageLabel(right, catalog)));
@@ -239,6 +251,12 @@ export default function Agents() {
     try {
       await api.deleteAgent(agent.id);
       setAgents((current) => current.filter((item) => item.id !== agent.id));
+      setRuntimeProfiles((current) => {
+        const next = { ...current };
+        delete next[agent.id];
+        return next;
+      });
+      if (runtimeAgentId === agent.id) setRuntimeAgentId(null);
       setNotice({
         type: 'success',
         text: agent.provider_agent_id
@@ -314,6 +332,8 @@ export default function Agents() {
     setAgents([]);
     setProvider(null);
     setCatalog(null);
+    setRuntimeProfiles({});
+    setRuntimeAgentId(null);
     setReloadKey((value) => value + 1);
   };
 
@@ -348,6 +368,15 @@ export default function Agents() {
           <span>{notice.text}</span>
         </div>
       )}
+
+      {runtimeAgent && runtimeProfile ? (
+        <RuntimeControlPanel
+          agent={runtimeAgent}
+          profile={runtimeProfile}
+          onClose={() => setRuntimeAgentId(null)}
+          onChange={(next) => setRuntimeProfiles((current) => ({ ...current, [next.agent_id]: next }))}
+        />
+      ) : null}
 
       {loading && (
         <div className="page-loading" role="status" aria-live="polite">
@@ -482,7 +511,12 @@ export default function Agents() {
               <div className="agent-card-actions">
                 <button className="btn btn-secondary btn-sm" disabled={!catalogReady || providerOperationUnresolved(agent.sync_status)} onClick={() => openEdit(agent)}><Pencil size={12} /> Edit</button>
                 {agent.voice_provider === 'sarvam' ? (
-                  <button className="btn btn-secondary btn-sm" disabled title="Sarvam live calls require the VAV realtime runtime."><Radio size={12} /> VAV runtime</button>
+                  <button
+                    className={`btn btn-sm ${runtimeProfiles[agent.id]?.enabled ? 'btn-primary' : 'btn-secondary'}`}
+                    disabled={!runtimeProfiles[agent.id]}
+                    onClick={() => { setRuntimeAgentId(agent.id); window.scrollTo({ top: 0, behavior: 'smooth' }); }}
+                    title={runtimeProfiles[agent.id]?.enabled ? 'Runtime active' : 'Configure and test the VAV runtime'}
+                  ><Radio size={12} /> {runtimeProfiles[agent.id]?.enabled ? 'Runtime active' : 'Configure runtime'}</button>
                 ) : agent.provider_agent_id ? (
                   <button className="btn btn-secondary btn-sm" disabled={working === `sync-${agent.id}` || agent.sync_status === 'synced'} onClick={() => runAgentAction(agent, 'sync')} title={isProviderConfigCorrection(agent) ? 'Recheck Smallest.ai without publishing another revision.' : undefined}><RefreshCw size={12} /> {providerActionLabel(agent)}</button>
                 ) : agent.sync_status === 'provision_unknown' ? (
@@ -495,10 +529,10 @@ export default function Agents() {
                 {agent.sync_status === 'publish_unknown' && (
                   <button className="btn btn-secondary btn-sm" disabled={working === `resolve-${agent.id}`} onClick={() => resolveProviderOperation(agent)}><RefreshCw size={12} /> Resolve unknown</button>
                 )}
-                {isAgentCallReady(agent) ? (
+                {isAgentCallReady(agent, runtimeProfiles[agent.id]) ? (
                   <Link href={`/playground?agent=${agent.id}`} className="btn btn-secondary btn-sm"><FlaskConical size={12} /> Test</Link>
                 ) : (
-                  <button className="btn btn-secondary btn-sm" disabled title={agentTestReadinessMessage(agent)}><FlaskConical size={12} /> Test</button>
+                  <button className="btn btn-secondary btn-sm" disabled title={agentTestReadinessMessage(agent, runtimeProfiles[agent.id])}><FlaskConical size={12} /> Test</button>
                 )}
                 <button className="btn btn-ghost btn-sm" disabled={providerOperationUnresolved(agent.sync_status) || working === `delete-${agent.id}`} onClick={() => removeAgent(agent)} aria-label={`Delete ${agent.name}`} title={agent.provider_agent_id ? 'Delete from VAV and archive the Smallest.ai agent.' : 'Delete local draft.'}><Trash2 size={12} /></button>
               </div>

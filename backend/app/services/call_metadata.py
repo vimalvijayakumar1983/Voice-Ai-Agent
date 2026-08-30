@@ -46,4 +46,34 @@ def public_call_metadata(value: Any) -> dict[str, Any] | None:
     switching_mode = snapshot.get("language_switching_mode")
     if switching_mode in {"disabled", "automatic"}:
         result["language_switching_mode"] = switching_mode
+    speech_provider = value.get("speech_provider")
+    if speech_provider in {"smallest", "sarvam"}:
+        result["speech_provider"] = speech_provider
+    runtime = value.get("runtime")
+    if isinstance(runtime, dict):
+        safe_runtime: dict[str, Any] = {}
+        string_fields = {
+            "speech_provider",
+            "llm_provider",
+            "llm_model",
+            "stt_language",
+            "cost_state",
+        }
+        numeric_fields = {
+            "turn_count",
+            "llm_tokens",
+            "inbound_audio_bytes",
+            "outbound_audio_bytes",
+            "barge_in_count",
+            "last_llm_latency_ms",
+            "last_tts_first_byte_ms",
+        }
+        for field in string_fields:
+            if isinstance(runtime.get(field), str):
+                safe_runtime[field] = runtime[field]
+        for field in numeric_fields:
+            if isinstance(runtime.get(field), (int, float)):
+                safe_runtime[field] = runtime[field]
+        if safe_runtime:
+            result["runtime"] = safe_runtime
     return result or None

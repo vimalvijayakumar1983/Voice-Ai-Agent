@@ -1,6 +1,9 @@
 'use strict';
 
-function isAgentCallReady(agent) {
+function isAgentCallReady(agent, runtimeProfile) {
+  if (agent?.voice_provider === 'sarvam') {
+    return Boolean(agent.is_active && runtimeProfile?.enabled && runtimeProfile?.status === 'active');
+  }
   return Boolean(
     agent
       && agent.is_active
@@ -11,7 +14,13 @@ function isAgentCallReady(agent) {
   );
 }
 
-function agentTestReadinessMessage(agent) {
+function agentTestReadinessMessage(agent, runtimeProfile) {
+  if (agent?.voice_provider === 'sarvam') {
+    if (!agent.is_active) return 'Activate this agent before testing.';
+    if (!runtimeProfile) return 'Load the VAV runtime profile before testing.';
+    if (runtimeProfile.blockers?.length) return runtimeProfile.blockers.join(' ');
+    return 'Activate the VAV realtime runtime before testing.';
+  }
   if (!agent?.provider_agent_id) return 'Provision this agent before testing.';
   if (!agent.is_active) return 'Activate this agent before testing.';
   if (agent.sync_status === 'provider_scanning') {

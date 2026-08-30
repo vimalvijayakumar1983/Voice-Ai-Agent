@@ -87,6 +87,42 @@ export interface ProviderCredentialStatus {
   updated_at: string | null;
 }
 
+export interface RuntimeProfile {
+  id: string | null;
+  agent_id: string;
+  enabled: boolean;
+  telephony_provider: 'twilio' | 'livekit_sip';
+  primary_speech_provider: 'sarvam';
+  fallback_speech_provider: 'smallest' | null;
+  llm_provider: 'openai';
+  llm_model: 'gpt-4o-mini' | 'gpt-4o';
+  stt_language: string;
+  max_concurrent_calls: number;
+  daily_call_limit: number;
+  monthly_budget_cents: number;
+  assigned_numbers: string[];
+  status: 'draft' | 'ready' | 'blocked' | 'active' | 'inactive';
+  ready: boolean;
+  blockers: string[];
+  last_tested_at: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface RuntimeReadiness {
+  agent_id: string;
+  ready: boolean;
+  status: 'ready' | 'blocked';
+  blockers: string[];
+  checks: Record<string, boolean>;
+  tested_at: string;
+}
+
+export interface SipCredentialStatus {
+  configured: boolean;
+  updated_at: string | null;
+}
+
 export interface VoiceCatalogItem {
   provider: 'smallest' | 'sarvam';
   id: string;
@@ -1133,6 +1169,66 @@ class ApiClient {
 
   async deleteSarvamCredential() {
     return this.request<ProviderCredentialStatus>('/api/v1/agents/provider/sarvam/credential', {
+      method: 'DELETE',
+    });
+  }
+
+  async listRuntimeProfiles() {
+    return this.request<RuntimeProfile[]>('/api/v1/runtime/agents');
+  }
+
+  async getRuntimeProfile(agentId: string) {
+    return this.request<RuntimeProfile>(`/api/v1/runtime/agents/${agentId}`);
+  }
+
+  async updateRuntimeProfile(agentId: string, data: Omit<RuntimeProfile,
+    'id' | 'agent_id' | 'enabled' | 'status' | 'ready' | 'blockers' |
+    'last_tested_at' | 'created_at' | 'updated_at'>) {
+    return this.request<RuntimeProfile>(`/api/v1/runtime/agents/${agentId}`, {
+      method: 'PUT',
+      body: JSON.stringify(data),
+    });
+  }
+
+  async testRuntimeProfile(agentId: string) {
+    return this.request<RuntimeReadiness>(`/api/v1/runtime/agents/${agentId}/test`, {
+      method: 'POST',
+    });
+  }
+
+  async activateRuntimeProfile(agentId: string) {
+    return this.request<RuntimeProfile>(`/api/v1/runtime/agents/${agentId}/activate`, {
+      method: 'POST',
+    });
+  }
+
+  async deactivateRuntimeProfile(agentId: string) {
+    return this.request<RuntimeProfile>(`/api/v1/runtime/agents/${agentId}/deactivate`, {
+      method: 'POST',
+    });
+  }
+
+  async getSipCredentialStatus() {
+    return this.request<SipCredentialStatus>('/api/v1/runtime/sip/credential');
+  }
+
+  async saveSipCredential(data: {
+    sip_uri: string;
+    username: string;
+    password: string;
+    inbound_number: string;
+    livekit_url: string;
+    livekit_api_key: string;
+    livekit_api_secret: string;
+  }) {
+    return this.request<SipCredentialStatus>('/api/v1/runtime/sip/credential', {
+      method: 'PUT',
+      body: JSON.stringify(data),
+    });
+  }
+
+  async deleteSipCredential() {
+    return this.request<SipCredentialStatus>('/api/v1/runtime/sip/credential', {
       method: 'DELETE',
     });
   }

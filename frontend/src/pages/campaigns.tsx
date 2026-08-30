@@ -298,7 +298,7 @@ export default function Campaigns() {
 
   const canMutateCampaigns = Boolean(currentUser && currentUser.role !== 'viewer');
   const canReconcileAttempts = currentUser?.role === 'owner' || currentUser?.role === 'admin';
-  const provisionedAgents = agents.filter(isAgentCallReady);
+  const provisionedAgents = agents.filter((agent) => isAgentCallReady(agent));
   const agentNames = new Map(agents.map((agent) => [agent.id, agent.name]));
   const contactLineCount = form.contacts.split(/\r?\n/).filter((line) => line.trim()).length;
   const timezoneOptions = COMMON_TIMEZONES.some((option) => option.value === browserTimezone)

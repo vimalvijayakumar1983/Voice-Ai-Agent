@@ -1,4 +1,5 @@
 export interface AgentReadiness {
+  voice_provider?: string;
   is_active: boolean;
   sync_status: string;
   provider_agent_id: string | null;
@@ -11,6 +12,12 @@ export interface AgentReadiness {
   } | null;
 }
 
+export interface RuntimeReadinessProfile {
+  enabled: boolean;
+  status: string;
+  blockers?: string[];
+}
+
 export type TestReadyAgent<T extends AgentReadiness> = T & {
   is_active: true;
   provider_agent_id: string;
@@ -20,9 +27,13 @@ export type TestReadyAgent<T extends AgentReadiness> = T & {
 
 export function isAgentCallReady<T extends AgentReadiness>(
   agent: T | null | undefined,
-): agent is TestReadyAgent<T>;
+  runtimeProfile?: RuntimeReadinessProfile | null,
+): boolean;
 
-export function agentTestReadinessMessage(agent: AgentReadiness | null | undefined): string;
+export function agentTestReadinessMessage(
+  agent: AgentReadiness | null | undefined,
+  runtimeProfile?: RuntimeReadinessProfile | null,
+): string;
 
 export function isProviderConfigCorrection(
   agent: AgentReadiness | null | undefined,

@@ -23,6 +23,7 @@ import {
   CallRecord,
   CallSummary,
   CallTranscript,
+  RuntimeProfile,
   VoiceAgent,
 } from '@/lib/api';
 import styles from '@/styles/conversation-operations.module.css';
@@ -175,6 +176,7 @@ export default function Calls() {
   const [recordingLoading, setRecordingLoading] = useState(false);
   const [recordingError, setRecordingError] = useState('');
   const [agents, setAgents] = useState<VoiceAgent[]>([]);
+  const [runtimeProfiles, setRuntimeProfiles] = useState<Record<string, RuntimeProfile>>({});
   const [showDialer, setShowDialer] = useState(false);
   const [dialing, setDialing] = useState(false);
   const [dialError, setDialError] = useState('');
@@ -196,9 +198,10 @@ export default function Calls() {
     listRequestRef.current = requestId;
     setLoading(true);
     setListError('');
-    const [callsResult, agentsResult] = await Promise.allSettled([
+    const [callsResult, agentsResult, runtimeResult] = await Promise.allSettled([
       api.listCalls({ page_size: '200' }),
       api.listAgents(),
+      api.listRuntimeProfiles(),
     ]);
     if (listRequestRef.current !== requestId) return;
     if (callsResult.status === 'fulfilled') {
@@ -207,6 +210,9 @@ export default function Calls() {
       setListError(callsResult.reason instanceof Error ? callsResult.reason.message : 'Could not load conversations.');
     }
     if (agentsResult.status === 'fulfilled') setAgents(agentsResult.value);
+    if (runtimeResult.status === 'fulfilled') {
+      setRuntimeProfiles(Object.fromEntries(runtimeResult.value.map((profile) => [profile.agent_id, profile])));
+    }
     setLoading(false);
   }, []);
 
@@ -217,7 +223,8 @@ export default function Calls() {
     Promise.allSettled([
       api.listCalls({ page_size: '200' }),
       api.listAgents(),
-    ]).then(([callsResult, agentsResult]) => {
+      api.listRuntimeProfiles(),
+    ]).then(([callsResult, agentsResult, runtimeResult]) => {
       if (!current || listRequestRef.current !== requestId) return;
       if (callsResult.status === 'fulfilled') {
         setCalls(callsResult.value);
@@ -225,6 +232,9 @@ export default function Calls() {
         setListError(callsResult.reason instanceof Error ? callsResult.reason.message : 'Could not load conversations.');
       }
       if (agentsResult.status === 'fulfilled') setAgents(agentsResult.value);
+      if (runtimeResult.status === 'fulfilled') {
+        setRuntimeProfiles(Object.fromEntries(runtimeResult.value.map((profile) => [profile.agent_id, profile])));
+      }
       setLoading(false);
     });
     return () => {
@@ -452,6 +462,9 @@ export default function Calls() {
 
   const selectedDialAgent = dialForm.agent_id ? agentMap.get(dialForm.agent_id) : undefined;
   const selectedMetadata = callMetadata(selectedCall);
+  const selectedRuntime = selectedMetadata.runtime && typeof selectedMetadata.runtime === 'object' && !Array.isArray(selectedMetadata.runtime)
+    ? selectedMetadata.runtime as Record<string, unknown>
+    : {};
   const metadataLanguages = configuredLanguages(selectedCall);
   const transcriptLanguages = transcript
     ? transcript.turns.map((turn) => transcriptLanguage(turn)).filter(Boolean)
@@ -490,7 +503,7 @@ export default function Calls() {
               <label htmlFor="dial-agent">Agent</label>
               <select id="dial-agent" name="agent_id" required value={dialForm.agent_id} onChange={(event) => updateDialField('agent_id', event.target.value)}>
                 <option value="">Select a published agent</option>
-                {agents.filter(isAgentCallReady).map((agent) => <option value={agent.id} key={agent.id}>{agent.name}</option>)}
+                {agents.filter((agent) => isAgentCallReady(agent, runtimeProfiles[agent.id])).map((agent) => <option value={agent.id} key={agent.id}>{agent.name}</option>)}
               </select>
               {selectedDialAgent ? (
                 <p className="form-hint">Configured languages: {Array.from(new Set([selectedDialAgent.language, ...selectedDialAgent.supported_languages])).map(languageName).join(', ')}. This does not certify live switching.</p>
@@ -610,6 +623,11 @@ export default function Calls() {
                   {selectedCall.cost_cents !== null ? <div><dt>Provider cost</dt><dd>{selectedCall.cost_cents} cents</dd></div> : null}
                   {selectedCall.sentiment_score !== null ? <div><dt>Sentiment score</dt><dd>{selectedCall.sentiment_score.toFixed(2)}</dd></div> : null}
                   {typeof selectedMetadata.provider_latency_ms === 'number' ? <div><dt>Provider latency</dt><dd>{selectedMetadata.provider_latency_ms} ms</dd></div> : null}
+                  {typeof selectedRuntime.last_llm_latency_ms === 'number' ? <div><dt>Last LLM latency</dt><dd>{selectedRuntime.last_llm_latency_ms} ms</dd></div> : null}
+                  {typeof selectedRuntime.last_tts_first_byte_ms === 'number' ? <div><dt>Last TTS first byte</dt><dd>{selectedRuntime.last_tts_first_byte_ms} ms</dd></div> : null}
+                  {typeof selectedRuntime.llm_tokens === 'number' ? <div><dt>LLM tokens</dt><dd>{selectedRuntime.llm_tokens}</dd></div> : null}
+                  {typeof selectedRuntime.barge_in_count === 'number' ? <div><dt>Barge-ins</dt><dd>{selectedRuntime.barge_in_count}</dd></div> : null}
+                  {selectedRuntime.cost_state === 'pending_provider_billing_sync' ? <div><dt>Runtime cost</dt><dd>Awaiting provider billing sync</dd></div> : null}
                 </dl>
               </section>
 

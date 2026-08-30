@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
+from io import BytesIO
 from pathlib import PurePath
 from urllib.parse import urlsplit, urlunsplit
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from pypdf import PdfReader
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -31,6 +34,7 @@ from app.services.audit import record_audit_event
 
 router = APIRouter(prefix="/knowledge", tags=["Knowledge Studio"])
 MAX_KNOWLEDGE_PDF_BYTES = 8 * 1024 * 1024
+MAX_EXTRACTED_PDF_CHARS = 500_000
 PROVIDER_INDEXED_STATUSES = {
     "complete",
     "completed",
@@ -48,6 +52,20 @@ BOUND_AGENT_PROVIDER_OPERATIONS = {
     "provider_scanning",
     "publish_unknown",
 }
+
+
+def _extract_pdf_text(content: bytes) -> str | None:
+    """Best-effort local text extraction keeps VAV retrieval provider-neutral."""
+    try:
+        reader = PdfReader(BytesIO(content), strict=False)
+        pages = [page.extract_text() or "" for page in reader.pages]
+    except Exception:
+        # Smallest remains authoritative for ingestion of PDFs its parser can
+        # accept. A malformed or image-only document must not create invented
+        # local text or expose raw bytes.
+        return None
+    text = "\n\n".join(" ".join(page.split()) for page in pages if page.strip()).strip()
+    return text[:MAX_EXTRACTED_PDF_CHARS] or None
 
 
 def _provider_error(exc: SmallestAIError) -> HTTPException:
@@ -654,6 +672,7 @@ async def upload_pdf_source(
         raise HTTPException(status_code=413, detail="PDF must be 8 MB or smaller")
     if not content.startswith(b"%PDF-"):
         raise HTTPException(status_code=422, detail="The uploaded file is not a valid PDF")
+    extracted_text = await asyncio.to_thread(_extract_pdf_text, content)
     client = get_smallest_client()
     remote_id = await _ensure_remote(db, kb, client)
     try:
@@ -670,6 +689,7 @@ async def upload_pdf_source(
             tenant_id=current_user.tenant_id,
             source_type="file",
             name=filename,
+            content=extracted_text,
             mime_type="application/pdf",
             size_bytes=len(content),
             status="processing",
@@ -689,6 +709,7 @@ async def upload_pdf_source(
         details={
             "name": filename,
             "bytes": len(content),
+            "local_text_extracted": bool(extracted_text),
             "agents_requiring_sync": [str(agent_id) for agent_id in affected_agent_ids],
         },
     )

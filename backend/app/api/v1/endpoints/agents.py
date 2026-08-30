@@ -2014,7 +2014,7 @@ async def get_provider_status(
             },
             "sarvam": {
                 "configured": sarvam.is_configured,
-                "agent_runtime": False,
+                "agent_runtime": True,
                 "voice_preview": sarvam.is_configured,
                 "source": sarvam_source,
                 "updated_at": sarvam_updated_at.isoformat() if sarvam_updated_at else None,

@@ -66,6 +66,43 @@ class Agent(TenantScopedModel):
         cascade="all, delete-orphan",
     )
     calls = relationship("Call", back_populates="agent", lazy="noload")
+    runtime_profile = relationship(
+        "AgentRuntimeProfile",
+        back_populates="agent",
+        uselist=False,
+        lazy="selectin",
+        cascade="all, delete-orphan",
+    )
+
+
+class AgentRuntimeProfile(TenantScopedModel):
+    """Provider-neutral serving policy for calls handled by VAV itself."""
+
+    __tablename__ = "agent_runtime_profiles"
+    __table_args__ = (UniqueConstraint("agent_id", name="uq_agent_runtime_profiles_agent_id"),)
+
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), index=True
+    )
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("agents.id", ondelete="CASCADE"), index=True
+    )
+    enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    telephony_provider: Mapped[str] = mapped_column(String(30), default="twilio")
+    primary_speech_provider: Mapped[str] = mapped_column(String(30), default="sarvam")
+    fallback_speech_provider: Mapped[str | None] = mapped_column(String(30))
+    llm_provider: Mapped[str] = mapped_column(String(30), default="openai")
+    llm_model: Mapped[str] = mapped_column(String(100), default="gpt-4o-mini")
+    stt_language: Mapped[str] = mapped_column(String(30), default="auto")
+    max_concurrent_calls: Mapped[int] = mapped_column(Integer, default=1)
+    daily_call_limit: Mapped[int] = mapped_column(Integer, default=100)
+    monthly_budget_cents: Mapped[int] = mapped_column(Integer, default=5000)
+    assigned_numbers: Mapped[list[str]] = mapped_column(JSONB, default=list)
+    status: Mapped[str] = mapped_column(String(30), default="draft")
+    last_tested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    runtime_config: Mapped[dict | None] = mapped_column("config", JSONB)
+
+    agent = relationship("Agent", back_populates="runtime_profile")
 
 
 class KnowledgeBase(TenantScopedModel):

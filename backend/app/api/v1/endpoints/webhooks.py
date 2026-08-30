@@ -8,7 +8,7 @@ import weakref
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from urllib.parse import parse_qsl
+from urllib.parse import parse_qsl, urlsplit, urlunsplit
 from uuid import UUID
 
 import structlog
@@ -19,9 +19,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.database import async_session_factory
-from app.models.agent import Agent
+from app.models.agent import Agent, AgentRuntimeProfile
 from app.models.call import Call, CallSummary, CallTranscript
 from app.models.campaign import Campaign, CampaignContact, CampaignContactAttempt
+from app.realtime.auth import create_media_token
 from app.services.call_metadata import agent_configuration_snapshot
 from app.services.campaign_lifecycle import (
     TERMINAL_CALL_STATUSES,
@@ -526,6 +527,15 @@ async def _verify_twilio_request(request: Request) -> dict[str, str]:
     return params
 
 
+def _runtime_stream_url(call_id: UUID) -> str:
+    public = urlsplit(settings.base_url)
+    websocket_origin = urlunsplit(
+        ("wss" if public.scheme == "https" else "ws", public.netloc, "", "", "")
+    )
+    token = create_media_token(call_id)
+    return f"{websocket_origin}/api/v1/realtime/twilio/{call_id}?token={token}"
+
+
 async def _process_smallest_webhook(
     db: AsyncSession,
     payload: dict,
@@ -767,20 +777,81 @@ async def smallest_webhook(request: Request):
 
 @router.post("/twilio/voice/inbound")
 async def twilio_inbound_webhook(request: Request):
-    """Fail closed until a tenant-owned inbound-number mapping is provisioned.
+    """Route an inbound DID only through an explicit, unique runtime assignment."""
+    params = await _verify_twilio_request(request)
+    to_number = params.get("To", "")
+    from_number = params.get("From", "")
+    call_sid = params.get("CallSid", "")
+    if not to_number or not from_number or not call_sid:
+        raise HTTPException(status_code=400, detail="Missing Twilio inbound call identity")
 
-    Agent transfer destinations are not inbound DID assignments. Routing by
-    that non-unique field would allow two tenants to claim the same number and
-    could disclose one workspace's agent behavior to another caller.
-    """
-    await _verify_twilio_request(request)
-    return Response(
-        content=(
-            '<?xml version="1.0"?><Response><Say>Sorry, this number is not configured. '
-            "Goodbye.</Say><Hangup/></Response>"
-        ),
-        media_type="application/xml",
-    )
+    async with async_session_factory() as db:
+        candidates = (
+            await db.execute(
+                select(AgentRuntimeProfile, Agent)
+                .join(
+                    Agent,
+                    (Agent.id == AgentRuntimeProfile.agent_id)
+                    & (Agent.tenant_id == AgentRuntimeProfile.tenant_id),
+                )
+                .where(
+                    AgentRuntimeProfile.enabled.is_(True),
+                    AgentRuntimeProfile.status == "active",
+                    AgentRuntimeProfile.telephony_provider == "twilio",
+                    Agent.is_active.is_(True),
+                    Agent.voice_provider == "sarvam",
+                )
+            )
+        ).all()
+        matches = [
+            (profile, agent)
+            for profile, agent in candidates
+            if to_number in (profile.assigned_numbers or [])
+        ]
+        if len(matches) != 1:
+            logger.warning(
+                "twilio_inbound_number_unroutable",
+                assigned_matches=len(matches),
+                to_number=to_number,
+            )
+            return Response(
+                content=(
+                    '<?xml version="1.0"?><Response><Say>Sorry, this number is not '
+                    "configured. Goodbye.</Say><Hangup/></Response>"
+                ),
+                media_type="application/xml",
+            )
+
+        _profile, agent = matches[0]
+        call = await db.scalar(select(Call).where(Call.provider_call_sid == call_sid))
+        if call is None:
+            now = datetime.now(UTC)
+            call = Call(
+                tenant_id=agent.tenant_id,
+                agent_id=agent.id,
+                direction="inbound",
+                status="in_progress",
+                from_number=from_number,
+                to_number=to_number,
+                provider="twilio",
+                provider_call_sid=call_sid,
+                started_at=now,
+                answered_at=now,
+                call_metadata={
+                    "agent_configuration": agent_configuration_snapshot(agent),
+                    "conversation_type": "telephonyInbound",
+                    "channel": "phone",
+                    "speech_provider": "sarvam",
+                },
+            )
+            db.add(call)
+            await db.flush()
+        elif call.tenant_id != agent.tenant_id or call.agent_id != agent.id:
+            raise HTTPException(status_code=409, detail="Conflicting inbound call identity")
+        await db.commit()
+
+    twiml = get_telephony_provider().generate_connect_stream(_runtime_stream_url(call.id))
+    return Response(content=twiml.xml, media_type="application/xml")
 
 
 @router.post("/twilio/voice/{call_id}")
@@ -812,17 +883,35 @@ async def twilio_voice_webhook(call_id: UUID, request: Request):
         agent = agent_result.scalar_one_or_none()
 
         provider = get_telephony_provider()
-
-        if agent and agent.greeting_message:
-            twiml = provider.generate_greeting(agent.greeting_message, agent.voice_id)
-        else:
-            twiml = provider.generate_greeting(
-                "Hello, how can I help you today?", "en-US-Standard-A"
+        runtime_profile = None
+        if agent is not None:
+            runtime_profile = await db.scalar(
+                select(AgentRuntimeProfile).where(
+                    AgentRuntimeProfile.agent_id == agent.id,
+                    AgentRuntimeProfile.tenant_id == agent.tenant_id,
+                )
             )
 
-        # For MVP, connect to a media stream for real-time AI conversation
-        # In production, this would connect to a WebSocket-based AI conversation handler
-        # For now, just play the greeting
+        if (
+            agent
+            and agent.voice_provider == "sarvam"
+            and runtime_profile
+            and runtime_profile.enabled
+            and runtime_profile.status == "active"
+            and runtime_profile.telephony_provider == "twilio"
+        ):
+            twiml = provider.generate_connect_stream(_runtime_stream_url(call.id))
+            metadata = dict(call.call_metadata or {})
+            metadata["runtime_route"] = {
+                "telephony_provider": "twilio",
+                "speech_provider": "sarvam",
+            }
+            call.call_metadata = metadata
+        else:
+            twiml = provider.generate_greeting(
+                "This voice agent is not active. Please contact the service administrator.",
+                "en-US-Standard-A",
+            )
 
         lifecycle = await sync_campaign_call_lifecycle(db, call, provider_callback=True)
         voice_effects = ProviderWebhookEffects(

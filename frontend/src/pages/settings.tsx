@@ -21,6 +21,7 @@ import {
   type AuditEvent,
   type CurrentUser,
   type ProviderStatus,
+  type SipCredentialStatus,
   type WorkspaceApiKey,
   type WorkspaceInvitation,
   type WorkspaceRole,
@@ -137,6 +138,7 @@ export default function Settings() {
   const [apiKeys, setApiKeys] = useState<WorkspaceApiKey[]>([]);
   const [auditEvents, setAuditEvents] = useState<AuditEvent[]>([]);
   const [providerStatus, setProviderStatus] = useState<ProviderStatus | null>(null);
+  const [sipStatus, setSipStatus] = useState<SipCredentialStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState('');
   const [actionError, setActionError] = useState('');
@@ -152,6 +154,15 @@ export default function Settings() {
   });
   const [apiKeyName, setApiKeyName] = useState('');
   const [sarvamApiKey, setSarvamApiKey] = useState('');
+  const [sipForm, setSipForm] = useState({
+    sip_uri: '',
+    username: '',
+    password: '',
+    inbound_number: '',
+    livekit_url: '',
+    livekit_api_key: '',
+    livekit_api_secret: '',
+  });
 
   useEffect(() => {
     let active = true;
@@ -166,12 +177,13 @@ export default function Settings() {
           setLoading(false);
           return;
         }
-        const [nextMembers, nextInvitations, nextApiKeys, nextAuditEvents, nextProviderStatus] = await Promise.all([
+        const [nextMembers, nextInvitations, nextApiKeys, nextAuditEvents, nextProviderStatus, nextSipStatus] = await Promise.all([
           api.listWorkspaceUsers(),
           api.listInvitations(),
           api.listApiKeys(),
           api.listAuditEvents(12),
           api.getProviderStatus(),
+          api.getSipCredentialStatus(),
         ]);
         if (!active) return;
         setMembers(nextMembers);
@@ -179,6 +191,7 @@ export default function Settings() {
         setApiKeys(nextApiKeys);
         setAuditEvents(nextAuditEvents);
         setProviderStatus(nextProviderStatus);
+        setSipStatus(nextSipStatus);
       } catch (caught: unknown) {
         if (active) {
           setLoadError(caught instanceof Error ? caught.message : 'Workspace settings could not be loaded.');
@@ -365,6 +378,41 @@ export default function Settings() {
       setNotice('Workspace Sarvam credential removed.');
     } catch (caught: unknown) {
       setActionError(caught instanceof Error ? caught.message : 'Sarvam credential could not be removed.');
+    } finally {
+      setBusyAction('');
+    }
+  };
+
+  const handleSaveSipCredential = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    resetMessages();
+    setBusyAction('sip-key');
+    try {
+      const next = await api.saveSipCredential(sipForm);
+      setSipStatus(next);
+      setSipForm({
+        sip_uri: '', username: '', password: '', inbound_number: '',
+        livekit_url: '', livekit_api_key: '', livekit_api_secret: '',
+      });
+      await refreshAudit();
+      setNotice('Etisalat SIP and LiveKit credentials saved securely. Assign the number in an agent runtime before activation.');
+    } catch (caught: unknown) {
+      setActionError(caught instanceof Error ? caught.message : 'SIP credentials could not be saved.');
+    } finally {
+      setBusyAction('');
+    }
+  };
+
+  const handleDeleteSipCredential = async () => {
+    resetMessages();
+    if (!window.confirm('Remove the Etisalat SIP and LiveKit credentials? SIP runtimes will fail readiness immediately.')) return;
+    setBusyAction('sip-delete');
+    try {
+      setSipStatus(await api.deleteSipCredential());
+      await refreshAudit();
+      setNotice('Etisalat SIP and LiveKit credentials removed.');
+    } catch (caught: unknown) {
+      setActionError(caught instanceof Error ? caught.message : 'SIP credentials could not be removed.');
     } finally {
       setBusyAction('');
     }
@@ -563,6 +611,29 @@ export default function Settings() {
                   {busyAction === 'sarvam-delete' ? 'Removing…' : 'Remove workspace key'}
                 </button>
               ) : null}
+            </form>
+            <div className="settings-section-heading settings-subtable">
+              <div className="settings-section-icon"><Radio size={18} /></div>
+              <div>
+                <h3>Etisalat SIP edge</h3>
+                <p>Store the carrier trunk and LiveKit gateway credentials as write-only encrypted values.</p>
+              </div>
+              <span className={`badge ${sipStatus?.configured ? 'badge-success' : 'badge-warning'}`}>
+                SIP {sipStatus?.configured ? 'connected' : 'not connected'}
+              </span>
+            </div>
+            <form className="api-key-form" onSubmit={handleSaveSipCredential}>
+              <div className="form-grid">
+                <div className="form-group"><label htmlFor="sip-uri">Etisalat SIP URI</label><input id="sip-uri" placeholder="sip:trunk.example.ae" value={sipForm.sip_uri} onChange={(event) => setSipForm({ ...sipForm, sip_uri: event.target.value })} required /></div>
+                <div className="form-group"><label htmlFor="sip-user">SIP username</label><input id="sip-user" autoComplete="off" value={sipForm.username} onChange={(event) => setSipForm({ ...sipForm, username: event.target.value })} required /></div>
+                <div className="form-group"><label htmlFor="sip-password">SIP password</label><input id="sip-password" type="password" autoComplete="new-password" value={sipForm.password} onChange={(event) => setSipForm({ ...sipForm, password: event.target.value })} minLength={8} required /></div>
+                <div className="form-group"><label htmlFor="sip-number">Inbound DID</label><input id="sip-number" placeholder="+971…" value={sipForm.inbound_number} onChange={(event) => setSipForm({ ...sipForm, inbound_number: event.target.value })} required /></div>
+                <div className="form-group"><label htmlFor="livekit-url">LiveKit URL</label><input id="livekit-url" placeholder="wss://…livekit.cloud" value={sipForm.livekit_url} onChange={(event) => setSipForm({ ...sipForm, livekit_url: event.target.value })} required /></div>
+                <div className="form-group"><label htmlFor="livekit-key">LiveKit API key</label><input id="livekit-key" type="password" autoComplete="new-password" value={sipForm.livekit_api_key} onChange={(event) => setSipForm({ ...sipForm, livekit_api_key: event.target.value })} minLength={8} required /></div>
+                <div className="form-group"><label htmlFor="livekit-secret">LiveKit API secret</label><input id="livekit-secret" type="password" autoComplete="new-password" value={sipForm.livekit_api_secret} onChange={(event) => setSipForm({ ...sipForm, livekit_api_secret: event.target.value })} minLength={16} required /></div>
+              </div>
+              <button type="submit" className="btn btn-primary" disabled={busyAction === 'sip-key'}><KeyRound size={14} /> {busyAction === 'sip-key' ? 'Saving…' : sipStatus?.configured ? 'Rotate SIP credentials' : 'Connect SIP edge'}</button>
+              {sipStatus?.configured ? <button type="button" className="btn btn-danger" disabled={busyAction === 'sip-delete'} onClick={() => void handleDeleteSipCredential()}>{busyAction === 'sip-delete' ? 'Removing…' : 'Remove SIP credentials'}</button> : null}
             </form>
           </section>
 
