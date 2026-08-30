@@ -10,6 +10,7 @@ import {
   MessageSquareText,
   Mic,
   MicOff,
+  PhoneCall,
   PhoneOff,
   Play,
   RefreshCw,
@@ -20,7 +21,7 @@ import {
 import Layout from '@/components/Layout';
 import { agentTestReadinessMessage, isAgentCallReady } from '@/lib/agent-readiness.cjs';
 import { parseTestVariables, reduceTranscriptState, sessionErrorGuidance } from '@/lib/conversation-ui.cjs';
-import { api, VoiceAgent } from '@/lib/api';
+import { api, RuntimeProfile, VoiceAgent } from '@/lib/api';
 import styles from '@/styles/conversation-operations.module.css';
 import type { AtomsAgent } from '@smallest-ai/agent-sdk';
 
@@ -83,6 +84,7 @@ async function requestMicrophoneReadiness() {
 export default function Playground() {
   const router = useRouter();
   const [agents, setAgents] = useState<VoiceAgent[]>([]);
+  const [runtimeProfiles, setRuntimeProfiles] = useState<Record<string, RuntimeProfile>>({});
   const [agentsLoading, setAgentsLoading] = useState(true);
   const [agentsError, setAgentsError] = useState('');
   const [selectedId, setSelectedId] = useState('');
@@ -108,8 +110,12 @@ export default function Playground() {
     setAgentsLoading(true);
     setAgentsError('');
     try {
-      const items = await api.listAgents();
+      const [items, profiles] = await Promise.all([
+        api.listAgents(),
+        api.listRuntimeProfiles(),
+      ]);
       setAgents(items);
+      setRuntimeProfiles(Object.fromEntries(profiles.map((profile) => [profile.agent_id, profile])));
       const requested = typeof router.query.agent === 'string' ? router.query.agent : '';
       setSelectedId((current) => {
         if (requested && items.some((agent) => agent.id === requested)) return requested;
@@ -118,6 +124,7 @@ export default function Playground() {
       });
     } catch (loadError) {
       setAgents([]);
+      setRuntimeProfiles({});
       setAgentsError(loadError instanceof Error ? loadError.message : 'Could not load voice agents.');
     } finally {
       setAgentsLoading(false);
@@ -134,7 +141,11 @@ export default function Playground() {
     () => agents.find((agent) => agent.id === selectedId),
     [agents, selectedId],
   );
-  const selectedReady = isAgentCallReady(selected);
+  const selectedRuntimeProfile = selected ? runtimeProfiles[selected.id] : undefined;
+  const selectedReady = isAgentCallReady(selected, selectedRuntimeProfile);
+  const selectedIsSarvam = selected?.voice_provider === 'sarvam';
+  const selectedPhoneNumber = selectedRuntimeProfile?.assigned_numbers[0] || '';
+  const browserTestReady = selectedReady && !selectedIsSarvam;
   const active = state === 'connecting' || state === 'listening' || state === 'speaking';
   const selectedLanguages = useMemo(() => {
     if (!selected) return [];
@@ -171,10 +182,12 @@ export default function Playground() {
 
   const startSession = async () => {
     if (attemptRef.current) return;
-    if (!selected || !isAgentCallReady(selected)) {
+    if (!selected || !isAgentCallReady(selected, selectedRuntimeProfile) || selected.voice_provider === 'sarvam') {
       setError({
         title: 'Agent is not ready to test',
-        message: selected ? agentTestReadinessMessage(selected) : 'Select a voice agent before testing.',
+        message: selected?.voice_provider === 'sarvam'
+          ? 'This Sarvam AI agent is tested through its assigned phone number.'
+          : selected ? agentTestReadinessMessage(selected, selectedRuntimeProfile) : 'Select a voice agent before testing.',
       });
       return;
     }
@@ -353,7 +366,7 @@ export default function Playground() {
         <div>
           <span className="page-kicker">Safe test environment</span>
           <h1>Voice playground</h1>
-          <p className="page-subtitle">Validate a published Atoms agent with a just-in-time, 30-second single-use token. Your Smallest.ai API key never reaches this page.</p>
+          <p className="page-subtitle">Test each deployed voice agent through its supported channel: a secure browser session or its assigned phone number.</p>
         </div>
         <span className="badge badge-success"><ShieldCheck size={12} /> Secure token flow</span>
       </div>
@@ -381,7 +394,11 @@ export default function Playground() {
               onChange={(event) => setSelectedId(event.target.value)}
             >
               <option value="">{agentsLoading ? 'Loading agents…' : 'Select an agent'}</option>
-              {agents.map((agent) => <option value={agent.id} key={agent.id}>{agent.name}{isAgentCallReady(agent) ? '' : ' — not ready'}</option>)}
+              {agents.map((agent) => {
+                const ready = isAgentCallReady(agent, runtimeProfiles[agent.id]);
+                const status = agent.voice_provider === 'sarvam' && ready ? ' — phone ready' : ready ? '' : ' — not ready';
+                return <option value={agent.id} key={agent.id}>{agent.name}{status}</option>;
+              })}
             </select>
           </div>
 
@@ -390,7 +407,11 @@ export default function Playground() {
               <Bot size={15} aria-hidden="true" />
               <div>
                 <strong>{selected.name}</strong>
-                <p>{selectedReady ? `Smallest.ai · ${languageName(selected.language)} · ${selected.model_name}` : agentTestReadinessMessage(selected)}</p>
+                <p>{selectedReady
+                  ? selectedIsSarvam
+                    ? `Sarvam AI phone runtime active${selectedPhoneNumber ? ` · ${selectedPhoneNumber}` : ''}`
+                    : `Smallest.ai · ${languageName(selected.language)} · ${selected.model_name}`
+                  : agentTestReadinessMessage(selected, selectedRuntimeProfile)}</p>
               </div>
             </div>
           ) : null}
@@ -481,8 +502,8 @@ export default function Playground() {
 
         <section className="card voice-stage" aria-labelledby="voice-stage-heading">
           <div className="voice-stage-header">
-            <div><h2 id="voice-stage-heading" className={styles.stageHeading}>{selected?.name || 'Select an agent'}</h2><p>Smallest.ai Atoms browser session</p></div>
-            <span className={`badge ${active ? 'badge-success' : state === 'error' ? 'badge-danger' : 'badge-neutral'}`}>{state}</span>
+            <div><h2 id="voice-stage-heading" className={styles.stageHeading}>{selected?.name || 'Select an agent'}</h2><p>{selectedIsSarvam ? 'Sarvam AI phone session' : 'Smallest.ai Atoms browser session'}</p></div>
+            <span className={`badge ${selectedIsSarvam && selectedReady ? 'badge-success' : active ? 'badge-success' : state === 'error' ? 'badge-danger' : 'badge-neutral'}`}>{selectedIsSarvam ? selectedReady ? 'active' : 'not ready' : state}</span>
           </div>
 
           <div className={styles.stageLanguageRow} aria-label="Test language configuration">
@@ -494,70 +515,100 @@ export default function Playground() {
             <div>
               <div className={`voice-orb ${state === 'listening' || state === 'speaking' ? 'listening' : ''}`} aria-hidden="true" />
               <div className="session-status" style={{ marginTop: 28 }} aria-live="polite" aria-atomic="true">
-                <strong>{sessionLabel(state)}</strong>
-                <span>{sessionDescription(state, selected, selectedReady)}</span>
+                <strong>{selectedIsSarvam && selectedReady ? 'Phone runtime ready' : sessionLabel(state)}</strong>
+                <span>{selectedIsSarvam && selectedReady
+                  ? `Call ${selectedPhoneNumber} from any phone to test Customer Support.`
+                  : sessionDescription(state, selected, selectedReady, selectedRuntimeProfile)}</span>
               </div>
             </div>
           </div>
 
-          <div className={styles.diagnostics} aria-label="Session diagnostics">
-            <div><Mic size={13} /><span>Microphone</span><strong>{diagnostics.permission}</strong></div>
-            <div><TimerReset size={13} /><span>Secure token</span><strong>{diagnostics.token}</strong></div>
-            <div><Gauge size={13} /><span>Connect time</span><strong>{diagnostics.connectTimeMs === null ? '—' : `${diagnostics.connectTimeMs} ms`}</strong></div>
-            <div title={diagnostics.sessionId || undefined}><CheckCircle2 size={13} /><span>Session</span><strong>{shortIdentifier(diagnostics.sessionId)}</strong></div>
-          </div>
+          {selectedIsSarvam ? (
+            <>
+              <div className={styles.diagnostics} aria-label="Phone runtime diagnostics">
+                <div><PhoneCall size={13} /><span>Phone number</span><strong>{selectedPhoneNumber || 'Not assigned'}</strong></div>
+                <div><ShieldCheck size={13} /><span>Runtime</span><strong>{selectedRuntimeProfile?.status || 'not loaded'}</strong></div>
+                <div><CheckCircle2 size={13} /><span>Readiness</span><strong>{selectedReady ? 'all gates passed' : 'attention required'}</strong></div>
+                <div><Gauge size={13} /><span>Call limit</span><strong>{selectedRuntimeProfile?.daily_call_limit ?? '—'} / day</strong></div>
+              </div>
+              <div className={styles.diagnosticLine} aria-live="polite">
+                <span>Twilio Media Streams</span>
+                <span>Sarvam speech</span>
+                <span>OpenAI response engine</span>
+                <span>Completed calls appear in Conversations</span>
+              </div>
+              <div className={`transcript-panel ${styles.transcriptPanel}`}>
+                <div className="transcript-empty"><div><PhoneCall size={20} style={{ marginBottom: 8 }} /><br />Use a phone to place a real inbound test call. Review the completed transcript in Conversations.</div></div>
+              </div>
+            </>
+          ) : (
+            <>
+              <div className={styles.diagnostics} aria-label="Session diagnostics">
+                <div><Mic size={13} /><span>Microphone</span><strong>{diagnostics.permission}</strong></div>
+                <div><TimerReset size={13} /><span>Secure token</span><strong>{diagnostics.token}</strong></div>
+                <div><Gauge size={13} /><span>Connect time</span><strong>{diagnostics.connectTimeMs === null ? '—' : `${diagnostics.connectTimeMs} ms`}</strong></div>
+                <div title={diagnostics.sessionId || undefined}><CheckCircle2 size={13} /><span>Session</span><strong>{shortIdentifier(diagnostics.sessionId)}</strong></div>
+              </div>
 
-          <div className={styles.diagnosticLine} aria-live="polite">
-            <span>{diagnostics.sampleRate ? `${(diagnostics.sampleRate / 1000).toFixed(0)} kHz` : 'Sample rate pending'}</span>
-            {diagnostics.tokenLifetimeSeconds ? <span>{diagnostics.tokenLifetimeSeconds}s single-use token</span> : null}
-            <span>{diagnostics.eventCount} events</span>
-            <span>{diagnostics.lastEvent}</span>
-            {diagnostics.callId ? <span title={diagnostics.callId}>Call {shortIdentifier(diagnostics.callId)}</span> : null}
-            {diagnostics.endReason ? <span>Ended: {diagnostics.endReason}</span> : null}
-          </div>
+              <div className={styles.diagnosticLine} aria-live="polite">
+                <span>{diagnostics.sampleRate ? `${(diagnostics.sampleRate / 1000).toFixed(0)} kHz` : 'Sample rate pending'}</span>
+                {diagnostics.tokenLifetimeSeconds ? <span>{diagnostics.tokenLifetimeSeconds}s single-use token</span> : null}
+                <span>{diagnostics.eventCount} events</span>
+                <span>{diagnostics.lastEvent}</span>
+                {diagnostics.callId ? <span title={diagnostics.callId}>Call {shortIdentifier(diagnostics.callId)}</span> : null}
+                {diagnostics.endReason ? <span>Ended: {diagnostics.endReason}</span> : null}
+              </div>
 
-          <div
-            ref={transcriptPanelRef}
-            className={`transcript-panel ${styles.transcriptPanel}`}
-            role="log"
-            aria-live="polite"
-            aria-relevant="additions text"
-            aria-label="Live conversation transcript"
-          >
-            {transcript.length === 0 && !liveTranscript ? (
-              <div className="transcript-empty"><div><MessageSquareText size={20} style={{ marginBottom: 8 }} /><br />Live transcript will appear here after the first turn.</div></div>
-            ) : (
-              <>
-                {transcript.map((turn) => (
-                  <div className={`transcript-turn ${turn.role}`} key={turn.id} dir="auto">
-                    <small>{turn.role} · language not reported by SDK</small>
-                    {turn.text}
-                  </div>
-                ))}
-                {liveTranscript ? (
-                  <div className={`transcript-turn ${liveTranscript.role} ${styles.liveTurn}`} dir="auto">
-                    <small>{liveTranscript.role} · live · language not reported by SDK</small>
-                    {liveTranscript.text}
-                  </div>
-                ) : null}
-              </>
-            )}
-          </div>
+              <div
+                ref={transcriptPanelRef}
+                className={`transcript-panel ${styles.transcriptPanel}`}
+                role="log"
+                aria-live="polite"
+                aria-relevant="additions text"
+                aria-label="Live conversation transcript"
+              >
+                {transcript.length === 0 && !liveTranscript ? (
+                  <div className="transcript-empty"><div><MessageSquareText size={20} style={{ marginBottom: 8 }} /><br />Live transcript will appear here after the first turn.</div></div>
+                ) : (
+                  <>
+                    {transcript.map((turn) => (
+                      <div className={`transcript-turn ${turn.role}`} key={turn.id} dir="auto">
+                        <small>{turn.role} · language not reported by SDK</small>
+                        {turn.text}
+                      </div>
+                    ))}
+                    {liveTranscript ? (
+                      <div className={`transcript-turn ${liveTranscript.role} ${styles.liveTurn}`} dir="auto">
+                        <small>{liveTranscript.role} · live · language not reported by SDK</small>
+                        {liveTranscript.text}
+                      </div>
+                    ) : null}
+                  </>
+                )}
+              </div>
+            </>
+          )}
 
           {error ? (
             <div className={styles.stageError} role="alert">
               <AlertTriangle size={16} aria-hidden="true" />
               <div><strong>{error.title}</strong><p>{error.message}</p></div>
-              <button type="button" className={styles.stageRetry} disabled={!selectedReady || active} onClick={() => void startSession()}><RefreshCw size={12} /> Retry</button>
+              <button type="button" className={styles.stageRetry} disabled={!browserTestReady || active} onClick={() => void startSession()}><RefreshCw size={12} /> Retry</button>
             </div>
           ) : null}
 
           <div className="call-controls">
-            {!active ? (
+            {selectedIsSarvam ? (
+              selectedReady && selectedPhoneNumber ? (
+                <a className="call-button" href={`tel:${selectedPhoneNumber}`}><PhoneCall size={15} /> Call {selectedPhoneNumber}</a>
+              ) : (
+                <button className="call-button" disabled title={selected ? agentTestReadinessMessage(selected, selectedRuntimeProfile) : 'Select a voice agent before testing.'}><PhoneCall size={15} /> Phone test unavailable</button>
+              )
+            ) : !active ? (
               <button
                 className="call-button"
-                disabled={!selectedReady || agentsLoading}
-                title={selectedReady ? undefined : selected ? agentTestReadinessMessage(selected) : 'Select a voice agent before testing.'}
+                disabled={!browserTestReady || agentsLoading}
+                title={browserTestReady ? undefined : selected ? agentTestReadinessMessage(selected, selectedRuntimeProfile) : 'Select a voice agent before testing.'}
                 onClick={() => void startSession()}
               ><Play size={15} /> {state === 'error' || state === 'ended' ? 'Start new test' : 'Start test'}</button>
             ) : (
@@ -585,13 +636,14 @@ function sessionLabel(state: SessionState) {
   return labels[state];
 }
 
-function sessionDescription(state: SessionState, selected: VoiceAgent | undefined, selectedReady: boolean) {
+function sessionDescription(state: SessionState, selected: VoiceAgent | undefined, selectedReady: boolean, runtimeProfile?: RuntimeProfile) {
   if (state === 'idle') {
     if (!selected) return 'Select a voice agent to begin';
-    return selectedReady ? 'Start a private test conversation' : agentTestReadinessMessage(selected);
+    return selectedReady ? 'Start a private test conversation' : agentTestReadinessMessage(selected, runtimeProfile);
   }
   if (state === 'speaking') return 'Agent audio is streaming';
   if (state === 'listening') return 'Speak naturally — interruption is supported';
   if (state === 'connecting') return 'Preparing microphone, token, and secure connection';
   return 'Review the transcript and diagnostics before another test';
 }
+
