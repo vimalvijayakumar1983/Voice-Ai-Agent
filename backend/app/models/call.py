@@ -1,8 +1,8 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, String, Text, Integer, Float
-from sqlalchemy.dialects.postgresql import UUID, JSONB
+from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import TenantScopedModel
@@ -44,13 +44,16 @@ class Call(TenantScopedModel):
     cost_cents: Mapped[int | None] = mapped_column(Integer)
 
     # Outcome
-    disposition: Mapped[str | None] = mapped_column(String(50))  # interested, not_interested, callback, dnc, voicemail
+    # interested, not_interested, callback, dnc, voicemail
+    disposition: Mapped[str | None] = mapped_column(String(50))
     sentiment_score: Mapped[float | None] = mapped_column(Float)
-    metadata: Mapped[dict | None] = mapped_column(JSONB)
+    call_metadata: Mapped[dict | None] = mapped_column("metadata", JSONB)
 
     # Relationships
     agent = relationship("Agent", back_populates="calls")
-    transcript = relationship("CallTranscript", back_populates="call", uselist=False, lazy="selectin")
+    transcript = relationship(
+        "CallTranscript", back_populates="call", uselist=False, lazy="selectin"
+    )
     summary = relationship("CallSummary", back_populates="call", uselist=False, lazy="selectin")
 
 

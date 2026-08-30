@@ -1,8 +1,8 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, String, Boolean, Integer, Float
-from sqlalchemy.dialects.postgresql import UUID, JSONB
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import BaseModel, TenantScopedModel
@@ -30,12 +30,12 @@ class TenantSubscription(TenantScopedModel):
     tenant_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), unique=True
     )
-    plan_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("billing_plans.id")
-    )
+    plan_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("billing_plans.id"))
     stripe_customer_id: Mapped[str | None] = mapped_column(String(100))
     stripe_subscription_id: Mapped[str | None] = mapped_column(String(100))
-    status: Mapped[str] = mapped_column(String(30), default="active")  # active, past_due, cancelled, trialing
+    status: Mapped[str] = mapped_column(
+        String(30), default="active"
+    )  # active, past_due, cancelled, trialing
     current_period_start: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     current_period_end: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
@@ -49,7 +49,9 @@ class UsageRecord(TenantScopedModel):
     call_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("calls.id", ondelete="SET NULL")
     )
-    usage_type: Mapped[str] = mapped_column(String(50), nullable=False)  # call_minutes, ai_tokens, tts_chars
+    usage_type: Mapped[str] = mapped_column(
+        String(50), nullable=False
+    )  # call_minutes, ai_tokens, tts_chars
     quantity: Mapped[float] = mapped_column(Float, nullable=False)
     unit: Mapped[str] = mapped_column(String(20), nullable=False)  # minutes, tokens, characters
     cost_cents: Mapped[int] = mapped_column(Integer, default=0)

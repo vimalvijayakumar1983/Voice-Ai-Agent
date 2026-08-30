@@ -1,8 +1,8 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, String, Boolean, Text, Integer
-from sqlalchemy.dialects.postgresql import UUID, JSONB
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import TenantScopedModel
@@ -15,10 +15,15 @@ class Integration(TenantScopedModel):
         UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), index=True
     )
     name: Mapped[str] = mapped_column(String(255), nullable=False)
-    integration_type: Mapped[str] = mapped_column(String(50), nullable=False)  # webhook, crm, zapier
+    integration_type: Mapped[str] = mapped_column(
+        String(50), nullable=False
+    )  # webhook, crm, zapier
     config: Mapped[dict] = mapped_column(JSONB, nullable=False)
-    # webhook config: {"url": "...", "secret": "...", "events": ["call.completed", "campaign.finished"]}
-    # crm config: {"provider": "hubspot", "api_key": "...", "sync_contacts": true}
+    # JSONB contains only the API-safe projection. The complete configuration,
+    # including credentials, is held in an authenticated encryption envelope.
+    # Null is retained temporarily for legacy rows and migrated on mutation.
+    encrypted_config: Mapped[str | None] = mapped_column(Text, nullable=True)
+    config_encryption_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
 
 

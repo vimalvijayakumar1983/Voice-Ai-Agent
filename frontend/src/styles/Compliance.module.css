@@ -1,0 +1,362 @@
+.consentSection {
+  margin-bottom: 18px;
+}
+
+.consentHeading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.consentHeading :global(.compliance-card-heading) {
+  margin-bottom: 16px;
+}
+
+.consentHeading > :global(.badge) {
+  flex: 0 0 auto;
+}
+
+.policyNotice {
+  margin-bottom: 18px;
+  padding: 13px 14px;
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr);
+  gap: 10px;
+  color: var(--warning);
+  background: var(--warning-soft);
+  border: 1px solid #ebd5a7;
+  border-radius: 11px;
+}
+
+.policyNotice > svg {
+  margin-top: 1px;
+}
+
+.policyNotice h3 {
+  font-size: 13px;
+}
+
+.policyNotice p {
+  margin-top: 3px;
+  color: #6d501d;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.consentWorkspace {
+  display: grid;
+  grid-template-columns: minmax(270px, 0.72fr) minmax(0, 1.7fr);
+  gap: 18px;
+  align-items: start;
+}
+
+.consentForm {
+  min-width: 0;
+  padding: 17px;
+  background: var(--bg-muted);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+}
+
+.formHeading,
+.historyHeading {
+  margin-bottom: 15px;
+}
+
+.formHeading h3,
+.historyHeading h3 {
+  font-size: 14px;
+  letter-spacing: -0.01em;
+}
+
+.formHeading p,
+.historyHeading p {
+  margin-top: 3px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.statusFieldset {
+  min-width: 0;
+  margin: 0 0 15px;
+  padding: 0;
+  border: 0;
+}
+
+.statusFieldset legend {
+  margin-bottom: 6px;
+  color: #4f566b;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.statusOptions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.statusOptions label {
+  min-height: 44px;
+  padding: 9px 10px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--text-secondary);
+  background: white;
+  border: 1px solid var(--border-strong);
+  border-radius: 9px;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.statusOptions input {
+  width: 16px;
+  height: 16px;
+  flex: 0 0 auto;
+  accent-color: var(--accent);
+}
+
+.statusOptions .statusOptionSelected {
+  color: var(--success);
+  background: var(--success-soft);
+  border-color: #a9d8c3;
+}
+
+.statusOptions .statusOptionSelectedDanger {
+  color: var(--danger);
+  background: var(--danger-soft);
+  border-color: #e7b8b3;
+}
+
+.statusOptionSelectedDanger input {
+  accent-color: var(--danger);
+}
+
+.decisionImpact,
+.decisionImpactDanger {
+  margin: -1px 0 14px;
+  padding: 9px 10px;
+  color: var(--text-secondary);
+  background: white;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.decisionImpactDanger {
+  color: var(--danger);
+  background: var(--danger-soft);
+  border-color: #efc9c5;
+}
+
+.consentForm > :global(.btn) {
+  width: 100%;
+}
+
+.historyPanel {
+  min-width: 0;
+}
+
+.historyHeading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.historyFilters {
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: minmax(180px, 1.35fr) minmax(135px, 1fr) minmax(125px, 0.8fr) auto;
+  align-items: end;
+  gap: 9px;
+  border: 0;
+}
+
+.historyFilters :global(.form-group) {
+  min-width: 0;
+  margin-bottom: 0;
+}
+
+.searchControl {
+  position: relative;
+}
+
+.searchControl > svg {
+  position: absolute;
+  top: 50%;
+  left: 11px;
+  z-index: 1;
+  color: var(--text-tertiary);
+  transform: translateY(-50%);
+  pointer-events: none;
+}
+
+.searchControl input {
+  padding-left: 34px !important;
+}
+
+.resultSummary {
+  margin: 10px 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.historyLoading,
+.historyEmpty {
+  min-height: 245px;
+  padding: 28px 20px;
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 5px;
+  color: var(--text-secondary);
+  background: var(--bg-muted);
+  border: 1px dashed var(--border-strong);
+  border-radius: 12px;
+  text-align: center;
+  font-size: 12px;
+}
+
+.historyEmpty > svg {
+  margin-bottom: 5px;
+  color: var(--accent);
+}
+
+.historyEmpty h4 {
+  color: var(--text-primary);
+  font-size: 13px;
+}
+
+.historyEmpty p {
+  max-width: 390px;
+}
+
+.historyEmpty :global(.btn) {
+  margin-top: 8px;
+}
+
+.historyTable {
+  max-height: 480px;
+  overflow: auto;
+}
+
+.historyTable table {
+  min-width: 760px;
+}
+
+.historyTable th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+
+.historyTable td {
+  vertical-align: top;
+}
+
+.historyTable time {
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.evidenceMethod,
+.evidenceReference {
+  display: block;
+  max-width: 220px;
+}
+
+.evidenceMethod {
+  color: var(--text-primary);
+  font-weight: 650;
+  text-transform: capitalize;
+}
+
+.evidenceReference {
+  margin-top: 2px;
+  color: var(--text-secondary);
+  overflow-wrap: anywhere;
+}
+
+.dncClarification {
+  margin-top: 9px;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+@media (max-width: 1120px) {
+  .consentWorkspace {
+    grid-template-columns: minmax(260px, 0.85fr) minmax(0, 1.4fr);
+  }
+
+  .historyFilters {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 900px) {
+  .consentWorkspace {
+    grid-template-columns: 1fr;
+  }
+
+  .consentForm {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    column-gap: 14px;
+  }
+
+  .formHeading,
+  .consentForm > :global(.compliance-feedback),
+  .consentForm > :global(.btn),
+  .decisionImpact,
+  .decisionImpactDanger {
+    grid-column: 1 / -1;
+  }
+}
+
+@media (max-width: 680px) {
+  .consentSection {
+    padding: 15px;
+  }
+
+  .consentHeading,
+  .historyHeading {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .consentHeading > :global(.badge) {
+    align-self: flex-start;
+  }
+
+  .consentForm {
+    padding: 14px;
+    display: block;
+  }
+
+  .historyFilters {
+    grid-template-columns: 1fr;
+  }
+
+  .historyFilters > :global(.btn),
+  .historyHeading > :global(.btn) {
+    width: 100%;
+  }
+
+  .historyTable {
+    max-height: 430px;
+  }
+}
+
+@media (max-width: 380px) {
+  .statusOptions {
+    grid-template-columns: 1fr;
+  }
+}

@@ -1,12 +1,16 @@
 """Test configuration and fixtures."""
 
 import asyncio
-import uuid
+import os
 from collections.abc import AsyncGenerator
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import event
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.compiler import compiles
+from sqlalchemy.pool import NullPool, StaticPool
 
 from app.core.database import Base, get_db
 from app.core.security import create_access_token, hash_password
@@ -14,9 +18,33 @@ from app.main import app
 from app.models.tenant import Tenant
 from app.models.user import User
 
-TEST_DATABASE_URL = "sqlite+aiosqlite:///./test.db"
+TEST_DATABASE_URL = os.getenv("TEST_DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
-engine = create_async_engine(TEST_DATABASE_URL, echo=False)
+
+@compiles(JSONB, "sqlite")
+def compile_jsonb_for_sqlite(_type, _compiler, **_kwargs):
+    return "JSON"
+
+
+if TEST_DATABASE_URL.startswith("sqlite"):
+    engine = create_async_engine(
+        TEST_DATABASE_URL,
+        echo=False,
+        poolclass=StaticPool,
+    )
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def enable_sqlite_foreign_keys(dbapi_connection, _connection_record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
+else:
+    # pytest-asyncio creates isolated event loops for tests. asyncpg connections
+    # are loop-bound, so a pooled connection from an earlier test cannot safely
+    # be reused by a later loop. Real application engines remain pooled; only
+    # the PostgreSQL test engine uses fresh connections per checkout.
+    engine = create_async_engine(TEST_DATABASE_URL, echo=False, poolclass=NullPool)
 test_session_factory = async_sessionmaker(engine, expire_on_commit=False)
 
 
@@ -59,7 +87,8 @@ async def db() -> AsyncGenerator[AsyncSession, None]:
 async def tenant(db: AsyncSession) -> Tenant:
     tenant = Tenant(name="Test Corp", slug="test-corp")
     db.add(tenant)
-    await db.flush()
+    await db.commit()
+    await db.refresh(tenant)
     return tenant
 
 
@@ -73,7 +102,8 @@ async def user(db: AsyncSession, tenant: Tenant) -> User:
         role="owner",
     )
     db.add(user)
-    await db.flush()
+    await db.commit()
+    await db.refresh(user)
     return user
 
 
