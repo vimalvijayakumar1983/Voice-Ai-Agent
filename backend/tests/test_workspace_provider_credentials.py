@@ -10,6 +10,7 @@ from app.core.config import settings
 from app.models.agent import Agent, AgentRuntimeProfile
 from app.models.call import Call
 from app.models.provider_credential import ProviderCredential
+from app.models.tenant import Tenant
 from tests.conftest import test_session_factory as session_factory
 
 
@@ -231,3 +232,99 @@ async def test_inbound_twilio_webhook_accepts_the_workspace_auth_token(
     call = await db.scalar(select(Call).where(Call.provider_call_sid == "CAworkspace123"))
     assert call is not None
     assert call.tenant_id == tenant.id
+
+
+@pytest.mark.asyncio
+async def test_inbound_twilio_webhook_resolves_duplicate_number_by_workspace_credential(
+    client,
+    auth_headers,
+    tenant,
+    db,
+    monkeypatch,
+):
+    account_sid = "AC" + "0123456789abcdef0123456789abcdef"
+    auth_token = "twilio_workspace_token_1234567890"
+    number = "+15551234567"
+    saved = await client.put(
+        "/api/v1/runtime/credentials/twilio/account",
+        headers=auth_headers,
+        json={
+            "account_sid": account_sid,
+            "auth_token": auth_token,
+            "default_from_number": number,
+        },
+    )
+    assert saved.status_code == 200
+
+    routed_agent = Agent(
+        tenant_id=tenant.id,
+        name="Credential-owned route",
+        system_prompt="Help callers.",
+        voice_provider="sarvam",
+        voice_id="sarvam:ishita",
+        language="en",
+        supported_languages=["en"],
+    )
+    other_tenant = Tenant(name="Other workspace", slug="other-workspace-twilio")
+    db.add_all([routed_agent, other_tenant])
+    await db.flush()
+    shadow_agent = Agent(
+        tenant_id=other_tenant.id,
+        name="Uncredentialed shadow route",
+        system_prompt="Do not route here.",
+        voice_provider="sarvam",
+        voice_id="sarvam:ishita",
+        language="en",
+        supported_languages=["en"],
+    )
+    db.add(shadow_agent)
+    await db.flush()
+    db.add_all(
+        [
+            AgentRuntimeProfile(
+                tenant_id=tenant.id,
+                agent_id=routed_agent.id,
+                enabled=True,
+                status="active",
+                telephony_provider="twilio",
+                assigned_numbers=[number],
+            ),
+            AgentRuntimeProfile(
+                tenant_id=other_tenant.id,
+                agent_id=shadow_agent.id,
+                enabled=True,
+                status="active",
+                telephony_provider="twilio",
+                assigned_numbers=[number],
+            ),
+        ]
+    )
+    await db.commit()
+
+    path = "/api/v1/webhooks/twilio/voice/inbound"
+    payload = {
+        "AccountSid": account_sid,
+        "From": "+15557654321",
+        "To": number,
+        "CallSid": "CAworkspace-duplicate-number",
+    }
+    monkeypatch.setattr(webhooks.settings, "base_url", "http://test")
+    monkeypatch.setattr(webhooks.settings, "twilio_account_sid", "")
+    monkeypatch.setattr(webhooks.settings, "twilio_auth_token", "")
+    monkeypatch.setattr(webhooks, "async_session_factory", session_factory)
+    signature = RequestValidator(auth_token).compute_signature(f"http://test{path}", payload)
+    response = await client.post(
+        path,
+        data=payload,
+        headers={"X-Twilio-Signature": signature},
+    )
+
+    assert response.status_code == 200
+    assert "/api/v1/realtime/twilio/" in response.text
+    call = await db.scalar(
+        select(Call).where(Call.provider_call_sid == "CAworkspace-duplicate-number")
+    )
+    assert call is not None
+    assert call.tenant_id == tenant.id
+    assert call.agent_id == routed_agent.id
+

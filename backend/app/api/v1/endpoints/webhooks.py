@@ -30,7 +30,7 @@ from app.services.campaign_lifecycle import (
     sync_campaign_call_lifecycle,
 )
 from app.services.provider_callback_outbox import persist_provider_callback_actions
-from app.services.provider_credentials import load_provider_config
+from app.services.provider_credentials import ProviderCredentialError, load_provider_config
 from app.telephony.twilio_provider import get_telephony_provider
 
 router = APIRouter(prefix="/webhooks", tags=["Webhooks"])
@@ -530,12 +530,23 @@ def _validate_twilio_request(
     """Reject callbacks that are not signed for the resolved workspace."""
     if not auth_token:
         raise HTTPException(status_code=503, detail="Twilio webhook validation is not configured")
+    if not _twilio_request_is_valid(request, params, auth_token):
+        raise HTTPException(status_code=401, detail="Invalid Twilio webhook signature")
+
+
+def _twilio_request_is_valid(
+    request: Request,
+    params: dict[str, str],
+    auth_token: str,
+) -> bool:
+    """Check a signature without revealing which tenant credential matched."""
+    if not auth_token:
+        return False
     signature = request.headers.get("X-Twilio-Signature", "")
     provider = get_telephony_provider(auth_token=auth_token)
-    if not signature or not provider.validate_webhook(
-        _twilio_validation_url(request), params, signature
-    ):
-        raise HTTPException(status_code=401, detail="Invalid Twilio webhook signature")
+    return bool(
+        signature and provider.validate_webhook(_twilio_validation_url(request), params, signature)
+    )
 
 
 async def _verify_twilio_request(
@@ -834,18 +845,43 @@ async def twilio_inbound_webhook(request: Request):
             for profile, agent in candidates
             if to_number in (profile.assigned_numbers or [])
         ]
-        twilio_config = (
-            await _tenant_twilio_config(db, matches[0][1].tenant_id) if len(matches) == 1 else {}
-        )
-        _validate_twilio_request(
-            request,
-            params,
-            str(twilio_config.get("auth_token") or settings.twilio_auth_token),
-        )
-        if len(matches) != 1:
+        account_sid = params.get("AccountSid", "")
+        validated_matches: list[tuple[AgentRuntimeProfile, Agent]] = []
+        configured_token_seen = False
+        for profile, candidate_agent in matches:
+            try:
+                twilio_config = await _tenant_twilio_config(db, candidate_agent.tenant_id)
+            except ProviderCredentialError:
+                logger.warning(
+                    "twilio_inbound_credential_unavailable",
+                    tenant_id=str(candidate_agent.tenant_id),
+                )
+                twilio_config = {}
+            candidate_account_sid = str(
+                twilio_config.get("account_sid") or settings.twilio_account_sid
+            )
+            candidate_auth_token = str(
+                twilio_config.get("auth_token") or settings.twilio_auth_token
+            )
+            configured_token_seen = configured_token_seen or bool(candidate_auth_token)
+            if account_sid and candidate_account_sid and account_sid != candidate_account_sid:
+                continue
+            if _twilio_request_is_valid(request, params, candidate_auth_token):
+                validated_matches.append((profile, candidate_agent))
+
+        if not validated_matches:
+            if configured_token_seen:
+                raise HTTPException(status_code=401, detail="Invalid Twilio webhook signature")
+            # No tenant route exposed a credential. A platform credential may
+            # still authenticate the request so Twilio receives safe fallback
+            # TwiML instead of an unsigned routing response.
+            _validate_twilio_request(request, params, settings.twilio_auth_token)
+
+        if len(validated_matches) != 1:
             logger.warning(
                 "twilio_inbound_number_unroutable",
                 assigned_matches=len(matches),
+                validated_matches=len(validated_matches),
                 to_number=to_number,
             )
             return Response(
@@ -856,7 +892,7 @@ async def twilio_inbound_webhook(request: Request):
                 media_type="application/xml",
             )
 
-        _profile, agent = matches[0]
+        _profile, agent = validated_matches[0]
         call = await db.scalar(select(Call).where(Call.provider_call_sid == call_sid))
         if call is None:
             now = datetime.now(UTC)
@@ -1054,3 +1090,4 @@ async def twilio_status_callback(
         await db.commit()
     _kick_provider_outbox(outbox_ids)
     return {"status": "ok"}
+
