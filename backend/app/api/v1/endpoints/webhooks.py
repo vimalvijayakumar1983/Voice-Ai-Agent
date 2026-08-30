@@ -1090,4 +1090,3 @@ async def twilio_status_callback(
         await db.commit()
     _kick_provider_outbox(outbox_ids)
     return {"status": "ok"}
-
