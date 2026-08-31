@@ -65,6 +65,7 @@ export default function AgentAIWizard({ catalog, busy, onCancel, onGenerate }: A
               <option value="auto">Choose the best available provider</option>
               {availableProviders.has('smallest') ? <option value="smallest">Smallest.ai</option> : null}
               {availableProviders.has('sarvam') ? <option value="sarvam">Sarvam AI</option> : null}
+              {availableProviders.has('elevenlabs') ? <option value="elevenlabs">ElevenLabs</option> : null}
             </select>
           </div>
           <div className="form-group">

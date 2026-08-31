@@ -123,7 +123,11 @@ export default function VoiceLibrary({
     [languages],
   );
   const selectedVoice = voices.find((voice) => voice.id === selectedVoiceId);
-  const providerName = voices[0]?.provider === 'sarvam' ? 'Sarvam AI' : 'Smallest.ai';
+  const providerName = voices[0]?.provider === 'sarvam'
+    ? 'Sarvam AI'
+    : voices[0]?.provider === 'elevenlabs'
+      ? 'ElevenLabs'
+      : 'Smallest.ai';
   const selectedCompatibility = selectedVoice
     ? voiceCompatibility(selectedVoice, selectedLanguages)
     : null;
@@ -305,7 +309,7 @@ export default function VoiceLibrary({
         configurationLocked={configurationLocked}
         preservedVoiceId={preservedVoiceId}
       />
-      {voices[0]?.provider !== 'sarvam' ? (
+      {voices[0]?.provider === 'smallest' ? (
         <VoiceCloneStudio
           languages={languages}
           selectedLanguages={selectedLanguages}
@@ -321,7 +325,7 @@ export default function VoiceLibrary({
             <div>
               <span className={styles.eyebrow}>{providerName} voice catalog</span>
               <h4 id={`${resultsId}-heading`}>Choose a voice with coverage for every language</h4>
-              <p>Compatibility uses the full set of published voice-language and Atoms model metadata. It does not prove same-call detection; test the exact combination before activation.</p>
+              <p>Compatibility uses the provider&apos;s published voice and language metadata. Test the exact language and voice combination before activation.</p>
             </div>
             <button type="button" className={styles.closeButton} onClick={closeLibrary}>
               Close <ChevronUp size={15} aria-hidden="true" />
@@ -719,13 +723,13 @@ function CatalogStatus({
   children: React.ReactNode;
 }) {
   if (state === 'loading') {
-    return <div className={styles.catalogState} id={resultId} role="status"><LoaderCircle className={styles.loadingIcon} size={20} aria-hidden="true" />Connecting to the Smallest.ai voice catalog…</div>;
+    return <div className={styles.catalogState} id={resultId} role="status"><LoaderCircle className={styles.loadingIcon} size={20} aria-hidden="true" />Connecting to the voice catalogs…</div>;
   }
   if (state === 'error') {
     return <div className={styles.catalogState} id={resultId} role="alert"><AlertCircle size={20} />{error || 'The voice catalog could not be loaded. Try again before choosing a voice.'}</div>;
   }
   if (voiceCount === 0) {
-    return <div className={styles.catalogState} id={resultId}><Info size={20} />No selectable voices were returned by Smallest.ai.</div>;
+    return <div className={styles.catalogState} id={resultId}><Info size={20} />No selectable voices were returned by this provider.</div>;
   }
   if (filteredCount === 0) {
     return <div className={styles.catalogState} id={resultId}><Search size={20} />No voices match these languages and filters. Adjust the filters or language set.</div>;

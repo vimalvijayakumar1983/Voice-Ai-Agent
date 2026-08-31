@@ -39,6 +39,25 @@ test('testing requires an active agent with a published provider revision', () =
   assert.equal(isAgentCallReady(undefined), false);
 });
 
+test('ElevenLabs agents use VAV phone runtime readiness without Smallest provisioning', () => {
+  const runtime = { enabled: true, status: 'active', blockers: [] };
+  const agent = {
+    voice_provider: 'elevenlabs',
+    is_active: true,
+    provider_agent_id: null,
+    provider_revision_id: null,
+    last_synced_at: null,
+    sync_status: 'local_only',
+  };
+
+  assert.equal(isAgentCallReady(agent, runtime), true);
+  assert.equal(isAgentCallReady(agent, { ...runtime, enabled: false }), false);
+  assert.equal(
+    agentTestReadinessMessage(agent, { ...runtime, blockers: ['Connect ElevenLabs.'] }),
+    'Connect ElevenLabs.',
+  );
+});
+
 test('readiness guidance explains provider scanning and local drafts', () => {
   assert.equal(
     agentTestReadinessMessage({ ...readyAgent, sync_status: 'provider_scanning' }),

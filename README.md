@@ -100,6 +100,9 @@ Set these service variables with Railway references where shown:
 | API + worker | `SMALLEST_API_KEY` | A sealed Smallest.ai API key |
 | API + worker | `SMALLEST_WEBHOOK_SECRET` | One identical generated, sealed webhook signing secret |
 | API + worker | `SMALLEST_WEBHOOK_ID` | The Smallest.ai webhook ID whose signing secret is configured above |
+| API + worker | `SARVAM_API_KEY` | Optional platform fallback for VAV realtime transcription and Sarvam speech |
+| API + worker | `ELEVENLABS_API_KEY` | Optional platform fallback for ElevenLabs speech output only |
+| API + worker | `OPENAI_API_KEY` | Optional platform fallback for VAV conversation generation |
 | API | `MAX_REQUEST_BODY_BYTES` | `8388608` (8 MiB app-wide ceiling; provider webhooks retain their tighter 2 MiB limit) |
 
 Railway deprecated Config as Code for new services, so configure these settings in the dashboard instead of relying on `railway.toml`. The API migration must run before traffic switches, both web services use Railway's dynamic `PORT`, and the frontend build embeds the API's public HTTPS URL only as its fixed server-side rewrite destination. Browser requests remain on the frontend origin at `/api/v1/*`, keeping the refresh cookie first-party even when privacy controls block third-party cookies. Generate public Railway domains for `api` and `frontend`, then configure the Smallest.ai webhook as `https://YOUR_API_DOMAIN/api/v1/webhooks/smallest`.

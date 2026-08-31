@@ -22,11 +22,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.core.database import get_db
 from app.middleware.tenant import CurrentUser, get_current_user, require_role
-from app.models.agent import Agent, AgentKnowledgeBinding, KnowledgeBase
+from app.models.agent import Agent, AgentKnowledgeBinding, AgentRuntimeProfile, KnowledgeBase
 from app.models.call import Call
 from app.models.campaign import Campaign, CampaignContactAttempt
 from app.models.provider_credential import ProviderCredential
 from app.models.voice import VoiceClone
+from app.providers.elevenlabs import (
+    ELEVENLABS_MODEL,
+    ElevenLabsClient,
+    ElevenLabsError,
+    get_elevenlabs_client,
+)
 from app.providers.sarvam import (
     SarvamAIClient,
     SarvamAIError,
@@ -738,6 +744,33 @@ async def _tenant_sarvam_client(
     return client, "platform" if client.is_configured else "none", None
 
 
+async def _tenant_elevenlabs_client(
+    db: AsyncSession,
+    tenant_id: UUID,
+) -> tuple[ElevenLabsClient, str, datetime | None]:
+    credential = await db.scalar(
+        select(ProviderCredential).where(
+            ProviderCredential.tenant_id == tenant_id,
+            ProviderCredential.provider == "elevenlabs",
+            ProviderCredential.is_active.is_(True),
+        )
+    )
+    if credential is not None:
+        try:
+            config = decrypt_integration_config(credential.encrypted_config)
+        except IntegrationConfigUnavailableError as exc:
+            raise HTTPException(
+                status_code=500,
+                detail="ElevenLabs credential is unavailable; ask an administrator to rotate it",
+            ) from exc
+        api_key = config.get("api_key")
+        if not isinstance(api_key, str) or not api_key:
+            raise HTTPException(status_code=500, detail="ElevenLabs credential is invalid")
+        return ElevenLabsClient(api_key=api_key), "workspace", credential.updated_at
+    client = get_elevenlabs_client()
+    return client, "platform" if client.is_configured else "none", None
+
+
 async def _require_tenant_voice(
     client,
     db: AsyncSession,
@@ -861,6 +894,39 @@ async def _require_sarvam_voice(
     )
 
 
+async def _require_elevenlabs_voice(
+    client: ElevenLabsClient,
+    voice_id: str,
+    selected_languages: list[str],
+) -> VoiceResolution:
+    try:
+        voices = await client.list_voices()
+    except ElevenLabsError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    selected_voice = next((voice for voice in voices if voice["id"] == voice_id), None)
+    if selected_voice is None:
+        raise HTTPException(
+            status_code=422,
+            detail="Voice is not available to this ElevenLabs workspace",
+        )
+    compatibility, unsupported = voice_language_compatibility(
+        voices,
+        voice_id,
+        selected_languages,
+    )
+    if compatibility != LanguageCompatibilityStatus.COMPATIBLE:
+        detail = "Selected ElevenLabs voice does not support every agent language"
+        if unsupported:
+            detail += ": " + ", ".join(unsupported)
+        raise HTTPException(status_code=422, detail=detail)
+    return VoiceResolution(
+        requested_voice_id=voice_id,
+        resolved_voice_id=voice_id,
+        synthesizer_model=ELEVENLABS_MODEL,
+        source="operator",
+    )
+
+
 async def _require_provider_voice(
     provider: str,
     db: AsyncSession,
@@ -879,6 +945,9 @@ async def _require_provider_voice(
         )
     if provider == "sarvam":
         return await _require_sarvam_voice(voice_id, selected_languages)
+    if provider == "elevenlabs":
+        client, _, _ = await _tenant_elevenlabs_client(db, tenant_id)
+        return await _require_elevenlabs_voice(client, voice_id, selected_languages)
     raise HTTPException(status_code=422, detail="Unsupported voice provider")
 
 
@@ -2130,6 +2199,9 @@ async def get_provider_status(
         db,
         current_user.tenant_id,
     )
+    elevenlabs, elevenlabs_source, elevenlabs_updated_at = (
+        await _tenant_elevenlabs_client(db, current_user.tenant_id)
+    )
     return {
         "provider": "smallest",
         "configured": client.is_configured,
@@ -2151,6 +2223,15 @@ async def get_provider_status(
                 "voice_preview": sarvam.is_configured,
                 "source": sarvam_source,
                 "updated_at": sarvam_updated_at.isoformat() if sarvam_updated_at else None,
+            },
+            "elevenlabs": {
+                "configured": elevenlabs.is_configured,
+                "agent_runtime": True,
+                "voice_preview": elevenlabs.is_configured,
+                "source": elevenlabs_source,
+                "updated_at": (
+                    elevenlabs_updated_at.isoformat() if elevenlabs_updated_at else None
+                ),
             },
         },
     }
@@ -2266,8 +2347,18 @@ async def get_provider_catalog(
     sarvam, _, _ = await _tenant_sarvam_client(db, current_user.tenant_id)
     if sarvam.is_configured:
         combined_voices.extend(sarvam_voice_catalog())
-    if not combined_voices and smallest_error is not None:
-        raise smallest_error
+    elevenlabs_error: HTTPException | None = None
+    elevenlabs, _, _ = await _tenant_elevenlabs_client(db, current_user.tenant_id)
+    if elevenlabs.is_configured:
+        try:
+            combined_voices.extend(await elevenlabs.list_voices())
+        except ElevenLabsError as exc:
+            elevenlabs_error = HTTPException(status_code=exc.status_code, detail=str(exc))
+    if not combined_voices:
+        if elevenlabs_error is not None:
+            raise elevenlabs_error
+        if smallest_error is not None:
+            raise smallest_error
 
     return AgentProviderCatalog(
         voices=combined_voices,
@@ -2601,6 +2692,37 @@ async def preview_provider_voice(
             },
         )
 
+    if data.provider == "elevenlabs":
+        elevenlabs, _, _ = await _tenant_elevenlabs_client(db, current_user.tenant_id)
+        try:
+            voices = await elevenlabs.list_voices()
+        except ElevenLabsError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+        voice = next((item for item in voices if item["id"] == data.voice_id), None)
+        if voice is None:
+            raise HTTPException(
+                status_code=422, detail="Voice is not available to this ElevenLabs workspace"
+            )
+        advertised_languages = voice.get("languages") or []
+        preview_language = data.language or (
+            str(advertised_languages[0]) if advertised_languages else "en"
+        )
+        try:
+            audio = await elevenlabs.synthesize_voice_preview(
+                voice_id=data.voice_id.removeprefix("elevenlabs:"),
+                language=preview_language,
+            )
+        except ElevenLabsError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+        return Response(
+            content=audio,
+            media_type="audio/mpeg",
+            headers={
+                "Cache-Control": "private, no-store",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+
     client, _, _ = await _tenant_smallest_client(db, current_user.tenant_id)
     try:
         voices = await _tenant_voice_catalog(client, db, current_user.tenant_id)
@@ -2676,7 +2798,8 @@ async def provision_smallest_agent(
         raise HTTPException(
             status_code=409,
             detail=(
-                "This agent uses Sarvam and cannot be provisioned into Smallest.ai. "
+                "This agent uses the VAV realtime voice runtime and cannot be provisioned "
+                "into Smallest.ai. "
                 "It must be activated on the VAV realtime runtime."
             ),
         )
@@ -2823,7 +2946,9 @@ async def sync_smallest_agent(
     if agent.voice_provider != "smallest":
         raise HTTPException(
             status_code=409,
-            detail="Sarvam agents are synchronized by the VAV realtime runtime, not Smallest.ai.",
+            detail=(
+                "VAV realtime voice agents are synchronized by VAV, not Smallest.ai."
+            ),
         )
     if _expire_stale_provisioning(agent):
         await db.commit()
@@ -3137,7 +3262,8 @@ async def update_agent(
         raise HTTPException(
             status_code=409,
             detail=(
-                "Confirm provider deprovisioning before switching this VAV agent to Sarvam. "
+                "Confirm provider deprovisioning before switching this agent to the VAV "
+                "realtime runtime. "
                 "The Smallest.ai remote agent must be archived first."
             ),
         )
@@ -3209,6 +3335,20 @@ async def update_agent(
 
     for key, value in effective_changes.items():
         setattr(agent, key, value)
+
+    runtime_sensitive_fields = VOICE_CONFIGURATION_FIELDS | {"speech_rate"}
+    if runtime_sensitive_fields.intersection(effective_changes):
+        runtime_profile = await db.scalar(
+            select(AgentRuntimeProfile).where(
+                AgentRuntimeProfile.agent_id == agent.id,
+                AgentRuntimeProfile.tenant_id == current_user.tenant_id,
+            )
+        )
+        if runtime_profile is not None:
+            runtime_profile.enabled = False
+            runtime_profile.status = "draft"
+            if agent.voice_provider in {"sarvam", "elevenlabs"}:
+                runtime_profile.primary_speech_provider = agent.voice_provider
 
     if agent.provider_agent_id and SMALLEST_SYNC_FIELDS.intersection(effective_changes):
         agent.sync_status = "dirty"

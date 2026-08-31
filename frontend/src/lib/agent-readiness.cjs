@@ -1,7 +1,7 @@
 'use strict';
 
 function isAgentCallReady(agent, runtimeProfile) {
-  if (agent?.voice_provider === 'sarvam') {
+  if (['sarvam', 'elevenlabs'].includes(agent?.voice_provider)) {
     return Boolean(agent.is_active && runtimeProfile?.enabled && runtimeProfile?.status === 'active');
   }
   return Boolean(
@@ -15,7 +15,7 @@ function isAgentCallReady(agent, runtimeProfile) {
 }
 
 function agentTestReadinessMessage(agent, runtimeProfile) {
-  if (agent?.voice_provider === 'sarvam') {
+  if (['sarvam', 'elevenlabs'].includes(agent?.voice_provider)) {
     if (!agent.is_active) return 'Activate this agent before testing.';
     if (!runtimeProfile) return 'Load the VAV runtime profile before testing.';
     if (runtimeProfile.blockers?.length) return runtimeProfile.blockers.join(' ');

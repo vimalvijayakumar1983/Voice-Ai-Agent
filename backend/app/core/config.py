@@ -79,6 +79,11 @@ class Settings(BaseSettings):
     sarvam_base_url: str = "https://api.sarvam.ai"
     sarvam_request_timeout_seconds: float = 30.0
 
+    # ElevenLabs is a speech-only option inside the VAV realtime runtime.
+    elevenlabs_api_key: str = ""
+    elevenlabs_base_url: str = "https://api.elevenlabs.io"
+    elevenlabs_request_timeout_seconds: float = 30.0
+
     # AI Providers
     openai_api_key: str = ""
     anthropic_api_key: str = ""

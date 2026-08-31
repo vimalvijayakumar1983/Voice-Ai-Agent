@@ -10,8 +10,8 @@ from pydantic import BaseModel, Field, field_validator
 
 class RuntimeProfileUpdate(BaseModel):
     telephony_provider: Literal["twilio", "livekit_sip"] = "twilio"
-    primary_speech_provider: Literal["sarvam"] = "sarvam"
-    fallback_speech_provider: Literal["smallest"] | None = None
+    primary_speech_provider: Literal["sarvam", "elevenlabs"] = "sarvam"
+    fallback_speech_provider: Literal["smallest", "sarvam", "elevenlabs"] | None = None
     llm_provider: Literal["openai"] = "openai"
     llm_model: Literal["gpt-4o-mini", "gpt-4o"] = "gpt-4o-mini"
     stt_language: str = Field("auto", min_length=2, max_length=30)

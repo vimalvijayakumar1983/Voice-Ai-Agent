@@ -841,7 +841,7 @@ async def twilio_inbound_webhook(request: Request):
                     AgentRuntimeProfile.status == "active",
                     AgentRuntimeProfile.telephony_provider == "twilio",
                     Agent.is_active.is_(True),
-                    Agent.voice_provider == "sarvam",
+                    Agent.voice_provider.in_(("sarvam", "elevenlabs")),
                 )
             )
         ).all()
@@ -917,7 +917,7 @@ async def twilio_inbound_webhook(request: Request):
                     "agent_configuration": agent_configuration_snapshot(agent),
                     "conversation_type": "telephonyInbound",
                     "channel": "phone",
-                    "speech_provider": "sarvam",
+                    "speech_provider": agent.voice_provider,
                 },
             )
             db.add(call)
@@ -984,11 +984,12 @@ async def twilio_voice_webhook(call_id: UUID, request: Request):
 
         if (
             agent
-            and agent.voice_provider == "sarvam"
+            and agent.voice_provider in {"sarvam", "elevenlabs"}
             and runtime_profile
             and runtime_profile.enabled
             and runtime_profile.status == "active"
             and runtime_profile.telephony_provider == "twilio"
+            and runtime_profile.primary_speech_provider == agent.voice_provider
         ):
             twiml = provider.generate_connect_stream(
                 _runtime_stream_url(call.id),
@@ -997,7 +998,7 @@ async def twilio_voice_webhook(call_id: UUID, request: Request):
             metadata = dict(call.call_metadata or {})
             metadata["runtime_route"] = {
                 "telephony_provider": "twilio",
-                "speech_provider": "sarvam",
+                "speech_provider": agent.voice_provider,
             }
             call.call_metadata = metadata
         else:

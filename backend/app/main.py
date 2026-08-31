@@ -63,6 +63,7 @@ async def health_check():
         "providers": {
             "smallest": bool(settings.smallest_api_key),
             "sarvam": bool(settings.sarvam_api_key),
+            "elevenlabs": bool(settings.elevenlabs_api_key),
         },
     }
 

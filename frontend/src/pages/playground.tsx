@@ -143,9 +143,9 @@ export default function Playground() {
   );
   const selectedRuntimeProfile = selected ? runtimeProfiles[selected.id] : undefined;
   const selectedReady = isAgentCallReady(selected, selectedRuntimeProfile);
-  const selectedIsSarvam = selected?.voice_provider === 'sarvam';
+  const selectedIsVav = ['sarvam', 'elevenlabs'].includes(selected?.voice_provider ?? '');
   const selectedPhoneNumber = selectedRuntimeProfile?.assigned_numbers[0] || '';
-  const browserTestReady = selectedReady && !selectedIsSarvam;
+  const browserTestReady = selectedReady && !selectedIsVav;
   const active = state === 'connecting' || state === 'listening' || state === 'speaking';
   const selectedLanguages = useMemo(() => {
     if (!selected) return [];
@@ -182,11 +182,11 @@ export default function Playground() {
 
   const startSession = async () => {
     if (attemptRef.current) return;
-    if (!selected || !isAgentCallReady(selected, selectedRuntimeProfile) || selected.voice_provider === 'sarvam') {
+    if (!selected || !isAgentCallReady(selected, selectedRuntimeProfile) || ['sarvam', 'elevenlabs'].includes(selected.voice_provider)) {
       setError({
         title: 'Agent is not ready to test',
-        message: selected?.voice_provider === 'sarvam'
-          ? 'This Sarvam AI agent is tested through its assigned phone number.'
+        message: ['sarvam', 'elevenlabs'].includes(selected?.voice_provider ?? '')
+          ? 'This VAV realtime agent is tested through its assigned phone number.'
           : selected ? agentTestReadinessMessage(selected, selectedRuntimeProfile) : 'Select a voice agent before testing.',
       });
       return;
@@ -396,7 +396,7 @@ export default function Playground() {
               <option value="">{agentsLoading ? 'Loading agents…' : 'Select an agent'}</option>
               {agents.map((agent) => {
                 const ready = isAgentCallReady(agent, runtimeProfiles[agent.id]);
-                const status = agent.voice_provider === 'sarvam' && ready ? ' — phone ready' : ready ? '' : ' — not ready';
+                const status = ['sarvam', 'elevenlabs'].includes(agent.voice_provider) && ready ? ' — phone ready' : ready ? '' : ' — not ready';
                 return <option value={agent.id} key={agent.id}>{agent.name}{status}</option>;
               })}
             </select>
@@ -408,8 +408,8 @@ export default function Playground() {
               <div>
                 <strong>{selected.name}</strong>
                 <p>{selectedReady
-                  ? selectedIsSarvam
-                    ? `Sarvam AI phone runtime active${selectedPhoneNumber ? ` · ${selectedPhoneNumber}` : ''}`
+                  ? selectedIsVav
+                    ? `${selected.voice_provider === 'elevenlabs' ? 'ElevenLabs voice' : 'Sarvam AI'} phone runtime active${selectedPhoneNumber ? ` · ${selectedPhoneNumber}` : ''}`
                     : `Smallest.ai · ${languageName(selected.language)} · ${selected.model_name}`
                   : agentTestReadinessMessage(selected, selectedRuntimeProfile)}</p>
               </div>
@@ -502,8 +502,8 @@ export default function Playground() {
 
         <section className="card voice-stage" aria-labelledby="voice-stage-heading">
           <div className="voice-stage-header">
-            <div><h2 id="voice-stage-heading" className={styles.stageHeading}>{selected?.name || 'Select an agent'}</h2><p>{selectedIsSarvam ? 'Sarvam AI phone session' : 'Smallest.ai Atoms browser session'}</p></div>
-            <span className={`badge ${selectedIsSarvam && selectedReady ? 'badge-success' : active ? 'badge-success' : state === 'error' ? 'badge-danger' : 'badge-neutral'}`}>{selectedIsSarvam ? selectedReady ? 'active' : 'not ready' : state}</span>
+            <div><h2 id="voice-stage-heading" className={styles.stageHeading}>{selected?.name || 'Select an agent'}</h2><p>{selectedIsVav ? `${selected?.voice_provider === 'elevenlabs' ? 'ElevenLabs' : 'Sarvam AI'} phone session` : 'Smallest.ai Atoms browser session'}</p></div>
+            <span className={`badge ${selectedIsVav && selectedReady ? 'badge-success' : active ? 'badge-success' : state === 'error' ? 'badge-danger' : 'badge-neutral'}`}>{selectedIsVav ? selectedReady ? 'active' : 'not ready' : state}</span>
           </div>
 
           <div className={styles.stageLanguageRow} aria-label="Test language configuration">
@@ -515,15 +515,15 @@ export default function Playground() {
             <div>
               <div className={`voice-orb ${state === 'listening' || state === 'speaking' ? 'listening' : ''}`} aria-hidden="true" />
               <div className="session-status" style={{ marginTop: 28 }} aria-live="polite" aria-atomic="true">
-                <strong>{selectedIsSarvam && selectedReady ? 'Phone runtime ready' : sessionLabel(state)}</strong>
-                <span>{selectedIsSarvam && selectedReady
+                <strong>{selectedIsVav && selectedReady ? 'Phone runtime ready' : sessionLabel(state)}</strong>
+                <span>{selectedIsVav && selectedReady
                   ? `Call ${selectedPhoneNumber} from any phone to test Customer Support.`
                   : sessionDescription(state, selected, selectedReady, selectedRuntimeProfile)}</span>
               </div>
             </div>
           </div>
 
-          {selectedIsSarvam ? (
+          {selectedIsVav ? (
             <>
               <div className={styles.diagnostics} aria-label="Phone runtime diagnostics">
                 <div><PhoneCall size={13} /><span>Phone number</span><strong>{selectedPhoneNumber || 'Not assigned'}</strong></div>
@@ -533,7 +533,7 @@ export default function Playground() {
               </div>
               <div className={styles.diagnosticLine} aria-live="polite">
                 <span>Twilio Media Streams</span>
-                <span>Sarvam speech</span>
+                <span>{selected?.voice_provider === 'elevenlabs' ? 'ElevenLabs speech · Sarvam transcription' : 'Sarvam speech'}</span>
                 <span>OpenAI response engine</span>
                 <span>Completed calls appear in Conversations</span>
               </div>
@@ -598,7 +598,7 @@ export default function Playground() {
           ) : null}
 
           <div className="call-controls">
-            {selectedIsSarvam ? (
+            {selectedIsVav ? (
               selectedReady && selectedPhoneNumber ? (
                 <a className="call-button" href={`tel:${selectedPhoneNumber}`}><PhoneCall size={15} /> Call {selectedPhoneNumber}</a>
               ) : (

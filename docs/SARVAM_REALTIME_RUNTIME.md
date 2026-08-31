@@ -1,13 +1,15 @@
 # Sarvam realtime runtime runbook
 
-VAV can serve Sarvam agents without creating a hosted Smallest.ai agent. The
+VAV can serve Sarvam or ElevenLabs-voice agents without creating a hosted
+Smallest.ai agent. The
 serving path is:
 
 1. Twilio sends bidirectional 8 kHz μ-law audio to the VAV WebSocket.
 2. Sarvam Saaras v3 performs realtime transcription and VAD.
 3. VAV retrieves approved text from the agent's bound knowledge base.
 4. OpenAI generates the response using the agent prompt and retrieved context.
-5. Sarvam Bulbul v3 streams μ-law audio back to Twilio.
+5. The selected speech provider streams μ-law audio back to Twilio: Sarvam
+   Bulbul v3 or ElevenLabs Flash v2.5.
 6. VAV stores transcript turns and runtime latency/usage metrics on the call.
 
 The runtime clears Twilio's playback buffer and cancels the current TTS stream
@@ -17,7 +19,9 @@ when Sarvam reports speech start, providing barge-in behavior.
 
 - Sarvam and OpenAI keys saved in Workspace Settings, with
   `SARVAM_API_KEY` and `OPENAI_API_KEY` retained only as optional platform
-  fallbacks.
+  fallbacks. Sarvam is always required for live transcription.
+- For an ElevenLabs voice, an ElevenLabs key saved in Workspace Settings, with
+  `ELEVENLABS_API_KEY` retained only as an optional platform fallback.
 - A Twilio Account SID, Auth Token, and default number saved in Workspace
   Settings, with the matching environment variables retained as optional
   platform fallbacks.
@@ -38,12 +42,12 @@ resolved workspace-first for API, worker, webhook, and realtime operations.
 Text sources are immediately available to the VAV retriever. New PDF uploads
 retain bounded locally extracted text as well as being uploaded to Smallest.ai.
 PDFs uploaded before migration `20260830_014` have no local extracted content
-and should be removed and re-uploaded before using them with a Sarvam agent.
+and should be removed and re-uploaded before using them with a VAV realtime agent.
 Image-only PDFs need OCR before upload.
 
 Website sources remain provider-indexed until VAV's controlled crawler stores
 their page text locally. Do not describe a provider-only URL as available to a
-Sarvam runtime.
+VAV realtime runtime.
 
 ## Etisalat SIP
 
@@ -68,6 +72,7 @@ unsynchronized runtime cost instead of presenting an invented estimate.
 
 - [Sarvam realtime STT](https://docs.sarvam.ai/api-reference/speech-to-text/transcribe/realtime/ws)
 - [Sarvam streaming TTS](https://docs.sarvam.ai/api/api-guides-tutorials/text-to-speech/streaming-api/web-socket)
+- [ElevenLabs streaming TTS](https://elevenlabs.io/docs/api-reference/text-to-speech/v-1-text-to-speech-voice-id-stream-input)
 - [Twilio bidirectional Media Streams](https://www.twilio.com/docs/voice/media-streams/websocket-messages)
 - [LiveKit SIP trunk setup](https://docs.livekit.io/telephony/start/sip-trunk-setup/)
 - [LiveKit self-hosted SIP ports](https://docs.livekit.io/transport/self-hosting/sip-server/)

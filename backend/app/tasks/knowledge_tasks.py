@@ -343,8 +343,8 @@ def _invalidate_crawl_bindings(knowledge_base: KnowledgeBase) -> None:
     now = datetime.now(UTC)
     for binding in knowledge_base.agent_bindings:
         agent = binding.agent
-        if getattr(agent, "voice_provider", "smallest") == "sarvam":
-            binding.provider = "sarvam"
+        if getattr(agent, "voice_provider", "smallest") in {"sarvam", "elevenlabs"}:
+            binding.provider = agent.voice_provider
             binding.sync_status = "synced"
             binding.last_synced_at = now
             continue
@@ -705,8 +705,8 @@ async def _repair(tenant_id: UUID, kb_id: UUID, source_id: UUID) -> None:
         affected_agent_ids: list[str] = []
         for binding in knowledge_base.agent_bindings:
             agent = binding.agent
-            if agent.voice_provider == "sarvam":
-                binding.provider = "sarvam"
+            if agent.voice_provider in {"sarvam", "elevenlabs"}:
+                binding.provider = agent.voice_provider
                 binding.sync_status = "synced"
                 binding.last_synced_at = now
                 continue

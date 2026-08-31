@@ -54,7 +54,7 @@ class AgentCreate(BaseModel):
     model_name: Literal["electron"] = "electron"
     temperature: float = Field(0.7, ge=0, le=2)
     max_tokens: int = Field(500, ge=32, le=8192)
-    voice_provider: Literal["smallest", "sarvam"] = "smallest"
+    voice_provider: Literal["smallest", "sarvam", "elevenlabs"] = "smallest"
     voice_id: str = Field("", max_length=100)
     language: str = Field("en", min_length=2, max_length=63)
     supported_languages: list[str] = Field(default_factory=lambda: ["en"], min_length=1)
@@ -112,7 +112,7 @@ class AgentUpdate(BaseModel):
     model_name: Literal["electron"] | None = None
     temperature: float | None = Field(None, ge=0, le=2)
     max_tokens: int | None = Field(None, ge=32, le=8192)
-    voice_provider: Literal["smallest", "sarvam"] | None = None
+    voice_provider: Literal["smallest", "sarvam", "elevenlabs"] | None = None
     voice_id: str | None = Field(None, max_length=100)
     language: str | None = Field(None, min_length=2, max_length=63)
     supported_languages: list[str] | None = Field(None, min_length=1)
@@ -206,7 +206,7 @@ class AgentResponse(BaseModel):
 
 class AgentAIDraftRequest(BaseModel):
     brief: str = Field(min_length=20, max_length=4000)
-    provider_preference: Literal["auto", "smallest", "sarvam"] = "auto"
+    provider_preference: Literal["auto", "smallest", "sarvam", "elevenlabs"] = "auto"
     primary_language: str = Field("en", min_length=2, max_length=63)
     timezone: str = Field("Asia/Dubai", max_length=64)
 
@@ -253,7 +253,7 @@ class SmallestSessionResponse(BaseModel):
 
 
 class VoicePreviewRequest(BaseModel):
-    provider: Literal["smallest", "sarvam"] = "smallest"
+    provider: Literal["smallest", "sarvam", "elevenlabs"] = "smallest"
     voice_id: str = Field(min_length=1, max_length=100)
     language: str | None = Field(None, min_length=2, max_length=63)
 
@@ -327,7 +327,7 @@ class SmallestProviderResolution(BaseModel):
 
 
 class VoiceCatalogItem(BaseModel):
-    provider: Literal["smallest", "sarvam"] = "smallest"
+    provider: Literal["smallest", "sarvam", "elevenlabs"] = "smallest"
     id: str
     name: str
     languages: list[str]

@@ -487,7 +487,7 @@ async def initiate_outbound_call(
         raise HTTPException(status_code=404, detail="Agent not found")
     if not agent.is_active:
         raise HTTPException(status_code=409, detail="Agent is inactive")
-    if agent.voice_provider not in {"smallest", "sarvam", "twilio"}:
+    if agent.voice_provider not in {"smallest", "sarvam", "elevenlabs", "twilio"}:
         raise HTTPException(status_code=422, detail="Agent voice provider is not supported")
 
     if await is_number_on_tenant_dnc(db, current_user.tenant_id, data.to_number):
@@ -514,7 +514,7 @@ async def initiate_outbound_call(
         (twilio_config or {}).get("default_from_number") or settings.twilio_default_from_number
     ).strip()
     runtime_profile = None
-    if agent.voice_provider == "sarvam":
+    if agent.voice_provider in {"sarvam", "elevenlabs"}:
         runtime_profile = await db.scalar(
             select(AgentRuntimeProfile).where(
                 AgentRuntimeProfile.agent_id == agent.id,
@@ -525,6 +525,7 @@ async def initiate_outbound_call(
             runtime_profile is None
             or not runtime_profile.enabled
             or runtime_profile.status != "active"
+            or runtime_profile.primary_speech_provider != agent.voice_provider
         ):
             raise HTTPException(
                 status_code=409,
@@ -719,7 +720,7 @@ async def initiate_outbound_call(
             )
         ).scalar_one_or_none()
         current_runtime_profile = None
-        if current_agent and current_agent.voice_provider == "sarvam":
+        if current_agent and current_agent.voice_provider in {"sarvam", "elevenlabs"}:
             current_runtime_profile = await db.scalar(
                 select(AgentRuntimeProfile)
                 .where(
@@ -766,12 +767,14 @@ async def initiate_outbound_call(
         )
         runtime_not_ready = bool(
             current_agent
-            and current_agent.voice_provider == "sarvam"
+            and current_agent.voice_provider in {"sarvam", "elevenlabs"}
             and (
                 current_runtime_profile is None
                 or not current_runtime_profile.enabled
                 or current_runtime_profile.status != "active"
                 or current_runtime_profile.telephony_provider != "twilio"
+                or current_runtime_profile.primary_speech_provider
+                != current_agent.voice_provider
             )
         )
         if (

@@ -495,7 +495,7 @@ export default function Calls() {
       {showDialer ? (
         <form className="card call-dialer" onSubmit={initiateCall}>
           <div className="card-title">
-            <div><h2 className={styles.sectionHeading}>Start a Smallest.ai outbound call</h2><p>Review the published agent and enter one E.164 number. A call starts only after you submit.</p></div>
+            <div><h2 className={styles.sectionHeading}>Start an outbound call</h2><p>Choose a ready agent and enter one E.164 number. A call starts only after you submit.</p></div>
             <PhoneOutgoing size={18} color="var(--accent)" />
           </div>
           <div className="form-grid">

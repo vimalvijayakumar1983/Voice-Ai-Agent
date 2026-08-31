@@ -158,10 +158,10 @@ def _invalidate_bound_agent_deployments(kb: KnowledgeBase) -> list[UUID]:
     affected_agent_ids: list[UUID] = []
     for binding in kb.agent_bindings:
         agent = binding.agent
-        if getattr(agent, "voice_provider", "smallest") == "sarvam":
-            # Sarvam sessions retrieve approved VAV knowledge directly on every
+        if getattr(agent, "voice_provider", "smallest") in {"sarvam", "elevenlabs"}:
+            # VAV realtime sessions retrieve approved VAV knowledge directly on every
             # turn, so indexed source changes are live without an Atoms publish.
-            binding.provider = "sarvam"
+            binding.provider = agent.voice_provider
             binding.sync_status = "synced"
             binding.last_synced_at = datetime.now(UTC)
             continue
@@ -1363,7 +1363,7 @@ async def bind_agent(
             provider=agent.voice_provider,
         )
         db.add(binding)
-    if agent.voice_provider == "sarvam":
+    if agent.voice_provider in {"sarvam", "elevenlabs"}:
         binding.sync_status = "synced"
         binding.last_synced_at = datetime.now(UTC)
     else:

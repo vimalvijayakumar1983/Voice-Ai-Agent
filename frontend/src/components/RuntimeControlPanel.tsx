@@ -21,14 +21,17 @@ type Props = {
 };
 
 export default function RuntimeControlPanel({ agent, profile, onClose, onChange }: Props) {
-  const [form, setForm] = useState(profile);
+  const speechProvider: RuntimeProfile['primary_speech_provider'] = agent.voice_provider === 'elevenlabs'
+    ? 'elevenlabs'
+    : 'sarvam';
+  const [form, setForm] = useState({ ...profile, primary_speech_provider: speechProvider });
   const [numbers, setNumbers] = useState(profile.assigned_numbers.join('\n'));
   const [working, setWorking] = useState('');
   const [notice, setNotice] = useState<{ type: 'success' | 'error' | 'info'; text: string } | null>(null);
 
   const payload = () => ({
     telephony_provider: form.telephony_provider,
-    primary_speech_provider: form.primary_speech_provider,
+    primary_speech_provider: speechProvider,
     fallback_speech_provider: form.fallback_speech_provider,
     llm_provider: form.llm_provider,
     llm_model: form.llm_model,
@@ -81,7 +84,7 @@ export default function RuntimeControlPanel({ agent, profile, onClose, onChange 
         <div>
           <span className="page-kicker">Production serving</span>
           <h2 id="runtime-panel-title">{agent.name} runtime</h2>
-          <p>Configure the VAV-owned Sarvam pipeline, telephony route, capacity, and spend guardrails.</p>
+          <p>Configure the VAV-owned {speechProvider === 'elevenlabs' ? 'ElevenLabs voice and Sarvam transcription' : 'Sarvam speech'} pipeline, telephony route, capacity, and spend guardrails.</p>
         </div>
         <span className={`badge ${profile.enabled ? 'badge-success' : profile.ready ? 'badge-info' : 'badge-warning'}`}>
           {profile.enabled ? 'Active' : profile.ready ? 'Ready' : profile.status}

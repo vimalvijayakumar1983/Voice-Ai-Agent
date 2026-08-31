@@ -22,6 +22,7 @@ from app.core.config import settings
 from app.core.database import async_session_factory
 from app.models.agent import Agent, AgentRuntimeProfile
 from app.models.call import Call, CallTranscript
+from app.realtime.elevenlabs_stream import ElevenLabsTTSStream
 from app.realtime.sarvam_stream import (
     SarvamSTTStream,
     SarvamTTSStream,
@@ -62,7 +63,9 @@ class RuntimeSessionConfig:
     max_tokens: int
     llm_model: str
     max_duration_seconds: int
+    speech_provider: str
     sarvam_api_key: str
+    tts_api_key: str
     openai_api_key: str
 
 
@@ -132,15 +135,27 @@ async def load_runtime_session(call_id: UUID) -> RuntimeSessionConfig | None:
         call, agent, profile = row
         if (
             not agent.is_active
-            or agent.voice_provider != "sarvam"
+            or agent.voice_provider not in {"sarvam", "elevenlabs"}
             or not profile.enabled
             or profile.status != "active"
             or profile.telephony_provider != "twilio"
+            or profile.primary_speech_provider != agent.voice_provider
         ):
             return None
-        tenant_config = await load_provider_config(db, agent.tenant_id, "sarvam")
-        api_key = str((tenant_config or {}).get("api_key") or settings.sarvam_api_key).strip()
-        if not api_key:
+        sarvam_config = await load_provider_config(db, agent.tenant_id, "sarvam")
+        sarvam_api_key = str(
+            (sarvam_config or {}).get("api_key") or settings.sarvam_api_key
+        ).strip()
+        if not sarvam_api_key:
+            return None
+        if agent.voice_provider == "elevenlabs":
+            elevenlabs_config = await load_provider_config(db, agent.tenant_id, "elevenlabs")
+            tts_api_key = str(
+                (elevenlabs_config or {}).get("api_key") or settings.elevenlabs_api_key
+            ).strip()
+        else:
+            tts_api_key = sarvam_api_key
+        if not tts_api_key:
             return None
         openai_config = await load_provider_config(db, agent.tenant_id, "openai")
         openai_api_key = str(
@@ -148,7 +163,12 @@ async def load_runtime_session(call_id: UUID) -> RuntimeSessionConfig | None:
         ).strip()
         if not openai_api_key:
             return None
-        speaker = agent.voice_id.removeprefix("sarvam:") or "ishita"
+        voice_prefix = f"{agent.voice_provider}:"
+        if not agent.voice_id.startswith(voice_prefix):
+            return None
+        speaker = agent.voice_id.removeprefix(voice_prefix)
+        if not speaker:
+            return None
         primary_language = _language_code(agent.language)
         stt_language = "auto" if agent.language_switching_enabled else profile.stt_language
         if stt_language != "auto":
@@ -170,7 +190,9 @@ async def load_runtime_session(call_id: UUID) -> RuntimeSessionConfig | None:
             max_tokens=agent.max_tokens,
             llm_model=profile.llm_model,
             max_duration_seconds=agent.max_call_duration_seconds,
-            sarvam_api_key=api_key,
+            speech_provider=agent.voice_provider,
+            sarvam_api_key=sarvam_api_key,
+            tts_api_key=tts_api_key,
             openai_api_key=openai_api_key,
         )
 
@@ -216,7 +238,7 @@ async def _store_metrics(config: RuntimeSessionConfig, metrics: dict) -> None:
             return
         metadata = dict(call.call_metadata or {})
         metadata["runtime"] = {
-            "speech_provider": "sarvam",
+            "speech_provider": config.speech_provider,
             "llm_provider": "openai",
             "llm_model": config.llm_model,
             "stt_language": config.stt_language,
@@ -280,12 +302,20 @@ async def run_twilio_media_session(
     last_speech_end_at: float | None = None
     turn_latency_samples: list[int] = []
     conversation_engine = ConversationEngine(api_key=config.openai_api_key)
-    tts = SarvamTTSStream(
-        api_key=config.sarvam_api_key,
-        base_url=settings.sarvam_base_url,
-        speaker=config.speaker,
-        pace=config.speech_rate,
-    )
+    if config.speech_provider == "elevenlabs":
+        tts = ElevenLabsTTSStream(
+            api_key=config.tts_api_key,
+            base_url=settings.elevenlabs_base_url,
+            voice_id=config.speaker,
+            speed=config.speech_rate,
+        )
+    else:
+        tts = SarvamTTSStream(
+            api_key=config.tts_api_key,
+            base_url=settings.sarvam_base_url,
+            speaker=config.speaker,
+            pace=config.speech_rate,
+        )
     metrics: dict[str, int | float | None] = {
         "turn_count": 0,
         "llm_tokens": 0,

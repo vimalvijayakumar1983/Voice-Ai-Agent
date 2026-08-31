@@ -100,7 +100,7 @@ export interface VoiceAgent {
 
 export interface AgentAIDraftRequest {
   brief: string;
-  provider_preference: 'auto' | 'smallest' | 'sarvam';
+  provider_preference: 'auto' | 'smallest' | 'sarvam' | 'elevenlabs';
   primary_language: string;
   timezone: string;
 }
@@ -113,7 +113,7 @@ export interface AgentAIDraftResponse {
     greeting_message: string | null;
     model_provider: string;
     model_name: string;
-    voice_provider: 'smallest' | 'sarvam';
+    voice_provider: 'smallest' | 'sarvam' | 'elevenlabs';
     voice_id: string;
     temperature: number;
     language: string;
@@ -135,7 +135,7 @@ export interface ProviderStatus {
   configured: boolean;
   webhook_configured: boolean;
   base_url: string;
-  providers?: Record<'smallest' | 'sarvam', {
+  providers?: Record<'smallest' | 'sarvam' | 'elevenlabs', {
     configured: boolean;
     agent_runtime: boolean;
     voice_preview: boolean;
@@ -151,7 +151,7 @@ export interface ProviderCredentialStatus {
   updated_at: string | null;
 }
 
-export type WorkspaceProviderName = 'smallest' | 'sarvam' | 'openai' | 'twilio';
+export type WorkspaceProviderName = 'smallest' | 'sarvam' | 'elevenlabs' | 'openai' | 'twilio';
 
 export interface WorkspaceCredentialStatus {
   provider: WorkspaceProviderName;
@@ -171,8 +171,8 @@ export interface RuntimeProfile {
   agent_id: string;
   enabled: boolean;
   telephony_provider: 'twilio' | 'livekit_sip';
-  primary_speech_provider: 'sarvam';
-  fallback_speech_provider: 'smallest' | null;
+  primary_speech_provider: 'sarvam' | 'elevenlabs';
+  fallback_speech_provider: 'smallest' | 'sarvam' | 'elevenlabs' | null;
   llm_provider: 'openai';
   llm_model: 'gpt-4o-mini' | 'gpt-4o';
   stt_language: string;
@@ -203,7 +203,7 @@ export interface SipCredentialStatus {
 }
 
 export interface VoiceCatalogItem {
-  provider: 'smallest' | 'sarvam';
+  provider: 'smallest' | 'sarvam' | 'elevenlabs';
   id: string;
   name: string;
   languages: string[];
@@ -1412,7 +1412,7 @@ class ApiClient {
     return this.request<AgentProviderCatalog>('/api/v1/agents/provider/catalog');
   }
 
-  async previewVoice(provider: 'smallest' | 'sarvam', voiceId: string, language?: string) {
+  async previewVoice(provider: 'smallest' | 'sarvam' | 'elevenlabs', voiceId: string, language?: string) {
     return this.requestBlob('/api/v1/agents/provider/voice-preview', {
       method: 'POST',
       body: JSON.stringify({ provider, voice_id: voiceId, language }),

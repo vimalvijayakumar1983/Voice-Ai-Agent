@@ -63,6 +63,12 @@ const fallbackLanguages: LanguageCatalogItem[] = [
   ['es', 'Spanish'], ['sv', 'Swedish'], ['ta', 'Tamil'], ['te', 'Telugu'],
 ].map(([code, name]) => ({ code, name }));
 
+function voiceProviderName(provider: string) {
+  if (provider === 'sarvam') return 'Sarvam AI';
+  if (provider === 'elevenlabs') return 'ElevenLabs';
+  return 'Smallest.ai';
+}
+
 interface AgentEditorProps {
   mode: 'create' | 'edit';
   catalog: AgentProviderCatalog | null;
@@ -172,9 +178,9 @@ export default function AgentEditor({
       supported_languages: ['en'],
       language_switching_enabled: false,
       language_switching_mode: 'disabled',
-      speech_rate: provider === 'sarvam' ? 0.95 : current.speech_rate,
+      speech_rate: provider === 'sarvam' ? 0.95 : provider === 'elevenlabs' ? 1 : current.speech_rate,
     }));
-    setVoiceNotice(`Voice and language selections were reset for the ${provider === 'sarvam' ? 'Sarvam AI' : 'Smallest.ai'} catalog.`);
+    setVoiceNotice(`Voice and language selections were reset for the ${voiceProviderName(provider)} catalog.`);
   };
 
   const toggleSupportedLanguage = (language: string) => {
@@ -314,8 +320,9 @@ export default function AgentEditor({
           <select id="voice-provider" value={form.voice_provider} onChange={(event) => updateVoiceProvider(event.target.value as AgentEditorValues['voice_provider'])}>
             {availableProviders.includes('smallest') ? <option value="smallest">Smallest.ai · Lightning</option> : null}
             {availableProviders.includes('sarvam') ? <option value="sarvam">Sarvam AI · Bulbul v3 Indian voices</option> : null}
+            {availableProviders.includes('elevenlabs') ? <option value="elevenlabs">ElevenLabs · Flash v2.5 voices</option> : null}
           </select>
-          <p className="form-hint">Smallest agents publish to Atoms. Sarvam agents use the separate VAV realtime runtime.</p>
+          <p className="form-hint">Smallest agents publish to Atoms. Sarvam and ElevenLabs voices use VAV realtime, VAV knowledge, and OpenAI behavior.</p>
         </div>
         <div className="form-group language-primary">
           <label htmlFor={primaryLanguageId}>Primary language</label>
@@ -419,11 +426,11 @@ export default function AgentEditor({
           <div><span className="section-icon"><Sparkles size={14} /></span><h3>Conversation tuning</h3></div>
         </div>
         <div className="form-grid">
-          {form.voice_provider === 'sarvam' ? (
+          {form.voice_provider !== 'smallest' ? (
             <div className="form-group">
               <label htmlFor={modelId}>Live phone runtime</label>
-              <input id={modelId} value="Sarvam Bulbul v3 + OpenAI" readOnly aria-readonly="true" />
-              <p className="form-hint">Production-safe Sarvam streaming profile with balanced 450 ms turn detection and concise phone responses.</p>
+              <input id={modelId} value={form.voice_provider === 'elevenlabs' ? 'ElevenLabs Flash v2.5 + Sarvam STT + OpenAI' : 'Sarvam Bulbul v3 + OpenAI'} readOnly aria-readonly="true" />
+              <p className="form-hint">VAV keeps the agent prompt and knowledge retrieval; only speech output changes with the selected voice provider.</p>
             </div>
           ) : (
             <div className="form-group">
@@ -431,7 +438,7 @@ export default function AgentEditor({
               <select id={modelId} value={form.model_name} onChange={(event) => setForm({ ...form, model_name: event.target.value })}><option value="electron">Electron · voice optimized</option></select>
             </div>
           )}
-          {form.voice_provider !== 'sarvam' && (
+          {form.voice_provider === 'smallest' && (
             <div className="form-group">
               <label htmlFor={timezoneId}>Timezone</label>
               <input id={timezoneId} required list="common-timezones" value={form.timezone} onChange={(event) => setForm({ ...form, timezone: event.target.value })} />
@@ -440,8 +447,9 @@ export default function AgentEditor({
           )}
           <div className="form-group range-control">
             <label htmlFor={speechRateId}>Speech rate <span>{form.speech_rate.toFixed(2)}×</span></label>
-            <input id={speechRateId} type="range" min="0.5" max="2" step="0.05" value={form.speech_rate} onChange={(event) => setForm({ ...form, speech_rate: Number(event.target.value) })} />
+            <input id={speechRateId} type="range" min={form.voice_provider === 'elevenlabs' ? 0.7 : 0.5} max={form.voice_provider === 'elevenlabs' ? 1.2 : 2} step="0.05" value={form.speech_rate} onChange={(event) => setForm({ ...form, speech_rate: Number(event.target.value) })} />
             {form.voice_provider === 'sarvam' && <p className="form-hint">For medical support, 0.95× gives callers the clearest balance of pace and natural delivery.</p>}
+            {form.voice_provider === 'elevenlabs' && <p className="form-hint">Start at 1.00×. VAV streams ElevenLabs μ-law audio directly to Twilio without transcoding.</p>}
           </div>
         </div>
       </section>

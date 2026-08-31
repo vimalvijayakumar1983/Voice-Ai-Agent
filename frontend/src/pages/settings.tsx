@@ -157,6 +157,7 @@ export default function Settings() {
   const [providerKeys, setProviderKeys] = useState({
     smallest: '',
     sarvam: '',
+    elevenlabs: '',
     openai: '',
   });
   const [twilioForm, setTwilioForm] = useState({
@@ -371,7 +372,14 @@ export default function Settings() {
       ]);
       setCredentialStatuses(nextCredentialStatuses);
       setAuditEvents(nextAuditEvents);
-      setNotice(`${provider === 'openai' ? 'OpenAI' : provider === 'sarvam' ? 'Sarvam AI' : 'Smallest.ai'} credential saved securely.`);
+      const providerName = provider === 'openai'
+        ? 'OpenAI'
+        : provider === 'sarvam'
+          ? 'Sarvam AI'
+          : provider === 'elevenlabs'
+            ? 'ElevenLabs'
+            : 'Smallest.ai';
+      setNotice(`${providerName} credential saved securely.`);
     } catch (caught: unknown) {
       setActionError(caught instanceof Error ? caught.message : 'Provider credential could not be saved.');
     } finally {
@@ -625,11 +633,17 @@ export default function Settings() {
                 <p>Connect provider credentials for this workspace. Keys are encrypted on the server and are never returned to the browser.</p>
               </div>
               <span className={`badge ${connectedProviders ? 'badge-success' : 'badge-warning'}`}>
-                {connectedProviders}/4 connected
+                {connectedProviders}/5 connected
               </span>
             </div>
-            {(['smallest', 'sarvam', 'openai'] as const).map((provider) => {
-              const providerName = provider === 'smallest' ? 'Smallest.ai' : provider === 'sarvam' ? 'Sarvam AI' : 'OpenAI';
+            {(['smallest', 'sarvam', 'elevenlabs', 'openai'] as const).map((provider) => {
+              const providerName = provider === 'smallest'
+                ? 'Smallest.ai'
+                : provider === 'sarvam'
+                  ? 'Sarvam AI'
+                  : provider === 'elevenlabs'
+                    ? 'ElevenLabs'
+                    : 'OpenAI';
               const status = credentialStatuses?.providers[provider];
               return (
                 <div className="settings-subtable" key={provider}>
@@ -645,7 +659,9 @@ export default function Settings() {
                     <div className="form-group">
                       <label htmlFor={`${provider}-api-key`}>{providerName} API key</label>
                       <input id={`${provider}-api-key`} type="password" autoComplete="new-password" placeholder={status?.configured ? 'Enter a new key to rotate' : 'Paste API key'} value={providerKeys[provider]} onChange={(event) => setProviderKeys((current) => ({ ...current, [provider]: event.target.value }))} minLength={20} maxLength={512} required />
-                      <p className="form-hint">The saved value is never returned to the browser. A new value rotates the workspace credential.</p>
+                      <p className="form-hint">{provider === 'elevenlabs'
+                        ? 'Used only for outgoing speech. Sarvam remains the live transcription provider and VAV keeps the knowledge and agent behavior.'
+                        : 'The saved value is never returned to the browser. A new value rotates the workspace credential.'}</p>
                     </div>
                     <button type="submit" className="btn btn-primary" disabled={busyAction === `${provider}-key`}><KeyRound size={14} /> {busyAction === `${provider}-key` ? 'Saving…' : status?.source === 'workspace' ? 'Rotate key' : 'Connect'}</button>
                     {status?.source === 'workspace' ? <button type="button" className="btn btn-danger" disabled={busyAction === `${provider}-delete`} onClick={() => void handleDeleteProviderCredential(provider)}>{busyAction === `${provider}-delete` ? 'Removing…' : 'Remove workspace key'}</button> : null}

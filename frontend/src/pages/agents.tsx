@@ -227,7 +227,7 @@ export default function Agents() {
         }
         const deprovisionExistingProvider = requiresSmallestDeprovision(editingAgent, patch);
         if (deprovisionExistingProvider && !window.confirm(
-          `Switch ${editingAgent.name} from Smallest.ai to Sarvam? The live Smallest.ai remote agent will be permanently archived first. The VAV agent and its knowledge base will be preserved.`,
+          `Switch ${editingAgent.name} from Smallest.ai to ${voiceProviderName(values.voice_provider)}? The live Smallest.ai remote agent will be permanently archived first. The VAV agent and its knowledge base will be preserved.`,
         )) return;
         const updated = await api.updateAgent(editingAgent.id, patch, {
           deprovisionExistingProvider,
@@ -237,7 +237,7 @@ export default function Agents() {
         setNotice({
           type: 'success',
           text: deprovisionExistingProvider
-            ? `${updated.name} was archived on Smallest.ai and switched to Sarvam. Its VAV configuration and knowledge binding were preserved.`
+            ? `${updated.name} was archived on Smallest.ai and switched to ${voiceProviderName(updated.voice_provider)}. Its VAV configuration and knowledge binding were preserved.`
             : agentUpdateNotice(updated.name, updated.sync_status),
         });
       } else {
@@ -581,14 +581,14 @@ export default function Agents() {
                 <span className="meta-chip"><Globe2 size={9} /> Primary: {languageLabel(agent.language, catalog)}</span>
                 <span className="meta-chip">{languageConfigurationLabel(agent)}</span>
                 <span className="meta-chip">Voice: {voiceLabel(agent.voice_id, catalog)}</span>
-                <span className="meta-chip">Provider: {agent.voice_provider === 'sarvam' ? 'Sarvam AI' : 'Smallest.ai'}</span>
+                <span className="meta-chip">Provider: {voiceProviderName(agent.voice_provider)}</span>
                 <span className={`badge ${syncBadge(agent.sync_status)}`}>{syncStatusLabel(agent.sync_status)}</span>
                 {agent.provider_revision_id && <span className="meta-chip">Revision: {agent.provider_revision_id.slice(0, 12)}…</span>}
                 {agent.last_synced_at && <span className="meta-chip">Last sync: {new Date(agent.last_synced_at).toLocaleString()}</span>}
               </div>
               <div className="agent-card-actions">
                 <button className="btn btn-secondary btn-sm" disabled={!catalogReady || providerOperationUnresolved(agent.sync_status)} onClick={() => openEdit(agent)}><Pencil size={12} /> Edit</button>
-                {agent.voice_provider === 'sarvam' ? (
+                {['sarvam', 'elevenlabs'].includes(agent.voice_provider) ? (
                   <button
                     className={`btn btn-sm ${runtimeProfiles[agent.id]?.enabled ? 'btn-primary' : 'btn-secondary'}`}
                     disabled={!runtimeProfiles[agent.id]}
@@ -702,11 +702,18 @@ function syncStatusLabel(status: VoiceAgent['sync_status']) {
 
 function deploymentDescription(agent: VoiceAgent) {
   if (agent.voice_provider === 'sarvam') return 'Sarvam AI · VAV realtime runtime';
+  if (agent.voice_provider === 'elevenlabs') return 'ElevenLabs voice · VAV realtime runtime';
   if (!agent.provider_agent_id) return 'Local draft · not provisioned';
   const providerId = `Atoms ID · ${agent.provider_agent_id.slice(0, 12)}…`;
   if (agent.sync_status === 'synced') return `${providerId} · published revision recorded`;
   if (agent.sync_status === 'dirty') return `${providerId} · local changes not published`;
   return `${providerId} · ${syncStatusLabel(agent.sync_status).toLowerCase()}`;
+}
+
+function voiceProviderName(provider: string) {
+  if (provider === 'sarvam') return 'Sarvam AI';
+  if (provider === 'elevenlabs') return 'ElevenLabs';
+  return 'Smallest.ai';
 }
 
 function languageConfigurationLabel(agent: VoiceAgent) {

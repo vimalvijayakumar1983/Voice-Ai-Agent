@@ -133,6 +133,14 @@ async def runtime_readiness(
         (sarvam_config and sarvam_config.get("api_key")) or settings.sarvam_api_key.strip()
     )
     try:
+        elevenlabs_config = await load_provider_config(db, agent.tenant_id, "elevenlabs")
+    except ProviderCredentialError:
+        elevenlabs_config = None
+    elevenlabs_ready = bool(
+        (elevenlabs_config and elevenlabs_config.get("api_key"))
+        or settings.elevenlabs_api_key.strip()
+    )
+    try:
         openai_config = await load_provider_config(db, agent.tenant_id, "openai")
     except ProviderCredentialError:
         openai_config = None
@@ -175,11 +183,24 @@ async def runtime_readiness(
 
     number_route_conflicts = await _number_route_conflicts(db, agent, profile)
 
+    vav_speech_agent = agent.voice_provider in {"sarvam", "elevenlabs"}
+    tts_ready = sarvam_ready if agent.voice_provider == "sarvam" else elevenlabs_ready
+    voice_ready = bool(
+        agent.voice_id
+        and vav_speech_agent
+        and agent.voice_id.startswith(f"{agent.voice_provider}:")
+    )
     checks = {
         "agent_active": bool(agent.is_active),
-        "sarvam_agent": agent.voice_provider == "sarvam",
-        "sarvam_credential": sarvam_ready,
-        "sarvam_voice": agent.voice_id.startswith("sarvam:") if agent.voice_id else False,
+        "vav_speech_agent": vav_speech_agent,
+        "stt_credential": sarvam_ready,
+        "tts_credential": tts_ready,
+        "voice_selection": voice_ready,
+        "speech_provider_match": bool(
+            profile
+            and vav_speech_agent
+            and profile.primary_speech_provider == agent.voice_provider
+        ),
         "openai_credential": bool(
             (openai_config and openai_config.get("api_key")) or settings.openai_api_key.strip()
         ),
@@ -212,9 +233,15 @@ async def runtime_readiness(
         checks["sip_gateway_provisioned"] = bool(sip and sip.get("gateway_provisioned"))
     labels = {
         "agent_active": "Activate the agent configuration.",
-        "sarvam_agent": "Select Sarvam as this agent's voice provider.",
-        "sarvam_credential": "Add a valid Sarvam API key in Settings.",
-        "sarvam_voice": "Select a Sarvam Bulbul v3 voice.",
+        "vav_speech_agent": "Select Sarvam or ElevenLabs as this agent's voice provider.",
+        "stt_credential": "Add a valid Sarvam API key in Settings for live transcription.",
+        "tts_credential": (
+            f"Add a valid {agent.voice_provider.title()} API key in Settings for speech output."
+        ),
+        "voice_selection": "Select a voice from the configured speech provider.",
+        "speech_provider_match": (
+            "Save the runtime so its primary speech provider matches the agent voice provider."
+        ),
         "openai_credential": "Add an OpenAI API key in Settings.",
         "public_runtime_url": "Configure BASE_URL as the public HTTPS API origin.",
         "telephony_credential": "Add credentials for the selected telephony provider in Settings.",
@@ -233,13 +260,15 @@ async def runtime_readiness(
 
 
 def _response(
-    agent_id: UUID,
+    agent: Agent,
     profile: AgentRuntimeProfile | None,
     blockers: list[str],
 ) -> RuntimeProfileResponse:
     values = {
         "telephony_provider": "twilio",
-        "primary_speech_provider": "sarvam",
+        "primary_speech_provider": (
+            agent.voice_provider if agent.voice_provider in {"sarvam", "elevenlabs"} else "sarvam"
+        ),
         "fallback_speech_provider": None,
         "llm_provider": "openai",
         "llm_model": "gpt-4o-mini",
@@ -253,7 +282,7 @@ def _response(
         values.update({key: getattr(profile, key) for key in values})
     return RuntimeProfileResponse(
         id=profile.id if profile else None,
-        agent_id=agent_id,
+        agent_id=agent.id,
         enabled=bool(profile and profile.enabled),
         status=profile.status if profile else "draft",
         ready=not blockers,
@@ -277,7 +306,7 @@ async def list_runtime_profiles(
     for agent in agents:
         profile = await _profile(db, current_user.tenant_id, agent.id)
         blockers, _checks = await runtime_readiness(db, agent, profile)
-        result.append(_response(agent.id, profile, blockers))
+        result.append(_response(agent, profile, blockers))
     return result
 
 
@@ -290,7 +319,7 @@ async def get_runtime_profile(
     agent = await _agent(db, current_user.tenant_id, agent_id)
     profile = await _profile(db, current_user.tenant_id, agent_id)
     blockers, _checks = await runtime_readiness(db, agent, profile)
-    return _response(agent.id, profile, blockers)
+    return _response(agent, profile, blockers)
 
 
 @router.put("/agents/{agent_id}", response_model=RuntimeProfileResponse)
@@ -321,7 +350,7 @@ async def update_runtime_profile(
         },
     )
     blockers, _checks = await runtime_readiness(db, agent, profile)
-    return _response(agent.id, profile, blockers)
+    return _response(agent, profile, blockers)
 
 
 @router.post("/agents/{agent_id}/test", response_model=RuntimeReadinessResponse)
@@ -393,7 +422,7 @@ async def activate_runtime_profile(
         resource_id=str(agent.id),
         details={"telephony_provider": profile.telephony_provider},
     )
-    return _response(agent.id, profile, blockers)
+    return _response(agent, profile, blockers)
 
 
 @router.post("/agents/{agent_id}/deactivate", response_model=RuntimeProfileResponse)
@@ -416,7 +445,7 @@ async def deactivate_runtime_profile(
         resource_type="agent",
         resource_id=str(agent.id),
     )
-    return _response(agent.id, profile, blockers)
+    return _response(agent, profile, blockers)
 
 
 def _platform_credential_config(provider: str) -> dict[str, str]:
@@ -424,6 +453,8 @@ def _platform_credential_config(provider: str) -> dict[str, str]:
         return {"api_key": settings.smallest_api_key}
     if provider == "sarvam":
         return {"api_key": settings.sarvam_api_key}
+    if provider == "elevenlabs":
+        return {"api_key": settings.elevenlabs_api_key}
     if provider == "openai":
         return {"api_key": settings.openai_api_key}
     if provider == "twilio":
@@ -483,7 +514,7 @@ async def list_workspace_credentials(
     db: AsyncSession = Depends(get_db),
 ):
     providers = {}
-    for provider in ("smallest", "sarvam", "openai", "twilio"):
+    for provider in ("smallest", "sarvam", "elevenlabs", "openai", "twilio"):
         providers[provider] = await _workspace_credential_status(
             db, current_user.tenant_id, provider
         )
@@ -497,7 +528,7 @@ async def save_api_key_credential(
     current_user: CurrentUser = Depends(require_role("owner", "admin")),
     db: AsyncSession = Depends(get_db),
 ):
-    if provider not in {"smallest", "sarvam", "openai"}:
+    if provider not in {"smallest", "sarvam", "elevenlabs", "openai"}:
         raise HTTPException(status_code=404, detail="Unsupported API-key provider")
     existing = await get_provider_credential(db, current_user.tenant_id, provider)
     try:
@@ -552,7 +583,7 @@ async def delete_workspace_credential(
     current_user: CurrentUser = Depends(require_role("owner", "admin")),
     db: AsyncSession = Depends(get_db),
 ):
-    if provider not in {"smallest", "sarvam", "openai", "twilio"}:
+    if provider not in {"smallest", "sarvam", "elevenlabs", "openai", "twilio"}:
         raise HTTPException(status_code=404, detail="Unsupported credential provider")
     credential = await get_provider_credential(
         db, current_user.tenant_id, provider, for_update=True
