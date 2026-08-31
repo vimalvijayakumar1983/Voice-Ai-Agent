@@ -31,6 +31,7 @@ from app.schemas.knowledge import (
 from app.services.audit import record_audit_event
 from app.services.pdf_ingestion import PdfIngestionError, PreparedPdf, prepare_pdf
 from app.services.provider_credentials import load_provider_config
+from app.services.website_recovery import recovery_metadata
 
 router = APIRouter(prefix="/knowledge", tags=["Knowledge Studio"])
 MAX_KNOWLEDGE_PDF_BYTES = 8 * 1024 * 1024
@@ -719,6 +720,83 @@ async def add_text_source(
         resource_id=str(kb.id),
         details={"name": data.name, "bytes": len(data.content.encode())},
     )
+    return _knowledge_response(kb)
+
+
+@router.post(
+    "/{kb_id}/sources/{source_id}/repair",
+    response_model=KnowledgeBaseResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def repair_website_source(
+    kb_id: UUID,
+    source_id: UUID,
+    current_user: CurrentUser = Depends(require_role("owner", "admin", "member")),
+    db: AsyncSession = Depends(get_db),
+):
+    """Queue VAV extraction and provider re-indexing for one failed web page."""
+    kb = await _get_knowledge_base(db, current_user.tenant_id, kb_id)
+    _ensure_bound_agents_accept_knowledge_change(kb)
+    source = next((item for item in kb.sources if item.id == source_id), None)
+    if source is None:
+        raise HTTPException(status_code=404, detail="Knowledge source not found")
+    if source.source_type not in {"url", "website", "sitemap"} or not source.location:
+        raise HTTPException(
+            status_code=422,
+            detail="Only website URL sources can use automatic page recovery",
+        )
+    recovery = (
+        source.source_metadata.get("recovery")
+        if isinstance(source.source_metadata, dict)
+        else None
+    )
+    if isinstance(recovery, dict) and recovery.get("status") in {"queued", "processing"}:
+        raise HTTPException(status_code=409, detail="This website page is already being repaired")
+
+    metadata = dict(source.source_metadata or {})
+    attempts = int(metadata.get("recovery_attempts") or 0) + 1
+    metadata["recovery_attempts"] = attempts
+    source.status = "processing"
+    source.error_message = None
+    source.source_metadata = recovery_metadata(
+        metadata,
+        stage="queued",
+        status="queued",
+        message="VAV queued safe download, extraction, provider indexing and verification.",
+    )
+    kb.sync_status = "processing"
+    kb.sync_error = None
+    await record_audit_event(
+        db,
+        tenant_id=current_user.tenant_id,
+        actor_user_id=current_user.id,
+        action="knowledge_source.website_repair_queued",
+        resource_type="knowledge_source",
+        resource_id=str(source.id),
+        details={"attempt": attempts},
+    )
+    # The worker must never race the request transaction that records the job.
+    await db.commit()
+
+    from app.tasks.knowledge_tasks import repair_website_source as repair_task
+
+    try:
+        repair_task.apply_async(
+            args=[str(current_user.tenant_id), str(kb.id), str(source.id)],
+            queue="knowledge",
+        )
+    except Exception as exc:
+        source.status = "failed"
+        source.error_message = "The website-recovery worker is temporarily unavailable."
+        source.source_metadata = recovery_metadata(
+            source.source_metadata,
+            stage="failed",
+            status="failed",
+            message=source.error_message,
+        )
+        _recount(kb)
+        await db.commit()
+        raise HTTPException(status_code=503, detail=source.error_message) from exc
     return _knowledge_response(kb)
 
 

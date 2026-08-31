@@ -44,6 +44,8 @@ type KnowledgeActionOptions = {
 
 const AGENT_SYNC_POLL_MS = 1500;
 const AGENT_SYNC_MAX_ATTEMPTS = 40;
+const SOURCE_REPAIR_POLL_MS = 2000;
+const SOURCE_REPAIR_MAX_ATTEMPTS = 90;
 
 const scopeOptions: Array<{ value: KnowledgeScope; label: string }> = [
   { value: 'workspace', label: 'Whole workspace' },
@@ -90,6 +92,25 @@ export default function KnowledgeStudio() {
   }, []);
 
   const selected = knowledgeBases.find((kb) => kb.id === selectedId) || null;
+  const selectedHasActiveRepair = Boolean(selected?.sources.some((source) => {
+    const recovery = sourceRecovery(source);
+    return recovery?.status === 'queued' || recovery?.status === 'processing';
+  }));
+
+  useEffect(() => {
+    if (!selectedId || !selectedHasActiveRepair) return;
+    let active = true;
+    const timer = window.setInterval(() => {
+      api.getKnowledgeBase(selectedId)
+        .then((updated) => {
+          if (!active) return;
+          setKnowledgeBases((current) => current.map((kb) => kb.id === updated.id ? updated : kb));
+        })
+        .catch(() => undefined);
+    }, SOURCE_REPAIR_POLL_MS);
+    return () => { active = false; window.clearInterval(timer); };
+  }, [selectedId, selectedHasActiveRepair]);
+
   const canEditKnowledge = Boolean(currentUser && currentUser.role !== 'viewer');
   const canGovernKnowledge = currentUser?.role === 'owner' || currentUser?.role === 'admin';
   const filtered = useMemo(() => {
@@ -334,6 +355,51 @@ export default function KnowledgeStudio() {
     );
   };
 
+  const repairSource = async (source: KnowledgeSource) => {
+    if (!selected) return;
+    const knowledgeBaseId = selected.id;
+    setWorking(`repair-source-${source.id}`);
+    setNotice({ type: 'info', text: 'VAV is queuing safe download and recovery for this page…' });
+    try {
+      let updated = await api.repairKnowledgeSource(knowledgeBaseId, source.id);
+      replaceKnowledgeBase(updated);
+      for (let attempt = 0; attempt < SOURCE_REPAIR_MAX_ATTEMPTS; attempt += 1) {
+        const currentSource = updated.sources.find((item) => item.id === source.id);
+        const recovery = currentSource ? sourceRecovery(currentSource) : null;
+        if (currentSource && recovery?.status === 'completed') {
+          const pendingAgentIds = updated.approval_status === 'approved'
+            ? updated.agent_bindings
+              .filter((binding) => binding.sync_status !== 'synced')
+              .map((binding) => binding.agent_id)
+            : [];
+          if (pendingAgentIds.length) {
+            setNotice({ type: 'info', text: 'The page is recovered. Publishing the updated knowledge to bound agents…' });
+            await synchronizeAgents(pendingAgentIds);
+            updated = await api.getKnowledgeBase(knowledgeBaseId);
+            replaceKnowledgeBase(updated);
+          }
+          setNotice({ type: 'success', text: `Recovered ${currentSource.name}: readable text was extracted, indexed and verified for agents.` });
+          return;
+        }
+        if (recovery?.status === 'failed' || currentSource?.status === 'failed') {
+          throw new Error(currentSource?.error_message || recovery?.message || 'Page recovery failed.');
+        }
+        setNotice({
+          type: 'info',
+          text: recovery?.message || `VAV is ${recoveryStageLabel(recovery?.stage)}…`,
+        });
+        await new Promise((resolve) => window.setTimeout(resolve, SOURCE_REPAIR_POLL_MS));
+        updated = await api.getKnowledgeBase(knowledgeBaseId);
+        replaceKnowledgeBase(updated);
+      }
+      throw new Error('The page is still being processed. VAV will continue in the background.');
+    } catch (error) {
+      setNotice({ type: 'error', text: errorMessage(error, 'VAV could not recover this website page.') });
+    } finally {
+      setWorking(null);
+    }
+  };
+
   const deleteSelected = async () => {
     if (!selected || !window.confirm(`Delete ${selected.name}? This permanently removes its provider copy and sources.`)) return;
     setWorking('delete');
@@ -480,8 +546,10 @@ export default function KnowledgeStudio() {
 
               <SourcesSection
                 sources={selected.sources}
+                canRepair={canEditKnowledge}
                 canRemove={canGovernKnowledge}
                 busy={working !== null}
+                onRepair={repairSource}
                 onRemove={removeSource}
               />
 
@@ -553,12 +621,20 @@ function TextForm({ busy, onSubmit }: { busy: boolean; onSubmit: (event: FormEve
   return <form onSubmit={onSubmit} className={styles.builderForm}><div><label htmlFor="text-name">Internal text note</label><p>Saved with clear “local only” status until the selected provider supports text ingestion.</p></div><input id="text-name" name="text_name" required maxLength={255} placeholder="Approved returns FAQ" /><textarea id="text-content" name="text_content" required minLength={20} maxLength={100000} placeholder="Paste approved question-and-answer content here…" /><button type="submit" className="btn btn-secondary" disabled={busy}>{busy ? <Loader2 className="spin" size={14} /> : <Plus size={14} />} Save local source</button></form>;
 }
 
-function SourcesSection({ sources, canRemove, busy, onRemove }: { sources: KnowledgeSource[]; canRemove: boolean; busy: boolean; onRemove: (source: KnowledgeSource) => void }) {
+function SourcesSection({ sources, canRepair, canRemove, busy, onRepair, onRemove }: { sources: KnowledgeSource[]; canRepair: boolean; canRemove: boolean; busy: boolean; onRepair: (source: KnowledgeSource) => void; onRemove: (source: KnowledgeSource) => void }) {
   const readyCount = sources.filter((source) => source.retrieval_ready && source.status === 'indexed').length;
   return <section className={styles.section} aria-labelledby="sources-heading"><div className={styles.sectionHeading}><div><span className={styles.sectionIcon}><Layers3 size={15} /></span><div><h3 id="sources-heading">Source inventory</h3><p>One row per document. “Ready for agents” requires provider indexing and searchable VAV text.</p></div></div><span className="badge badge-neutral">{sources.length} documents · {readyCount} ready</span></div>{sources.length === 0 ? <div className={styles.sourceEmpty}><FileText size={20} /><div><strong>No sources yet</strong><p>Add curated web pages or an approved PDF to begin indexing.</p></div></div> : <div className={styles.sourceList}>{sources.map((source) => {
     const method = typeof source.source_metadata?.extraction_method === 'string' ? source.source_metadata.extraction_method : null;
     const isReady = source.retrieval_ready && source.status === 'indexed';
-    return <article className={styles.sourceRow} key={source.id}><span className={styles.sourceTypeIcon}>{source.source_type === 'file' ? <FileText size={16} /> : source.source_type === 'text' ? <Layers3 size={16} /> : <Globe2 size={16} />}</span><div className={styles.sourceIdentity}><strong>{source.name}</strong><span>{source.location || (source.size_bytes ? formatBytes(source.size_bytes) : source.source_type)} · {source.retrieval_ready ? `${source.extracted_character_count.toLocaleString()} searchable characters${method ? ` · ${method === 'native' ? 'text extracted' : `${method} OCR`}` : ''}` : 'no voice-searchable text'}</span>{!source.retrieval_ready && <p>VAV cannot use this document yet. Re-upload it to run extraction and OCR repair.</p>}{source.error_message && <p>{source.error_message}</p>}</div><span className={`badge ${isReady ? 'badge-success' : sourceBadge(source.status)}`}>{isReady ? 'Ready for agents' : source.status.replace('_', ' ')}</span><time>{formatDate(source.last_synced_at || source.updated_at)}</time>{canRemove && <button type="button" className="icon-button" disabled={busy} onClick={() => onRemove(source)} aria-label={`Remove ${source.name} from VAV and Smallest.ai`} title="Remove from VAV and Smallest.ai"><Trash2 size={14} /></button>}</article>;
+    const recovery = sourceRecovery(source);
+    const isWebsite = source.source_type === 'url' || source.source_type === 'website' || source.source_type === 'sitemap';
+    const repairable = isWebsite && (source.status === 'failed' || !source.retrieval_ready);
+    const detail = recovery?.status === 'queued' || recovery?.status === 'processing'
+      ? recovery.message || `VAV is ${recoveryStageLabel(recovery.stage)}…`
+      : !source.retrieval_ready
+        ? isWebsite ? 'VAV could not read this page yet. Use Repair page to recover it automatically.' : 'VAV cannot use this document yet. Re-upload it to run extraction and OCR repair.'
+        : null;
+    return <article className={styles.sourceRow} key={source.id}><span className={styles.sourceTypeIcon}>{source.source_type === 'file' ? <FileText size={16} /> : source.source_type === 'text' ? <Layers3 size={16} /> : <Globe2 size={16} />}</span><div className={styles.sourceIdentity}><strong>{source.name}</strong><span>{source.location || (source.size_bytes ? formatBytes(source.size_bytes) : source.source_type)} · {source.retrieval_ready ? `${source.extracted_character_count.toLocaleString()} searchable characters${method ? ` · ${method === 'native' ? 'text extracted' : method === 'static_html' ? 'HTML extracted' : method === 'javascript_render' ? 'JavaScript rendered' : method}` : ''}` : 'no voice-searchable text'}</span>{detail && <p className={recovery?.status === 'queued' || recovery?.status === 'processing' ? styles.recoveryProgress : undefined}>{detail}</p>}{source.error_message && source.error_message !== detail && <p>{source.error_message}</p>}</div><span className={`badge ${isReady ? 'badge-success' : sourceBadge(source.status)}`}>{isReady ? 'Ready for agents' : recovery?.status === 'queued' || recovery?.status === 'processing' ? recoveryStageLabel(recovery.stage) : source.status.replace('_', ' ')}</span><time>{formatDate(source.last_synced_at || source.updated_at)}</time><span className={styles.sourceActions}>{canRepair && repairable && <button type="button" className="btn btn-secondary btn-sm" disabled={busy || recovery?.status === 'queued' || recovery?.status === 'processing'} onClick={() => onRepair(source)} title="Retry, render, extract, index and verify this page"><RefreshCw size={12} className={recovery?.status === 'queued' || recovery?.status === 'processing' ? 'spin' : undefined} /> Repair page</button>}{canRemove && <button type="button" className="icon-button" disabled={busy} onClick={() => onRemove(source)} aria-label={`Remove ${source.name} from VAV and Smallest.ai`} title="Remove from VAV and Smallest.ai"><Trash2 size={14} /></button>}</span></article>;
   })}</div>}</section>;
 }
 
@@ -577,6 +653,9 @@ function StatusBadge({ status }: { status: KnowledgeBase['sync_status'] }) {
 function StatusDot({ status }: { status: KnowledgeBase['sync_status'] }) { return <span className={`${styles.statusDot} ${styles[`status_${status}`]}`} title={status.replace('_', ' ')} />; }
 function scopeLabel(kb: KnowledgeBase) { return kb.scope_label || scopeOptions.find((scope) => scope.value === kb.scope_type)?.label || kb.scope_type; }
 function sourceBadge(status: KnowledgeSource['status']) { if (status === 'indexed') return 'badge-success'; if (status === 'failed') return 'badge-danger'; if (status === 'processing' || status === 'pending') return 'badge-warning'; return 'badge-neutral'; }
+type SourceRecovery = { status?: string; stage?: string; message?: string };
+function sourceRecovery(source: KnowledgeSource): SourceRecovery | null { const value = source.source_metadata?.recovery; return value && typeof value === 'object' ? value as SourceRecovery : null; }
+function recoveryStageLabel(stage?: string) { const labels: Record<string, string> = { queued: 'Queued', fetching: 'Downloading', rendering: 'Rendering JavaScript', extracting: 'Extracting text', provider_indexing: 'Indexing', verifying: 'Verifying index', verified: 'Verified', failed: 'Needs attention' }; return labels[stage || ''] || 'Repairing'; }
 function formatBytes(bytes: number) { return bytes < 1024 * 1024 ? `${Math.ceil(bytes / 1024)} KB` : `${(bytes / 1024 / 1024).toFixed(1)} MB`; }
 function formatDate(value: string) { return new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value)); }
 function errorMessage(error: unknown, fallback: string) { return error instanceof Error ? error.message : fallback; }

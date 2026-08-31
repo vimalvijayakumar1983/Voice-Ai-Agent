@@ -193,7 +193,9 @@
 .sourceIdentity strong { font-size: 11px; }
 .sourceIdentity span { margin-top: 3px; color: var(--text-tertiary); font-size: 10px; }
 .sourceIdentity p { margin-top: 3px; color: var(--danger); font-size: 10px; }
+.sourceIdentity .recoveryProgress { color: var(--accent); }
 .sourceRow time { color: var(--text-tertiary); text-align: right; font-size: 9px; }
+.sourceActions { display: flex; align-items: center; justify-content: flex-end; gap: 6px; }
 
 .governanceGrid { display: grid; grid-template-columns: minmax(240px, .75fr) minmax(320px, 1.25fr); gap: 12px; }
 .approvalCard,

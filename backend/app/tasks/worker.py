@@ -27,12 +27,14 @@ celery_app.conf.update(
         Queue("celery"),
         Queue("campaigns"),
         Queue("calls"),
+        Queue("knowledge"),
         Queue("webhooks"),
     ),
     task_create_missing_queues=False,
     task_routes={
         "app.tasks.campaign_tasks.*": {"queue": "campaigns"},
         "app.tasks.call_tasks.*": {"queue": "calls"},
+        "app.tasks.knowledge_tasks.*": {"queue": "knowledge"},
         "app.tasks.webhook_tasks.*": {"queue": "webhooks"},
     },
     beat_schedule={
@@ -63,6 +65,7 @@ celery_app.conf.update(
     imports=(
         "app.tasks.campaign_tasks",
         "app.tasks.call_tasks",
+        "app.tasks.knowledge_tasks",
         "app.tasks.webhook_tasks",
     ),
 )

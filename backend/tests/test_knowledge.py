@@ -564,3 +564,56 @@ async def test_delete_grouped_url_source_removes_provider_and_local_group(
         )
     ).all()
     assert [source.name for source in remaining] == ["doctors.pdf"]
+
+
+@pytest.mark.asyncio
+async def test_failed_website_source_can_be_queued_for_vav_repair(
+    client,
+    auth_headers,
+    tenant,
+    db,
+    monkeypatch,
+):
+    queued: list[tuple[list[str], str]] = []
+
+    from app.tasks import knowledge_tasks
+
+    monkeypatch.setattr(
+        knowledge_tasks.repair_website_source,
+        "apply_async",
+        lambda *, args, queue: queued.append((args, queue)),
+    )
+    knowledge = KnowledgeBase(
+        tenant_id=tenant.id,
+        name="Website recovery",
+        provider="smallest",
+        sync_status="error",
+        approval_status="draft",
+    )
+    source = KnowledgeSource(
+        tenant_id=tenant.id,
+        source_type="url",
+        name="Doctors",
+        location="https://www.aesmc.com/doctors",
+        status="failed",
+        error_message="Provider could not extract this page",
+    )
+    knowledge.sources.append(source)
+    knowledge.source_count = 1
+    db.add(knowledge)
+    await db.commit()
+
+    response = await client.post(
+        f"/api/v1/knowledge/{knowledge.id}/sources/{source.id}/repair",
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 202
+    repaired = response.json()["sources"][0]
+    assert repaired["status"] == "processing"
+    assert repaired["error_message"] is None
+    assert repaired["source_metadata"]["recovery_attempts"] == 1
+    assert repaired["source_metadata"]["recovery"]["stage"] == "queued"
+    assert queued == [
+        ([str(tenant.id), str(knowledge.id), str(source.id)], "knowledge")
+    ]

@@ -1429,6 +1429,12 @@ class ApiClient {
     });
   }
 
+  async repairKnowledgeSource(id: string, sourceId: string) {
+    return this.request<KnowledgeBase>(`/api/v1/knowledge/${id}/sources/${sourceId}/repair`, {
+      method: 'POST',
+    });
+  }
+
   async refreshKnowledgeBase(id: string) {
     return this.request<KnowledgeBase>(`/api/v1/knowledge/${id}/refresh`, { method: 'POST' });
   }
