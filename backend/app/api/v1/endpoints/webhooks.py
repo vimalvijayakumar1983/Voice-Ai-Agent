@@ -886,6 +886,7 @@ async def twilio_inbound_webhook(request: Request):
             logger.warning(
                 "twilio_inbound_number_unroutable",
                 assigned_matches=len(matches),
+                matched_agent_ids=[str(agent.id) for _profile, agent in matches],
                 validated_matches=len(validated_matches),
                 to_number=to_number,
             )

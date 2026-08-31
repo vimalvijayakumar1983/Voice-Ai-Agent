@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
@@ -68,6 +68,58 @@ async def _profile(
     return profile
 
 
+async def _number_route_conflicts(
+    db: AsyncSession,
+    agent: Agent,
+    profile: AgentRuntimeProfile | None,
+) -> list[Agent]:
+    """Return active agents that already own one of this profile's phone routes."""
+    if profile is None or not profile.assigned_numbers:
+        return []
+
+    rows = (
+        await db.execute(
+            select(AgentRuntimeProfile, Agent)
+            .join(
+                Agent,
+                (Agent.id == AgentRuntimeProfile.agent_id)
+                & (Agent.tenant_id == AgentRuntimeProfile.tenant_id),
+            )
+            .where(
+                AgentRuntimeProfile.tenant_id == agent.tenant_id,
+                AgentRuntimeProfile.agent_id != agent.id,
+                AgentRuntimeProfile.enabled.is_(True),
+                AgentRuntimeProfile.status == "active",
+                AgentRuntimeProfile.telephony_provider == profile.telephony_provider,
+                Agent.is_active.is_(True),
+            )
+        )
+    ).all()
+    assigned = set(profile.assigned_numbers)
+    return [
+        candidate_agent
+        for candidate_profile, candidate_agent in rows
+        if assigned.intersection(candidate_profile.assigned_numbers or [])
+    ]
+
+
+async def _lock_number_routes(
+    db: AsyncSession,
+    agent: Agent,
+    profile: AgentRuntimeProfile,
+) -> None:
+    """Serialize activation for the same tenant/provider/number on PostgreSQL."""
+    bind = db.get_bind()
+    if bind.dialect.name != "postgresql":
+        return
+    for number in sorted(set(profile.assigned_numbers or [])):
+        route_key = f"{agent.tenant_id}:{profile.telephony_provider}:{number}"
+        await db.execute(
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:route_key, 0))"),
+            {"route_key": route_key},
+        )
+
+
 async def runtime_readiness(
     db: AsyncSession,
     agent: Agent,
@@ -121,6 +173,8 @@ async def runtime_readiness(
                 for status, content in source_states
             )
 
+    number_route_conflicts = await _number_route_conflicts(db, agent, profile)
+
     checks = {
         "agent_active": bool(agent.is_active),
         "sarvam_agent": agent.voice_provider == "sarvam",
@@ -132,6 +186,7 @@ async def runtime_readiness(
         "public_runtime_url": settings.base_url.startswith("https://"),
         "telephony_credential": False,
         "number_assigned": bool(profile and profile.assigned_numbers),
+        "number_route_unique": not number_route_conflicts,
         "knowledge_retrieval": knowledge_ready,
     }
     if profile and profile.telephony_provider == "twilio":
@@ -164,6 +219,9 @@ async def runtime_readiness(
         "public_runtime_url": "Configure BASE_URL as the public HTTPS API origin.",
         "telephony_credential": "Add credentials for the selected telephony provider in Settings.",
         "number_assigned": "Assign at least one E.164 phone number to the runtime.",
+        "number_route_unique": (
+            "Move the assigned phone number from its other active agent before activation."
+        ),
         "knowledge_retrieval": (
             "Repair the bound knowledge base so every source has searchable text."
         ),
@@ -315,6 +373,7 @@ async def activate_runtime_profile(
     agent = await _agent(db, current_user.tenant_id, agent_id)
     profile = await _profile(db, current_user.tenant_id, agent_id, create=True)
     assert profile is not None
+    await _lock_number_routes(db, agent, profile)
     blockers, _checks = await runtime_readiness(db, agent, profile)
     if blockers:
         profile.enabled = False

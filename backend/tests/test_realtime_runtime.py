@@ -7,7 +7,13 @@ from httpx import AsyncClient
 
 from app.api.v1.endpoints.realtime import _twilio_start_token
 from app.core.config import settings
-from app.models.agent import Agent, AgentKnowledgeBinding, KnowledgeBase, KnowledgeSource
+from app.models.agent import (
+    Agent,
+    AgentKnowledgeBinding,
+    AgentRuntimeProfile,
+    KnowledgeBase,
+    KnowledgeSource,
+)
 from app.realtime.auth import create_media_token, verify_media_token
 from app.realtime.sarvam_stream import is_speech_start, parse_transcript_event
 from app.services.knowledge_retrieval import rank_knowledge
@@ -190,6 +196,74 @@ async def test_ready_runtime_can_be_activated(
     assert retested.json()["ready"] is True
     assert active_profile.json()["enabled"] is True
     assert active_profile.json()["status"] == "active"
+
+
+@pytest.mark.asyncio
+async def test_runtime_readiness_blocks_number_owned_by_another_active_agent(
+    client: AsyncClient,
+    auth_headers,
+    tenant,
+    db,
+    monkeypatch,
+):
+    monkeypatch.setattr(settings, "sarvam_api_key", "sarvam-test-key-long-enough")
+    monkeypatch.setattr(settings, "openai_api_key", "openai-test-key")
+    monkeypatch.setattr(settings, "twilio_account_sid", "ACtest")
+    monkeypatch.setattr(settings, "twilio_auth_token", "twilio-test-token")
+    monkeypatch.setattr(settings, "base_url", "https://api.example.com")
+    active_agent = Agent(
+        tenant_id=tenant.id,
+        name="Existing phone owner",
+        system_prompt="Answer calls.",
+        voice_provider="sarvam",
+        voice_id="sarvam:ishita",
+    )
+    new_agent = Agent(
+        tenant_id=tenant.id,
+        name="Conflicting phone owner",
+        system_prompt="Answer calls.",
+        voice_provider="sarvam",
+        voice_id="sarvam:ishita",
+    )
+    db.add_all([active_agent, new_agent])
+    await db.flush()
+    db.add(
+        AgentRuntimeProfile(
+            tenant_id=tenant.id,
+            agent_id=active_agent.id,
+            enabled=True,
+            status="active",
+            telephony_provider="twilio",
+            assigned_numbers=["+971501234567"],
+        )
+    )
+    await db.commit()
+
+    configured = await client.put(
+        f"/api/v1/runtime/agents/{new_agent.id}",
+        headers=auth_headers,
+        json={
+            "assigned_numbers": ["+971501234567"],
+            "telephony_provider": "twilio",
+            "primary_speech_provider": "sarvam",
+            "fallback_speech_provider": None,
+            "llm_provider": "openai",
+            "llm_model": "gpt-4o-mini",
+            "stt_language": "auto",
+            "max_concurrent_calls": 1,
+            "daily_call_limit": 50,
+            "monthly_budget_cents": 10000,
+        },
+    )
+    activated = await client.post(
+        f"/api/v1/runtime/agents/{new_agent.id}/activate",
+        headers=auth_headers,
+    )
+
+    assert configured.status_code == 200
+    assert configured.json()["ready"] is False
+    assert any("other active agent" in blocker for blocker in configured.json()["blockers"])
+    assert activated.status_code == 409
 
 
 @pytest.mark.asyncio
