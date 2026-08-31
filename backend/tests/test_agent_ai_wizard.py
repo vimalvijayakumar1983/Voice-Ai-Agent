@@ -95,7 +95,12 @@ async def test_ai_wizard_generates_valid_review_only_draft_with_catalog_voice():
     assert result.draft.language_switching_enabled is True
     assert result.recommended_knowledge_base_id == knowledge_id
     assert result.model == "gpt-4o-mini"
-    assert completions.calls[0]["response_format"] == {"type": "json_object"}
+    response_format = completions.calls[0]["response_format"]
+    assert response_format["type"] == "json_schema"
+    assert response_format["json_schema"]["strict"] is True
+    schema = response_format["json_schema"]["schema"]
+    assert schema["additionalProperties"] is False
+    assert set(schema["required"]) == set(schema["properties"])
 
 
 @pytest.mark.asyncio

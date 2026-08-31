@@ -26,15 +26,15 @@ class _GeneratedAgentSpec(BaseModel):
     description: str = Field(min_length=10, max_length=2000)
     system_prompt: str = Field(min_length=50, max_length=4000)
     greeting_message: str = Field(min_length=5, max_length=500)
-    provider: Literal["smallest", "sarvam"] = "smallest"
-    supported_languages: list[str] = Field(default_factory=list, max_length=8)
-    speech_rate: float = Field(1.0, ge=0.8, le=1.2)
-    voice_gender: Literal["female", "male", "neutral", "any"] = "any"
-    voice_accent: str = Field("", max_length=80)
-    voice_style: str = Field("", max_length=120)
+    provider: Literal["smallest", "sarvam"]
+    supported_languages: list[str] = Field(max_length=8)
+    speech_rate: float = Field(ge=0.8, le=1.2)
+    voice_gender: Literal["female", "male", "neutral", "any"]
+    voice_accent: str = Field(max_length=80)
+    voice_style: str = Field(max_length=120)
     rationale: str = Field(min_length=10, max_length=1500)
-    assumptions: list[str] = Field(default_factory=list, max_length=8)
-    recommended_knowledge_base_name: str | None = Field(None, max_length=255)
+    assumptions: list[str] = Field(max_length=8)
+    recommended_knowledge_base_name: str | None = Field(max_length=255)
 
     model_config = {"extra": "forbid"}
 
@@ -177,7 +177,14 @@ Use only the supplied provider names, language codes, and exact knowledge-base n
             ],
             temperature=0.25,
             max_tokens=1800,
-            response_format={"type": "json_object"},
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "vav_agent_draft",
+                    "strict": True,
+                    "schema": _GeneratedAgentSpec.model_json_schema(),
+                },
+            },
         )
         content = response.choices[0].message.content or "{}"
         spec = _GeneratedAgentSpec.model_validate_json(content)
