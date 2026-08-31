@@ -35,7 +35,7 @@ async def generate_knowledge_ai_draft(
     api_key: str,
     brief: str,
     scope_preference: str,
-    primary_language: str,
+    languages: list[str],
     client: AsyncOpenAI | None = None,
 ) -> KnowledgeAIDraftResponse:
     """Generate governed metadata without creating a knowledge base or any sources."""
@@ -51,7 +51,7 @@ indexed, approved, and bound separately after the user saves the reviewed draft.
     payload = {
         "business_brief": brief,
         "scope_preference": scope_preference,
-        "primary_language": primary_language,
+        "content_languages": languages,
         "allowed_scope_types": [
             "workspace",
             "group",
@@ -110,7 +110,7 @@ indexed, approved, and bound separately after the user saves the reviewed draft.
         description=spec.description,
         scope_type=scope_type,
         scope_label=scope_label,
-        languages=[primary_language],
+        languages=languages,
         tags=spec.tags,
     )
     return KnowledgeAIDraftResponse(

@@ -569,7 +569,7 @@ async def create_knowledge_ai_draft(
             api_key=api_key,
             brief=data.brief,
             scope_preference=data.scope_preference,
-            primary_language=data.primary_language,
+            languages=data.languages,
         )
     except KnowledgeAIWizardError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -589,7 +589,7 @@ async def create_knowledge_ai_draft(
         details={
             "model": generated.model,
             "scope_type": generated.draft.scope_type,
-            "primary_language": generated.draft.languages[0],
+            "languages": generated.draft.languages,
         },
     )
     return generated

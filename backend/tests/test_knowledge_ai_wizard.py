@@ -5,7 +5,11 @@ import pytest
 
 from app.api.v1.endpoints import knowledge as knowledge_endpoint
 from app.core.config import settings
-from app.schemas.knowledge import KnowledgeAIDraftResponse, KnowledgeBaseCreate
+from app.schemas.knowledge import (
+    KnowledgeAIDraftRequest,
+    KnowledgeAIDraftResponse,
+    KnowledgeBaseCreate,
+)
 from app.services.knowledge_ai_wizard import generate_knowledge_ai_draft
 
 
@@ -52,13 +56,15 @@ async def test_knowledge_ai_wizard_generates_strict_reviewable_metadata():
         api_key="test-key",
         brief="Create governed knowledge for the clinic patient services department.",
         scope_preference="workspace",
-        primary_language="en",
+        languages=["en", "ar"],
         client=client,
     )
 
     assert result.draft.scope_type == "workspace"
     assert result.draft.scope_label is None
-    assert result.draft.languages == ["en"]
+    assert result.draft.languages == ["en", "ar"]
+    prompt_payload = json.loads(completions.calls[0]["messages"][1]["content"])
+    assert prompt_payload["content_languages"] == ["en", "ar"]
     assert result.recommended_sources[0] == "Official service pages"
     response_format = completions.calls[0]["response_format"]
     assert response_format["type"] == "json_schema"
@@ -98,13 +104,14 @@ async def test_knowledge_ai_endpoint_uses_server_key_without_creating_knowledge(
         json={
             "brief": "Create governed support knowledge from approved company information.",
             "scope_preference": "workspace",
-            "primary_language": "en",
+            "languages": ["en", "ar"],
         },
     )
 
     assert response.status_code == 200
     assert response.json()["draft"]["name"] == "Support Knowledge"
     assert captured["api_key"] == "platform-openai-test-key"
+    assert captured["languages"] == ["en", "ar"]
     knowledge = await client.get("/api/v1/knowledge", headers=auth_headers)
     assert knowledge.json() == []
 
@@ -121,3 +128,21 @@ async def test_knowledge_ai_endpoint_requires_openai_key(client, auth_headers, m
 
     assert response.status_code == 409
     assert response.json()["detail"] == "Add an OpenAI API key in Settings first."
+
+
+def test_knowledge_ai_languages_accept_lists_and_legacy_comma_separated_value():
+    current = KnowledgeAIDraftRequest.model_validate(
+        {
+            "brief": "Create governed multilingual support knowledge for callers.",
+            "languages": ["EN", "ar", "en"],
+        }
+    )
+    legacy = KnowledgeAIDraftRequest.model_validate(
+        {
+            "brief": "Create governed multilingual support knowledge for callers.",
+            "primary_language": "en, ar",
+        }
+    )
+
+    assert current.languages == ["en", "ar"]
+    assert legacy.languages == ["en", "ar"]

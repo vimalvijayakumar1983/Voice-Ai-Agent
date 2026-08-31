@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Annotated, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field, HttpUrl, field_validator
+from pydantic import BaseModel, Field, HttpUrl, field_validator, model_validator
 
 from app.services.integration_security import (
     IntegrationConfigError,
@@ -53,16 +53,47 @@ class KnowledgeAIDraftRequest(BaseModel):
     scope_preference: Literal["auto", "workspace", "group", "division", "branch", "department"] = (
         "auto"
     )
-    primary_language: Annotated[str, Field(min_length=2, max_length=20)] = "en"
+    languages: list[str] = Field(
+        default_factory=lambda: ["en"],
+        min_length=1,
+        max_length=20,
+    )
 
     model_config = {"extra": "forbid", "str_strip_whitespace": True}
 
-    @field_validator("primary_language")
+    @model_validator(mode="before")
     @classmethod
-    def clean_primary_language(cls, value: str) -> str:
-        cleaned = value.strip().lower().replace("_", "-")
-        if not cleaned or not all(part.isalnum() for part in cleaned.split("-")):
-            raise ValueError("Use a valid language code such as en, ar, hi, or en-GB.")
+    def migrate_legacy_primary_language(cls, value: object) -> object:
+        # Keep the previous single-language request compatible during rolling deploys.
+        if isinstance(value, dict) and "languages" not in value and "primary_language" in value:
+            migrated = dict(value)
+            migrated["languages"] = migrated.pop("primary_language")
+            return migrated
+        return value
+
+    @field_validator("languages", mode="before")
+    @classmethod
+    def accept_language_list_or_legacy_primary(cls, value: object) -> object:
+        if isinstance(value, str):
+            return value.split(",")
+        return value
+
+    @field_validator("languages")
+    @classmethod
+    def clean_languages(cls, values: list[str]) -> list[str]:
+        cleaned = _clean_list(
+            [value.lower().replace("_", "-") for value in values],
+            maximum=20,
+            item_maximum=20,
+        )
+        for language in cleaned:
+            parts = language.split("-")
+            if not (2 <= len(parts[0]) <= 3 and parts[0].isalpha()) or not all(
+                2 <= len(part) <= 8 and part.isalnum() for part in parts[1:]
+            ):
+                raise ValueError("Use valid language codes such as en, ar, hi, or en-GB.")
+        if not cleaned:
+            raise ValueError("Enter at least one language code.")
         return cleaned
 
 

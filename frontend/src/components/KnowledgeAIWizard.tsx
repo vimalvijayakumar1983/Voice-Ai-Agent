@@ -28,10 +28,14 @@ export default function KnowledgeAIWizard({ busy, onCancel, onGenerate }: Knowle
 
   const submit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
+    const languages = language
+      .split(',')
+      .map((value) => value.trim().toLowerCase().replaceAll('_', '-'))
+      .filter(Boolean);
     await onGenerate({
       brief: brief.trim(),
       scope_preference: scope,
-      primary_language: language.trim().toLowerCase(),
+      languages,
     });
   };
 
@@ -70,9 +74,9 @@ export default function KnowledgeAIWizard({ busy, onCancel, onGenerate }: Knowle
           </select>
         </div>
         <div className="form-group">
-          <label htmlFor={languageId}>Primary content language</label>
-          <input id={languageId} required maxLength={20} value={language} placeholder="en" onChange={(event) => setLanguage(event.target.value)} />
-          <p className="form-hint">Use a language code such as en, ar, hi, ml, or en-GB.</p>
+          <label htmlFor={languageId}>Content languages</label>
+          <input id={languageId} required maxLength={200} value={language} placeholder="en, ar" onChange={(event) => setLanguage(event.target.value)} />
+          <p className="form-hint">Enter comma-separated language codes, such as en, ar, hi, ml, or en-GB.</p>
         </div>
       </div>
       <div className={styles.formActions}>

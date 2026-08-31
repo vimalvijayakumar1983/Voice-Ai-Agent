@@ -11,8 +11,18 @@ test('Knowledge Studio Create with AI is a genuine review-first OpenAI wizard', 
   assert.match(layoutSource, /\/knowledge\?create=ai/);
   assert.match(apiSource, /\/api\/v1\/knowledge\/ai-draft/);
   assert.match(wizardSource, /Generate reviewable draft/);
+  assert.match(wizardSource, /Content languages/);
+  assert.match(wizardSource, /\.split\(','\)/);
+  assert.match(wizardSource, /languages,/);
   assert.match(wizardSource, /Zero automatic indexing/);
   assert.match(knowledgeSource, /Review knowledge metadata/);
   assert.match(knowledgeSource, /recommended_sources/);
   assert.match(knowledgeSource, /OpenAI generated governed metadata only/);
+});
+
+test('API validation errors are converted into readable messages', () => {
+  assert.match(apiSource, /function formatApiError/);
+  assert.match(apiSource, /issue\.msg/);
+  assert.match(apiSource, /issue\.loc/);
+  assert.doesNotMatch(apiSource, /new Error\(error\.detail/);
 });

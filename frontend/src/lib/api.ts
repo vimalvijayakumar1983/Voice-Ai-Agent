@@ -11,6 +11,38 @@ import {
 const API_URL = '';
 const SESSION_SIGNAL_KEY = 'vav:session-signal';
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function validationIssueMessage(issue: unknown): string | null {
+  if (typeof issue === 'string') return issue.trim() || null;
+  if (!isRecord(issue)) return null;
+  const message = typeof issue.msg === 'string'
+    ? issue.msg.replace(/^Value error,\s*/i, '').trim()
+    : '';
+  const location = Array.isArray(issue.loc)
+    ? issue.loc.filter((part) => part !== 'body').map(String).join('.')
+    : '';
+  if (!message) return null;
+  return location ? `${location}: ${message}` : message;
+}
+
+export function formatApiError(payload: unknown, fallback: string): string {
+  const detail = isRecord(payload) && 'detail' in payload ? payload.detail : payload;
+  if (typeof detail === 'string') return detail.trim() || fallback;
+  if (Array.isArray(detail)) {
+    const messages = detail.map(validationIssueMessage).filter((value): value is string => Boolean(value));
+    return messages.length ? messages.join(' ') : fallback;
+  }
+  if (isRecord(detail)) {
+    if (typeof detail.message === 'string' && detail.message.trim()) return detail.message.trim();
+    const issue = validationIssueMessage(detail);
+    if (issue) return issue;
+  }
+  return fallback;
+}
+
 function createIdempotencyKey() {
   if (typeof globalThis.crypto?.randomUUID === 'function') {
     return globalThis.crypto.randomUUID();
@@ -327,7 +359,7 @@ export interface KnowledgeBase {
 export interface KnowledgeAIDraftRequest {
   brief: string;
   scope_preference: 'auto' | KnowledgeScope;
-  primary_language: string;
+  languages: string[];
 }
 
 export interface KnowledgeAIDraftResponse {
@@ -1044,8 +1076,8 @@ class ApiClient {
     }
 
     if (!response.ok) {
-      const error = await response.json().catch(() => ({ detail: 'Request failed' }));
-      throw new Error(error.detail || 'Request failed');
+      const error: unknown = await response.json().catch(() => null);
+      throw new Error(formatApiError(error, 'Request failed'));
     }
 
     if (response.status === 204) return undefined as T;
@@ -1100,8 +1132,8 @@ class ApiClient {
       throw new Error('Your session has expired. Please sign in again.');
     }
     if (!response.ok) {
-      const error = await response.json().catch(() => ({ detail: 'Audio request failed' }));
-      throw new Error(error.detail || 'Audio request failed');
+      const error: unknown = await response.json().catch(() => null);
+      throw new Error(formatApiError(error, 'Audio request failed'));
     }
     return response.blob();
   }
