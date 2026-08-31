@@ -13,7 +13,13 @@ from sqlalchemy.orm import selectinload
 
 from app.core.database import get_db
 from app.middleware.tenant import CurrentUser, get_current_user, require_role
-from app.models.agent import Agent, AgentKnowledgeBinding, KnowledgeBase, KnowledgeSource
+from app.models.agent import (
+    Agent,
+    AgentKnowledgeBinding,
+    KnowledgeBase,
+    KnowledgeCrawl,
+    KnowledgeSource,
+)
 from app.providers.smallest import SmallestAIClient, SmallestAIError, get_smallest_client
 from app.schemas.knowledge import (
     AgentKnowledgeBindRequest,
@@ -22,6 +28,8 @@ from app.schemas.knowledge import (
     KnowledgeBaseCreate,
     KnowledgeBaseResponse,
     KnowledgeBaseUpdate,
+    KnowledgeCrawlCreate,
+    KnowledgeCrawlResponse,
     KnowledgeSourceResponse,
     SitemapDiscoveryRequest,
     SitemapDiscoveryResponse,
@@ -109,6 +117,7 @@ def _knowledge_response(kb: KnowledgeBase) -> KnowledgeBaseResponse:
         published_at=kb.published_at,
         sources=[_source_response(source) for source in kb.sources],
         agent_bindings=bindings,
+        crawls=[KnowledgeCrawlResponse.model_validate(crawl) for crawl in kb.crawls],
         created_at=kb.created_at,
         updated_at=kb.updated_at,
     )
@@ -169,6 +178,7 @@ def _knowledge_query(tenant_id: UUID):
         .options(
             selectinload(KnowledgeBase.sources),
             selectinload(KnowledgeBase.agent_bindings).selectinload(AgentKnowledgeBinding.agent),
+            selectinload(KnowledgeBase.crawls).selectinload(KnowledgeCrawl.pages),
         )
     )
 
@@ -636,6 +646,159 @@ async def discover_sitemap(
         await _mark_provider_error(db, kb, exc)
         raise _provider_error(exc) from exc
     return SitemapDiscoveryResponse(urls=urls)
+
+
+ACTIVE_CRAWL_STATUSES = {"queued", "discovering", "indexing", "retrying"}
+
+
+@router.post(
+    "/{kb_id}/crawls",
+    response_model=KnowledgeBaseResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def start_website_crawl(
+    kb_id: UUID,
+    data: KnowledgeCrawlCreate,
+    current_user: CurrentUser = Depends(require_role("owner", "admin", "member")),
+    db: AsyncSession = Depends(get_db),
+):
+    """Queue a bounded, robots-aware crawl from one public HTTPS homepage."""
+    kb = await _get_knowledge_base(db, current_user.tenant_id, kb_id)
+    _ensure_bound_agents_accept_knowledge_change(kb)
+    if any(crawl.status in ACTIVE_CRAWL_STATUSES for crawl in kb.crawls):
+        raise HTTPException(
+            status_code=409,
+            detail="This knowledge base already has an active website crawl.",
+        )
+    homepage_url = str(data.homepage_url)
+    host = (urlsplit(homepage_url).hostname or "").rstrip(".").lower()
+    crawl = KnowledgeCrawl(
+        tenant_id=current_user.tenant_id,
+        knowledge_base_id=kb.id,
+        root_url=homepage_url,
+        allowed_host=host,
+        status="queued",
+        max_pages=data.max_pages,
+        max_depth=data.max_depth,
+        include_subdomains=data.include_subdomains,
+        options={"respects_robots": True},
+    )
+    kb.crawls.append(crawl)
+    await db.flush()
+    await record_audit_event(
+        db,
+        tenant_id=current_user.tenant_id,
+        actor_user_id=current_user.id,
+        action="knowledge_crawl.queued",
+        resource_type="knowledge_crawl",
+        resource_id=str(crawl.id),
+        details={
+            "homepage_url": homepage_url,
+            "max_pages": data.max_pages,
+            "max_depth": data.max_depth,
+            "include_subdomains": data.include_subdomains,
+        },
+    )
+    await db.commit()
+
+    from app.tasks.knowledge_tasks import crawl_website
+
+    try:
+        crawl_website.apply_async(
+            args=[str(current_user.tenant_id), str(kb.id), str(crawl.id)],
+            queue="knowledge",
+        )
+    except Exception:
+        crawl.status = "failed"
+        crawl.error_message = (
+            "The website-crawl worker is temporarily unavailable. Retry the crawl."
+        )
+        crawl.completed_at = datetime.now(UTC)
+        await db.commit()
+    refreshed = await _get_knowledge_base(db, current_user.tenant_id, kb.id)
+    return _knowledge_response(refreshed)
+
+
+@router.post(
+    "/{kb_id}/crawls/{crawl_id}/retry",
+    response_model=KnowledgeBaseResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def retry_website_crawl(
+    kb_id: UUID,
+    crawl_id: UUID,
+    current_user: CurrentUser = Depends(require_role("owner", "admin", "member")),
+    db: AsyncSession = Depends(get_db),
+):
+    """Retry discovery or only the failed pages of a completed crawl."""
+    kb = await _get_knowledge_base(db, current_user.tenant_id, kb_id)
+    _ensure_bound_agents_accept_knowledge_change(kb)
+    crawl = next((item for item in kb.crawls if item.id == crawl_id), None)
+    if crawl is None:
+        raise HTTPException(status_code=404, detail="Website crawl not found")
+    if crawl.status in ACTIVE_CRAWL_STATUSES:
+        raise HTTPException(status_code=409, detail="The website crawl is already active")
+
+    failed_pages = [page for page in crawl.pages if page.status == "failed"]
+    source_by_id = {source.id: source for source in kb.sources}
+    queued_sources: list[UUID] = []
+    for page in failed_pages:
+        source = source_by_id.get(page.knowledge_source_id)
+        if source is None:
+            continue
+        page.status = "queued"
+        page.retry_count += 1
+        page.error_code = None
+        page.error_message = None
+        source.status = "processing"
+        source.error_message = None
+        metadata = dict(source.source_metadata or {})
+        metadata["recovery_attempts"] = int(metadata.get("recovery_attempts") or 0) + 1
+        source.source_metadata = recovery_metadata(
+            metadata,
+            stage="queued",
+            status="queued",
+            message="Failed page queued for another complete recovery attempt.",
+        )
+        if source.id not in queued_sources:
+            queued_sources.append(source.id)
+
+    crawl.error_message = None
+    crawl.completed_at = None
+    crawl.status = "retrying" if queued_sources else "queued"
+    crawl.failed_count = max(0, crawl.failed_count - len(failed_pages))
+    crawl.queued_count = len(queued_sources)
+    _recount(kb)
+    await db.commit()
+
+    from app.tasks.knowledge_tasks import _mark_failed, crawl_website, repair_website_source
+
+    if queued_sources:
+        for source_id in queued_sources:
+            try:
+                repair_website_source.apply_async(
+                    args=[str(current_user.tenant_id), str(kb.id), str(source_id)],
+                    queue="knowledge",
+                )
+            except Exception:
+                await _mark_failed(
+                    current_user.tenant_id,
+                    kb.id,
+                    source_id,
+                    message="The recovery worker is unavailable. Retry this failed page.",
+                    code="worker_unavailable",
+                )
+    elif not crawl.pages:
+        crawl_website.apply_async(
+            args=[str(current_user.tenant_id), str(kb.id), str(crawl.id)],
+            queue="knowledge",
+        )
+    else:
+        crawl.status = "completed"
+        crawl.completed_at = datetime.now(UTC)
+        await db.commit()
+    refreshed = await _get_knowledge_base(db, current_user.tenant_id, kb.id)
+    return _knowledge_response(refreshed)
 
 
 @router.post("/{kb_id}/sources/urls", response_model=KnowledgeBaseResponse)

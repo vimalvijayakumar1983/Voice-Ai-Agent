@@ -4,6 +4,7 @@ import uuid
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import Annotated
 
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -18,7 +19,7 @@ from app.models.user import ApiKey, User
 _current_tenant_id: ContextVar[uuid.UUID | None] = ContextVar("current_tenant_id", default=None)
 _current_user_id: ContextVar[uuid.UUID | None] = ContextVar("current_user_id", default=None)
 
-security = HTTPBearer()
+security = HTTPBearer(auto_error=False)
 
 
 @dataclass
@@ -39,9 +40,15 @@ def set_current_tenant_id(tenant_id: uuid.UUID) -> None:
 
 
 async def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(security),
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(security)],
     db: AsyncSession = Depends(get_db),
 ) -> CurrentUser:
+    if credentials is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
     token = credentials.credentials
 
     if token.startswith("vai_"):

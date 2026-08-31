@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useMemo, useRef, useState } from 'react';
+import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   BadgeCheck,
   BookOpenCheck,
@@ -29,6 +29,7 @@ import {
   api,
   CurrentUser,
   KnowledgeBase,
+  KnowledgeCrawl,
   KnowledgeScope,
   KnowledgeSource,
   VoiceAgent,
@@ -36,7 +37,7 @@ import {
 import styles from '@/styles/Knowledge.module.css';
 
 type Notice = { type: 'success' | 'error' | 'info'; text: string };
-type SourceMode = 'urls' | 'sitemap' | 'pdf' | 'text';
+type SourceMode = 'crawl' | 'urls' | 'sitemap' | 'pdf' | 'text';
 type KnowledgeActionOptions = {
   syncAgentIds?: string[];
   syncPendingBindings?: boolean;
@@ -67,10 +68,11 @@ export default function KnowledgeStudio() {
   const [statusFilter, setStatusFilter] = useState('all');
   const [showCreate, setShowCreate] = useState(false);
   const [showEdit, setShowEdit] = useState(false);
-  const [sourceMode, setSourceMode] = useState<SourceMode>('urls');
+  const [sourceMode, setSourceMode] = useState<SourceMode>('crawl');
   const [sitemapUrls, setSitemapUrls] = useState<string[]>([]);
   const [selectedSitemapUrls, setSelectedSitemapUrls] = useState<Set<string>>(new Set());
   const detailHeadingRef = useRef<HTMLHeadingElement>(null);
+  const completedCrawlSyncRef = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     let active = true;
@@ -95,7 +97,7 @@ export default function KnowledgeStudio() {
   const selectedHasActiveRepair = Boolean(selected?.sources.some((source) => {
     const recovery = sourceRecovery(source);
     return recovery?.status === 'queued' || recovery?.status === 'processing';
-  }));
+  }) || selected?.crawls.some((crawl) => ['queued', 'discovering', 'indexing', 'retrying'].includes(crawl.status)));
 
   useEffect(() => {
     if (!selectedId || !selectedHasActiveRepair) return;
@@ -128,15 +130,15 @@ export default function KnowledgeStudio() {
   const processing = knowledgeBases.filter((kb) => kb.sync_status === 'processing' || kb.sync_status === 'provisioning').length;
   const boundAgents = new Set(knowledgeBases.flatMap((kb) => kb.agent_bindings.map((binding) => binding.agent_id))).size;
 
-  const replaceKnowledgeBase = (updated: KnowledgeBase) => {
+  const replaceKnowledgeBase = useCallback((updated: KnowledgeBase) => {
     setKnowledgeBases((current) => current.map((kb) => kb.id === updated.id ? updated : kb));
-  };
+  }, []);
 
-  const replaceAgent = (updated: VoiceAgent) => {
+  const replaceAgent = useCallback((updated: VoiceAgent) => {
     setAgents((current) => current.map((agent) => agent.id === updated.id ? updated : agent));
-  };
+  }, []);
 
-  const syncAgentUntilSettled = async (agentId: string) => {
+  const syncAgentUntilSettled = useCallback(async (agentId: string) => {
     let latest = await api.getAgent(agentId);
     replaceAgent(latest);
     if (!latest.provider_agent_id) return latest;
@@ -159,14 +161,37 @@ export default function KnowledgeStudio() {
       replaceAgent(latest);
     }
     throw new Error(`${latest.name} is still being reviewed by Smallest.ai. Check status shortly.`);
-  };
+  }, [replaceAgent]);
 
-  const synchronizeAgents = async (agentIds: string[]) => {
+  const synchronizeAgents = useCallback(async (agentIds: string[]) => {
     const uniqueAgentIds = Array.from(new Set(agentIds));
     if (!uniqueAgentIds.length) return 0;
     for (const agentId of uniqueAgentIds) await syncAgentUntilSettled(agentId);
     return uniqueAgentIds.length;
-  };
+  }, [syncAgentUntilSettled]);
+
+  useEffect(() => {
+    const latest = selected?.crawls[0];
+    if (!selected || !latest || !canGovernKnowledge || selected.approval_status !== 'approved') return;
+    if (!['completed', 'completed_with_errors'].includes(latest.status)) return;
+    const pendingAgentIds = selected.agent_bindings
+      .filter((binding) => binding.sync_status !== 'synced')
+      .map((binding) => binding.agent_id);
+    if (!pendingAgentIds.length) return;
+    const syncKey = `${selected.id}:${latest.id}:${pendingAgentIds.sort().join(',')}`;
+    if (completedCrawlSyncRef.current.has(syncKey)) return;
+    completedCrawlSyncRef.current.add(syncKey);
+    setNotice({ type: 'info', text: 'Website indexing finished. Publishing the updated knowledge to bound agents…' });
+    synchronizeAgents(pendingAgentIds)
+      .then(async (syncedCount) => {
+        const refreshed = await api.getKnowledgeBase(selected.id);
+        replaceKnowledgeBase(refreshed);
+        setNotice({ type: 'success', text: `Website knowledge is indexed and live on ${syncedCount} bound agent${syncedCount === 1 ? '' : 's'}.` });
+      })
+      .catch((error) => {
+        setNotice({ type: 'error', text: `Website indexing completed, but agent publishing needs attention: ${errorMessage(error, 'Check the agent provider status.')}` });
+      });
+  }, [canGovernKnowledge, replaceKnowledgeBase, selected, synchronizeAgents]);
 
   const runAction = async (
     key: string,
@@ -355,6 +380,33 @@ export default function KnowledgeStudio() {
     );
   };
 
+  const startSiteCrawl = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!selected) return;
+    const form = new FormData(event.currentTarget);
+    await runAction(
+      'crawl-site',
+      () => api.startKnowledgeCrawl(selected.id, {
+        homepage_url: String(form.get('homepage_url') || ''),
+        max_pages: Number(form.get('max_pages') || 100),
+        max_depth: Number(form.get('max_depth') || 3),
+        include_subdomains: form.get('include_subdomains') === 'on',
+      }),
+      'Whole-site discovery started. Progress and every failed page will remain visible here.',
+    );
+  };
+
+  const retrySiteCrawl = async (crawl: KnowledgeCrawl) => {
+    if (!selected) return;
+    await runAction(
+      `retry-crawl-${crawl.id}`,
+      () => api.retryKnowledgeCrawl(selected.id, crawl.id),
+      crawl.failed_count
+        ? `${crawl.failed_count} failed page${crawl.failed_count === 1 ? '' : 's'} queued for repair.`
+        : 'Website discovery queued for another attempt.',
+    );
+  };
+
   const repairSource = async (source: KnowledgeSource) => {
     if (!selected) return;
     const knowledgeBaseId = selected.id;
@@ -531,18 +583,29 @@ export default function KnowledgeStudio() {
                   <div><span className={styles.sectionIcon}><Plus size={15} /></span><div><h3 id="source-builder-heading">Add trusted knowledge</h3><p>Provider credentials stay on the server. Website content is curated before indexing.</p></div></div>
                 </div>
                 <div className={styles.sourceTabs} role="tablist" aria-label="Knowledge source type">
+                  <SourceTab active={sourceMode === 'crawl'} icon={Globe2} label="Crawl website" onClick={() => setSourceMode('crawl')} />
                   <SourceTab active={sourceMode === 'urls'} icon={Globe2} label="Web pages" onClick={() => setSourceMode('urls')} />
                   <SourceTab active={sourceMode === 'sitemap'} icon={Link2} label="Sitemap" onClick={() => setSourceMode('sitemap')} />
                   <SourceTab active={sourceMode === 'pdf'} icon={FileText} label="PDF" onClick={() => setSourceMode('pdf')} />
                   <SourceTab active={sourceMode === 'text'} icon={Layers3} label="Text" onClick={() => setSourceMode('text')} />
                 </div>
                 <div className={styles.sourceBuilder} role="tabpanel">
+                  {sourceMode === 'crawl' && <CrawlForm busy={working === 'crawl-site'} onSubmit={startSiteCrawl} />}
                   {sourceMode === 'urls' && <UrlForm busy={working === 'add-urls'} onSubmit={addUrls} />}
                   {sourceMode === 'sitemap' && <SitemapForm busy={working === 'discover-sitemap' || working === 'index-sitemap'} onSubmit={discoverSitemap} urls={sitemapUrls} selected={selectedSitemapUrls} onToggle={(url) => setSelectedSitemapUrls((current) => { const next = new Set(current); if (next.has(url)) next.delete(url); else next.add(url); return next; })} onToggleAll={() => setSelectedSitemapUrls((current) => current.size === sitemapUrls.length ? new Set() : new Set(sitemapUrls))} onIndex={indexSitemapSelection} />}
                   {sourceMode === 'pdf' && <PdfForm busy={working === 'upload-pdf'} onSubmit={uploadPdf} />}
                   {sourceMode === 'text' && <TextForm busy={working === 'add-text'} onSubmit={addText} />}
                 </div>
               </section>}
+
+              {selected.crawls.length > 0 && (
+                <CrawlRuns
+                  crawls={selected.crawls}
+                  busy={working !== null}
+                  canRepair={canEditKnowledge}
+                  onRetry={retrySiteCrawl}
+                />
+              )}
 
               <SourcesSection
                 sources={selected.sources}
@@ -617,6 +680,40 @@ function PdfForm({ busy, onSubmit }: { busy: boolean; onSubmit: (event: FormEven
   return <form onSubmit={onSubmit} className={styles.uploadForm}><div className={styles.uploadDrop}><Upload size={22} /><div><label htmlFor="knowledge-pdf">Choose an approved PDF</label><p>VAV extracts text automatically and OCRs scanned pages · same filename safely updates one document · maximum 8 MB</p></div><input id="knowledge-pdf" name="media" type="file" accept="application/pdf,.pdf" required /></div><button type="submit" className="btn btn-primary" disabled={busy}>{busy ? <Loader2 className="spin" size={14} /> : <CloudUpload size={14} />} Validate and index</button></form>;
 }
 
+function CrawlForm({ busy, onSubmit }: { busy: boolean; onSubmit: (event: FormEvent<HTMLFormElement>) => void }) {
+  return <form onSubmit={onSubmit} className={styles.crawlForm}>
+    <div className={styles.crawlIntro}><label htmlFor="homepage-url">Website homepage</label><p>VAV follows sitemaps and same-site links, respects robots.txt, renders JavaScript when needed, and keeps a repair ledger for every page.</p></div>
+    <input id="homepage-url" name="homepage_url" type="url" required placeholder="https://www.example.com/" />
+    <label><span>Page limit</span><input name="max_pages" type="number" min="1" max="500" defaultValue="100" /></label>
+    <label><span>Link depth</span><input name="max_depth" type="number" min="0" max="8" defaultValue="3" /></label>
+    <label className={styles.crawlCheckbox}><input name="include_subdomains" type="checkbox" /> Include subdomains</label>
+    <button type="submit" className="btn btn-primary" disabled={busy}>{busy ? <Loader2 className="spin" size={14} /> : <Search size={14} />} Crawl and index</button>
+  </form>;
+}
+
+function CrawlRuns({ crawls, busy, canRepair, onRetry }: { crawls: KnowledgeCrawl[]; busy: boolean; canRepair: boolean; onRetry: (crawl: KnowledgeCrawl) => void }) {
+  return <section className={styles.section} aria-labelledby="crawl-runs-heading">
+    <div className={styles.sectionHeading}><div><span className={styles.sectionIcon}><Globe2 size={15} /></span><div><h3 id="crawl-runs-heading">Website crawl activity</h3><p>Discovery, extraction, provider indexing and page-level failures remain traceable.</p></div></div><span className="badge badge-neutral">{crawls.length} run{crawls.length === 1 ? '' : 's'}</span></div>
+    <div className={styles.crawlRuns}>{crawls.slice(0, 5).map((crawl) => {
+      const terminal = crawl.indexed_count + crawl.failed_count;
+      const percent = crawl.discovered_count ? Math.round((terminal / crawl.discovered_count) * 100) : 0;
+      const active = ['queued', 'discovering', 'indexing', 'retrying'].includes(crawl.status);
+      const warnings = Array.isArray(crawl.options?.warnings) ? crawl.options.warnings.filter((item): item is string => typeof item === 'string') : [];
+      const failures = crawl.pages.filter((page) => page.status === 'failed');
+      return <article className={styles.crawlRun} key={crawl.id}>
+        <div className={styles.crawlRunHeader}><div><strong>{crawl.allowed_host}</strong><span>{crawl.root_url}</span></div><span className={`badge ${crawl.failed_count || crawl.status === 'failed' ? 'badge-danger' : crawl.status === 'completed' ? 'badge-success' : 'badge-warning'}`}>{crawlStatusLabel(crawl.status)}</span></div>
+        <div className={styles.crawlStats}><span><strong>{crawl.discovered_count}</strong> discovered</span><span><strong>{crawl.indexed_count}</strong> ready</span><span><strong>{crawl.queued_count}</strong> processing</span><span><strong>{crawl.failed_count}</strong> failed</span><span><strong>{crawl.skipped_count}</strong> skipped</span></div>
+        <div className={styles.crawlProgress} aria-label={`${percent}% of discovered pages processed`}><div style={{ width: `${percent}%` }} /></div>
+        {active && <p className={styles.crawlMessage}><Loader2 className="spin" size={12} /> {crawl.status === 'discovering' ? 'Discovering sitemaps and same-site links…' : 'Extracting, indexing and verifying discovered pages…'}</p>}
+        {crawl.error_message && <p className={styles.crawlError}><CircleAlert size={12} /> {crawl.error_message}</p>}
+        {warnings.map((warning) => <p className={styles.crawlWarning} key={warning}>{warning}</p>)}
+        {failures.length > 0 && <details className={styles.crawlFailures}><summary>{failures.length} failed page{failures.length === 1 ? '' : 's'} — inspect details</summary><ul>{failures.slice(0, 50).map((page) => <li key={page.id}><span>{page.url}</span><small>{page.error_code ? `${page.error_code}: ` : ''}{page.error_message || 'Recovery failed'}</small></li>)}</ul></details>}
+        {canRepair && !active && (crawl.failed_count > 0 || crawl.status === 'failed') && <button type="button" className="btn btn-secondary btn-sm" disabled={busy} onClick={() => onRetry(crawl)}><RefreshCw size={12} /> {crawl.failed_count ? 'Repair failed pages' : 'Retry discovery'}</button>}
+      </article>;
+    })}</div>
+  </section>;
+}
+
 function TextForm({ busy, onSubmit }: { busy: boolean; onSubmit: (event: FormEvent<HTMLFormElement>) => void }) {
   return <form onSubmit={onSubmit} className={styles.builderForm}><div><label htmlFor="text-name">Internal text note</label><p>Saved with clear “local only” status until the selected provider supports text ingestion.</p></div><input id="text-name" name="text_name" required maxLength={255} placeholder="Approved returns FAQ" /><textarea id="text-content" name="text_content" required minLength={20} maxLength={100000} placeholder="Paste approved question-and-answer content here…" /><button type="submit" className="btn btn-secondary" disabled={busy}>{busy ? <Loader2 className="spin" size={14} /> : <Plus size={14} />} Save local source</button></form>;
 }
@@ -656,6 +753,7 @@ function sourceBadge(status: KnowledgeSource['status']) { if (status === 'indexe
 type SourceRecovery = { status?: string; stage?: string; message?: string };
 function sourceRecovery(source: KnowledgeSource): SourceRecovery | null { const value = source.source_metadata?.recovery; return value && typeof value === 'object' ? value as SourceRecovery : null; }
 function recoveryStageLabel(stage?: string) { const labels: Record<string, string> = { queued: 'Queued', fetching: 'Downloading', rendering: 'Rendering JavaScript', extracting: 'Extracting text', provider_indexing: 'Indexing', verifying: 'Verifying index', verified: 'Verified', failed: 'Needs attention' }; return labels[stage || ''] || 'Repairing'; }
+function crawlStatusLabel(status: KnowledgeCrawl['status']) { const labels: Record<KnowledgeCrawl['status'], string> = { queued: 'Queued', discovering: 'Discovering', indexing: 'Indexing', retrying: 'Repairing', completed: 'Complete', completed_with_errors: 'Needs repair', failed: 'Discovery failed', cancelled: 'Cancelled' }; return labels[status]; }
 function formatBytes(bytes: number) { return bytes < 1024 * 1024 ? `${Math.ceil(bytes / 1024)} KB` : `${(bytes / 1024 / 1024).toFixed(1)} MB`; }
 function formatDate(value: string) { return new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value)); }
 function errorMessage(error: unknown, fallback: string) { return error instanceof Error ? error.message : fallback; }

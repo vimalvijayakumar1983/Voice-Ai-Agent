@@ -160,6 +160,13 @@ class KnowledgeBase(TenantScopedModel):
         lazy="selectin",
         cascade="all, delete-orphan",
     )
+    crawls = relationship(
+        "KnowledgeCrawl",
+        back_populates="knowledge_base",
+        lazy="selectin",
+        cascade="all, delete-orphan",
+        order_by="KnowledgeCrawl.created_at.desc()",
+    )
 
 
 class KnowledgeSource(TenantScopedModel):
@@ -185,6 +192,80 @@ class KnowledgeSource(TenantScopedModel):
     last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     knowledge_base = relationship("KnowledgeBase", back_populates="sources")
+    crawl_pages = relationship(
+        "KnowledgeCrawlPage",
+        back_populates="knowledge_source",
+        lazy="noload",
+    )
+
+
+class KnowledgeCrawl(TenantScopedModel):
+    """One durable, user-visible whole-site crawl operation."""
+
+    __tablename__ = "knowledge_crawls"
+
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), index=True
+    )
+    knowledge_base_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("knowledge_bases.id", ondelete="CASCADE"), index=True
+    )
+    root_url: Mapped[str] = mapped_column(Text, nullable=False)
+    allowed_host: Mapped[str] = mapped_column(String(255), nullable=False)
+    status: Mapped[str] = mapped_column(String(40), default="queued", index=True)
+    max_pages: Mapped[int] = mapped_column(Integer, default=100)
+    max_depth: Mapped[int] = mapped_column(Integer, default=3)
+    include_subdomains: Mapped[bool] = mapped_column(Boolean, default=False)
+    discovered_count: Mapped[int] = mapped_column(Integer, default=0)
+    queued_count: Mapped[int] = mapped_column(Integer, default=0)
+    indexed_count: Mapped[int] = mapped_column(Integer, default=0)
+    failed_count: Mapped[int] = mapped_column(Integer, default=0)
+    skipped_count: Mapped[int] = mapped_column(Integer, default=0)
+    options: Mapped[dict | None] = mapped_column(JSONB)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    knowledge_base = relationship("KnowledgeBase", back_populates="crawls")
+    pages = relationship(
+        "KnowledgeCrawlPage",
+        back_populates="crawl",
+        lazy="selectin",
+        cascade="all, delete-orphan",
+    )
+
+
+class KnowledgeCrawlPage(TenantScopedModel):
+    """Page-level crawl ledger used for progress, retries, and auditability."""
+
+    __tablename__ = "knowledge_crawl_pages"
+    __table_args__ = (
+        UniqueConstraint("crawl_id", "canonical_url", name="uq_knowledge_crawl_page_url"),
+    )
+
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), index=True
+    )
+    crawl_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("knowledge_crawls.id", ondelete="CASCADE"), index=True
+    )
+    knowledge_source_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("knowledge_sources.id", ondelete="SET NULL"),
+        index=True,
+    )
+    url: Mapped[str] = mapped_column(Text, nullable=False)
+    canonical_url: Mapped[str] = mapped_column(Text, nullable=False)
+    depth: Mapped[int] = mapped_column(Integer, default=0)
+    discovered_via: Mapped[str] = mapped_column(String(30), default="link")
+    status: Mapped[str] = mapped_column(String(30), default="discovered", index=True)
+    error_code: Mapped[str | None] = mapped_column(String(80))
+    error_message: Mapped[str | None] = mapped_column(Text)
+    retry_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_attempted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    crawl = relationship("KnowledgeCrawl", back_populates="pages")
+    knowledge_source = relationship("KnowledgeSource", back_populates="crawl_pages")
 
 
 class AgentKnowledgeBinding(TenantScopedModel):

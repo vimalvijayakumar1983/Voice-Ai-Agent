@@ -7,7 +7,7 @@ This repository combines a multi-tenant FastAPI control plane with a polished Ne
 ## What is included
 
 - Local-first, editable agent authoring with Smallest.ai's public voice/language catalog, five governed templates, explicit provisioning, and versioned publishing. Private voice clones stay unavailable until tenant-owned provider entitlements are implemented.
-- Provider-neutral Knowledge Studio with reusable group/division/branch/department scopes, curated URL and sitemap ingestion, bounded PDF uploads, local text notes, provider-authoritative indexing status, approval gates, agent bindings, and tenant-scoped audit history.
+- Provider-neutral Knowledge Studio with reusable group/division/branch/department scopes, automatic robots-aware whole-site crawling, curated URL and sitemap ingestion, JavaScript recovery, bounded PDF uploads, page-level repair ledgers, provider-verified indexing, approval gates, agent bindings, and tenant-scoped audit history.
 - Secure browser voice playground using `@smallest-ai/agent-sdk`
 - Controlled outbound calls and bounded campaigns with tenant-scoped E.164 DNC enforcement, calling windows, pause checks, and Smallest/Twilio provider routing
 - Signed Smallest.ai and Twilio lifecycle ingestion plus signed, idempotent outbound integration webhooks with retry and destination safety checks
@@ -212,17 +212,22 @@ Twilio inbound routing currently fails closed after signature verification. An a
 ## Knowledge Studio flow
 
 Knowledge is a workspace resource, not prompt text hidden inside one agent.
-Operators create and scope a local draft first. Provider provisioning happens
-only when they connect it, URLs are curated before scraping, and PDF uploads are
-validated and capped at 8 MiB. A knowledge base cannot be approved until every
-provider source reports indexed, and an agent cannot be bound until that
-approved knowledge base has a provider mapping. Publishing the agent then sends
-the provider knowledge-base ID in its versioned draft configuration.
+Operators create and scope a local draft first. A homepage crawl combines
+robots.txt, nested sitemaps, same-site links, and JavaScript-rendered links under
+explicit page/depth limits. Every page gets a durable progress and failure
+record; temporary failures retry automatically, and terminal failures can be
+repaired individually or as one crawl. Re-crawls refresh existing content while
+content-addressed artifacts avoid uploading unchanged pages again. PDF uploads
+are validated and capped at 8 MiB. A knowledge base cannot be approved until
+every source is retrieval-ready, and agent bindings are republished after an
+approved crawl completes.
 
 | Action | Endpoint | Guardrail |
 | --- | --- | --- |
 | Create governed draft | `POST /api/v1/knowledge` | Tenant-scoped; no provider call |
 | Connect provider copy | `POST /api/v1/knowledge/{id}/provision` | Durable remote mapping and error state |
+| Crawl complete website | `POST /api/v1/knowledge/{id}/crawls` | Public HTTPS, DNS-pinned requests, robots-aware, same-site, bounded pages/depth |
+| Repair failed crawl | `POST /api/v1/knowledge/{id}/crawls/{crawl_id}/retry` | Requeues discovery or only failed page ledgers |
 | Discover sitemap | `POST /api/v1/knowledge/{id}/sitemap/discover` | Public HTTPS sitemap only; selection required before indexing |
 | Index selected pages | `POST /api/v1/knowledge/{id}/sources/urls` | Public HTTPS URLs, de-duplicated, maximum 100 per request |
 | Upload PDF | `POST /api/v1/knowledge/{id}/sources/pdf` | PDF signature/type check; maximum 8 MiB |

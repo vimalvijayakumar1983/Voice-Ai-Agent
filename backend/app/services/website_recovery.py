@@ -211,8 +211,16 @@ async def _download_once(url: str) -> tuple[int, dict[str, str], bytes]:
         ) from exc
 
 
-async def download_html(url: str) -> tuple[str, str, int]:
-    """Download one public HTTPS page with bounded retries and safe redirects."""
+async def download_public_text(
+    url: str,
+    *,
+    supported_types: tuple[str, ...] = (
+        "text/html",
+        "application/xhtml",
+        "text/plain",
+    ),
+) -> tuple[str, str, int]:
+    """Download a bounded public text resource with DNS-pinned safe redirects."""
     current_url = url
     redirects = 0
     while True:
@@ -249,7 +257,6 @@ async def download_html(url: str) -> tuple[str, str, int]:
                 code="http_error",
             )
         content_type = headers.get("content-type", "").lower()
-        supported_types = ("text/html", "application/xhtml", "text/plain")
         if not any(value in content_type for value in supported_types):
             raise WebsiteRecoveryError(
                 f"The page returned unsupported content type {content_type or 'unknown'}.",
@@ -263,6 +270,11 @@ async def download_html(url: str) -> tuple[str, str, int]:
         except LookupError:
             decoded = content.decode("utf-8", errors="replace")
         return current_url, decoded, len(content)
+
+
+async def download_html(url: str) -> tuple[str, str, int]:
+    """Download one public HTTPS page with bounded retries and safe redirects."""
+    return await download_public_text(url)
 
 
 def _json_strings(value: object) -> list[str]:

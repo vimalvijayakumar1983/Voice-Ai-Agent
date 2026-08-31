@@ -231,6 +231,43 @@ export interface KnowledgeAgentBinding {
   last_synced_at: string | null;
 }
 
+export interface KnowledgeCrawlPage {
+  id: string;
+  knowledge_source_id: string | null;
+  url: string;
+  canonical_url: string;
+  depth: number;
+  discovered_via: string;
+  status: 'discovered' | 'queued' | 'processing' | 'indexed' | 'failed' | 'skipped';
+  error_code: string | null;
+  error_message: string | null;
+  retry_count: number;
+  last_attempted_at: string | null;
+}
+
+export interface KnowledgeCrawl {
+  id: string;
+  knowledge_base_id: string;
+  root_url: string;
+  allowed_host: string;
+  status: 'queued' | 'discovering' | 'indexing' | 'retrying' | 'completed' | 'completed_with_errors' | 'failed' | 'cancelled';
+  max_pages: number;
+  max_depth: number;
+  include_subdomains: boolean;
+  discovered_count: number;
+  queued_count: number;
+  indexed_count: number;
+  failed_count: number;
+  skipped_count: number;
+  options: Record<string, unknown> | null;
+  error_message: string | null;
+  started_at: string | null;
+  completed_at: string | null;
+  pages: KnowledgeCrawlPage[];
+  created_at: string;
+  updated_at: string;
+}
+
 export interface KnowledgeBase {
   id: string;
   name: string;
@@ -250,6 +287,7 @@ export interface KnowledgeBase {
   published_at: string | null;
   sources: KnowledgeSource[];
   agent_bindings: KnowledgeAgentBinding[];
+  crawls: KnowledgeCrawl[];
   created_at: string;
   updated_at: string;
 }
@@ -1426,6 +1464,24 @@ class ApiClient {
   async deleteKnowledgeSource(id: string, sourceId: string) {
     return this.request<KnowledgeBase>(`/api/v1/knowledge/${id}/sources/${sourceId}`, {
       method: 'DELETE',
+    });
+  }
+
+  async startKnowledgeCrawl(id: string, data: {
+    homepage_url: string;
+    max_pages: number;
+    max_depth: number;
+    include_subdomains: boolean;
+  }) {
+    return this.request<KnowledgeBase>(`/api/v1/knowledge/${id}/crawls`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    });
+  }
+
+  async retryKnowledgeCrawl(id: string, crawlId: string) {
+    return this.request<KnowledgeBase>(`/api/v1/knowledge/${id}/crawls/${crawlId}/retry`, {
+      method: 'POST',
     });
   }
 

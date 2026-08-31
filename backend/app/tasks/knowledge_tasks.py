@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from datetime import UTC, datetime
 from uuid import UUID
 
@@ -11,10 +12,17 @@ from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
 from app.core.database import async_session_factory
-from app.models.agent import AgentKnowledgeBinding, KnowledgeBase
+from app.models.agent import (
+    AgentKnowledgeBinding,
+    KnowledgeBase,
+    KnowledgeCrawl,
+    KnowledgeCrawlPage,
+    KnowledgeSource,
+)
 from app.providers.smallest import SmallestAIClient, SmallestAIError, get_smallest_client
 from app.services.audit import record_audit_event
 from app.services.provider_credentials import load_provider_config
+from app.services.website_crawler import canonicalize_page_url, discover_website
 from app.services.website_recovery import (
     RecoveredPage,
     WebsiteRecoveryError,
@@ -177,6 +185,271 @@ async def _set_stage(
         await session.commit()
     finally:
         await session.close()
+    await _mark_crawl_pages_for_source(source_id, status="processing")
+
+
+async def _refresh_crawl(crawl_id: UUID) -> None:
+    session = async_session_factory()
+    try:
+        crawl = await session.scalar(
+            select(KnowledgeCrawl).where(KnowledgeCrawl.id == crawl_id).with_for_update()
+        )
+        if crawl is None:
+            return
+        pages = list(
+            (
+                await session.scalars(
+                    select(KnowledgeCrawlPage).where(KnowledgeCrawlPage.crawl_id == crawl.id)
+                )
+            ).all()
+        )
+        crawl.discovered_count = len(pages)
+        crawl.indexed_count = sum(page.status == "indexed" for page in pages)
+        crawl.failed_count = sum(page.status == "failed" for page in pages)
+        crawl.queued_count = sum(
+            page.status in {"discovered", "queued", "processing"} for page in pages
+        )
+        terminal = crawl.indexed_count + crawl.failed_count == crawl.discovered_count
+        if terminal and crawl.discovered_count:
+            crawl.status = "completed_with_errors" if crawl.failed_count else "completed"
+            crawl.completed_at = datetime.now(UTC)
+        elif crawl.status not in {"discovering", "failed", "cancelled"}:
+            crawl.status = "indexing"
+        await session.commit()
+    finally:
+        await session.close()
+
+
+async def _mark_crawl_pages_for_source(
+    source_id: UUID,
+    *,
+    status: str,
+    error_code: str | None = None,
+    error_message: str | None = None,
+) -> None:
+    session = async_session_factory()
+    try:
+        pages = list(
+            (
+                await session.scalars(
+                    select(KnowledgeCrawlPage).where(
+                        KnowledgeCrawlPage.knowledge_source_id == source_id,
+                        KnowledgeCrawlPage.status.in_(
+                            {"discovered", "queued", "processing", "failed"}
+                        ),
+                    )
+                )
+            ).all()
+        )
+        crawl_ids: set[UUID] = set()
+        now = datetime.now(UTC)
+        for page in pages:
+            page.status = status
+            page.last_attempted_at = now
+            page.error_code = error_code
+            page.error_message = error_message[:1000] if error_message else None
+            crawl_ids.add(page.crawl_id)
+        await session.commit()
+    finally:
+        await session.close()
+    for crawl_id in crawl_ids:
+        await _refresh_crawl(crawl_id)
+
+
+def _invalidate_crawl_bindings(knowledge_base: KnowledgeBase) -> None:
+    now = datetime.now(UTC)
+    for binding in knowledge_base.agent_bindings:
+        agent = binding.agent
+        if getattr(agent, "voice_provider", "smallest") == "sarvam":
+            binding.provider = "sarvam"
+            binding.sync_status = "synced"
+            binding.last_synced_at = now
+            continue
+        binding.sync_status = "pending"
+        binding.last_synced_at = None
+        if agent.provider_agent_id and agent.sync_status != "error":
+            agent.sync_status = "dirty"
+
+
+async def _crawl_website(tenant_id: UUID, kb_id: UUID, crawl_id: UUID) -> None:
+    session = async_session_factory()
+    try:
+        crawl = await session.scalar(
+            select(KnowledgeCrawl).where(
+                KnowledgeCrawl.id == crawl_id,
+                KnowledgeCrawl.tenant_id == tenant_id,
+                KnowledgeCrawl.knowledge_base_id == kb_id,
+            )
+        )
+        if crawl is None:
+            return
+        crawl.status = "discovering"
+        crawl.started_at = crawl.started_at or datetime.now(UTC)
+        crawl.error_message = None
+        await session.commit()
+        root_url = crawl.root_url
+        max_pages = crawl.max_pages
+        max_depth = crawl.max_depth
+        include_subdomains = crawl.include_subdomains
+    finally:
+        await session.close()
+
+    discovery = await discover_website(
+        root_url,
+        max_pages=max_pages,
+        max_depth=max_depth,
+        include_subdomains=include_subdomains,
+    )
+
+    session = async_session_factory()
+    queued_sources: list[UUID] = []
+    try:
+        crawl = await session.scalar(
+            select(KnowledgeCrawl)
+            .where(KnowledgeCrawl.id == crawl_id, KnowledgeCrawl.tenant_id == tenant_id)
+            .with_for_update()
+        )
+        knowledge_base = await session.scalar(
+            select(KnowledgeBase)
+            .where(KnowledgeBase.id == kb_id, KnowledgeBase.tenant_id == tenant_id)
+            .options(
+                selectinload(KnowledgeBase.sources),
+                selectinload(KnowledgeBase.agent_bindings).selectinload(
+                    AgentKnowledgeBinding.agent
+                ),
+            )
+            .with_for_update()
+        )
+        if crawl is None or knowledge_base is None or crawl.status == "cancelled":
+            return
+        existing_by_url = {
+            canonical: source
+            for source in knowledge_base.sources
+            if source.location and (canonical := canonicalize_page_url(source.location))
+        }
+        for discovered in discovery.pages:
+            source = existing_by_url.get(discovered.canonical_url)
+            # A new crawl is also a content refresh. Existing pages are
+            # re-extracted; content-addressed provider artifacts below avoid
+            # uploading an unchanged page again.
+            ready = False
+            if source is None:
+                source = KnowledgeSource(
+                    tenant_id=tenant_id,
+                    knowledge_base_id=knowledge_base.id,
+                    source_type="website",
+                    name=discovered.url.rsplit("/", 1)[-1] or discovery.allowed_host,
+                    location=discovered.url,
+                    status="processing",
+                    source_metadata=recovery_metadata(
+                        {
+                            "crawl_root": discovery.root_url,
+                            "discovered_via": discovered.discovered_via,
+                            "crawl_depth": discovered.depth,
+                        },
+                        stage="queued",
+                        status="queued",
+                        message="Discovered automatically and queued for extraction.",
+                    ),
+                )
+                knowledge_base.sources.append(source)
+                await session.flush()
+                existing_by_url[discovered.canonical_url] = source
+            elif not ready:
+                metadata = dict(source.source_metadata or {})
+                metadata.update(
+                    {
+                        "crawl_root": discovery.root_url,
+                        "discovered_via": discovered.discovered_via,
+                        "crawl_depth": discovered.depth,
+                    }
+                )
+                source.status = "processing"
+                source.error_message = None
+                source.source_metadata = recovery_metadata(
+                    metadata,
+                    stage="queued",
+                    status="queued",
+                    message="Queued by the whole-site crawler for extraction and verification.",
+                )
+            page = KnowledgeCrawlPage(
+                tenant_id=tenant_id,
+                crawl_id=crawl.id,
+                knowledge_source_id=source.id,
+                url=discovered.url,
+                canonical_url=discovered.canonical_url,
+                depth=discovered.depth,
+                discovered_via=discovered.discovered_via,
+                status="indexed" if ready else "queued",
+            )
+            session.add(page)
+            if not ready and source.id not in queued_sources:
+                queued_sources.append(source.id)
+
+        crawl.root_url = discovery.root_url
+        crawl.allowed_host = discovery.allowed_host
+        crawl.discovered_count = len(discovery.pages)
+        crawl.skipped_count = discovery.skipped_count
+        crawl.options = {
+            **(crawl.options or {}),
+            "warnings": list(discovery.warnings),
+            "respects_robots": True,
+            "discovery_methods": ["robots", "sitemap", "same_site_links", "javascript_links"],
+        }
+        crawl.indexed_count = len(discovery.pages) - len(queued_sources)
+        crawl.queued_count = len(queued_sources)
+        crawl.failed_count = 0
+        crawl.status = "indexing" if queued_sources else "completed"
+        if not queued_sources:
+            crawl.completed_at = datetime.now(UTC)
+        _recount(knowledge_base)
+        if discovery.pages:
+            _invalidate_crawl_bindings(knowledge_base)
+        await record_audit_event(
+            session,
+            tenant_id=tenant_id,
+            actor_user_id=None,
+            action="knowledge_crawl.discovered",
+            resource_type="knowledge_crawl",
+            resource_id=str(crawl.id),
+            details={
+                "root_url": discovery.root_url,
+                "pages": len(discovery.pages),
+                "skipped": discovery.skipped_count,
+                "queued": len(queued_sources),
+            },
+        )
+        await session.commit()
+    finally:
+        await session.close()
+
+    for source_id in queued_sources:
+        try:
+            repair_website_source.apply_async(
+                args=[str(tenant_id), str(kb_id), str(source_id)],
+                queue="knowledge",
+            )
+        except Exception:
+            await _mark_failed(
+                tenant_id,
+                kb_id,
+                source_id,
+                message="The page was discovered, but the recovery worker could not be queued.",
+                code="worker_unavailable",
+            )
+
+
+async def _mark_crawl_failed(crawl_id: UUID, message: str) -> None:
+    session = async_session_factory()
+    try:
+        crawl = await session.get(KnowledgeCrawl, crawl_id)
+        if crawl is not None:
+            crawl.status = "failed"
+            crawl.error_message = message[:1000]
+            crawl.completed_at = datetime.now(UTC)
+            await session.commit()
+    finally:
+        await session.close()
 
 
 async def _tenant_client(session, tenant_id: UUID) -> SmallestAIClient:
@@ -271,7 +544,10 @@ async def _repair(tenant_id: UUID, kb_id: UUID, source_id: UUID) -> None:
             knowledge_base.provider_knowledge_base_id = remote_id
             await session.commit()
 
-        artifact_name = f"vav-web-recovery-{source.id}.pdf"
+        content_sha256 = hashlib.sha256(page.text.encode("utf-8")).hexdigest()
+        artifact_prefix = f"vav-web-recovery-{source.id}-"
+        legacy_artifact_name = f"vav-web-recovery-{source.id}.pdf"
+        artifact_name = f"{artifact_prefix}{content_sha256[:16]}.pdf"
         existing_items = await provider.list_knowledge_items(remote_id)
         reusable_item = next(
             (
@@ -326,6 +602,7 @@ async def _repair(tenant_id: UUID, kb_id: UUID, source_id: UUID) -> None:
         metadata.update(
             {
                 "extraction_method": page.method,
+                "content_sha256": content_sha256,
                 "provider_artifact_name": artifact_name,
                 "retrieval_content_source": "vav_website_recovery",
             }
@@ -372,9 +649,18 @@ async def _repair(tenant_id: UUID, kb_id: UUID, source_id: UUID) -> None:
         )
         await session.commit()
 
+        await _mark_crawl_pages_for_source(source_id, status="indexed")
+
         for item in existing_items:
             old_id = str(item.get("_id") or item.get("id") or "")
-            if old_id and old_id != provider_item_id and _provider_file_name(item) == artifact_name:
+            if (
+                old_id
+                and old_id != provider_item_id
+                and (
+                    _provider_file_name(item).startswith(artifact_prefix)
+                    or _provider_file_name(item) == legacy_artifact_name
+                )
+            ):
                 try:
                     await provider.delete_knowledge_item(
                         knowledge_base_id=remote_id,
@@ -418,6 +704,47 @@ async def _mark_failed(
         await session.commit()
     finally:
         await session.close()
+    await _mark_crawl_pages_for_source(
+        source_id,
+        status="failed",
+        error_code=code,
+        error_message=message,
+    )
+
+
+@celery_app.task(
+    name="app.tasks.knowledge_tasks.crawl_website",
+    bind=True,
+    max_retries=2,
+)
+def crawl_website(self, tenant_id: str, knowledge_base_id: str, crawl_id: str):
+    tenant_uuid = UUID(tenant_id)
+    knowledge_uuid = UUID(knowledge_base_id)
+    crawl_uuid = UUID(crawl_id)
+    try:
+        _run_async(_crawl_website(tenant_uuid, knowledge_uuid, crawl_uuid))
+    except WebsiteRecoveryError as exc:
+        if exc.retryable and self.request.retries < self.max_retries:
+            raise self.retry(exc=exc, countdown=10 * (self.request.retries + 1))
+        _run_async(_mark_crawl_failed(crawl_uuid, str(exc)))
+        logger.warning(
+            "knowledge_site_crawl_failed",
+            knowledge_base_id=knowledge_base_id,
+            crawl_id=crawl_id,
+            error_code=exc.code,
+        )
+    except Exception:
+        logger.exception(
+            "knowledge_site_crawl_unexpected_failure",
+            knowledge_base_id=knowledge_base_id,
+            crawl_id=crawl_id,
+        )
+        _run_async(
+            _mark_crawl_failed(
+                crawl_uuid,
+                "VAV could not complete website discovery. Retry the site crawl.",
+            )
+        )
 
 
 @celery_app.task(

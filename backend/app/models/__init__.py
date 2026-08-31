@@ -3,6 +3,8 @@ from app.models.agent import (
     AgentKnowledgeBinding,
     AgentRuntimeProfile,
     KnowledgeBase,
+    KnowledgeCrawl,
+    KnowledgeCrawlPage,
     KnowledgeSource,
 )
 from app.models.audit import AuditEvent
@@ -32,6 +34,8 @@ __all__ = [
     "Agent",
     "AgentRuntimeProfile",
     "KnowledgeBase",
+    "KnowledgeCrawl",
+    "KnowledgeCrawlPage",
     "KnowledgeSource",
     "AgentKnowledgeBinding",
     "AuditEvent",

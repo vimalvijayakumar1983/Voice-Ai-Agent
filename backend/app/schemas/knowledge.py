@@ -92,6 +92,47 @@ class KnowledgeAgentBindingResponse(BaseModel):
     last_synced_at: datetime | None
 
 
+class KnowledgeCrawlPageResponse(BaseModel):
+    id: UUID
+    knowledge_source_id: UUID | None
+    url: str
+    canonical_url: str
+    depth: int
+    discovered_via: str
+    status: str
+    error_code: str | None
+    error_message: str | None
+    retry_count: int
+    last_attempted_at: datetime | None
+
+    model_config = {"from_attributes": True}
+
+
+class KnowledgeCrawlResponse(BaseModel):
+    id: UUID
+    knowledge_base_id: UUID
+    root_url: str
+    allowed_host: str
+    status: str
+    max_pages: int
+    max_depth: int
+    include_subdomains: bool
+    discovered_count: int
+    queued_count: int
+    indexed_count: int
+    failed_count: int
+    skipped_count: int
+    options: dict | None
+    error_message: str | None
+    started_at: datetime | None
+    completed_at: datetime | None
+    pages: list[KnowledgeCrawlPageResponse] = Field(default_factory=list)
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
 class KnowledgeBaseResponse(BaseModel):
     id: UUID
     name: str
@@ -111,6 +152,7 @@ class KnowledgeBaseResponse(BaseModel):
     published_at: datetime | None
     sources: list[KnowledgeSourceResponse] = Field(default_factory=list)
     agent_bindings: list[KnowledgeAgentBindingResponse] = Field(default_factory=list)
+    crawls: list[KnowledgeCrawlResponse] = Field(default_factory=list)
     created_at: datetime
     updated_at: datetime
 
@@ -138,6 +180,19 @@ class SitemapDiscoveryRequest(BaseModel):
 
 class SitemapDiscoveryResponse(BaseModel):
     urls: list[str]
+
+
+class KnowledgeCrawlCreate(BaseModel):
+    homepage_url: HttpUrl
+    max_pages: int = Field(default=100, ge=1, le=500)
+    max_depth: int = Field(default=3, ge=0, le=8)
+    include_subdomains: bool = False
+
+    @field_validator("homepage_url")
+    @classmethod
+    def require_public_homepage(cls, value: HttpUrl) -> HttpUrl:
+        _validate_knowledge_url(value)
+        return value
 
 
 class TextSourceCreate(BaseModel):

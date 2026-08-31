@@ -14,7 +14,13 @@ from app.api.v1.endpoints.knowledge import (
     _provider_url_key,
     _reconcile_provider_sources,
 )
-from app.models.agent import Agent, AgentKnowledgeBinding, KnowledgeBase, KnowledgeSource
+from app.models.agent import (
+    Agent,
+    AgentKnowledgeBinding,
+    KnowledgeBase,
+    KnowledgeCrawl,
+    KnowledgeSource,
+)
 from app.services.pdf_ingestion import PreparedPdf
 
 
@@ -615,3 +621,50 @@ async def test_failed_website_source_can_be_queued_for_vav_repair(
     assert repaired["source_metadata"]["recovery_attempts"] == 1
     assert repaired["source_metadata"]["recovery"]["stage"] == "queued"
     assert queued == [([str(tenant.id), str(knowledge.id), str(source.id)], "knowledge")]
+
+
+@pytest.mark.asyncio
+async def test_homepage_crawl_is_persisted_and_queued(
+    client,
+    auth_headers,
+    tenant,
+    db,
+    monkeypatch,
+):
+    queued: list[tuple[list[str], str]] = []
+    from app.tasks import knowledge_tasks
+
+    monkeypatch.setattr(
+        knowledge_tasks.crawl_website,
+        "apply_async",
+        lambda *, args, queue: queued.append((args, queue)),
+    )
+    knowledge = KnowledgeBase(
+        tenant_id=tenant.id,
+        name="Automatic website knowledge",
+        provider="smallest",
+        sync_status="local_only",
+        approval_status="draft",
+    )
+    db.add(knowledge)
+    await db.commit()
+
+    response = await client.post(
+        f"/api/v1/knowledge/{knowledge.id}/crawls",
+        headers=auth_headers,
+        json={
+            "homepage_url": "https://clinic.example/",
+            "max_pages": 120,
+            "max_depth": 4,
+            "include_subdomains": False,
+        },
+    )
+
+    assert response.status_code == 202
+    crawl_data = response.json()["crawls"][0]
+    assert crawl_data["status"] == "queued"
+    assert crawl_data["max_pages"] == 120
+    assert crawl_data["max_depth"] == 4
+    crawl = await db.get(KnowledgeCrawl, UUID(crawl_data["id"]))
+    assert crawl is not None
+    assert queued == [([str(tenant.id), str(knowledge.id), str(crawl.id)], "knowledge")]
