@@ -15,6 +15,10 @@ def test_canonicalize_page_url_removes_trackers_and_rejects_non_pages():
     )
     assert canonicalize_page_url("https://example.com/brochure.pdf") is None
     assert canonicalize_page_url("https://example.com/checkout") is None
+    assert canonicalize_page_url("https://example.com/social-media") is None
+    assert canonicalize_page_url("https://example.com/portfolio_category/videos") is None
+    assert canonicalize_page_url("https://example.com/testimonial_category/group") is None
+    assert canonicalize_page_url("https://example.com/2022/02") is None
     assert canonicalize_page_url("http://example.com/services") is None
 
 

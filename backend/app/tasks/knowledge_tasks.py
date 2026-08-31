@@ -124,7 +124,10 @@ def _recount(knowledge_base: KnowledgeBase) -> None:
         source.status == "indexed" and bool(str(source.content or "").strip())
         for source in knowledge_base.sources
     )
-    if knowledge_base.indexed_source_count == knowledge_base.source_count:
+    if not knowledge_base.source_count:
+        knowledge_base.sync_status = "local_only"
+        knowledge_base.sync_error = None
+    elif knowledge_base.indexed_source_count == knowledge_base.source_count:
         knowledge_base.sync_status = "ready"
         knowledge_base.sync_error = None
     elif any(source.status == "failed" for source in knowledge_base.sources):
@@ -206,10 +209,19 @@ async def _refresh_crawl(crawl_id: UUID) -> None:
         crawl.discovered_count = len(pages)
         crawl.indexed_count = sum(page.status == "indexed" for page in pages)
         crawl.failed_count = sum(page.status == "failed" for page in pages)
+        skipped_pages = sum(page.status == "skipped" for page in pages)
         crawl.queued_count = sum(
             page.status in {"discovered", "queued", "processing"} for page in pages
         )
-        terminal = crawl.indexed_count + crawl.failed_count == crawl.discovered_count
+        options = dict(crawl.options or {})
+        previous_non_content = int(options.get("non_content_skipped_count") or 0)
+        discovery_skipped = max(0, int(crawl.skipped_count or 0) - previous_non_content)
+        options["non_content_skipped_count"] = skipped_pages
+        crawl.options = options
+        crawl.skipped_count = discovery_skipped + skipped_pages
+        terminal = (
+            crawl.indexed_count + crawl.failed_count + skipped_pages == crawl.discovered_count
+        )
         if terminal and crawl.discovered_count:
             crawl.status = "completed_with_errors" if crawl.failed_count else "completed"
             crawl.completed_at = datetime.now(UTC)
@@ -249,6 +261,77 @@ async def _mark_crawl_pages_for_source(
             page.error_code = error_code
             page.error_message = error_message[:1000] if error_message else None
             crawl_ids.add(page.crawl_id)
+        await session.commit()
+    finally:
+        await session.close()
+    for crawl_id in crawl_ids:
+        await _refresh_crawl(crawl_id)
+
+
+def _is_permanent_non_content_failure(*, code: str, message: str) -> bool:
+    if code == "no_readable_text":
+        return True
+    return code == "http_error" and any(marker in message for marker in ("HTTP 404", "HTTP 410"))
+
+
+async def _mark_non_content_skipped(
+    tenant_id: UUID,
+    kb_id: UUID,
+    source_id: UUID,
+    *,
+    original_code: str,
+) -> None:
+    """Retain the crawl ledger while removing a source that has no usable knowledge."""
+    session = async_session_factory()
+    crawl_ids: set[UUID] = set()
+    try:
+        knowledge_base = await session.scalar(
+            select(KnowledgeBase)
+            .where(KnowledgeBase.id == kb_id, KnowledgeBase.tenant_id == tenant_id)
+            .options(selectinload(KnowledgeBase.sources))
+        )
+        source = await session.scalar(
+            select(KnowledgeSource).where(
+                KnowledgeSource.id == source_id,
+                KnowledgeSource.tenant_id == tenant_id,
+                KnowledgeSource.knowledge_base_id == kb_id,
+            )
+        )
+        if knowledge_base is None or source is None:
+            return
+        pages = list(
+            (
+                await session.scalars(
+                    select(KnowledgeCrawlPage).where(
+                        KnowledgeCrawlPage.knowledge_source_id == source_id
+                    )
+                )
+            ).all()
+        )
+        now = datetime.now(UTC)
+        for page in pages:
+            page.status = "skipped"
+            page.error_code = "excluded_non_content"
+            page.error_message = (
+                "Excluded automatically because the page is missing or contains no useful "
+                "voice-searchable business content."
+            )
+            page.last_attempted_at = now
+            page.knowledge_source_id = None
+            crawl_ids.add(page.crawl_id)
+        if source in knowledge_base.sources:
+            knowledge_base.sources.remove(source)
+        await session.delete(source)
+        _recount(knowledge_base)
+        await record_audit_event(
+            session,
+            tenant_id=tenant_id,
+            actor_user_id=None,
+            action="knowledge_crawl.page_excluded",
+            resource_type="knowledge_source",
+            resource_id=str(source_id),
+            details={"reason": original_code, "pages": len(pages)},
+        )
         await session.commit()
     finally:
         await session.close()
@@ -684,6 +767,14 @@ async def _mark_failed(
     message: str,
     code: str,
 ) -> None:
+    if _is_permanent_non_content_failure(code=code, message=message):
+        await _mark_non_content_skipped(
+            tenant_id,
+            kb_id,
+            source_id,
+            original_code=code,
+        )
+        return
     try:
         session, knowledge_base, source = await _context(tenant_id, kb_id, source_id)
     except WebsiteRecoveryError:

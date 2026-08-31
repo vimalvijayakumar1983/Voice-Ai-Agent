@@ -69,9 +69,13 @@ BLOCKED_PATH_SEGMENTS = {
     "register",
     "signin",
     "signup",
+    "social-media",
+    "testimonial_category",
+    "portfolio_category",
     "wp-admin",
     "wp-login.php",
 }
+DATE_ARCHIVE_PATH = re.compile(r"/(?:19|20)\d{2}/(?:0?[1-9]|1[0-2])(?:/|$)")
 
 
 @dataclass(frozen=True)
@@ -110,6 +114,8 @@ def canonicalize_page_url(value: str) -> str | None:
         return None
     segments = {segment.casefold() for segment in path.split("/") if segment}
     if segments & BLOCKED_PATH_SEGMENTS:
+        return None
+    if DATE_ARCHIVE_PATH.search(path):
         return None
     query = [
         (key, item)

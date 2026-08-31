@@ -19,6 +19,7 @@ from app.models.agent import (
     AgentKnowledgeBinding,
     KnowledgeBase,
     KnowledgeCrawl,
+    KnowledgeCrawlPage,
     KnowledgeSource,
 )
 from app.services.pdf_ingestion import PreparedPdf
@@ -668,3 +669,108 @@ async def test_homepage_crawl_is_persisted_and_queued(
     crawl = await db.get(KnowledgeCrawl, UUID(crawl_data["id"]))
     assert crawl is not None
     assert queued == [([str(tenant.id), str(knowledge.id), str(crawl.id)], "knowledge")]
+
+
+@pytest.mark.asyncio
+async def test_permanent_non_content_page_is_excluded_without_failing_the_crawl(
+    tenant,
+    db,
+    monkeypatch,
+):
+    from app.tasks import knowledge_tasks
+
+    monkeypatch.setattr(knowledge_tasks, "async_session_factory", lambda: db)
+    knowledge = KnowledgeBase(
+        tenant_id=tenant.id,
+        name="Corporate website",
+        provider="smallest",
+        sync_status="error",
+        approval_status="draft",
+    )
+    ready = KnowledgeSource(
+        tenant_id=tenant.id,
+        source_type="website",
+        name="Services",
+        location="https://company.example/services",
+        content="Approved services and contact information.",
+        status="indexed",
+        provider_item_id="provider-ready",
+    )
+    empty = KnowledgeSource(
+        tenant_id=tenant.id,
+        source_type="website",
+        name="Social media",
+        location="https://company.example/social-media",
+        status="failed",
+        error_message="The downloaded page contained too little readable text.",
+    )
+    knowledge.sources.extend([ready, empty])
+    knowledge.source_count = 2
+    knowledge.indexed_source_count = 1
+    crawl = KnowledgeCrawl(
+        tenant_id=tenant.id,
+        root_url="https://company.example/",
+        allowed_host="company.example",
+        status="completed_with_errors",
+        discovered_count=2,
+        indexed_count=1,
+        failed_count=1,
+        skipped_count=3,
+        options={"respects_robots": True},
+        pages=[],
+    )
+    knowledge.crawls.append(crawl)
+    db.add(knowledge)
+    await db.flush()
+    crawl.pages.extend(
+        [
+            KnowledgeCrawlPage(
+                tenant_id=tenant.id,
+                knowledge_source_id=ready.id,
+                url=ready.location,
+                canonical_url=ready.location,
+                status="indexed",
+            ),
+            KnowledgeCrawlPage(
+                tenant_id=tenant.id,
+                knowledge_source_id=empty.id,
+                url=empty.location,
+                canonical_url=empty.location,
+                status="failed",
+                error_code="no_readable_text",
+            ),
+        ]
+    )
+    await db.commit()
+
+    await knowledge_tasks._mark_failed(
+        tenant.id,
+        knowledge.id,
+        empty.id,
+        message="The downloaded page contained too little readable text.",
+        code="no_readable_text",
+    )
+
+    remaining = list(
+        (
+            await db.scalars(
+                select(KnowledgeSource).where(KnowledgeSource.knowledge_base_id == knowledge.id)
+            )
+        ).all()
+    )
+    skipped_page = await db.scalar(
+        select(KnowledgeCrawlPage).where(
+            KnowledgeCrawlPage.canonical_url == "https://company.example/social-media"
+        )
+    )
+    refreshed_crawl = await db.get(KnowledgeCrawl, crawl.id)
+    refreshed_knowledge = await db.get(KnowledgeBase, knowledge.id)
+
+    assert [source.name for source in remaining] == ["Services"]
+    assert skipped_page.status == "skipped"
+    assert skipped_page.knowledge_source_id is None
+    assert refreshed_crawl.status == "completed"
+    assert refreshed_crawl.failed_count == 0
+    assert refreshed_crawl.skipped_count == 4
+    assert refreshed_knowledge.sync_status == "ready"
+    assert refreshed_knowledge.source_count == 1

@@ -758,7 +758,8 @@ function CrawlRuns({ crawls, busy, canRepair, onRetry }: { crawls: KnowledgeCraw
   return <section className={styles.section} aria-labelledby="crawl-runs-heading">
     <div className={styles.sectionHeading}><div><span className={styles.sectionIcon}><Globe2 size={15} /></span><div><h3 id="crawl-runs-heading">Website crawl activity</h3><p>Discovery, extraction, provider indexing and page-level failures remain traceable.</p></div></div><span className="badge badge-neutral">{crawls.length} run{crawls.length === 1 ? '' : 's'}</span></div>
     <div className={styles.crawlRuns}>{crawls.slice(0, 5).map((crawl) => {
-      const terminal = crawl.indexed_count + crawl.failed_count;
+      const excluded = crawl.pages.filter((page) => page.status === 'skipped');
+      const terminal = crawl.indexed_count + crawl.failed_count + excluded.length;
       const percent = crawl.discovered_count ? Math.round((terminal / crawl.discovered_count) * 100) : 0;
       const active = ['queued', 'discovering', 'indexing', 'retrying'].includes(crawl.status);
       const warnings = Array.isArray(crawl.options?.warnings) ? crawl.options.warnings.filter((item): item is string => typeof item === 'string') : [];
@@ -770,6 +771,7 @@ function CrawlRuns({ crawls, busy, canRepair, onRetry }: { crawls: KnowledgeCraw
         {active && <p className={styles.crawlMessage}><Loader2 className="spin" size={12} /> {crawl.status === 'discovering' ? 'Discovering sitemaps and same-site links…' : 'Extracting, indexing and verifying discovered pages…'}</p>}
         {crawl.error_message && <p className={styles.crawlError}><CircleAlert size={12} /> {crawl.error_message}</p>}
         {warnings.map((warning) => <p className={styles.crawlWarning} key={warning}>{warning}</p>)}
+        {excluded.length > 0 && <details className={styles.crawlFailures}><summary>{excluded.length} non-content page{excluded.length === 1 ? '' : 's'} excluded automatically</summary><ul>{excluded.slice(0, 50).map((page) => <li key={page.id}><span>{page.url}</span><small>{page.error_message || 'No useful voice-searchable content'}</small></li>)}</ul></details>}
         {failures.length > 0 && <details className={styles.crawlFailures}><summary>{failures.length} failed page{failures.length === 1 ? '' : 's'} — inspect details</summary><ul>{failures.slice(0, 50).map((page) => <li key={page.id}><span>{page.url}</span><small>{page.error_code ? `${page.error_code}: ` : ''}{page.error_message || 'Recovery failed'}</small></li>)}</ul></details>}
         {canRepair && !active && (crawl.failed_count > 0 || crawl.status === 'failed') && <button type="button" className="btn btn-secondary btn-sm" disabled={busy} onClick={() => onRetry(crawl)}><RefreshCw size={12} /> {crawl.failed_count ? 'Repair failed pages' : 'Retry discovery'}</button>}
       </article>;
