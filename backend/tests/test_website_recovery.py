@@ -179,3 +179,36 @@ async def test_provider_verification_discovers_item_when_upload_response_has_no_
 
     assert provider.calls == 2
     assert item_id == "provider-item-from-list"
+
+
+@pytest.mark.asyncio
+async def test_provider_verification_ignores_stale_artifact_when_upload_has_no_id(monkeypatch):
+    class Provider:
+        async def list_knowledge_items(self, _knowledge_base_id):
+            return [
+                {
+                    "_id": "stale-provider-item",
+                    "fileName": "recovered.pdf",
+                    "processingStatus": "completed",
+                },
+                {
+                    "_id": "new-provider-item",
+                    "fileName": "recovered.pdf",
+                    "processingStatus": "completed",
+                },
+            ]
+
+    async def no_wait(_seconds):
+        return None
+
+    monkeypatch.setattr("app.tasks.knowledge_tasks._provider_poll_wait", no_wait)
+
+    item_id = await _wait_for_provider_index(
+        Provider(),
+        knowledge_base_id="provider-kb-1",
+        provider_item_id=None,
+        artifact_name="recovered.pdf",
+        excluded_item_ids={"stale-provider-item"},
+    )
+
+    assert item_id == "new-provider-item"

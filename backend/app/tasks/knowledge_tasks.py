@@ -61,16 +61,23 @@ async def _wait_for_provider_index(
     knowledge_base_id: str,
     provider_item_id: str | None,
     artifact_name: str,
+    excluded_item_ids: set[str] | None = None,
 ) -> str:
     """Do not report success until the provider item itself is indexed."""
     for attempt in range(30):
         items = await provider.list_knowledge_items(knowledge_base_id)
+        excluded = excluded_item_ids or set()
         item = next(
             (
                 candidate
                 for candidate in items
-                if str(candidate.get("_id") or candidate.get("id") or "") == provider_item_id
-                or _provider_file_name(candidate) == artifact_name
+                if (
+                    str(candidate.get("_id") or candidate.get("id") or "") == provider_item_id
+                    or (
+                        _provider_file_name(candidate) == artifact_name
+                        and str(candidate.get("_id") or candidate.get("id") or "") not in excluded
+                    )
+                )
             ),
             None,
         )
@@ -266,12 +273,32 @@ async def _repair(tenant_id: UUID, kb_id: UUID, source_id: UUID) -> None:
 
         artifact_name = f"vav-web-recovery-{source.id}.pdf"
         existing_items = await provider.list_knowledge_items(remote_id)
-        upload = await provider.upload_knowledge_pdf(
-            knowledge_base_id=remote_id,
-            file_name=artifact_name,
-            content=provider_document,
+        reusable_item = next(
+            (
+                item
+                for item in existing_items
+                if _provider_file_name(item) == artifact_name
+                and _provider_status(item) in PROVIDER_READY
+                and _provider_item_id(item)
+            ),
+            None,
         )
-        provider_item_id = _provider_item_id(upload)
+        excluded_item_ids: set[str] = set()
+        if reusable_item is not None:
+            provider_item_id = _provider_item_id(reusable_item)
+        else:
+            upload = await provider.upload_knowledge_pdf(
+                knowledge_base_id=remote_id,
+                file_name=artifact_name,
+                content=provider_document,
+            )
+            provider_item_id = _provider_item_id(upload)
+            if not provider_item_id:
+                excluded_item_ids = {
+                    item_id
+                    for item in existing_items
+                    if (item_id := _provider_item_id(item)) is not None
+                }
         await _set_stage(
             tenant_id,
             kb_id,
@@ -284,6 +311,7 @@ async def _repair(tenant_id: UUID, kb_id: UUID, source_id: UUID) -> None:
             knowledge_base_id=remote_id,
             provider_item_id=provider_item_id,
             artifact_name=artifact_name,
+            excluded_item_ids=excluded_item_ids,
         )
 
         source.name = page.title[:255]
