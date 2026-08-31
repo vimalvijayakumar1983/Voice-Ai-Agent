@@ -1,11 +1,11 @@
 """Post-call processing tasks."""
 
-import asyncio
 import uuid
 from datetime import UTC, datetime, timedelta
 
 import structlog
 
+from app.tasks.async_runner import run_async as _run_async
 from app.tasks.worker import celery_app
 
 logger = structlog.get_logger()
@@ -13,14 +13,6 @@ DISPATCH_RECONCILE_DELAY_SECONDS = 15 * 60
 DIRECT_TERMINAL_CALLBACK_GRACE_SECONDS = 120
 DIRECT_CALL_WATCHDOG_STATUSES = frozenset({"ringing", "in_progress"})
 DIRECT_CALL_UNKNOWN_STATUS = "terminal_unknown"
-
-
-def _run_async(coro):
-    loop = asyncio.new_event_loop()
-    try:
-        return loop.run_until_complete(coro)
-    finally:
-        loop.close()
 
 
 def _as_utc(value: datetime | None) -> datetime | None:

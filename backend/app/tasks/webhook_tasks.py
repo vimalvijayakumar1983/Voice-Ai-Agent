@@ -38,6 +38,7 @@ from app.services.integration_security import (
     load_integration_config,
     validate_public_https_url,
 )
+from app.tasks.async_runner import run_async as _run_async
 from app.tasks.worker import celery_app
 
 logger = structlog.get_logger()
@@ -66,14 +67,6 @@ class DeliveryResult:
 
 class WebhookPreparationError(RuntimeError):
     """Safe error raised when matching deliveries cannot be persisted."""
-
-
-def _run_async(coro):
-    loop = asyncio.new_event_loop()
-    try:
-        return loop.run_until_complete(coro)
-    finally:
-        loop.close()
 
 
 def _deterministic_body(event_type: str, payload: dict) -> bytes:

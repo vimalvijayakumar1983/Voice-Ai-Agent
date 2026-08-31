@@ -25,19 +25,12 @@ from app.services.website_recovery import (
     searchable_pdf,
     should_render_javascript,
 )
+from app.tasks.async_runner import run_async as _run_async
 from app.tasks.worker import celery_app
 
 logger = structlog.get_logger()
 PROVIDER_READY = {"complete", "completed", "indexed", "processed", "ready", "success", "succeeded"}
 PROVIDER_FAILED = {"error", "failed", "failure"}
-
-
-def _run_async(coro):
-    loop = asyncio.new_event_loop()
-    try:
-        return loop.run_until_complete(coro)
-    finally:
-        loop.close()
 
 
 def _provider_item_id(value: dict | None) -> str | None:

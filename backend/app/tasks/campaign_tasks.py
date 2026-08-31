@@ -1,6 +1,5 @@
 """Crash-safe, tenant-scoped campaign execution tasks."""
 
-import asyncio
 import json
 import math
 import uuid
@@ -38,6 +37,7 @@ from app.services.phone_numbers import (
     tenant_phone_dnc_lock,
 )
 from app.services.provider_credentials import load_provider_config
+from app.tasks.async_runner import run_async as _run_async
 from app.tasks.worker import celery_app
 from app.telephony.base import CallRequest
 from app.telephony.twilio_provider import get_telephony_provider
@@ -87,15 +87,6 @@ class FollowUp:
 
 class DefinitiveDispatchError(RuntimeError):
     """A local/provider rejection that proves no paid call was accepted."""
-
-
-def _run_async(coro):
-    """Run an async campaign transaction from a synchronous Celery task."""
-    loop = asyncio.new_event_loop()
-    try:
-        return loop.run_until_complete(coro)
-    finally:
-        loop.close()
 
 
 @celery_app.task(name="app.tasks.campaign_tasks.run_campaign", bind=True, max_retries=3)
