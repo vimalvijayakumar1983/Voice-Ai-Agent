@@ -107,6 +107,72 @@ def test_reconcile_matches_completed_url_returned_as_knowledge_item():
     assert knowledge.indexed_source_count == 1
 
 
+def test_reconcile_backfills_provider_extracted_content_for_runtime_retrieval():
+    source = SimpleNamespace(
+        source_type="file",
+        name="botox.pdf",
+        location=None,
+        content=None,
+        source_metadata=None,
+        status="processing",
+        provider_item_id=None,
+        last_synced_at=None,
+        error_message=None,
+    )
+    knowledge = _knowledge(source)
+
+    _reconcile_provider_sources(
+        knowledge,
+        scraped=[],
+        items=[
+            {
+                "_id": "provider-pdf-1",
+                "fileName": "botox.pdf",
+                "processingStatus": "completed",
+                "content": "Botox treatment can be used for hyperhidrosis.",
+            }
+        ],
+        provider_knowledge_base={"processingStatus": "completed"},
+        now=datetime.now(UTC),
+    )
+
+    assert source.content == "Botox treatment can be used for hyperhidrosis."
+    assert source.source_metadata == {"retrieval_content_source": "smallest_index"}
+
+
+def test_reconcile_preserves_existing_local_pdf_text():
+    source = SimpleNamespace(
+        source_type="file",
+        name="prp.pdf",
+        location=None,
+        content="Locally extracted PRP guidance.",
+        source_metadata={"retrieval_content_source": "local_pdf"},
+        status="processing",
+        provider_item_id=None,
+        last_synced_at=None,
+        error_message=None,
+    )
+    knowledge = _knowledge(source)
+
+    _reconcile_provider_sources(
+        knowledge,
+        scraped=[],
+        items=[
+            {
+                "_id": "provider-pdf-2",
+                "fileName": "prp.pdf",
+                "processingStatus": "completed",
+                "content": "Provider PRP text.",
+            }
+        ],
+        provider_knowledge_base={"processingStatus": "completed"},
+        now=datetime.now(UTC),
+    )
+
+    assert source.content == "Locally extracted PRP guidance."
+    assert source.source_metadata == {"retrieval_content_source": "local_pdf"}
+
+
 def test_reconcile_matches_smallest_completed_scrape_batch():
     source = _url_source()
     knowledge = _knowledge(source)

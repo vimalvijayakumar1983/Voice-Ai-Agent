@@ -339,6 +339,15 @@ def _provider_file_name(item: dict) -> str:
     return str(item.get("fileName") or metadata.get("fileName") or "")
 
 
+def _provider_item_content(item: dict) -> str | None:
+    """Return bounded provider-extracted text suitable for local retrieval."""
+    content = item.get("content")
+    if not isinstance(content, str):
+        return None
+    content = content.strip()
+    return content[:MAX_EXTRACTED_PDF_CHARS] if content else None
+
+
 def _reconcile_provider_sources(
     kb: KnowledgeBase,
     *,
@@ -376,6 +385,13 @@ def _reconcile_provider_sources(
             source.provider_item_id = str(item.get("_id") or item.get("id") or "") or None
             source.last_synced_at = now
             source.error_message = None
+            if not str(getattr(source, "content", None) or "").strip():
+                provider_content = _provider_item_content(item)
+                if provider_content:
+                    source.content = provider_content
+                    source_metadata = dict(getattr(source, "source_metadata", None) or {})
+                    source_metadata["retrieval_content_source"] = "smallest_index"
+                    source.source_metadata = source_metadata
             if source.status == "failed":
                 source.error_message = str(
                     item.get("error") or item.get("errorMessage") or "Provider processing failed"
