@@ -412,9 +412,11 @@ def _reconcile_provider_sources(
                 source.error_message = str(
                     item.get("error") or item.get("errorMessage") or "Provider processing failed"
                 )
-            elif source.source_type == "file" and source.status == "indexed" and not str(
-                getattr(source, "content", None) or ""
-            ).strip():
+            elif (
+                source.source_type == "file"
+                and source.status == "indexed"
+                and not str(getattr(source, "content", None) or "").strip()
+            ):
                 source.status = "failed"
                 source.error_message = (
                     "Provider indexing completed, but VAV found no retrievable text. "
@@ -431,9 +433,7 @@ def _reconcile_provider_sources(
             and source.source_type in {"url", "file", "website", "sitemap"}
             and source.status in {"pending", "processing"}
         ):
-            if source.source_type != "file" or str(
-                getattr(source, "content", None) or ""
-            ).strip():
+            if source.source_type != "file" or str(getattr(source, "content", None) or "").strip():
                 source.status = "indexed"
                 source.error_message = None
             else:
