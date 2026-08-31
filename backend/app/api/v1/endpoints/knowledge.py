@@ -2,13 +2,11 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime
-from io import BytesIO
 from pathlib import PurePath
 from urllib.parse import urlsplit, urlunsplit
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
-from pypdf import PdfReader
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -31,6 +29,7 @@ from app.schemas.knowledge import (
     UrlSourceCreate,
 )
 from app.services.audit import record_audit_event
+from app.services.pdf_ingestion import PdfIngestionError, PreparedPdf, prepare_pdf
 from app.services.provider_credentials import load_provider_config
 
 router = APIRouter(prefix="/knowledge", tags=["Knowledge Studio"])
@@ -61,20 +60,6 @@ BOUND_AGENT_PROVIDER_OPERATIONS = {
     "provider_scanning",
     "publish_unknown",
 }
-
-
-def _extract_pdf_text(content: bytes) -> str | None:
-    """Best-effort local text extraction keeps VAV retrieval provider-neutral."""
-    try:
-        reader = PdfReader(BytesIO(content), strict=False)
-        pages = [page.extract_text() or "" for page in reader.pages]
-    except Exception:
-        # Smallest remains authoritative for ingestion of PDFs its parser can
-        # accept. A malformed or image-only document must not create invented
-        # local text or expose raw bytes.
-        return None
-    text = "\n\n".join(" ".join(page.split()) for page in pages if page.strip()).strip()
-    return text[:MAX_EXTRACTED_PDF_CHARS] or None
 
 
 def _provider_error(exc: SmallestAIError) -> HTTPException:
@@ -238,7 +223,14 @@ async def _ensure_remote(
 
 def _recount(kb: KnowledgeBase) -> None:
     kb.source_count = len(kb.sources)
-    kb.indexed_source_count = sum(source.status == "indexed" for source in kb.sources)
+    kb.indexed_source_count = sum(
+        source.status == "indexed"
+        and (
+            source.source_type not in {"file", "text"}
+            or bool(str(getattr(source, "content", None) or "").strip())
+        )
+        for source in kb.sources
+    )
     if not kb.source_count:
         kb.sync_status = "local_only"
         kb.sync_error = None
@@ -247,6 +239,10 @@ def _recount(kb: KnowledgeBase) -> None:
         kb.sync_error = None
     elif any(source.status == "failed" for source in kb.sources):
         kb.sync_status = "error"
+        kb.sync_error = next(
+            (source.error_message for source in kb.sources if source.error_message),
+            "One or more sources are not usable for agent retrieval.",
+        )
     elif any(source.status in {"pending", "processing"} for source in kb.sources):
         kb.sync_status = "processing"
 
@@ -355,6 +351,19 @@ def _provider_item_content(item: dict) -> str | None:
     return content[:MAX_EXTRACTED_PDF_CHARS] if content else None
 
 
+def _provider_item_id(value: dict | None) -> str | None:
+    """Resolve a provider item ID from the common upload response envelopes."""
+    current: object = value
+    for _ in range(4):
+        if not isinstance(current, dict):
+            return None
+        item_id = current.get("_id") or current.get("id")
+        if item_id:
+            return str(item_id)
+        current = current.get("data") or current.get("item")
+    return None
+
+
 def _reconcile_provider_sources(
     kb: KnowledgeBase,
     *,
@@ -403,6 +412,14 @@ def _reconcile_provider_sources(
                 source.error_message = str(
                     item.get("error") or item.get("errorMessage") or "Provider processing failed"
                 )
+            elif source.source_type == "file" and source.status == "indexed" and not str(
+                getattr(source, "content", None) or ""
+            ).strip():
+                source.status = "failed"
+                source.error_message = (
+                    "Provider indexing completed, but VAV found no retrievable text. "
+                    "Re-upload the PDF so VAV can extract or OCR it."
+                )
             continue
 
         # Smallest.ai's knowledge-base status is authoritative for the whole
@@ -414,8 +431,17 @@ def _reconcile_provider_sources(
             and source.source_type in {"url", "file", "website", "sitemap"}
             and source.status in {"pending", "processing"}
         ):
-            source.status = "indexed"
-            source.error_message = None
+            if source.source_type != "file" or str(
+                getattr(source, "content", None) or ""
+            ).strip():
+                source.status = "indexed"
+                source.error_message = None
+            else:
+                source.status = "failed"
+                source.error_message = (
+                    "Provider indexing completed, but VAV found no retrievable text. "
+                    "Re-upload the source to repair it."
+                )
             source.last_synced_at = now
 
     _recount(kb)
@@ -713,29 +739,99 @@ async def upload_pdf_source(
         raise HTTPException(status_code=413, detail="PDF must be 8 MB or smaller")
     if not content.startswith(b"%PDF-"):
         raise HTTPException(status_code=422, detail="The uploaded file is not a valid PDF")
-    extracted_text = await asyncio.to_thread(_extract_pdf_text, content)
+    try:
+        prepared: PreparedPdf = await asyncio.to_thread(
+            prepare_pdf,
+            content,
+            languages=kb.languages,
+        )
+    except PdfIngestionError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
     client = await _tenant_smallest_client(db, current_user.tenant_id)
     remote_id = await _ensure_remote(db, kb, client)
+    existing_source = next(
+        (
+            source
+            for source in kb.sources
+            if source.source_type == "file" and source.name.casefold() == filename.casefold()
+        ),
+        None,
+    )
+    previous_items: list[dict] = []
     try:
-        await client.upload_knowledge_pdf(
+        previous_items = await client.list_knowledge_items(remote_id)
+        upload_response = await client.upload_knowledge_pdf(
             knowledge_base_id=remote_id,
             file_name=filename,
-            content=content,
+            content=prepared.provider_content,
         )
+        current_items = await client.list_knowledge_items(remote_id)
     except SmallestAIError as exc:
         await _mark_provider_error(db, kb, exc)
         raise _provider_error(exc) from exc
-    kb.sources.append(
-        KnowledgeSource(
+
+    previous_file_ids = {
+        str(item.get("_id") or item.get("id"))
+        for item in previous_items
+        if _provider_file_name(item).casefold() == filename.casefold()
+        and (item.get("_id") or item.get("id"))
+    }
+    current_file_ids = {
+        str(item.get("_id") or item.get("id"))
+        for item in current_items
+        if _provider_file_name(item).casefold() == filename.casefold()
+        and (item.get("_id") or item.get("id"))
+    }
+    response_item_id = _provider_item_id(upload_response)
+    provider_item_id = response_item_id if response_item_id in current_file_ids else None
+    added_ids = current_file_ids - previous_file_ids
+    if provider_item_id is None and len(added_ids) == 1:
+        provider_item_id = next(iter(added_ids))
+    elif provider_item_id is None and len(current_file_ids) == 1:
+        # Some provider uploads replace an existing item in place.
+        provider_item_id = next(iter(current_file_ids))
+
+    stale_provider_ids = previous_file_ids - ({provider_item_id} if provider_item_id else set())
+    new_item_confirmed = bool(provider_item_id and provider_item_id in added_ids)
+    if new_item_confirmed:
+        try:
+            for stale_provider_id in stale_provider_ids:
+                await client.delete_knowledge_item(
+                    knowledge_base_id=remote_id,
+                    item_id=stale_provider_id,
+                )
+        except SmallestAIError as exc:
+            # The new item is already safe and retrievable locally. Keep it and
+            # expose remote cleanup as an operator warning instead of rolling
+            # the source back to unusable content.
+            kb.sync_error = f"PDF updated, but an older provider copy could not be removed: {exc}"
+
+    source_metadata = {
+        "retrieval_content_source": "vav_pdf_ingestion",
+        "extraction_method": prepared.extraction_method,
+        "page_count": prepared.page_count,
+        "ocr_page_count": prepared.ocr_page_count,
+        "sha256": prepared.sha256,
+    }
+    source = existing_source
+    if source is None:
+        source = KnowledgeSource(
             tenant_id=current_user.tenant_id,
             source_type="file",
             name=filename,
-            content=extracted_text,
-            mime_type="application/pdf",
-            size_bytes=len(content),
-            status="processing",
         )
-    )
+        kb.sources.append(source)
+    source.name = filename
+    source.content = prepared.extracted_text
+    source.file_content = content
+    source.mime_type = "application/pdf"
+    source.size_bytes = len(content)
+    source.status = "processing"
+    source.provider_item_id = provider_item_id
+    source.error_message = None
+    source.source_metadata = source_metadata
+    source.last_synced_at = datetime.now(UTC)
     _recount(kb)
     kb.last_synced_at = datetime.now(UTC)
     affected_agent_ids = _invalidate_bound_agent_deployments(kb)
@@ -744,13 +840,18 @@ async def upload_pdf_source(
         db,
         tenant_id=current_user.tenant_id,
         actor_user_id=current_user.id,
-        action="knowledge_source.pdf_added",
+        action=(
+            "knowledge_source.pdf_updated" if existing_source else "knowledge_source.pdf_added"
+        ),
         resource_type="knowledge_base",
         resource_id=str(kb.id),
         details={
             "name": filename,
             "bytes": len(content),
-            "local_text_extracted": bool(extracted_text),
+            "characters": len(prepared.extracted_text),
+            "extraction_method": prepared.extraction_method,
+            "ocr_pages": prepared.ocr_page_count,
+            "replaced_existing": bool(existing_source),
             "agents_requiring_sync": [str(agent_id) for agent_id in affected_agent_ids],
         },
     )

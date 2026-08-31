@@ -770,8 +770,8 @@ class SmallestAIClient:
 
     async def upload_knowledge_pdf(
         self, *, knowledge_base_id: str, file_name: str, content: bytes
-    ) -> None:
-        await self._request_media(
+    ) -> dict[str, Any]:
+        return await self._request_media(
             "POST",
             f"/knowledgebase/{quote(knowledge_base_id, safe='')}/items/upload-media",
             file_name=file_name,

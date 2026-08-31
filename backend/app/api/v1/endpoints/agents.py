@@ -536,19 +536,27 @@ async def _approved_bound_provider_knowledge_base_id(
     )
     if not knowledge_binding:
         return None
-    remote_knowledge_id = await db.scalar(
-        select(KnowledgeBase.provider_knowledge_base_id).where(
+    bound_knowledge = await db.scalar(
+        select(KnowledgeBase).where(
             KnowledgeBase.id == knowledge_binding.knowledge_base_id,
             KnowledgeBase.tenant_id == tenant_id,
             KnowledgeBase.approval_status == "approved",
         )
     )
-    if not remote_knowledge_id:
+    if not bound_knowledge or not bound_knowledge.provider_knowledge_base_id:
         raise HTTPException(
             status_code=409,
             detail="Bound knowledge must be approved and provisioned before publishing",
         )
-    return remote_knowledge_id
+    if bound_knowledge.sync_status != "ready":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Bound knowledge is not retrieval-ready. Repair or finish indexing every "
+                "source before publishing."
+            ),
+        )
+    return bound_knowledge.provider_knowledge_base_id
 
 
 def _voice_configuration_snapshot(agent: Agent) -> tuple:

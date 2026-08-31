@@ -143,7 +143,9 @@ async def retrieve_knowledge_context(
             select(KnowledgeSource).where(
                 KnowledgeSource.knowledge_base_id == knowledge_base.id,
                 KnowledgeSource.tenant_id == tenant_id,
-                KnowledgeSource.status.in_(("indexed", "local_only")),
+                # Locally validated PDF text is safe to use immediately while
+                # the provider refreshes its own index after an in-place update.
+                KnowledgeSource.status.in_(("processing", "indexed", "local_only")),
                 KnowledgeSource.content.is_not(None),
             )
         )

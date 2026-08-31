@@ -304,7 +304,7 @@ export default function KnowledgeStudio() {
     await runAction(
       'upload-pdf',
       () => api.uploadKnowledgePdf(selected.id, file),
-      `${file.name} was queued for indexing.`,
+      `${file.name} passed VAV extraction and was sent for provider indexing. Re-uploading the same filename updates it in place.`,
       { syncPendingBindings: true },
     );
     event.currentTarget.reset();
@@ -448,11 +448,11 @@ export default function KnowledgeStudio() {
                   {canEditKnowledge && <button type="button" className="btn btn-secondary btn-sm" disabled={working !== null} onClick={() => { setShowCreate(false); setShowEdit(true); }}><Pencil size={12} /> Edit details</button>}
                   {canGovernKnowledge && <button type="button" className="btn btn-ghost btn-sm" disabled={working !== null} onClick={deleteSelected} aria-label={`Delete ${selected.name}`}><Trash2 size={13} /> Delete</button>}
                 </div>
-                <div className={styles.progressRail} aria-label={`${selected.indexed_source_count} of ${selected.source_count} sources indexed`}>
+                <div className={styles.progressRail} aria-label={`${selected.indexed_source_count} of ${selected.source_count} documents ready for agents`}>
                   <div style={{ width: `${selected.source_count ? Math.round(selected.indexed_source_count / selected.source_count * 100) : 0}%` }} />
                 </div>
                 <div className={styles.heroMeta}>
-                  <span><strong>{selected.indexed_source_count}/{selected.source_count}</strong> indexed</span>
+                  <span><strong>{selected.indexed_source_count}/{selected.source_count}</strong> ready for agents</span>
                   <span><strong>{selected.languages.join(', ').toUpperCase()}</strong> languages</span>
                   <span><strong>{selected.agent_bindings.length}</strong> bound agents</span>
                   <span><strong>{selected.last_synced_at ? formatDate(selected.last_synced_at) : 'Never'}</strong> provider check</span>
@@ -546,7 +546,7 @@ function SitemapForm({ busy, onSubmit, urls, selected, onToggle, onToggleAll, on
 }
 
 function PdfForm({ busy, onSubmit }: { busy: boolean; onSubmit: (event: FormEvent<HTMLFormElement>) => void }) {
-  return <form onSubmit={onSubmit} className={styles.uploadForm}><div className={styles.uploadDrop}><Upload size={22} /><div><label htmlFor="knowledge-pdf">Choose an approved PDF</label><p>PDF only · maximum 8 MB · remove confidential or customer-specific data first</p></div><input id="knowledge-pdf" name="media" type="file" accept="application/pdf,.pdf" required /></div><button type="submit" className="btn btn-primary" disabled={busy}>{busy ? <Loader2 className="spin" size={14} /> : <CloudUpload size={14} />} Upload and index</button></form>;
+  return <form onSubmit={onSubmit} className={styles.uploadForm}><div className={styles.uploadDrop}><Upload size={22} /><div><label htmlFor="knowledge-pdf">Choose an approved PDF</label><p>VAV extracts text automatically and OCRs scanned pages · same filename safely updates one document · maximum 8 MB</p></div><input id="knowledge-pdf" name="media" type="file" accept="application/pdf,.pdf" required /></div><button type="submit" className="btn btn-primary" disabled={busy}>{busy ? <Loader2 className="spin" size={14} /> : <CloudUpload size={14} />} Validate and index</button></form>;
 }
 
 function TextForm({ busy, onSubmit }: { busy: boolean; onSubmit: (event: FormEvent<HTMLFormElement>) => void }) {
@@ -554,7 +554,12 @@ function TextForm({ busy, onSubmit }: { busy: boolean; onSubmit: (event: FormEve
 }
 
 function SourcesSection({ sources, canRemove, busy, onRemove }: { sources: KnowledgeSource[]; canRemove: boolean; busy: boolean; onRemove: (source: KnowledgeSource) => void }) {
-  return <section className={styles.section} aria-labelledby="sources-heading"><div className={styles.sectionHeading}><div><span className={styles.sectionIcon}><Layers3 size={15} /></span><div><h3 id="sources-heading">Source inventory</h3><p>Provider status and voice-searchable text are checked separately.</p></div></div><span className="badge badge-neutral">{sources.length} sources</span></div>{sources.length === 0 ? <div className={styles.sourceEmpty}><FileText size={20} /><div><strong>No sources yet</strong><p>Add curated web pages or an approved PDF to begin indexing.</p></div></div> : <div className={styles.sourceList}>{sources.map((source) => <article className={styles.sourceRow} key={source.id}><span className={styles.sourceTypeIcon}>{source.source_type === 'file' ? <FileText size={16} /> : source.source_type === 'text' ? <Layers3 size={16} /> : <Globe2 size={16} />}</span><div className={styles.sourceIdentity}><strong>{source.name}</strong><span>{source.location || (source.size_bytes ? formatBytes(source.size_bytes) : source.source_type)} · {source.retrieval_ready ? `${source.extracted_character_count.toLocaleString()} searchable characters` : 'no voice-searchable text'}</span>{!source.retrieval_ready && source.status === 'indexed' && <p>Provider indexed, but VAV found no readable text. Upload a text-searchable PDF or add the directory as text.</p>}{source.error_message && <p>{source.error_message}</p>}</div><span className={`badge ${sourceBadge(source.status)}`}>{source.status.replace('_', ' ')}</span><time>{formatDate(source.last_synced_at || source.updated_at)}</time>{canRemove && <button type="button" className="icon-button" disabled={busy} onClick={() => onRemove(source)} aria-label={`Remove ${source.name} from VAV and Smallest.ai`} title="Remove from VAV and Smallest.ai"><Trash2 size={14} /></button>}</article>)}</div>}</section>;
+  const readyCount = sources.filter((source) => source.retrieval_ready && source.status === 'indexed').length;
+  return <section className={styles.section} aria-labelledby="sources-heading"><div className={styles.sectionHeading}><div><span className={styles.sectionIcon}><Layers3 size={15} /></span><div><h3 id="sources-heading">Source inventory</h3><p>One row per document. “Ready for agents” requires provider indexing and searchable VAV text.</p></div></div><span className="badge badge-neutral">{sources.length} documents · {readyCount} ready</span></div>{sources.length === 0 ? <div className={styles.sourceEmpty}><FileText size={20} /><div><strong>No sources yet</strong><p>Add curated web pages or an approved PDF to begin indexing.</p></div></div> : <div className={styles.sourceList}>{sources.map((source) => {
+    const method = typeof source.source_metadata?.extraction_method === 'string' ? source.source_metadata.extraction_method : null;
+    const isReady = source.retrieval_ready && source.status === 'indexed';
+    return <article className={styles.sourceRow} key={source.id}><span className={styles.sourceTypeIcon}>{source.source_type === 'file' ? <FileText size={16} /> : source.source_type === 'text' ? <Layers3 size={16} /> : <Globe2 size={16} />}</span><div className={styles.sourceIdentity}><strong>{source.name}</strong><span>{source.location || (source.size_bytes ? formatBytes(source.size_bytes) : source.source_type)} · {source.retrieval_ready ? `${source.extracted_character_count.toLocaleString()} searchable characters${method ? ` · ${method === 'native' ? 'text extracted' : `${method} OCR`}` : ''}` : 'no voice-searchable text'}</span>{!source.retrieval_ready && <p>VAV cannot use this document yet. Re-upload it to run extraction and OCR repair.</p>}{source.error_message && <p>{source.error_message}</p>}</div><span className={`badge ${isReady ? 'badge-success' : sourceBadge(source.status)}`}>{isReady ? 'Ready for agents' : source.status.replace('_', ' ')}</span><time>{formatDate(source.last_synced_at || source.updated_at)}</time>{canRemove && <button type="button" className="icon-button" disabled={busy} onClick={() => onRemove(source)} aria-label={`Remove ${source.name} from VAV and Smallest.ai`} title="Remove from VAV and Smallest.ai"><Trash2 size={14} /></button>}</article>;
+  })}</div>}</section>;
 }
 
 function AgentBinding({ selected, agents, busy, canManage, onBind, onUnbind }: { selected: KnowledgeBase; agents: VoiceAgent[]; busy: boolean; canManage: boolean; onBind: (agentId: string) => void; onUnbind: (agentId: string) => void }) {

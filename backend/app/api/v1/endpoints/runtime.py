@@ -12,7 +12,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.core.database import get_db
 from app.middleware.tenant import CurrentUser, get_current_user, require_role
-from app.models.agent import Agent, AgentRuntimeProfile
+from app.models.agent import (
+    Agent,
+    AgentKnowledgeBinding,
+    AgentRuntimeProfile,
+    KnowledgeBase,
+    KnowledgeSource,
+)
 from app.schemas.runtime import (
     ApiKeyCredentialRequest,
     RuntimeProfileResponse,
@@ -82,6 +88,39 @@ async def runtime_readiness(
         twilio_config = await load_provider_config(db, agent.tenant_id, "twilio")
     except ProviderCredentialError:
         twilio_config = None
+    knowledge_binding = await db.scalar(
+        select(AgentKnowledgeBinding).where(
+            AgentKnowledgeBinding.agent_id == agent.id,
+            AgentKnowledgeBinding.tenant_id == agent.tenant_id,
+        )
+    )
+    knowledge_ready = True
+    if knowledge_binding is not None:
+        bound_knowledge = await db.scalar(
+            select(KnowledgeBase).where(
+                KnowledgeBase.id == knowledge_binding.knowledge_base_id,
+                KnowledgeBase.tenant_id == agent.tenant_id,
+                KnowledgeBase.is_active.is_(True),
+                KnowledgeBase.approval_status == "approved",
+            )
+        )
+        if bound_knowledge is None:
+            knowledge_ready = False
+        else:
+            source_states = (
+                await db.execute(
+                    select(KnowledgeSource.status, KnowledgeSource.content).where(
+                        KnowledgeSource.knowledge_base_id == bound_knowledge.id,
+                        KnowledgeSource.tenant_id == agent.tenant_id,
+                    )
+                )
+            ).all()
+            knowledge_ready = bool(source_states) and all(
+                status in {"processing", "indexed", "local_only"}
+                and bool(str(content or "").strip())
+                for status, content in source_states
+            )
+
     checks = {
         "agent_active": bool(agent.is_active),
         "sarvam_agent": agent.voice_provider == "sarvam",
@@ -93,6 +132,7 @@ async def runtime_readiness(
         "public_runtime_url": settings.base_url.startswith("https://"),
         "telephony_credential": False,
         "number_assigned": bool(profile and profile.assigned_numbers),
+        "knowledge_retrieval": knowledge_ready,
     }
     if profile and profile.telephony_provider == "twilio":
         checks["telephony_credential"] = bool(
@@ -124,6 +164,9 @@ async def runtime_readiness(
         "public_runtime_url": "Configure BASE_URL as the public HTTPS API origin.",
         "telephony_credential": "Add credentials for the selected telephony provider in Settings.",
         "number_assigned": "Assign at least one E.164 phone number to the runtime.",
+        "knowledge_retrieval": (
+            "Repair the bound knowledge base so every source has searchable text."
+        ),
         "sip_gateway_provisioned": (
             "Provision and verify the external LiveKit SIP/RTP gateway for the Etisalat trunk."
         ),

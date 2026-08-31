@@ -15,6 +15,7 @@ from app.api.v1.endpoints.knowledge import (
     _reconcile_provider_sources,
 )
 from app.models.agent import Agent, AgentKnowledgeBinding, KnowledgeBase, KnowledgeSource
+from app.services.pdf_ingestion import PreparedPdf
 
 
 def _knowledge(source):
@@ -173,6 +174,40 @@ def test_reconcile_preserves_existing_local_pdf_text():
     assert source.source_metadata == {"retrieval_content_source": "local_pdf"}
 
 
+def test_reconcile_fails_closed_when_provider_indexed_pdf_has_no_retrievable_text():
+    source = SimpleNamespace(
+        source_type="file",
+        name="unreadable.pdf",
+        location=None,
+        content=None,
+        source_metadata=None,
+        status="processing",
+        provider_item_id=None,
+        last_synced_at=None,
+        error_message=None,
+    )
+    knowledge = _knowledge(source)
+
+    _reconcile_provider_sources(
+        knowledge,
+        scraped=[],
+        items=[
+            {
+                "_id": "provider-pdf-unreadable",
+                "fileName": "unreadable.pdf",
+                "processingStatus": "completed",
+            }
+        ],
+        provider_knowledge_base={"processingStatus": "completed"},
+        now=datetime.now(UTC),
+    )
+
+    assert source.status == "failed"
+    assert "no retrievable text" in source.error_message
+    assert knowledge.sync_status == "error"
+    assert knowledge.indexed_source_count == 0
+
+
 def test_reconcile_matches_smallest_completed_scrape_batch():
     source = _url_source()
     knowledge = _knowledge(source)
@@ -317,11 +352,31 @@ async def test_pdf_upload_marks_existing_provider_binding_for_publish(
     monkeypatch,
 ):
     class KnowledgeClient:
+        async def list_knowledge_items(self, knowledge_base_id):
+            assert knowledge_base_id == "provider-kb-1"
+            return []
+
         async def upload_knowledge_pdf(self, **kwargs):
             assert kwargs["knowledge_base_id"] == "provider-kb-1"
             assert kwargs["file_name"] == "botox.pdf"
+            return {"data": {"_id": "provider-pdf-1"}}
+
+        async def delete_knowledge_item(self, **kwargs):
+            raise AssertionError("No stale item should exist")
 
     monkeypatch.setattr(knowledge_endpoint, "get_smallest_client", KnowledgeClient)
+    monkeypatch.setattr(
+        knowledge_endpoint,
+        "prepare_pdf",
+        lambda *_args, **_kwargs: PreparedPdf(
+            provider_content=b"%PDF-1.4\nsearchable",
+            extracted_text="Botox treatment knowledge for reliable customer support.",
+            extraction_method="native",
+            page_count=1,
+            sha256="f" * 64,
+            ocr_page_count=0,
+        ),
+    )
     created = await client.post(
         "/api/v1/agents",
         headers=auth_headers,
@@ -361,7 +416,19 @@ async def test_pdf_upload_marks_existing_provider_binding_for_publish(
     )
 
     assert response.status_code == 200
+    first_source_id = response.json()["sources"][0]["id"]
     assert response.json()["agent_bindings"][0]["sync_status"] == "pending"
+
+    replacement = await client.post(
+        f"/api/v1/knowledge/{knowledge.id}/sources/pdf",
+        headers=auth_headers,
+        files={"media": ("botox.pdf", b"%PDF-1.4\nreplacement", "application/pdf")},
+    )
+
+    assert replacement.status_code == 200
+    assert replacement.json()["source_count"] == 1
+    assert replacement.json()["sources"][0]["id"] == first_source_id
+    assert replacement.json()["sources"][0]["retrieval_ready"] is True
     persisted_agent = await db.scalar(
         select(Agent).where(Agent.id == agent.id).execution_options(populate_existing=True)
     )
@@ -461,6 +528,7 @@ async def test_delete_grouped_url_source_removes_provider_and_local_group(
         knowledge_base_id=knowledge.id,
         source_type="file",
         name="doctors.pdf",
+        content="Searchable doctor directory content.",
         status="indexed",
         provider_item_id="provider-pdf-1",
     )
