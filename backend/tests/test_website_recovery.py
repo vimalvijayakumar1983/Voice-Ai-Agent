@@ -5,6 +5,7 @@ from app.services import website_recovery
 from app.services.website_recovery import (
     RecoveredPage,
     WebsiteRecoveryError,
+    _is_related_site_hostname,
     download_html,
     extract_readable_text,
     recover_page,
@@ -37,6 +38,34 @@ def test_extract_readable_text_removes_scripts_and_keeps_structured_content():
     assert "+971 2 555 0100" in text
     assert "alert" not in text
     assert "Repeated navigation" not in text
+
+
+def test_extract_readable_text_removes_repeated_page_chrome():
+    _title, text = extract_readable_text(
+        """
+        <html><head><title>Chemical peeling</title></head><body>
+          <header><p>Clinic phone repeated on every page</p></header>
+          <nav><p>Home Treatments Doctors Offers</p></nav>
+          <main><h1>Chemical peeling</h1>
+            <p>Chemical peeling guidance that is long enough to be useful to callers,
+            including preparation, consultation and aftercare information.</p>
+          </main>
+          <footer><p>Copyright and repeated footer links</p></footer>
+        </body></html>
+        """,
+        url="https://clinic.example/treatments/peeling",
+    )
+
+    assert "preparation, consultation and aftercare" in text
+    assert "phone repeated" not in text
+    assert "footer links" not in text
+
+
+def test_related_api_host_scope_accepts_only_same_site_subdomains():
+    assert _is_related_site_hostname("aecmc.com", "adminxpanel.aecmc.com")
+    assert _is_related_site_hostname("www.clinic.example", "api.clinic.example")
+    assert not _is_related_site_hostname("clinic.example", "clinic.example.attacker.test")
+    assert not _is_related_site_hostname("clinic.example", "unrelated.example")
 
 
 @pytest.mark.asyncio

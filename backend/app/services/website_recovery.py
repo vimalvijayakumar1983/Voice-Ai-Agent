@@ -21,6 +21,9 @@ from bs4 import BeautifulSoup
 from app.services.integration_security import IntegrationConfigError, validate_public_https_url
 
 MAX_WEBSITE_BYTES = 5 * 1024 * 1024
+MAX_BROWSER_API_BYTES = 2 * 1024 * 1024
+MAX_BROWSER_API_BODY_BYTES = 256 * 1024
+MAX_BROWSER_API_REQUESTS = 24
 MAX_EXTRACTED_CHARS = 500_000
 MAX_PROVIDER_PDF_BYTES = 8 * 1024 * 1024
 MIN_USEFUL_CHARS = 120
@@ -81,6 +84,15 @@ def recovery_metadata(
 
 def _canonical_hostname(hostname: str) -> str:
     return hostname.rstrip(".").encode("idna").decode("ascii").lower()
+
+
+def _is_related_site_hostname(page_hostname: str, request_hostname: str | None) -> bool:
+    """Allow the site's own host and its subdomains, including APIs behind www sites."""
+    if not request_hostname:
+        return False
+    trusted_site = _canonical_hostname(page_hostname).removeprefix("www.")
+    candidate = _canonical_hostname(request_hostname)
+    return candidate == trusted_site or candidate.endswith(f".{trusted_site}")
 
 
 class _PinnedNetworkBackend(httpcore.AsyncNetworkBackend):
@@ -301,7 +313,20 @@ def extract_readable_text(document: str, *, url: str) -> tuple[str, str]:
             structured.extend(_json_strings(json.loads(tag.string or "")))
         except (TypeError, ValueError, json.JSONDecodeError):
             continue
-    for tag in soup.find_all(("script", "style", "noscript", "svg", "canvas", "template")):
+    for tag in soup.find_all(
+        (
+            "script",
+            "style",
+            "noscript",
+            "svg",
+            "canvas",
+            "template",
+            "nav",
+            "header",
+            "footer",
+            "aside",
+        )
+    ):
         tag.decompose()
     semantic_root = soup.find("main") or soup.find("article") or soup.find(attrs={"role": "main"})
     body_root = soup.body or soup
@@ -383,21 +408,97 @@ async def render_html(url: str) -> tuple[str, int]:
                 ],
             )
             page = await browser.new_page(service_workers="block")
+            proxied_api_requests = 0
+
+            async def proxy_related_api(route) -> None:
+                """Safely relay public same-site APIs used by JavaScript-only pages.
+
+                Chromium is never allowed to resolve these hosts itself. The relay
+                validates and pins DNS immediately before the request, retaining the
+                SSRF guarantees used by the ordinary website downloader.
+                """
+                request = route.request
+                method = request.method.upper()
+                body = request.post_data_buffer or b""
+                if method not in {"GET", "POST"} or len(body) > MAX_BROWSER_API_BODY_BYTES:
+                    await route.abort()
+                    return
+                request_hostname, address = await _resolve_public_destination(request.url)
+                transport = _PinnedAsyncHTTPTransport(request_hostname, address)
+                forwarded_headers = {
+                    key: value
+                    for key, value in request.headers.items()
+                    if key.lower() in {"accept", "content-type", "accept-language"}
+                }
+                forwarded_headers["User-Agent"] = (
+                    "VAV-Knowledge-Recovery/1.0 (+website knowledge indexing)"
+                )
+                async with httpx.AsyncClient(
+                    transport=transport,
+                    timeout=FETCH_TIMEOUT,
+                    follow_redirects=False,
+                    headers=forwarded_headers,
+                ) as client:
+                    async with client.stream(method, request.url, content=body) as response:
+                        content_length = response.headers.get("content-length")
+                        if content_length and int(content_length) > MAX_BROWSER_API_BYTES:
+                            await route.abort()
+                            return
+                        content = bytearray()
+                        async for chunk in response.aiter_bytes():
+                            content.extend(chunk)
+                            if len(content) > MAX_BROWSER_API_BYTES:
+                                await route.abort()
+                                return
+                        response_headers = {
+                            key: value
+                            for key, value in response.headers.items()
+                            if key.lower()
+                            not in {
+                                "content-encoding",
+                                "content-length",
+                                "connection",
+                                "transfer-encoding",
+                            }
+                        }
+                        response_headers["access-control-allow-origin"] = "*"
+                        await route.fulfill(
+                            status=response.status_code,
+                            headers=response_headers,
+                            body=bytes(content),
+                        )
 
             async def guard_request(route):
+                nonlocal proxied_api_requests
                 parsed = urlsplit(route.request.url)
-                if parsed.scheme != "https" or parsed.hostname != hostname:
+                if parsed.scheme != "https":
                     await route.abort()
                     return
                 if route.request.resource_type in {"image", "media", "font"}:
                     await route.abort()
                     return
-                await route.continue_()
+                if parsed.hostname == hostname:
+                    await route.continue_()
+                    return
+                if (
+                    route.request.resource_type in {"xhr", "fetch"}
+                    and _is_related_site_hostname(hostname, parsed.hostname)
+                    and proxied_api_requests < MAX_BROWSER_API_REQUESTS
+                ):
+                    proxied_api_requests += 1
+                    try:
+                        await proxy_related_api(route)
+                    except (WebsiteRecoveryError, httpx.HTTPError, OSError, ValueError):
+                        await route.abort()
+                    return
+                await route.abort()
 
             await page.route("**/*", guard_request)
             try:
                 await page.goto(url, wait_until="domcontentloaded", timeout=20_000)
-                await page.wait_for_timeout(1_500)
+                with suppress(PlaywrightTimeoutError):
+                    await page.wait_for_load_state("networkidle", timeout=5_000)
+                await page.wait_for_timeout(750)
             except PlaywrightTimeoutError:
                 # A slow analytics request must not discard already-rendered content.
                 pass
