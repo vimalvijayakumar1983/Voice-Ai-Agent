@@ -281,9 +281,7 @@ def extract_readable_text(document: str, *, url: str) -> tuple[str, str]:
     title = " ".join((soup.title.get_text(" ", strip=True) if soup.title else "").split())
     description_tag = soup.find("meta", attrs={"name": "description"})
     description = (
-        " ".join(str(description_tag.get("content") or "").split())
-        if description_tag
-        else ""
+        " ".join(str(description_tag.get("content") or "").split()) if description_tag else ""
     )
     structured: list[str] = []
     for tag in soup.find_all("script", attrs={"type": "application/ld+json"}):
@@ -443,9 +441,7 @@ def searchable_pdf(*, title: str, url: str, text: str) -> bytes:
     """Create a searchable provider artifact from recovered web text."""
     paragraphs = "".join(f"<p>{html.escape(part)}</p>" for part in text.split("\n\n") if part)
     document_html = (
-        f"<h1>{html.escape(title)}</h1>"
-        f"<p><b>Source:</b> {html.escape(url)}</p>"
-        f"{paragraphs}"
+        f"<h1>{html.escape(title)}</h1><p><b>Source:</b> {html.escape(url)}</p>{paragraphs}"
     )
     output = io.BytesIO()
     writer = pymupdf.DocumentWriter(output)

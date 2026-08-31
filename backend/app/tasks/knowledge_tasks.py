@@ -128,10 +128,14 @@ async def _context(tenant_id: UUID, kb_id: UUID, source_id: UUID):
             selectinload(KnowledgeBase.agent_bindings).selectinload(AgentKnowledgeBinding.agent),
         )
     )
-    source = next(
-        (candidate for candidate in knowledge_base.sources if candidate.id == source_id),
-        None,
-    ) if knowledge_base else None
+    source = (
+        next(
+            (candidate for candidate in knowledge_base.sources if candidate.id == source_id),
+            None,
+        )
+        if knowledge_base
+        else None
+    )
     if knowledge_base is None or source is None:
         await session.close()
         raise WebsiteRecoveryError(
@@ -345,11 +349,7 @@ async def _repair(tenant_id: UUID, kb_id: UUID, source_id: UUID) -> None:
 
         for item in existing_items:
             old_id = str(item.get("_id") or item.get("id") or "")
-            if (
-                old_id
-                and old_id != provider_item_id
-                and _provider_file_name(item) == artifact_name
-            ):
+            if old_id and old_id != provider_item_id and _provider_file_name(item) == artifact_name:
                 try:
                     await provider.delete_knowledge_item(
                         knowledge_base_id=remote_id,

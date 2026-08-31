@@ -746,9 +746,7 @@ async def repair_website_source(
             detail="Only website URL sources can use automatic page recovery",
         )
     recovery = (
-        source.source_metadata.get("recovery")
-        if isinstance(source.source_metadata, dict)
-        else None
+        source.source_metadata.get("recovery") if isinstance(source.source_metadata, dict) else None
     )
     if isinstance(recovery, dict) and recovery.get("status") in {"queued", "processing"}:
         raise HTTPException(status_code=409, detail="This website page is already being repaired")

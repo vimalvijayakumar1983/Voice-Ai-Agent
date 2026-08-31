@@ -614,6 +614,4 @@ async def test_failed_website_source_can_be_queued_for_vav_repair(
     assert repaired["error_message"] is None
     assert repaired["source_metadata"]["recovery_attempts"] == 1
     assert repaired["source_metadata"]["recovery"]["stage"] == "queued"
-    assert queued == [
-        ([str(tenant.id), str(knowledge.id), str(source.id)], "knowledge")
-    ]
+    assert queued == [([str(tenant.id), str(knowledge.id), str(source.id)], "knowledge")]
