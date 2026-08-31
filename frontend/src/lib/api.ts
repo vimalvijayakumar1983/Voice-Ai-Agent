@@ -66,6 +66,38 @@ export interface VoiceAgent {
   updated_at: string;
 }
 
+export interface AgentAIDraftRequest {
+  brief: string;
+  provider_preference: 'auto' | 'smallest' | 'sarvam';
+  primary_language: string;
+  timezone: string;
+}
+
+export interface AgentAIDraftResponse {
+  draft: {
+    name: string;
+    description: string | null;
+    system_prompt: string;
+    greeting_message: string | null;
+    model_provider: string;
+    model_name: string;
+    voice_provider: 'smallest' | 'sarvam';
+    voice_id: string;
+    temperature: number;
+    language: string;
+    supported_languages: string[];
+    language_switching_enabled: boolean;
+    language_switching_mode: 'disabled' | 'automatic';
+    speech_rate: number;
+    timezone: string;
+  };
+  rationale: string;
+  assumptions: string[];
+  recommended_knowledge_base_id: string | null;
+  recommended_knowledge_base_name: string | null;
+  model: string;
+}
+
 export interface ProviderStatus {
   provider: 'smallest';
   configured: boolean;
@@ -1187,6 +1219,13 @@ class ApiClient {
 
   async createAgent(data: Partial<VoiceAgent> & { name: string; system_prompt: string }) {
     return this.request<VoiceAgent>('/api/v1/agents', { method: 'POST', body: JSON.stringify(data) });
+  }
+
+  async generateAgentDraft(data: AgentAIDraftRequest) {
+    return this.request<AgentAIDraftResponse>('/api/v1/agents/ai-draft', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    });
   }
 
   async getAgent(id: string) {

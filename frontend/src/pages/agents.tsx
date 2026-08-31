@@ -1,4 +1,5 @@
 import Link from 'next/link';
+import { useRouter } from 'next/router';
 import { useEffect, useMemo, useState } from 'react';
 import {
   ArrowDownAZ,
@@ -19,6 +20,7 @@ import {
   X,
 } from 'lucide-react';
 import AgentEditor, { AgentEditorValues, defaultAgentValues } from '@/components/AgentEditor';
+import AgentAIWizard from '@/components/AgentAIWizard';
 import RuntimeControlPanel from '@/components/RuntimeControlPanel';
 import agentEditorDiff from '@/components/agent-editor-diff.cjs';
 import Layout from '@/components/Layout';
@@ -29,7 +31,7 @@ import {
   providerActionLabel,
   providerActionNotice,
 } from '@/lib/agent-readiness.cjs';
-import { api, AgentProviderCatalog, ProviderStatus, RuntimeProfile, VoiceAgent } from '@/lib/api';
+import { api, AgentAIDraftRequest, AgentAIDraftResponse, AgentProviderCatalog, ProviderStatus, RuntimeProfile, VoiceAgent } from '@/lib/api';
 
 const { agentEditorPatch, agentUpdateNotice, requiresSmallestDeprovision } = agentEditorDiff;
 
@@ -38,12 +40,15 @@ type DeploymentFilter = 'all' | 'local' | 'synced' | 'changes' | 'attention';
 type AgentSort = 'updated' | 'created' | 'name-asc' | 'name-desc';
 
 export default function Agents() {
+  const router = useRouter();
   const [agents, setAgents] = useState<VoiceAgent[]>([]);
   const [provider, setProvider] = useState<ProviderStatus | null>(null);
   const [catalog, setCatalog] = useState<AgentProviderCatalog | null>(null);
   const [runtimeProfiles, setRuntimeProfiles] = useState<Record<string, RuntimeProfile>>({});
   const [runtimeAgentId, setRuntimeAgentId] = useState<string | null>(null);
   const [showCreate, setShowCreate] = useState(false);
+  const [showAIWizard, setShowAIWizard] = useState(false);
+  const [generatedDraft, setGeneratedDraft] = useState<AgentAIDraftResponse | null>(null);
   const [editingAgentId, setEditingAgentId] = useState<string | null>(null);
   const [working, setWorking] = useState<string | null>(null);
   const [notice, setNotice] = useState<{ type: 'success' | 'info' | 'error'; text: string } | null>(null);
@@ -135,6 +140,7 @@ export default function Agents() {
     Boolean(voice.synthesizer_model) && !voice.unavailability_reason
   )).length;
   const catalogReady = Boolean(catalog && catalog.voices.length && catalog.languages.length);
+  const aiWizardVisible = showAIWizard || (router.query.create === 'ai' && !showCreate);
 
   const openCreate = () => {
     if (!catalogReady) {
@@ -142,17 +148,52 @@ export default function Agents() {
       return;
     }
     setEditingAgentId(null);
+    setShowAIWizard(false);
+    setGeneratedDraft(null);
     setShowCreate(true);
+    setNotice(null);
+    if (router.query.create === 'ai') void router.replace('/agents', undefined, { shallow: true });
+  };
+
+  const openAIWizard = () => {
+    if (!catalogReady) {
+      setNotice({ type: 'error', text: 'The provider catalog must load before AI can generate a valid voice configuration.' });
+      return;
+    }
+    setEditingAgentId(null);
+    setShowCreate(false);
+    setGeneratedDraft(null);
+    setShowAIWizard(true);
     setNotice(null);
   };
 
+  const generateAIDraft = async (request: AgentAIDraftRequest) => {
+    setWorking('ai-draft');
+    setNotice(null);
+    try {
+      const result = await api.generateAgentDraft(request);
+      setGeneratedDraft(result);
+      setShowAIWizard(false);
+      setShowCreate(true);
+      setNotice({ type: 'info', text: 'OpenAI generated a constrained local draft. Review every field before saving it.' });
+      if (router.query.create === 'ai') void router.replace('/agents', undefined, { shallow: true });
+    } catch (error) {
+      setNotice({ type: 'error', text: errorMessage(error, 'OpenAI could not generate the agent draft.') });
+    } finally {
+      setWorking(null);
+    }
+  };
+
   const openEdit = (agent: VoiceAgent) => {
+    setShowAIWizard(false);
+    setGeneratedDraft(null);
     setShowCreate(false);
     setEditingAgentId(agent.id);
     setNotice(catalogReady ? null : {
       type: 'info',
       text: 'The provider catalog is unavailable. Existing voice and language settings are locked, but unrelated fields remain editable.',
     });
+    if (router.query.create === 'ai') void router.replace('/agents', undefined, { shallow: true });
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
 
@@ -203,6 +244,7 @@ export default function Agents() {
         const created = await api.createAgent(values);
         setAgents((current) => [created, ...current]);
         setShowCreate(false);
+        setGeneratedDraft(null);
         setNotice({ type: 'success', text: `${created.name} was created as a local draft.` });
       }
     } catch (error) {
@@ -321,11 +363,16 @@ export default function Agents() {
 
   const closeEditor = () => {
     setShowCreate(false);
+    setShowAIWizard(false);
+    setGeneratedDraft(null);
     setEditingAgentId(null);
+    if (router.query.create === 'ai') void router.replace('/agents', undefined, { shallow: true });
   };
 
   const retryLoad = () => {
     setShowCreate(false);
+    setShowAIWizard(false);
+    setGeneratedDraft(null);
     setEditingAgentId(null);
     setLoading(true);
     setLoadErrors({});
@@ -347,6 +394,13 @@ export default function Agents() {
         </div>
         <div className="header-actions">
           <Link href="/playground" className="btn btn-secondary"><FlaskConical size={14} /> Open playground</Link>
+          <button
+            className="btn btn-secondary"
+            onClick={aiWizardVisible ? closeEditor : openAIWizard}
+            disabled={loading || (!aiWizardVisible && !catalogReady)}
+          >
+            {aiWizardVisible ? <X size={14} /> : <Sparkles size={14} />}{aiWizardVisible ? 'Close AI wizard' : 'Create with AI'}
+          </button>
           <button
             className="btn btn-primary"
             onClick={showCreate ? closeEditor : openCreate}
@@ -379,6 +433,27 @@ export default function Agents() {
         />
       ) : null}
 
+      {aiWizardVisible && catalog ? (
+        <section className="card create-panel agent-editor-panel">
+          <aside className="create-panel-aside">
+            <Sparkles size={22} />
+            <h3>AI agent architect</h3>
+            <p>Describe the outcome. VAV asks OpenAI for a safe draft, then validates it against live voices, languages, providers, and approved knowledge bases.</p>
+            <div className="catalog-stats">
+              <div><strong>{usableVoiceCount ?? '—'}</strong><span>usable catalog voices</span></div>
+              <div><strong>{catalog.languages.length}</strong><span>catalog languages</span></div>
+              <div><strong>0</strong><span>automatic publishes</span></div>
+            </div>
+          </aside>
+          <AgentAIWizard
+            catalog={catalog}
+            busy={working === 'ai-draft'}
+            onCancel={closeEditor}
+            onGenerate={generateAIDraft}
+          />
+        </section>
+      ) : null}
+
       {loading && (
         <div className="page-loading" role="status" aria-live="polite">
           <Loader2 className="spin" size={16} /> Loading agents and provider capabilities…
@@ -402,8 +477,10 @@ export default function Agents() {
         <section className="card create-panel agent-editor-panel">
           <aside className="create-panel-aside">
             <Sparkles size={22} />
-            <h3>{editingAgent ? `Edit ${editingAgent.name}` : 'Create a local agent draft.'}</h3>
-            <p>{editingAgent ? 'Changes to a provisioned agent remain local until a provider publish succeeds.' : 'Choose a built-in starting point, review every field, then provision deliberately.'}</p>
+            <h3>{editingAgent ? `Edit ${editingAgent.name}` : generatedDraft ? 'Review the AI-generated draft.' : 'Create a local agent draft.'}</h3>
+            <p>{editingAgent ? 'Changes to a provisioned agent remain local until a provider publish succeeds.' : generatedDraft ? generatedDraft.rationale : 'Choose a built-in starting point, review every field, then provision deliberately.'}</p>
+            {generatedDraft?.recommended_knowledge_base_name ? <p><strong>Recommended knowledge:</strong> {generatedDraft.recommended_knowledge_base_name}</p> : null}
+            {generatedDraft?.assumptions.length ? <ul>{generatedDraft.assumptions.map((assumption) => <li key={assumption}>{assumption}</li>)}</ul> : null}
             <div className="catalog-stats">
               <div><strong>{usableVoiceCount ?? '—'}</strong><span>usable catalog voices</span></div>
               <div><strong>{catalog?.languages.length ?? '—'}</strong><span>catalog languages</span></div>
@@ -411,11 +488,11 @@ export default function Agents() {
             </div>
           </aside>
           <AgentEditor
-            key={editingAgent?.id ?? 'create'}
+            key={editingAgent?.id ?? (generatedDraft ? `ai-${generatedDraft.draft.name}` : 'create')}
             mode={editingAgent ? 'edit' : 'create'}
             catalog={catalog}
             catalogError={loadErrors.catalog ?? null}
-            initialValues={editingAgent ? editorValues(editingAgent) : defaultAgentValues}
+            initialValues={editingAgent ? editorValues(editingAgent) : generatedDraft ? aiDraftValues(generatedDraft) : defaultAgentValues}
             busy={working === (editingAgent ? `save-${editingAgent.id}` : 'save-new')}
             onCancel={closeEditor}
             onSubmit={saveAgent}
@@ -562,6 +639,27 @@ function editorValues(agent: VoiceAgent): AgentEditorValues {
     language_switching_mode: agent.language_switching_mode,
     speech_rate: agent.speech_rate,
     timezone: agent.timezone,
+  };
+}
+
+function aiDraftValues(result: AgentAIDraftResponse): AgentEditorValues {
+  const draft = result.draft;
+  return {
+    name: draft.name,
+    description: draft.description ?? '',
+    system_prompt: draft.system_prompt,
+    greeting_message: draft.greeting_message ?? '',
+    model_provider: draft.model_provider,
+    model_name: draft.model_name,
+    voice_provider: draft.voice_provider,
+    voice_id: draft.voice_id,
+    temperature: draft.temperature,
+    language: draft.language,
+    supported_languages: draft.supported_languages,
+    language_switching_enabled: draft.language_switching_enabled,
+    language_switching_mode: draft.language_switching_mode,
+    speech_rate: draft.speech_rate,
+    timezone: draft.timezone,
   };
 }
 

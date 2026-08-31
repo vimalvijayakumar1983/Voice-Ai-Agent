@@ -40,6 +40,8 @@ from app.providers.smallest import (
     resolve_active_knowledge_base_id,
 )
 from app.schemas.agent import (
+    AgentAIDraftRequest,
+    AgentAIDraftResponse,
     AgentCreate,
     AgentProviderCatalog,
     AgentResponse,
@@ -54,6 +56,11 @@ from app.schemas.agent import (
     VoiceCloneResponse,
     VoicePreviewRequest,
     validate_language_configuration,
+)
+from app.services.agent_ai_wizard import (
+    AgentAIWizardError,
+    KnowledgeBaseSummary,
+    generate_agent_ai_draft,
 )
 from app.services.agent_catalog import (
     AGENT_TEMPLATES,
@@ -74,6 +81,7 @@ from app.services.integration_security import (
     decrypt_integration_config,
     encrypt_integration_config,
 )
+from app.services.provider_credentials import ProviderCredentialError, load_provider_config
 from app.services.rate_limit import enforce_rate_limit
 
 router = APIRouter(prefix="/agents", tags=["Agents"])
@@ -2024,6 +2032,89 @@ async def create_agent(
     db.add(agent)
     await db.flush()
     return AgentResponse.model_validate(agent)
+
+
+@router.post("/ai-draft", response_model=AgentAIDraftResponse)
+async def create_agent_ai_draft(
+    data: AgentAIDraftRequest,
+    request: Request,
+    current_user: CurrentUser = Depends(require_role("owner", "admin", "member")),
+    db: AsyncSession = Depends(get_db),
+):
+    """Generate a reviewable local draft without creating or publishing an agent."""
+    await enforce_rate_limit(
+        request,
+        scope="agent-ai-draft",
+        limit=10,
+        window_seconds=60,
+        subject=str(current_user.tenant_id),
+        bind_to_client=False,
+    )
+    try:
+        openai_config = await load_provider_config(db, current_user.tenant_id, "openai")
+    except ProviderCredentialError as exc:
+        raise HTTPException(
+            status_code=503, detail="The OpenAI credential is unavailable."
+        ) from exc
+    api_key = str((openai_config or {}).get("api_key") or settings.openai_api_key).strip()
+    if not api_key:
+        raise HTTPException(status_code=409, detail="Add an OpenAI API key in Settings first.")
+
+    catalog = await get_provider_catalog(current_user=current_user, db=db)
+    knowledge_result = await db.execute(
+        select(KnowledgeBase)
+        .where(
+            KnowledgeBase.tenant_id == current_user.tenant_id,
+            KnowledgeBase.approval_status == "approved",
+        )
+        .order_by(KnowledgeBase.name.asc())
+    )
+    knowledge_bases = [
+        KnowledgeBaseSummary(
+            id=knowledge.id,
+            name=knowledge.name,
+            description=knowledge.description or "",
+        )
+        for knowledge in knowledge_result.scalars().all()
+    ]
+    try:
+        generated = await generate_agent_ai_draft(
+            api_key=api_key,
+            brief=data.brief,
+            provider_preference=data.provider_preference,
+            primary_language=data.primary_language,
+            timezone=data.timezone,
+            voices=[voice.model_dump() for voice in catalog.voices],
+            available_languages=[language.code for language in catalog.languages],
+            knowledge_bases=knowledge_bases,
+        )
+    except AgentAIWizardError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="OpenAI could not generate an agent draft right now. Please retry.",
+        ) from exc
+
+    await record_audit_event(
+        db,
+        tenant_id=current_user.tenant_id,
+        actor_user_id=current_user.id,
+        action="agent.ai_draft_generated",
+        resource_type="agent_draft",
+        resource_id=None,
+        details={
+            "model": generated.model,
+            "voice_provider": generated.draft.voice_provider,
+            "primary_language": generated.draft.language,
+            "knowledge_base_id": (
+                str(generated.recommended_knowledge_base_id)
+                if generated.recommended_knowledge_base_id
+                else None
+            ),
+        },
+    )
+    return generated
 
 
 @router.get("/provider/status")

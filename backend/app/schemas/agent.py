@@ -204,6 +204,34 @@ class AgentResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class AgentAIDraftRequest(BaseModel):
+    brief: str = Field(min_length=20, max_length=4000)
+    provider_preference: Literal["auto", "smallest", "sarvam"] = "auto"
+    primary_language: str = Field("en", min_length=2, max_length=63)
+    timezone: str = Field("Asia/Dubai", max_length=64)
+
+    model_config = {"extra": "forbid", "str_strip_whitespace": True}
+
+    @field_validator("primary_language")
+    @classmethod
+    def normalize_primary_language(cls, value: str) -> str:
+        return _normalize_language(value)
+
+    @field_validator("timezone")
+    @classmethod
+    def validate_draft_timezone(cls, value: str) -> str:
+        return _validate_timezone(value)
+
+
+class AgentAIDraftResponse(BaseModel):
+    draft: AgentCreate
+    rationale: str = Field(max_length=1500)
+    assumptions: list[str] = Field(default_factory=list, max_length=8)
+    recommended_knowledge_base_id: UUID | None = None
+    recommended_knowledge_base_name: str | None = None
+    model: str
+
+
 class SmallestSessionRequest(BaseModel):
     variables: dict[str, str | int | float | bool] = Field(default_factory=dict)
 

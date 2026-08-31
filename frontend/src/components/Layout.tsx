@@ -347,7 +347,7 @@ export default function Layout({ children }: { children: ReactNode }) {
             <span>Secure production workspace</span>
           </div>
           <div className="topbar-actions">
-            <Link className="ai-action" href="/agents" onClick={() => handleNavigation('/agents')}><Sparkles size={15} aria-hidden="true" /> Create with AI</Link>
+            <Link className="ai-action" href="/agents?create=ai" onClick={() => handleNavigation('/agents')}><Sparkles size={15} aria-hidden="true" /> Create with AI</Link>
             <div className="profile-control" ref={profileRef}>
               <button
                 ref={profileButtonRef}
