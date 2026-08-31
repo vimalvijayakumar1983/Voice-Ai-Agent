@@ -15,6 +15,18 @@ from app.schemas.agent import AgentAIDraftResponse, AgentCreate
 
 AI_WIZARD_MODEL = "gpt-4o-mini"
 _WORD_RE = re.compile(r"[a-z0-9]+")
+_GENERIC_KNOWLEDGE_TOKENS = {
+    "and",
+    "approved",
+    "base",
+    "business",
+    "center",
+    "centre",
+    "clinic",
+    "knowledge",
+    "medical",
+    "the",
+}
 
 
 class AgentAIWizardError(RuntimeError):
@@ -27,7 +39,6 @@ class _GeneratedAgentSpec(BaseModel):
     system_prompt: str = Field(min_length=50, max_length=4000)
     greeting_message: str = Field(min_length=5, max_length=500)
     provider: Literal["smallest", "sarvam"]
-    supported_languages: list[str] = Field(max_length=8)
     speech_rate: float = Field(ge=0.8, le=1.2)
     voice_gender: Literal["female", "male", "neutral", "any"]
     voice_accent: str = Field(max_length=80)
@@ -96,11 +107,20 @@ def _select_voice(
 def _knowledge_recommendation(
     requested_name: str | None,
     knowledge_bases: list[KnowledgeBaseSummary],
+    brief: str,
 ) -> KnowledgeBaseSummary | None:
     if not requested_name:
         return None
     requested = requested_name.strip().casefold()
-    return next((item for item in knowledge_bases if item.name.casefold() == requested), None)
+    candidate = next((item for item in knowledge_bases if item.name.casefold() == requested), None)
+    if candidate is None:
+        return None
+    if candidate.name.casefold() in brief.casefold():
+        return candidate
+    identifying_tokens = _tokens(candidate.name) - _GENERIC_KNOWLEDGE_TOKENS
+    overlap = identifying_tokens & _tokens(brief)
+    required_overlap = min(2, len(identifying_tokens))
+    return candidate if required_overlap and len(overlap) >= required_overlap else None
 
 
 async def generate_agent_ai_draft(
@@ -157,7 +177,6 @@ Use only the supplied provider names, language codes, and exact knowledge-base n
             "system_prompt": "string",
             "greeting_message": "string",
             "provider": "smallest or sarvam",
-            "supported_languages": ["language code; primary first"],
             "speech_rate": "number from 0.8 to 1.2",
             "voice_gender": "female, male, neutral, or any",
             "voice_accent": "string",
@@ -196,11 +215,7 @@ Use only the supplied provider names, language codes, and exact knowledge-base n
     provider = provider_preference if provider_preference != "auto" else spec.provider
     if provider not in providers:
         provider = providers[0]
-    supported_languages = [
-        code
-        for code in dict.fromkeys([primary_language, *spec.supported_languages])
-        if code in available_languages
-    ][:8]
+    supported_languages = [primary_language]
     compatible_voice = _select_voice(
         voices,
         provider=provider,
@@ -216,6 +231,7 @@ Use only the supplied provider names, language codes, and exact knowledge-base n
     recommendation = _knowledge_recommendation(
         spec.recommended_knowledge_base_name,
         knowledge_bases,
+        brief,
     )
     draft = AgentCreate(
         name=spec.name,

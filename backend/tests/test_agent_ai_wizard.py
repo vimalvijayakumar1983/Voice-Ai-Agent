@@ -10,6 +10,7 @@ from app.schemas.agent import AgentAIDraftResponse, AgentCreate
 from app.services.agent_ai_wizard import (
     AgentAIWizardError,
     KnowledgeBaseSummary,
+    _knowledge_recommendation,
     generate_agent_ai_draft,
 )
 
@@ -35,6 +36,31 @@ def fake_openai(payload: dict):
     return SimpleNamespace(chat=SimpleNamespace(completions=completions)), completions
 
 
+def test_ai_wizard_does_not_recommend_an_unidentified_business_knowledge_base():
+    knowledge = KnowledgeBaseSummary(
+        id=uuid4(),
+        name="Adam & Eve Cosmetic Medical Centre",
+        description="Approved treatments and appointment information.",
+    )
+
+    assert (
+        _knowledge_recommendation(
+            knowledge.name,
+            [knowledge],
+            "Create a customer support agent for a fictional clinic.",
+        )
+        is None
+    )
+    assert (
+        _knowledge_recommendation(
+            knowledge.name,
+            [knowledge],
+            "Create an Adam and Eve cosmetic support concierge.",
+        )
+        == knowledge
+    )
+
+
 @pytest.mark.asyncio
 async def test_ai_wizard_generates_valid_review_only_draft_with_catalog_voice():
     knowledge_id = uuid4()
@@ -49,7 +75,6 @@ async def test_ai_wizard_generates_valid_review_only_draft_with_catalog_voice():
             ),
             "greeting_message": "Hello, how may I help you with the clinic today?",
             "provider": "smallest",
-            "supported_languages": ["en", "hi", "unsupported"],
             "speech_rate": 0.95,
             "voice_gender": "female",
             "voice_accent": "Indian",
@@ -61,7 +86,9 @@ async def test_ai_wizard_generates_valid_review_only_draft_with_catalog_voice():
     )
     result = await generate_agent_ai_draft(
         api_key="test-key",
-        brief="Create a warm clinic support agent for English and Hindi appointment enquiries.",
+        brief=(
+            "Create a warm support agent using Approved Clinic Knowledge for appointment enquiries."
+        ),
         provider_preference="auto",
         primary_language="en",
         timezone="Asia/Dubai",
@@ -91,8 +118,8 @@ async def test_ai_wizard_generates_valid_review_only_draft_with_catalog_voice():
     )
 
     assert result.draft.voice_id == "jordan"
-    assert result.draft.supported_languages == ["en", "hi"]
-    assert result.draft.language_switching_enabled is True
+    assert result.draft.supported_languages == ["en"]
+    assert result.draft.language_switching_enabled is False
     assert result.recommended_knowledge_base_id == knowledge_id
     assert result.model == "gpt-4o-mini"
     response_format = completions.calls[0]["response_format"]
