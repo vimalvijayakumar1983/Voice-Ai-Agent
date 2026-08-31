@@ -91,12 +91,16 @@ async def _wait_for_provider_index(
                     code="provider_indexing_failed",
                 )
         if attempt < 29:
-            await asyncio.sleep(2)
+            await _provider_poll_wait(2)
     raise WebsiteRecoveryError(
         "The recovered page is still waiting for provider indexing.",
         code="provider_indexing_timeout",
         retryable=True,
     )
+
+
+async def _provider_poll_wait(seconds: float) -> None:
+    await asyncio.sleep(seconds)
 
 
 def _recount(knowledge_base: KnowledgeBase) -> None:

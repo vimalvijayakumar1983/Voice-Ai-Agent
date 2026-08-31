@@ -132,7 +132,7 @@ async def test_provider_verification_waits_for_indexed_item(monkeypatch):
     async def no_wait(_seconds):
         return None
 
-    monkeypatch.setattr("app.tasks.knowledge_tasks.asyncio.sleep", no_wait)
+    monkeypatch.setattr("app.tasks.knowledge_tasks._provider_poll_wait", no_wait)
     provider = Provider()
 
     await _wait_for_provider_index(
