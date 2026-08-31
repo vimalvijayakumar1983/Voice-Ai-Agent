@@ -10,7 +10,6 @@ from app.realtime import sarvam_stream
 from app.realtime.sarvam_stream import (
     SARVAM_STT_SILENCE_DURATION_MS,
     SARVAM_TTS_MIN_BUFFER_SIZE,
-    SARVAM_TTS_TEMPERATURE,
     SarvamStreamError,
     SarvamSTTStream,
     SarvamTTSStream,
@@ -167,7 +166,7 @@ async def test_sarvam_tts_reuses_one_connection_for_same_language(monkeypatch):
     config = next(message for message in connection.sent if message["type"] == "config")
     assert config["data"]["output_audio_codec"] == "mulaw"
     assert config["data"]["speech_sample_rate"] == 8000
-    assert config["data"]["temperature"] == SARVAM_TTS_TEMPERATURE
+    assert "temperature" not in config["data"]
     assert config["data"]["min_buffer_size"] == SARVAM_TTS_MIN_BUFFER_SIZE
     assert config["data"]["max_chunk_length"] == 120
     assert connection.close_count == 1

@@ -12,8 +12,7 @@ from urllib.parse import urlencode, urlsplit, urlunsplit
 from websockets.asyncio.client import ClientConnection, connect
 
 SARVAM_STT_SILENCE_DURATION_MS = 450
-SARVAM_TTS_TEMPERATURE = 0.4
-SARVAM_TTS_MIN_BUFFER_SIZE = 20
+SARVAM_TTS_MIN_BUFFER_SIZE = 30
 SARVAM_TTS_MAX_CHUNK_LENGTH = 120
 
 
@@ -157,7 +156,6 @@ class SarvamTTSStream:
         base_url: str,
         speaker: str,
         pace: float,
-        temperature: float = SARVAM_TTS_TEMPERATURE,
         min_buffer_size: int = SARVAM_TTS_MIN_BUFFER_SIZE,
         max_chunk_length: int = SARVAM_TTS_MAX_CHUNK_LENGTH,
     ):
@@ -165,7 +163,6 @@ class SarvamTTSStream:
         self.base_url = base_url
         self.speaker = speaker
         self.pace = pace
-        self.temperature = max(0.01, min(float(temperature), 1.0))
         self.min_buffer_size = max(10, min(int(min_buffer_size), 100))
         self.max_chunk_length = max(50, min(int(max_chunk_length), 500))
         self.connection: ClientConnection | None = None
@@ -212,7 +209,6 @@ class SarvamTTSStream:
                             "speaker": self.speaker,
                             "language_code": language_code,
                             "pace": max(0.5, min(float(self.pace), 2.0)),
-                            "temperature": self.temperature,
                             "min_buffer_size": self.min_buffer_size,
                             "max_chunk_length": self.max_chunk_length,
                             "output_audio_codec": "mulaw",

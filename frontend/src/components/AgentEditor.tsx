@@ -423,7 +423,7 @@ export default function AgentEditor({
             <div className="form-group">
               <label htmlFor={modelId}>Live phone runtime</label>
               <input id={modelId} value="Sarvam Bulbul v3 + OpenAI" readOnly aria-readonly="true" />
-              <p className="form-hint">Optimized profile: steady voice (0.4), 20-character audio buffer, and balanced 450 ms turn detection.</p>
+              <p className="form-hint">Production-safe Sarvam streaming profile with balanced 450 ms turn detection and concise phone responses.</p>
             </div>
           ) : (
             <div className="form-group">
