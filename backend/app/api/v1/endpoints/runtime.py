@@ -41,6 +41,10 @@ from app.services.provider_credentials import (
 router = APIRouter(prefix="/runtime", tags=["Realtime Runtime"])
 
 
+def _speech_provider_name(provider: str) -> str:
+    return "ElevenLabs" if provider == "elevenlabs" else "Sarvam AI"
+
+
 async def _agent(db: AsyncSession, tenant_id: UUID, agent_id: UUID) -> Agent:
     agent = await db.scalar(select(Agent).where(Agent.id == agent_id, Agent.tenant_id == tenant_id))
     if agent is None:
@@ -234,7 +238,8 @@ async def runtime_readiness(
         "vav_speech_agent": "Select Sarvam or ElevenLabs as this agent's voice provider.",
         "stt_credential": "Add a valid Sarvam API key in Settings for live transcription.",
         "tts_credential": (
-            f"Add a valid {agent.voice_provider.title()} API key in Settings for speech output."
+            f"Add a valid {_speech_provider_name(agent.voice_provider)} API key in Settings "
+            "for speech output."
         ),
         "voice_selection": "Select a voice from the configured speech provider.",
         "speech_provider_match": (

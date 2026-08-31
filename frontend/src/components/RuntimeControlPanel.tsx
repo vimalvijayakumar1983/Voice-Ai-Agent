@@ -109,6 +109,16 @@ export default function RuntimeControlPanel({ agent, profile, onClose, onChange 
           <p className="form-hint">LiveKit SIP also requires the encrypted trunk credentials in Settings.</p>
         </div>
         <div className="form-group">
+          <label htmlFor="runtime-speech-provider">Speech output</label>
+          <input
+            id="runtime-speech-provider"
+            value={speechProvider === 'elevenlabs' ? 'ElevenLabs Flash v2.5' : 'Sarvam Bulbul v3'}
+            readOnly
+            aria-readonly="true"
+          />
+          <p className="form-hint">This follows the agent&apos;s selected voice provider; Sarvam handles live transcription.</p>
+        </div>
+        <div className="form-group">
           <label htmlFor="runtime-llm">LLM route</label>
           <select id="runtime-llm" value={form.llm_model} onChange={(event) => setForm({ ...form, llm_model: event.target.value as RuntimeProfile['llm_model'] })}>
             <option value="gpt-4o-mini">OpenAI GPT-4o mini · lower cost</option>
