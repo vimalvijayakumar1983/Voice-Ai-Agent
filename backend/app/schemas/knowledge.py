@@ -74,6 +74,8 @@ class KnowledgeSourceResponse(BaseModel):
     provider_item_id: str | None
     error_message: str | None
     source_metadata: dict | None
+    retrieval_ready: bool = False
+    extracted_character_count: int = 0
     last_synced_at: datetime | None
     created_at: datetime
     updated_at: datetime

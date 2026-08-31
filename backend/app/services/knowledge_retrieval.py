@@ -11,9 +11,32 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.agent import AgentKnowledgeBinding, KnowledgeBase, KnowledgeSource
 
-_TOKEN = re.compile(r"[\w\u0900-\u0d7f]+", re.UNICODE)
+_TOKEN = re.compile(r"[^\W_]+", re.UNICODE)
 _SPLIT = re.compile(r"(?:\r?\n){2,}|(?<=[.!?।])\s+")
 MAX_CONTEXT_CHARS = 6000
+_QUERY_STOP_WORDS = {
+    "a",
+    "about",
+    "an",
+    "and",
+    "are",
+    "can",
+    "could",
+    "do",
+    "does",
+    "for",
+    "from",
+    "have",
+    "is",
+    "me",
+    "of",
+    "please",
+    "tell",
+    "the",
+    "what",
+    "which",
+    "who",
+}
 
 
 @dataclass(frozen=True)
@@ -24,7 +47,23 @@ class KnowledgeMatch:
 
 
 def _tokens(value: str) -> set[str]:
-    return {token.casefold() for token in _TOKEN.findall(value) if len(token) > 1}
+    tokens: set[str] = set()
+    for raw_token in _TOKEN.findall(value):
+        token = raw_token.casefold()
+        if len(token) <= 1:
+            continue
+        tokens.add(token)
+        if len(token) > 4 and token.endswith("ies"):
+            tokens.add(f"{token[:-3]}y")
+        elif len(token) > 3 and token.endswith("s") and not token.endswith(("is", "ss", "us")):
+            tokens.add(token[:-1])
+    return tokens
+
+
+def _query_tokens(value: str) -> set[str]:
+    tokens = _tokens(value)
+    meaningful = tokens - _QUERY_STOP_WORDS
+    return meaningful or tokens
 
 
 def _chunks(value: str, *, max_chars: int = 900) -> list[str]:
@@ -53,20 +92,25 @@ def rank_knowledge(
     *,
     limit: int = 6,
 ) -> list[KnowledgeMatch]:
-    query_tokens = _tokens(query)
+    query_tokens = _query_tokens(query)
     if not query_tokens:
         return []
     matches: list[KnowledgeMatch] = []
     for source, content in documents:
+        source_tokens = _tokens(source)
+        source_overlap = query_tokens & source_tokens
         for chunk in _chunks(content):
             chunk_tokens = _tokens(chunk)
-            overlap = query_tokens & chunk_tokens
+            content_overlap = query_tokens & chunk_tokens
+            overlap = content_overlap | source_overlap
             if not overlap:
                 continue
             coverage = len(overlap) / len(query_tokens)
-            density = len(overlap) / max(len(chunk_tokens), 1)
-            matches.append(KnowledgeMatch(source, chunk, coverage * 0.85 + density * 0.15))
-    return sorted(matches, key=lambda item: (-item.score, item.source, item.text))[:limit]
+            density = len(content_overlap) / max(len(chunk_tokens), 1)
+            source_bonus = min(len(source_overlap), 2) * 0.03
+            score = coverage * 0.82 + density * 0.15 + source_bonus
+            matches.append(KnowledgeMatch(source, chunk, score))
+    return sorted(matches, key=lambda item: -item.score)[:limit]
 
 
 async def retrieve_knowledge_context(

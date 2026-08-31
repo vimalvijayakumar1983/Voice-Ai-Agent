@@ -82,7 +82,14 @@ def _provider_error(exc: SmallestAIError) -> HTTPException:
 
 
 def _source_response(source: KnowledgeSource) -> KnowledgeSourceResponse:
-    return KnowledgeSourceResponse.model_validate(source)
+    content = source.content if isinstance(source.content, str) else ""
+    response = KnowledgeSourceResponse.model_validate(source)
+    return response.model_copy(
+        update={
+            "retrieval_ready": bool(content.strip()),
+            "extracted_character_count": len(content.strip()),
+        }
+    )
 
 
 def _knowledge_response(kb: KnowledgeBase) -> KnowledgeBaseResponse:

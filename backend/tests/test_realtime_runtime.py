@@ -67,6 +67,22 @@ def test_provider_neutral_knowledge_ranking_prefers_query_coverage():
     assert "Dr Rao" in matches[0].text
 
 
+def test_knowledge_ranking_routes_directory_questions_by_source_name():
+    matches = rank_knowledge(
+        "Which doctors are available?",
+        [
+            ("PRP_Treatment.pdf", "Appointments are available at the clinic."),
+            (
+                "Adam_and_Eve_Doctors_Directory.pdf",
+                "Dr Rao — Dermatology. Dr Khan — Plastic Surgery.",
+            ),
+        ],
+    )
+
+    assert matches[0].source == "Adam_and_Eve_Doctors_Directory.pdf"
+    assert "Dr Rao" in matches[0].text
+
+
 @pytest.mark.asyncio
 async def test_runtime_profile_requires_readiness_before_activation(
     client: AsyncClient,
