@@ -257,6 +257,8 @@ export default function Layout({ children }: { children: ReactNode }) {
   };
 
   const pageTitle = pageTitleForPath(router.pathname);
+  const aiActionHref = router.pathname === '/knowledge' ? '/knowledge?create=ai' : '/agents?create=ai';
+  const aiActionPath = router.pathname === '/knowledge' ? '/knowledge' : '/agents';
 
   return (
     <>
@@ -347,7 +349,7 @@ export default function Layout({ children }: { children: ReactNode }) {
             <span>Secure production workspace</span>
           </div>
           <div className="topbar-actions">
-            <Link className="ai-action" href="/agents?create=ai" onClick={() => handleNavigation('/agents')}><Sparkles size={15} aria-hidden="true" /> Create with AI</Link>
+            <Link className="ai-action" href={aiActionHref} onClick={() => handleNavigation(aiActionPath)}><Sparkles size={15} aria-hidden="true" /> Create with AI</Link>
             <div className="profile-control" ref={profileRef}>
               <button
                 ref={profileButtonRef}

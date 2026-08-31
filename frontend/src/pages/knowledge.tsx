@@ -1,3 +1,4 @@
+import { useRouter } from 'next/router';
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   BadgeCheck,
@@ -25,9 +26,12 @@ import {
   X,
 } from 'lucide-react';
 import Layout from '@/components/Layout';
+import KnowledgeAIWizard from '@/components/KnowledgeAIWizard';
 import {
   api,
   CurrentUser,
+  KnowledgeAIDraftRequest,
+  KnowledgeAIDraftResponse,
   KnowledgeBase,
   KnowledgeCrawl,
   KnowledgeScope,
@@ -57,6 +61,7 @@ const scopeOptions: Array<{ value: KnowledgeScope; label: string }> = [
 ];
 
 export default function KnowledgeStudio() {
+  const router = useRouter();
   const [knowledgeBases, setKnowledgeBases] = useState<KnowledgeBase[]>([]);
   const [agents, setAgents] = useState<VoiceAgent[]>([]);
   const [currentUser, setCurrentUser] = useState<CurrentUser | null>(null);
@@ -67,6 +72,8 @@ export default function KnowledgeStudio() {
   const [query, setQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState('all');
   const [showCreate, setShowCreate] = useState(false);
+  const [showAIWizard, setShowAIWizard] = useState(false);
+  const [generatedDraft, setGeneratedDraft] = useState<KnowledgeAIDraftResponse | null>(null);
   const [showEdit, setShowEdit] = useState(false);
   const [sourceMode, setSourceMode] = useState<SourceMode>('crawl');
   const [sitemapUrls, setSitemapUrls] = useState<string[]>([]);
@@ -115,6 +122,7 @@ export default function KnowledgeStudio() {
 
   const canEditKnowledge = Boolean(currentUser && currentUser.role !== 'viewer');
   const canGovernKnowledge = currentUser?.role === 'owner' || currentUser?.role === 'admin';
+  const aiWizardVisible = showAIWizard || (router.query.create === 'ai' && !showCreate);
   const filtered = useMemo(() => {
     const normalized = query.trim().toLowerCase();
     return knowledgeBases.filter((kb) => {
@@ -245,6 +253,47 @@ export default function KnowledgeStudio() {
     }
   };
 
+  const clearCreatePanels = () => {
+    setShowCreate(false);
+    setShowAIWizard(false);
+    setGeneratedDraft(null);
+    if (router.query.create === 'ai') void router.replace('/knowledge', undefined, { shallow: true });
+  };
+
+  const openManualCreate = () => {
+    setShowEdit(false);
+    setShowAIWizard(false);
+    setGeneratedDraft(null);
+    setShowCreate(true);
+    setNotice(null);
+    if (router.query.create === 'ai') void router.replace('/knowledge', undefined, { shallow: true });
+  };
+
+  const openAIWizard = () => {
+    setShowEdit(false);
+    setShowCreate(false);
+    setGeneratedDraft(null);
+    setShowAIWizard(true);
+    setNotice(null);
+  };
+
+  const generateKnowledgeDraft = async (request: KnowledgeAIDraftRequest) => {
+    setWorking('knowledge-ai-draft');
+    setNotice(null);
+    try {
+      const result = await api.generateKnowledgeDraft(request);
+      setGeneratedDraft(result);
+      setShowAIWizard(false);
+      setShowCreate(true);
+      setNotice({ type: 'info', text: 'OpenAI generated governed metadata only. Review every field before creating the knowledge draft.' });
+      if (router.query.create === 'ai') void router.replace('/knowledge', undefined, { shallow: true });
+    } catch (error) {
+      setNotice({ type: 'error', text: errorMessage(error, 'OpenAI could not generate the knowledge draft.') });
+    } finally {
+      setWorking(null);
+    }
+  };
+
   const createKnowledgeBase = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
@@ -262,6 +311,7 @@ export default function KnowledgeStudio() {
       setKnowledgeBases((current) => [created, ...current]);
       setSelectedId(created.id);
       setShowCreate(false);
+      setGeneratedDraft(null);
       setNotice({ type: 'success', text: `${created.name} was created as a governed local draft.` });
       window.requestAnimationFrame(() => detailHeadingRef.current?.focus());
     } catch (error) {
@@ -481,7 +531,10 @@ export default function KnowledgeStudio() {
           <button type="button" className="btn btn-secondary" disabled={!selected || working !== null || !canEditKnowledge} onClick={() => selected && runAction('refresh', () => api.refreshKnowledgeBase(selected.id), 'Provider processing status refreshed.', { syncPendingBindings: true })}>
             <RefreshCw size={14} className={working === 'refresh' ? 'spin' : undefined} /> Refresh status
           </button>
-          {canEditKnowledge && <button type="button" className="btn btn-primary" onClick={() => { setShowEdit(false); setShowCreate((open) => !open); }}>
+          {canEditKnowledge && <button type="button" className="btn btn-secondary" disabled={working !== null} onClick={aiWizardVisible ? clearCreatePanels : openAIWizard}>
+            {aiWizardVisible ? <X size={14} /> : <Sparkles size={14} />}{aiWizardVisible ? 'Close AI wizard' : 'Create with AI'}
+          </button>}
+          {canEditKnowledge && <button type="button" className="btn btn-primary" disabled={working !== null} onClick={showCreate ? clearCreatePanels : openManualCreate}>
             {showCreate ? <X size={14} /> : <Plus size={14} />}{showCreate ? 'Close' : 'New knowledge base'}
           </button>}
         </div>
@@ -496,7 +549,8 @@ export default function KnowledgeStudio() {
 
       {currentUser?.role === 'viewer' && <div className="provider-alert" role="status"><ShieldCheck size={15} /><span>Viewer access is read-only. Ask an owner or administrator to change sources, approval, or agent access.</span></div>}
 
-      {showCreate && <KnowledgeFormPanel mode="create" busy={working === 'create'} onSubmit={createKnowledgeBase} onCancel={() => setShowCreate(false)} />}
+      {aiWizardVisible && canEditKnowledge && <KnowledgeAIWizard busy={working === 'knowledge-ai-draft'} onGenerate={generateKnowledgeDraft} onCancel={clearCreatePanels} />}
+      {showCreate && <KnowledgeFormPanel mode="create" draft={generatedDraft} busy={working === 'create'} onSubmit={createKnowledgeBase} onCancel={clearCreatePanels} />}
       {showEdit && selected && <KnowledgeFormPanel key={selected.id} mode="edit" knowledge={selected} busy={working === 'update'} onSubmit={updateKnowledgeBase} onCancel={() => setShowEdit(false)} />}
 
       <section className={styles.stats} aria-label="Knowledge health">
@@ -519,7 +573,7 @@ export default function KnowledgeStudio() {
             <span><strong>2</strong>Add trusted sources</span><ChevronRight size={15} />
             <span><strong>3</strong>Approve and bind</span>
           </div>
-          {canEditKnowledge && <button type="button" className="btn btn-primary" onClick={() => setShowCreate(true)}><Plus size={14} /> Create first knowledge base</button>}
+          {canEditKnowledge && <button type="button" className="btn btn-primary" onClick={openManualCreate}><Plus size={14} /> Create first knowledge base</button>}
         </section>
       ) : (
         <div className={styles.workspace}>
@@ -563,7 +617,7 @@ export default function KnowledgeStudio() {
                 </div>
                 <div className={styles.heroActions}>
                   {canEditKnowledge && !selected.provider_knowledge_base_id && <button type="button" className="btn btn-secondary btn-sm" disabled={working !== null} onClick={() => runAction('provision', () => api.provisionKnowledgeBase(selected.id), 'A secure provider knowledge base was created.')}><CloudUpload size={12} /> Connect provider</button>}
-                  {canEditKnowledge && <button type="button" className="btn btn-secondary btn-sm" disabled={working !== null} onClick={() => { setShowCreate(false); setShowEdit(true); }}><Pencil size={12} /> Edit details</button>}
+                  {canEditKnowledge && <button type="button" className="btn btn-secondary btn-sm" disabled={working !== null} onClick={() => { setShowCreate(false); setShowAIWizard(false); setGeneratedDraft(null); setShowEdit(true); if (router.query.create === 'ai') void router.replace('/knowledge', undefined, { shallow: true }); }}><Pencil size={12} /> Edit details</button>}
                   {canGovernKnowledge && <button type="button" className="btn btn-ghost btn-sm" disabled={working !== null} onClick={deleteSelected} aria-label={`Delete ${selected.name}`}><Trash2 size={13} /> Delete</button>}
                 </div>
                 <div className={styles.progressRail} aria-label={`${selected.indexed_source_count} of ${selected.source_count} documents ready for agents`}>
@@ -640,21 +694,30 @@ export default function KnowledgeStudio() {
   );
 }
 
-function KnowledgeFormPanel({ mode, knowledge, busy, onSubmit, onCancel }: { mode: 'create' | 'edit'; knowledge?: KnowledgeBase; busy: boolean; onSubmit: (event: FormEvent<HTMLFormElement>) => void; onCancel: () => void }) {
+function KnowledgeFormPanel({ mode, knowledge, draft, busy, onSubmit, onCancel }: { mode: 'create' | 'edit'; knowledge?: KnowledgeBase; draft?: KnowledgeAIDraftResponse | null; busy: boolean; onSubmit: (event: FormEvent<HTMLFormElement>) => void; onCancel: () => void }) {
   const editing = mode === 'edit';
+  const generated = editing ? null : draft?.draft;
   return <section className={styles.createPanel} aria-labelledby="create-knowledge-heading">
-    <div className={styles.createAside}><Sparkles size={21} /><span className="page-kicker">{editing ? 'Keep context accurate' : 'Govern from day one'}</span><h2 id="create-knowledge-heading">{editing ? 'Edit knowledge details' : 'Create a reusable knowledge base'}</h2><p>{editing ? 'Update business scope, languages, and discovery metadata without losing source provenance or bindings.' : 'Scope it to the correct business level. Sources and agent access are added after creation.'}</p><div><span><ShieldCheck size={14} /> Tenant isolated</span><span><Layers3 size={14} /> Provider neutral</span><span><BadgeCheck size={14} /> Approval gated</span></div></div>
+    <div className={styles.createAside}>
+      <Sparkles size={21} />
+      <span className="page-kicker">{editing ? 'Keep context accurate' : draft ? 'Review the OpenAI draft' : 'Govern from day one'}</span>
+      <h2 id="create-knowledge-heading">{editing ? 'Edit knowledge details' : draft ? 'Review knowledge metadata' : 'Create a reusable knowledge base'}</h2>
+      <p>{editing ? 'Update business scope, languages, and discovery metadata without losing source provenance or bindings.' : draft ? draft.rationale : 'Scope it to the correct business level. Sources and agent access are added after creation.'}</p>
+      {draft?.assumptions.length ? <><strong>Assumptions to verify</strong><ul>{draft.assumptions.map((item) => <li key={item}>{item}</li>)}</ul></> : null}
+      {draft?.recommended_sources.length ? <><strong>Recommended approved sources</strong><ul>{draft.recommended_sources.map((item) => <li key={item}>{item}</li>)}</ul></> : null}
+      <div><span><ShieldCheck size={14} /> Tenant isolated</span><span><Layers3 size={14} /> Provider neutral</span><span><BadgeCheck size={14} /> Approval gated</span></div>
+    </div>
     <form className={styles.createForm} onSubmit={onSubmit}>
       <div className="form-grid">
-        <div className="form-group"><label htmlFor="kb-name">Name <span>Required</span></label><input id="kb-name" name="name" maxLength={40} required defaultValue={knowledge?.name || ''} placeholder="FEPY product & policy knowledge" /></div>
-        <div className="form-group"><label htmlFor="kb-scope">Business scope</label><select id="kb-scope" name="scope_type" defaultValue={knowledge?.scope_type || 'workspace'}>{scopeOptions.map((scope) => <option key={scope.value} value={scope.value}>{scope.label}</option>)}</select></div>
+        <div className="form-group"><label htmlFor="kb-name">Name <span>Required</span></label><input id="kb-name" name="name" maxLength={40} required defaultValue={knowledge?.name || generated?.name || ''} placeholder="Company product and policy knowledge" /></div>
+        <div className="form-group"><label htmlFor="kb-scope">Business scope</label><select id="kb-scope" name="scope_type" defaultValue={knowledge?.scope_type || generated?.scope_type || 'workspace'}>{scopeOptions.map((scope) => <option key={scope.value} value={scope.value}>{scope.label}</option>)}</select></div>
       </div>
-      <div className="form-group"><label htmlFor="kb-description">Purpose</label><textarea id="kb-description" name="description" maxLength={1000} defaultValue={knowledge?.description || ''} placeholder="Approved product descriptions, delivery policies, returns and customer FAQs." /></div>
+      <div className="form-group"><label htmlFor="kb-description">Purpose</label><textarea id="kb-description" name="description" maxLength={1000} defaultValue={knowledge?.description || generated?.description || ''} placeholder="Approved product descriptions, delivery policies, returns and customer FAQs." /></div>
       <div className="form-grid">
-        <div className="form-group"><label htmlFor="kb-scope-label">Scope name</label><input id="kb-scope-label" name="scope_label" maxLength={255} defaultValue={knowledge?.scope_label || ''} placeholder="E-commerce division" /></div>
-        <div className="form-group"><label htmlFor="kb-languages">Languages <span>Comma separated</span></label><input id="kb-languages" name="languages" defaultValue={knowledge?.languages.join(', ') || 'en'} placeholder="en, ar, hi, ml" /></div>
+        <div className="form-group"><label htmlFor="kb-scope-label">Scope name</label><input id="kb-scope-label" name="scope_label" maxLength={255} defaultValue={knowledge?.scope_label || generated?.scope_label || ''} placeholder="E-commerce division" /></div>
+        <div className="form-group"><label htmlFor="kb-languages">Languages <span>Comma separated</span></label><input id="kb-languages" name="languages" defaultValue={knowledge?.languages.join(', ') || generated?.languages.join(', ') || 'en'} placeholder="en, ar, hi, ml" /></div>
       </div>
-      <div className="form-group"><label htmlFor="kb-tags">Tags <span>Comma separated</span></label><input id="kb-tags" name="tags" defaultValue={knowledge?.tags.join(', ') || ''} placeholder="products, delivery, returns" /></div>
+      <div className="form-group"><label htmlFor="kb-tags">Tags <span>Comma separated</span></label><input id="kb-tags" name="tags" defaultValue={knowledge?.tags.join(', ') || generated?.tags.join(', ') || ''} placeholder="products, delivery, returns" /></div>
       <div className={styles.formActions}><button type="button" className="btn btn-ghost" onClick={onCancel}>Cancel</button><button type="submit" className="btn btn-primary" disabled={busy}>{busy ? <Loader2 className="spin" size={14} /> : editing ? <Check size={14} /> : <Plus size={14} />} {editing ? 'Save details' : 'Create draft'}</button></div>
     </form>
   </section>;

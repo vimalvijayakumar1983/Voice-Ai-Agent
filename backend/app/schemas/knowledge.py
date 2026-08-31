@@ -48,6 +48,32 @@ class KnowledgeBaseCreate(BaseModel):
         return _clean_list(value, maximum=20, item_maximum=40)
 
 
+class KnowledgeAIDraftRequest(BaseModel):
+    brief: Annotated[str, Field(min_length=20, max_length=4000)]
+    scope_preference: Literal["auto", "workspace", "group", "division", "branch", "department"] = (
+        "auto"
+    )
+    primary_language: Annotated[str, Field(min_length=2, max_length=20)] = "en"
+
+    model_config = {"extra": "forbid", "str_strip_whitespace": True}
+
+    @field_validator("primary_language")
+    @classmethod
+    def clean_primary_language(cls, value: str) -> str:
+        cleaned = value.strip().lower().replace("_", "-")
+        if not cleaned or not all(part.isalnum() for part in cleaned.split("-")):
+            raise ValueError("Use a valid language code such as en, ar, hi, or en-GB.")
+        return cleaned
+
+
+class KnowledgeAIDraftResponse(BaseModel):
+    draft: KnowledgeBaseCreate
+    rationale: Annotated[str, Field(max_length=1500)]
+    assumptions: list[str] = Field(default_factory=list, max_length=8)
+    recommended_sources: list[str] = Field(default_factory=list, max_length=8)
+    model: str
+
+
 class KnowledgeBaseUpdate(BaseModel):
     name: Annotated[str | None, Field(min_length=1, max_length=40)] = None
     description: Annotated[str | None, Field(max_length=1000)] = None

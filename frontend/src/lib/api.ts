@@ -324,6 +324,27 @@ export interface KnowledgeBase {
   updated_at: string;
 }
 
+export interface KnowledgeAIDraftRequest {
+  brief: string;
+  scope_preference: 'auto' | KnowledgeScope;
+  primary_language: string;
+}
+
+export interface KnowledgeAIDraftResponse {
+  draft: {
+    name: string;
+    description: string;
+    scope_type: KnowledgeScope;
+    scope_label: string | null;
+    languages: string[];
+    tags: string[];
+  };
+  rationale: string;
+  assumptions: string[];
+  recommended_sources: string[];
+  model: string;
+}
+
 export interface BrowserSession {
   access_token: string;
   expires_in: number;
@@ -1513,6 +1534,13 @@ class ApiClient {
     include_subdomains: boolean;
   }) {
     return this.request<KnowledgeBase>(`/api/v1/knowledge/${id}/crawls`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    });
+  }
+
+  async generateKnowledgeDraft(data: KnowledgeAIDraftRequest) {
+    return this.request<KnowledgeAIDraftResponse>('/api/v1/knowledge/ai-draft', {
       method: 'POST',
       body: JSON.stringify(data),
     });

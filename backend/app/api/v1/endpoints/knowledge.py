@@ -6,11 +6,12 @@ from pathlib import PurePath
 from urllib.parse import urlsplit, urlunsplit
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, status
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.core.config import settings
 from app.core.database import get_db
 from app.middleware.tenant import CurrentUser, get_current_user, require_role
 from app.models.agent import (
@@ -24,6 +25,8 @@ from app.providers.smallest import SmallestAIClient, SmallestAIError, get_smalle
 from app.schemas.knowledge import (
     AgentKnowledgeBindRequest,
     KnowledgeAgentBindingResponse,
+    KnowledgeAIDraftRequest,
+    KnowledgeAIDraftResponse,
     KnowledgeApprovalRequest,
     KnowledgeBaseCreate,
     KnowledgeBaseResponse,
@@ -37,8 +40,13 @@ from app.schemas.knowledge import (
     UrlSourceCreate,
 )
 from app.services.audit import record_audit_event
+from app.services.knowledge_ai_wizard import (
+    KnowledgeAIWizardError,
+    generate_knowledge_ai_draft,
+)
 from app.services.pdf_ingestion import PdfIngestionError, PreparedPdf, prepare_pdf
-from app.services.provider_credentials import load_provider_config
+from app.services.provider_credentials import ProviderCredentialError, load_provider_config
+from app.services.rate_limit import enforce_rate_limit
 from app.services.website_recovery import recovery_metadata
 
 router = APIRouter(prefix="/knowledge", tags=["Knowledge Studio"])
@@ -528,6 +536,63 @@ async def list_knowledge_bases(
         _knowledge_query(current_user.tenant_id).order_by(KnowledgeBase.updated_at.desc())
     )
     return [_knowledge_response(kb) for kb in result.scalars().unique().all()]
+
+
+@router.post("/ai-draft", response_model=KnowledgeAIDraftResponse)
+async def create_knowledge_ai_draft(
+    data: KnowledgeAIDraftRequest,
+    request: Request,
+    current_user: CurrentUser = Depends(require_role("owner", "admin", "member")),
+    db: AsyncSession = Depends(get_db),
+):
+    """Generate governed metadata for review without creating a knowledge base."""
+    await enforce_rate_limit(
+        request,
+        scope="knowledge-ai-draft",
+        limit=10,
+        window_seconds=60,
+        subject=str(current_user.tenant_id),
+        bind_to_client=False,
+    )
+    try:
+        openai_config = await load_provider_config(db, current_user.tenant_id, "openai")
+    except ProviderCredentialError as exc:
+        raise HTTPException(
+            status_code=503, detail="The OpenAI credential is unavailable."
+        ) from exc
+    api_key = str((openai_config or {}).get("api_key") or settings.openai_api_key).strip()
+    if not api_key:
+        raise HTTPException(status_code=409, detail="Add an OpenAI API key in Settings first.")
+
+    try:
+        generated = await generate_knowledge_ai_draft(
+            api_key=api_key,
+            brief=data.brief,
+            scope_preference=data.scope_preference,
+            primary_language=data.primary_language,
+        )
+    except KnowledgeAIWizardError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="OpenAI could not generate a knowledge draft right now. Please retry.",
+        ) from exc
+
+    await record_audit_event(
+        db,
+        tenant_id=current_user.tenant_id,
+        actor_user_id=current_user.id,
+        action="knowledge_base.ai_draft_generated",
+        resource_type="knowledge_base_draft",
+        resource_id=None,
+        details={
+            "model": generated.model,
+            "scope_type": generated.draft.scope_type,
+            "primary_language": generated.draft.languages[0],
+        },
+    )
+    return generated
 
 
 @router.post("", response_model=KnowledgeBaseResponse, status_code=status.HTTP_201_CREATED)

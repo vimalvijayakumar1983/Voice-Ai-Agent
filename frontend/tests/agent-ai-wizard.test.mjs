@@ -8,7 +8,7 @@ const apiSource = readFileSync(new URL('../src/lib/api.ts', import.meta.url), 'u
 const wizardSource = readFileSync(new URL('../src/components/AgentAIWizard.tsx', import.meta.url), 'utf8');
 
 test('Create with AI opens a genuine review-first OpenAI wizard', () => {
-  assert.match(layoutSource, /href="\/agents\?create=ai"/);
+  assert.match(layoutSource, /'\/agents\?create=ai'/);
   assert.match(apiSource, /\/api\/v1\/agents\/ai-draft/);
   assert.match(wizardSource, /Generate reviewable draft/);
   assert.match(wizardSource, /review every field before anything is saved/i);
