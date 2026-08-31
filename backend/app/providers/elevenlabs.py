@@ -163,18 +163,14 @@ class ElevenLabsClient:
                             if response.status_code in {400, 401, 403, 422, 429}
                             else 502
                         )
-                        raise ElevenLabsError(
-                            _bounded_error(response), status_code=status_code
-                        )
+                        raise ElevenLabsError(_bounded_error(response), status_code=status_code)
                     payload = response.json()
                     page = payload.get("voices") if isinstance(payload, dict) else None
                     if not isinstance(page, list):
                         raise ElevenLabsError("ElevenLabs returned an invalid voice catalog.")
                     for item in page:
                         normalized = (
-                            normalize_elevenlabs_voice(item)
-                            if isinstance(item, dict)
-                            else None
+                            normalize_elevenlabs_voice(item) if isinstance(item, dict) else None
                         )
                         if normalized is not None:
                             voices.append(normalized)
@@ -247,9 +243,7 @@ class ElevenLabsClient:
             raise ElevenLabsError("ElevenLabs could not be reached.") from exc
         if response.status_code >= 400:
             status_code = (
-                response.status_code
-                if response.status_code in {400, 401, 403, 422, 429}
-                else 502
+                response.status_code if response.status_code in {400, 401, 403, 422, 429} else 502
             )
             raise ElevenLabsError(_bounded_error(response), status_code=status_code)
         audio = response.content

@@ -2199,8 +2199,8 @@ async def get_provider_status(
         db,
         current_user.tenant_id,
     )
-    elevenlabs, elevenlabs_source, elevenlabs_updated_at = (
-        await _tenant_elevenlabs_client(db, current_user.tenant_id)
+    elevenlabs, elevenlabs_source, elevenlabs_updated_at = await _tenant_elevenlabs_client(
+        db, current_user.tenant_id
     )
     return {
         "provider": "smallest",
@@ -2946,9 +2946,7 @@ async def sync_smallest_agent(
     if agent.voice_provider != "smallest":
         raise HTTPException(
             status_code=409,
-            detail=(
-                "VAV realtime voice agents are synchronized by VAV, not Smallest.ai."
-            ),
+            detail=("VAV realtime voice agents are synchronized by VAV, not Smallest.ai."),
         )
     if _expire_stale_provisioning(agent):
         await db.commit()

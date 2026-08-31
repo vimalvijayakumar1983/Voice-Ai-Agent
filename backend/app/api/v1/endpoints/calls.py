@@ -773,8 +773,7 @@ async def initiate_outbound_call(
                 or not current_runtime_profile.enabled
                 or current_runtime_profile.status != "active"
                 or current_runtime_profile.telephony_provider != "twilio"
-                or current_runtime_profile.primary_speech_provider
-                != current_agent.voice_provider
+                or current_runtime_profile.primary_speech_provider != current_agent.voice_provider
             )
         )
         if (

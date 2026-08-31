@@ -96,9 +96,7 @@ class ElevenLabsTTSStream:
             )
             return connection
         except Exception as exc:
-            raise ElevenLabsStreamError(
-                "ElevenLabs speech synthesis could not connect"
-            ) from exc
+            raise ElevenLabsStreamError("ElevenLabs speech synthesis could not connect") from exc
 
     @staticmethod
     async def _send_fragments(

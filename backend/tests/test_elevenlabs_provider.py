@@ -78,9 +78,7 @@ async def test_elevenlabs_preview_uses_flash_model_and_bounded_speed():
     )
 
     assert audio == b"ID3-preview"
-    assert requests[0].url.raw_path.startswith(
-        b"/v1/text-to-speech/voice%2Fwith%20slash/stream"
-    )
+    assert requests[0].url.raw_path.startswith(b"/v1/text-to-speech/voice%2Fwith%20slash/stream")
     payload = json.loads(requests[0].content)
     assert payload["model_id"] == "eleven_flash_v2_5"
     assert payload["language_code"] == "en"

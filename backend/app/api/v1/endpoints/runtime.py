@@ -197,9 +197,7 @@ async def runtime_readiness(
         "tts_credential": tts_ready,
         "voice_selection": voice_ready,
         "speech_provider_match": bool(
-            profile
-            and vav_speech_agent
-            and profile.primary_speech_provider == agent.voice_provider
+            profile and vav_speech_agent and profile.primary_speech_provider == agent.voice_provider
         ),
         "openai_credential": bool(
             (openai_config and openai_config.get("api_key")) or settings.openai_api_key.strip()
