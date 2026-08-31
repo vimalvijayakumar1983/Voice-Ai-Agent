@@ -7,8 +7,21 @@ import pytest
 
 from app.ai.conversation import ConversationEngine
 from app.realtime import sarvam_stream
-from app.realtime.sarvam_stream import SarvamStreamError, SarvamTTSStream, is_speech_end
-from app.realtime.session import latency_percentile, split_tts_buffer
+from app.realtime.sarvam_stream import (
+    SARVAM_STT_SILENCE_DURATION_MS,
+    SARVAM_TTS_MIN_BUFFER_SIZE,
+    SARVAM_TTS_TEMPERATURE,
+    SarvamStreamError,
+    SarvamSTTStream,
+    SarvamTTSStream,
+    is_speech_end,
+)
+from app.realtime.session import (
+    MAX_VOICE_RESPONSE_TOKENS,
+    latency_percentile,
+    split_tts_buffer,
+    voice_response_token_limit,
+)
 from app.services.call_metadata import public_call_metadata
 
 
@@ -154,7 +167,35 @@ async def test_sarvam_tts_reuses_one_connection_for_same_language(monkeypatch):
     config = next(message for message in connection.sent if message["type"] == "config")
     assert config["data"]["output_audio_codec"] == "mulaw"
     assert config["data"]["speech_sample_rate"] == 8000
+    assert config["data"]["temperature"] == SARVAM_TTS_TEMPERATURE
+    assert config["data"]["min_buffer_size"] == SARVAM_TTS_MIN_BUFFER_SIZE
+    assert config["data"]["max_chunk_length"] == 120
     assert connection.close_count == 1
+
+
+@pytest.mark.asyncio
+async def test_sarvam_stt_uses_balanced_clinic_turn_detection(monkeypatch):
+    connection = FakeTTSConnection()
+    requested_url = None
+
+    async def fake_connect(url, *_args, **_kwargs):
+        nonlocal requested_url
+        requested_url = url
+        return connection
+
+    monkeypatch.setattr(sarvam_stream, "connect", fake_connect)
+    stream = SarvamSTTStream(
+        api_key="sarvam-key",
+        base_url="https://api.sarvam.ai",
+        language_code="en-IN",
+    )
+
+    async with stream:
+        pass
+
+    assert f"silence_duration_ms={SARVAM_STT_SILENCE_DURATION_MS}" in requested_url
+    assert "encoding=mulaw" in requested_url
+    assert "sample_rate=8000" in requested_url
 
 
 @pytest.mark.asyncio
@@ -228,6 +269,12 @@ def test_streamed_text_is_split_without_changing_content():
     assert is_speech_end({"event": "vad.speech_end"})
     assert latency_percentile([900, 400, 700, 1200], 0.5) == 700
     assert latency_percentile([900, 400, 700, 1200], 0.95) == 1200
+
+
+def test_live_voice_response_tokens_are_bounded():
+    assert voice_response_token_limit(500) == MAX_VOICE_RESPONSE_TOKENS
+    assert voice_response_token_limit(120) == 120
+    assert voice_response_token_limit(10) == 32
 
 
 def test_new_latency_metrics_are_safe_for_call_details():

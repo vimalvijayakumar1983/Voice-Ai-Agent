@@ -34,6 +34,15 @@ from app.services.provider_credentials import load_provider_config
 
 logger = structlog.get_logger()
 TTS_MAX_FRAGMENT_CHARS = 120
+MAX_VOICE_RESPONSE_TOKENS = 160
+VOICE_CALL_GUIDANCE = """
+
+Voice-call delivery requirements:
+- Keep the first answer to one or two short sentences unless the caller asks for more detail.
+- Ask no more than one question at a time.
+- Expand an unfamiliar medical abbreviation on first use, then pronounce its letters separately.
+- Prefer clear, speakable wording over symbols, dense lists, or long paragraphs.
+""".rstrip()
 _TTS_SENTENCE_BOUNDARY = re.compile(r"(?<=[.!?।])(?:\s+|$)")
 
 
@@ -102,6 +111,12 @@ def latency_percentile(values: list[int], percentile: float) -> int | None:
     return ordered[min(index, len(ordered) - 1)]
 
 
+def voice_response_token_limit(configured_limit: int) -> int:
+    """Bound live-call responses without changing stored agent configuration."""
+
+    return max(32, min(int(configured_limit), MAX_VOICE_RESPONSE_TOKENS))
+
+
 async def load_runtime_session(call_id: UUID) -> RuntimeSessionConfig | None:
     async with async_session_factory() as db:
         row = (
@@ -142,7 +157,7 @@ async def load_runtime_session(call_id: UUID) -> RuntimeSessionConfig | None:
             call_id=call.id,
             tenant_id=call.tenant_id,
             agent_id=agent.id,
-            system_prompt=agent.system_prompt,
+            system_prompt=f"{agent.system_prompt.rstrip()}\n\n{VOICE_CALL_GUIDANCE}",
             greeting_message=agent.greeting_message or "Hello, how may I help you today?",
             fallback_message=(
                 agent.fallback_message or "I am sorry, I could not complete that request."
@@ -384,7 +399,7 @@ async def run_twilio_media_session(
                 history[-12:],
                 model=config.llm_model,
                 temperature=config.temperature,
-                max_tokens=config.max_tokens,
+                max_tokens=voice_response_token_limit(config.max_tokens),
                 knowledge_context=knowledge,
             ):
                 if event.is_final:

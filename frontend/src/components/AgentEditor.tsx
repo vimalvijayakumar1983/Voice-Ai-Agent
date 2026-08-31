@@ -172,6 +172,7 @@ export default function AgentEditor({
       supported_languages: ['en'],
       language_switching_enabled: false,
       language_switching_mode: 'disabled',
+      speech_rate: provider === 'sarvam' ? 0.95 : current.speech_rate,
     }));
     setVoiceNotice(`Voice and language selections were reset for the ${provider === 'sarvam' ? 'Sarvam AI' : 'Smallest.ai'} catalog.`);
   };
@@ -418,18 +419,29 @@ export default function AgentEditor({
           <div><span className="section-icon"><Sparkles size={14} /></span><h3>Conversation tuning</h3></div>
         </div>
         <div className="form-grid">
-          <div className="form-group">
-            <label htmlFor={modelId}>Model</label>
-            <select id={modelId} value={form.model_name} onChange={(event) => setForm({ ...form, model_name: event.target.value })}><option value="electron">Electron · voice optimized</option></select>
-          </div>
-          <div className="form-group">
-            <label htmlFor={timezoneId}>Timezone</label>
-            <input id={timezoneId} required list="common-timezones" value={form.timezone} onChange={(event) => setForm({ ...form, timezone: event.target.value })} />
-            <datalist id="common-timezones"><option value="Asia/Dubai" /><option value="Asia/Kolkata" /><option value="Europe/London" /><option value="America/New_York" /><option value="America/Los_Angeles" /></datalist>
-          </div>
+          {form.voice_provider === 'sarvam' ? (
+            <div className="form-group">
+              <label htmlFor={modelId}>Live phone runtime</label>
+              <input id={modelId} value="Sarvam Bulbul v3 + OpenAI" readOnly aria-readonly="true" />
+              <p className="form-hint">Optimized profile: steady voice (0.4), 20-character audio buffer, and balanced 450 ms turn detection.</p>
+            </div>
+          ) : (
+            <div className="form-group">
+              <label htmlFor={modelId}>Model</label>
+              <select id={modelId} value={form.model_name} onChange={(event) => setForm({ ...form, model_name: event.target.value })}><option value="electron">Electron · voice optimized</option></select>
+            </div>
+          )}
+          {form.voice_provider !== 'sarvam' && (
+            <div className="form-group">
+              <label htmlFor={timezoneId}>Timezone</label>
+              <input id={timezoneId} required list="common-timezones" value={form.timezone} onChange={(event) => setForm({ ...form, timezone: event.target.value })} />
+              <datalist id="common-timezones"><option value="Asia/Dubai" /><option value="Asia/Kolkata" /><option value="Europe/London" /><option value="America/New_York" /><option value="America/Los_Angeles" /></datalist>
+            </div>
+          )}
           <div className="form-group range-control">
             <label htmlFor={speechRateId}>Speech rate <span>{form.speech_rate.toFixed(2)}×</span></label>
             <input id={speechRateId} type="range" min="0.5" max="2" step="0.05" value={form.speech_rate} onChange={(event) => setForm({ ...form, speech_rate: Number(event.target.value) })} />
+            {form.voice_provider === 'sarvam' && <p className="form-hint">For medical support, 0.95× gives callers the clearest balance of pace and natural delivery.</p>}
           </div>
         </div>
       </section>

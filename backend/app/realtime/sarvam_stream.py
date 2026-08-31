@@ -11,6 +11,11 @@ from urllib.parse import urlencode, urlsplit, urlunsplit
 
 from websockets.asyncio.client import ClientConnection, connect
 
+SARVAM_STT_SILENCE_DURATION_MS = 450
+SARVAM_TTS_TEMPERATURE = 0.4
+SARVAM_TTS_MIN_BUFFER_SIZE = 20
+SARVAM_TTS_MAX_CHUNK_LENGTH = 120
+
 
 class SarvamStreamError(RuntimeError):
     pass
@@ -75,11 +80,13 @@ class SarvamSTTStream:
         base_url: str,
         language_code: str,
         sample_rate: int = 8000,
+        silence_duration_ms: int = SARVAM_STT_SILENCE_DURATION_MS,
     ):
         self.api_key = api_key
         self.base_url = base_url
         self.language_code = language_code
         self.sample_rate = sample_rate
+        self.silence_duration_ms = max(250, min(int(silence_duration_ms), 1200))
         self.connection: ClientConnection | None = None
 
     async def __aenter__(self):
@@ -94,7 +101,7 @@ class SarvamSTTStream:
                 "sample_rate": self.sample_rate,
                 "threshold": 0.3,
                 "prefix_padding_ms": 300,
-                "silence_duration_ms": 350,
+                "silence_duration_ms": self.silence_duration_ms,
                 "min_speech_duration_ms": 250,
             }
         )
@@ -150,11 +157,17 @@ class SarvamTTSStream:
         base_url: str,
         speaker: str,
         pace: float,
+        temperature: float = SARVAM_TTS_TEMPERATURE,
+        min_buffer_size: int = SARVAM_TTS_MIN_BUFFER_SIZE,
+        max_chunk_length: int = SARVAM_TTS_MAX_CHUNK_LENGTH,
     ):
         self.api_key = api_key
         self.base_url = base_url
         self.speaker = speaker
         self.pace = pace
+        self.temperature = max(0.01, min(float(temperature), 1.0))
+        self.min_buffer_size = max(10, min(int(min_buffer_size), 100))
+        self.max_chunk_length = max(50, min(int(max_chunk_length), 500))
         self.connection: ClientConnection | None = None
         self.language_code: str | None = None
 
@@ -199,8 +212,9 @@ class SarvamTTSStream:
                             "speaker": self.speaker,
                             "language_code": language_code,
                             "pace": max(0.5, min(float(self.pace), 2.0)),
-                            "min_buffer_size": 30,
-                            "max_chunk_length": 120,
+                            "temperature": self.temperature,
+                            "min_buffer_size": self.min_buffer_size,
+                            "max_chunk_length": self.max_chunk_length,
                             "output_audio_codec": "mulaw",
                             "speech_sample_rate": 8000,
                         },
