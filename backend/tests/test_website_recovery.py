@@ -135,7 +135,7 @@ async def test_provider_verification_waits_for_indexed_item(monkeypatch):
     monkeypatch.setattr("app.tasks.knowledge_tasks._provider_poll_wait", no_wait)
     provider = Provider()
 
-    await _wait_for_provider_index(
+    item_id = await _wait_for_provider_index(
         provider,
         knowledge_base_id="provider-kb-1",
         provider_item_id="provider-item-1",
@@ -143,3 +143,39 @@ async def test_provider_verification_waits_for_indexed_item(monkeypatch):
     )
 
     assert provider.calls == 2
+    assert item_id == "provider-item-1"
+
+
+@pytest.mark.asyncio
+async def test_provider_verification_discovers_item_when_upload_response_has_no_id(monkeypatch):
+    class Provider:
+        def __init__(self):
+            self.calls = 0
+
+        async def list_knowledge_items(self, _knowledge_base_id):
+            self.calls += 1
+            if self.calls == 1:
+                return []
+            return [
+                {
+                    "_id": "provider-item-from-list",
+                    "fileName": "recovered.pdf",
+                    "processingStatus": "completed",
+                }
+            ]
+
+    async def no_wait(_seconds):
+        return None
+
+    monkeypatch.setattr("app.tasks.knowledge_tasks._provider_poll_wait", no_wait)
+    provider = Provider()
+
+    item_id = await _wait_for_provider_index(
+        provider,
+        knowledge_base_id="provider-kb-1",
+        provider_item_id=None,
+        artifact_name="recovered.pdf",
+    )
+
+    assert provider.calls == 2
+    assert item_id == "provider-item-from-list"

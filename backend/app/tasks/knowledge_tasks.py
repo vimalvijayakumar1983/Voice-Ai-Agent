@@ -59,9 +59,9 @@ async def _wait_for_provider_index(
     provider: SmallestAIClient,
     *,
     knowledge_base_id: str,
-    provider_item_id: str,
+    provider_item_id: str | None,
     artifact_name: str,
-) -> None:
+) -> str:
     """Do not report success until the provider item itself is indexed."""
     for attempt in range(30):
         items = await provider.list_knowledge_items(knowledge_base_id)
@@ -77,7 +77,14 @@ async def _wait_for_provider_index(
         if item is not None:
             provider_state = _provider_status(item)
             if provider_state in PROVIDER_READY:
-                return
+                indexed_item_id = _provider_item_id(item)
+                if indexed_item_id:
+                    return indexed_item_id
+                raise WebsiteRecoveryError(
+                    "The provider indexed the recovered page but returned no item identifier.",
+                    code="provider_response_invalid",
+                    retryable=True,
+                )
             if provider_state in PROVIDER_FAILED:
                 raise WebsiteRecoveryError(
                     "The provider rejected the recovered searchable document.",
@@ -265,13 +272,6 @@ async def _repair(tenant_id: UUID, kb_id: UUID, source_id: UUID) -> None:
             content=provider_document,
         )
         provider_item_id = _provider_item_id(upload)
-        if not provider_item_id:
-            raise WebsiteRecoveryError(
-                "The provider accepted the recovered page but returned no index item.",
-                code="provider_response_invalid",
-                retryable=True,
-            )
-
         await _set_stage(
             tenant_id,
             kb_id,
@@ -279,7 +279,7 @@ async def _repair(tenant_id: UUID, kb_id: UUID, source_id: UUID) -> None:
             "verifying",
             "The searchable document was accepted. VAV is verifying provider indexing.",
         )
-        await _wait_for_provider_index(
+        provider_item_id = await _wait_for_provider_index(
             provider,
             knowledge_base_id=remote_id,
             provider_item_id=provider_item_id,
