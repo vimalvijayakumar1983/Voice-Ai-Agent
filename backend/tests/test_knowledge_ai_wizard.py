@@ -146,3 +146,32 @@ def test_knowledge_ai_languages_accept_lists_and_legacy_comma_separated_value():
 
     assert current.languages == ["en", "ar"]
     assert legacy.languages == ["en", "ar"]
+
+
+@pytest.mark.asyncio
+async def test_reviewed_ai_metadata_can_be_saved_as_a_new_knowledge_draft(
+    client,
+    auth_headers,
+):
+    response = await client.post(
+        "/api/v1/knowledge",
+        headers=auth_headers,
+        json={
+            "name": "Group Corporate Knowledge",
+            "description": (
+                "Approved corporate information, locations, services, and customer FAQs."
+            ),
+            "scope_type": "group",
+            "scope_label": "Corporate",
+            "languages": ["en", "ar"],
+            "tags": ["corporate", "customer service"],
+        },
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["approval_status"] == "draft"
+    assert body["languages"] == ["en", "ar"]
+    assert body["sources"] == []
+    assert body["agent_bindings"] == []
+    assert body["crawls"] == []

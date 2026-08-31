@@ -613,6 +613,7 @@ async def create_knowledge_base(
         tags=data.tags,
         sources=[],
         agent_bindings=[],
+        crawls=[],
     )
     db.add(kb)
     await db.flush()
@@ -625,7 +626,10 @@ async def create_knowledge_base(
         resource_id=str(kb.id),
         details={"scope_type": kb.scope_type, "provider": kb.provider},
     )
-    return _knowledge_response(kb)
+    # Re-load through the canonical eager query before serialization. Async
+    # SQLAlchemy cannot lazy-load a newly created relationship while FastAPI
+    # is building the response, even when that relationship is currently empty.
+    return _knowledge_response(await _get_knowledge_base(db, current_user.tenant_id, kb.id))
 
 
 @router.get("/{kb_id}", response_model=KnowledgeBaseResponse)
