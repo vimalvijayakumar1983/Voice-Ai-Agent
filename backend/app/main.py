@@ -14,7 +14,7 @@ from app.middleware.request_body_limit import RequestBodyLimitMiddleware
 from app.middleware.security_headers import SecurityHeadersMiddleware
 
 logger = structlog.get_logger()
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.3.1"
 
 
 @asynccontextmanager
