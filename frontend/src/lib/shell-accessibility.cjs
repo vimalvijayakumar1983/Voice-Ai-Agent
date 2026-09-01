@@ -10,7 +10,7 @@ const PAGE_TITLES = Object.freeze({
   '/campaigns': 'Campaigns',
   '/compliance': 'Compliance',
   '/integrations': 'Integrations',
-  '/billing': 'Usage & billing',
+  '/billing': 'Cost & call reports',
   '/settings': 'Workspace settings',
 });
 

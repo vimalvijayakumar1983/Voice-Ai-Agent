@@ -244,6 +244,9 @@ async def _store_metrics(config: RuntimeSessionConfig, metrics: dict) -> None:
             "stt_language": config.stt_language,
             "turn_count": metrics.get("turn_count", 0),
             "llm_tokens": metrics.get("llm_tokens", 0),
+            "llm_input_tokens": metrics.get("llm_input_tokens", 0),
+            "llm_output_tokens": metrics.get("llm_output_tokens", 0),
+            "tts_characters": metrics.get("tts_characters", 0),
             "inbound_audio_bytes": metrics.get("inbound_audio_bytes", 0),
             "outbound_audio_bytes": metrics.get("outbound_audio_bytes", 0),
             "barge_in_count": metrics.get("barge_in_count", 0),
@@ -319,6 +322,9 @@ async def run_twilio_media_session(
     metrics: dict[str, int | float | None] = {
         "turn_count": 0,
         "llm_tokens": 0,
+        "llm_input_tokens": 0,
+        "llm_output_tokens": 0,
+        "tts_characters": 0,
         "inbound_audio_bytes": 0,
         "outbound_audio_bytes": 0,
         "barge_in_count": 0,
@@ -350,7 +356,13 @@ async def run_twilio_media_session(
         on_first_audio: Callable[[float], None] | None = None,
     ) -> None:
         first = True
-        async for audio in tts.audio_for(fragments, language_code=language_code):
+
+        async def metered_fragments() -> AsyncIterator[str]:
+            async for fragment in fragments:
+                metrics["tts_characters"] = int(metrics["tts_characters"] or 0) + len(fragment)
+                yield fragment
+
+        async for audio in tts.audio_for(metered_fragments(), language_code=language_code):
             if stop_event.is_set() or not stream_sid:
                 return
             if first:
@@ -412,6 +424,8 @@ async def run_twilio_media_session(
         first_tts_input_at: float | None = None
         response_parts: list[str] = []
         tokens = 0
+        input_tokens = 0
+        output_tokens = 0
         persisted = False
         audio_started = False
         language = (
@@ -421,7 +435,7 @@ async def run_twilio_media_session(
         )
 
         async def response_fragments() -> AsyncIterator[str]:
-            nonlocal first_tts_input_at, tokens
+            nonlocal first_tts_input_at, tokens, input_tokens, output_tokens
             buffer = ""
             first_token = True
             async for event in conversation_engine.stream_response(
@@ -434,6 +448,8 @@ async def run_twilio_media_session(
             ):
                 if event.is_final:
                     tokens = event.tokens_used
+                    input_tokens = event.input_tokens
+                    output_tokens = event.output_tokens
                     metrics["last_llm_latency_ms"] = round(
                         (time.perf_counter() - llm_started) * 1000
                     )
@@ -491,6 +507,8 @@ async def run_twilio_media_session(
                 response_parts.append(config.fallback_message)
                 await play_text(config.fallback_message, language)
         metrics["llm_tokens"] = int(metrics["llm_tokens"] or 0) + int(tokens)
+        metrics["llm_input_tokens"] = int(metrics["llm_input_tokens"] or 0) + int(input_tokens)
+        metrics["llm_output_tokens"] = int(metrics["llm_output_tokens"] or 0) + int(output_tokens)
         metrics["turn_count"] = int(metrics["turn_count"] or 0) + 1
         await persist_response()
         await _store_metrics(config, metrics)

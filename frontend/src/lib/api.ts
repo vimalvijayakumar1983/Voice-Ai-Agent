@@ -723,6 +723,116 @@ export interface BillingPlan {
   features: Record<string, unknown> | null;
 }
 
+export interface CostReportFilters {
+  days?: number;
+  provider?: 'twilio' | 'smallest' | '';
+  speech_provider?: 'sarvam' | 'elevenlabs' | 'smallest' | '';
+  agent_id?: string;
+  direction?: 'inbound' | 'outbound' | '';
+  status?: string;
+}
+
+export interface CostComponent {
+  provider: string;
+  service: string;
+  quantity: number;
+  unit: string;
+  rate_usd: number;
+  cost_usd: number;
+  cost_aed: number;
+  source_url: string;
+  basis: string;
+}
+
+export interface CostCallRow {
+  call_id: string;
+  created_at: string;
+  agent_id: string | null;
+  agent_name: string;
+  direction: string;
+  status: string;
+  disposition: string | null;
+  telephony_provider: string;
+  speech_provider: string | null;
+  from_number: string;
+  to_number: string;
+  duration_seconds: number;
+  cost_usd: number;
+  cost_aed: number;
+  ledger_cost_usd: number;
+  ledger_cost_aed: number;
+  cost_state: string;
+  pricing_completeness: string;
+  missing_cost_inputs: string[];
+  components: CostComponent[];
+}
+
+export interface ProviderRateCard {
+  provider: string;
+  service: string;
+  native_amount: number;
+  native_currency: string;
+  unit: string;
+  usd: number;
+  aed: number;
+  source_url: string;
+  effective_date: string;
+  notes: string;
+}
+
+export interface CostReport {
+  period_start: string;
+  period_end: string;
+  currency: {
+    display: string[];
+    usd_to_aed: number;
+    inr_to_aed: number;
+    fx_effective_date: string;
+    source_url: string;
+    notes: string;
+  };
+  summary: {
+    total_calls: number;
+    answered_calls: number;
+    completed_calls: number;
+    successful_calls: number;
+    total_minutes: number;
+    avg_duration_seconds: number;
+    answer_rate: number;
+    success_rate: number;
+    estimated_cost_usd: number;
+    estimated_cost_aed: number;
+    avg_cost_per_call_usd: number;
+    avg_cost_per_call_aed: number;
+    cost_per_minute_usd: number;
+    cost_per_minute_aed: number;
+    priced_calls: number;
+    fully_priced_calls: number;
+    unpriced_calls: number;
+    cost_coverage: number;
+    full_cost_coverage: number;
+    ledger_estimate_usd: number;
+    ledger_estimate_aed: number;
+    calls_by_status: Record<string, number>;
+    calls_by_direction: Record<string, number>;
+  };
+  provider_breakdown: Array<{
+    provider: string;
+    service: string;
+    calls: number;
+    quantity: number;
+    unit: string;
+    cost_usd: number;
+    cost_aed: number;
+    source_url: string;
+    basis: string;
+  }>;
+  trend: Array<{ date: string; calls: number; minutes: number; cost_usd: number; cost_aed: number }>;
+  calls: CostCallRow[];
+  rate_cards: ProviderRateCard[];
+  methodology: { primary_total: string; not_included: string; invoice_status: string };
+}
+
 class ApiClient {
   private token: string | null = null;
   private refreshPromise: Promise<RefreshResult> | null = null;
@@ -1813,6 +1923,27 @@ class ApiClient {
 
   async getPlans() {
     return this.request<BillingPlan[]>('/api/v1/billing/plans');
+  }
+
+  private costReportQuery(filters: CostReportFilters = {}) {
+    const query = new URLSearchParams();
+    query.set('days', String(filters.days || 30));
+    if (filters.provider) query.set('provider', filters.provider);
+    if (filters.speech_provider) query.set('speech_provider', filters.speech_provider);
+    if (filters.agent_id) query.set('agent_id', filters.agent_id);
+    if (filters.direction) query.set('direction', filters.direction);
+    if (filters.status) query.set('status', filters.status);
+    return query.toString();
+  }
+
+  async getCostReport(filters: CostReportFilters = {}) {
+    return this.request<CostReport>(`/api/v1/billing/cost-report?${this.costReportQuery(filters)}`);
+  }
+
+  async downloadCostReport(filters: CostReportFilters = {}) {
+    return this.requestBlob(
+      `/api/v1/billing/cost-report.csv?${this.costReportQuery(filters)}`,
+    );
   }
 }
 

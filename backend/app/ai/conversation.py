@@ -35,6 +35,8 @@ class ResponseStreamEvent:
 
     text: str = ""
     tokens_used: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
     is_final: bool = False
 
 
@@ -120,11 +122,15 @@ class ConversationEngine:
         )
         response_length = 0
         tokens_used = 0
+        input_tokens = 0
+        output_tokens = 0
         try:
             async for chunk in stream:
                 usage = getattr(chunk, "usage", None)
                 if usage is not None:
                     tokens_used = int(getattr(usage, "total_tokens", 0) or 0)
+                    input_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
+                    output_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
                 for choice in getattr(chunk, "choices", []) or []:
                     delta = getattr(getattr(choice, "delta", None), "content", None)
                     if isinstance(delta, str) and delta:
@@ -136,7 +142,12 @@ class ConversationEngine:
                 tokens=tokens_used,
                 response_length=response_length,
             )
-            yield ResponseStreamEvent(tokens_used=tokens_used, is_final=True)
+            yield ResponseStreamEvent(
+                tokens_used=tokens_used,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                is_final=True,
+            )
         finally:
             close = getattr(stream, "close", None)
             if callable(close):

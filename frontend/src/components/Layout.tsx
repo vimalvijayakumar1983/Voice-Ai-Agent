@@ -49,7 +49,7 @@ const navigation = [
   {
     label: 'Manage',
     items: [
-      { href: '/billing', label: 'Usage & billing', icon: CreditCard },
+      { href: '/billing', label: 'Cost & call reports', icon: CreditCard },
       { href: '/settings', label: 'Settings', icon: Settings },
     ],
   },
