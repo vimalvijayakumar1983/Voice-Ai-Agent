@@ -1,15 +1,16 @@
 import { FormEvent, useId, useState } from 'react';
 import { Loader2, ShieldCheck, Sparkles } from 'lucide-react';
-import { AgentAIDraftRequest, AgentProviderCatalog } from '@/lib/api';
+import { AgentAIDraftRequest, AgentProviderCatalog, ProviderStatus } from '@/lib/api';
 
 interface AgentAIWizardProps {
   catalog: AgentProviderCatalog;
+  providerStatus?: ProviderStatus | null;
   busy: boolean;
   onCancel: () => void;
   onGenerate: (request: AgentAIDraftRequest) => Promise<void>;
 }
 
-export default function AgentAIWizard({ catalog, busy, onCancel, onGenerate }: AgentAIWizardProps) {
+export default function AgentAIWizard({ catalog, providerStatus = null, busy, onCancel, onGenerate }: AgentAIWizardProps) {
   const [brief, setBrief] = useState('');
   const [provider, setProvider] = useState<AgentAIDraftRequest['provider_preference']>('auto');
   const [language, setLanguage] = useState('en');
@@ -63,9 +64,9 @@ export default function AgentAIWizard({ catalog, busy, onCancel, onGenerate }: A
             <label htmlFor={providerId}>Voice provider</label>
             <select id={providerId} value={provider} onChange={(event) => setProvider(event.target.value as AgentAIDraftRequest['provider_preference'])}>
               <option value="auto">Choose the best available provider</option>
-              {availableProviders.has('smallest') ? <option value="smallest">Smallest.ai</option> : null}
-              {availableProviders.has('sarvam') ? <option value="sarvam">Sarvam AI</option> : null}
-              {availableProviders.has('elevenlabs') ? <option value="elevenlabs">ElevenLabs</option> : null}
+              <option value="smallest" disabled={!availableProviders.has('smallest')}>Smallest.ai{availableProviders.has('smallest') ? '' : ' · unavailable'}</option>
+              <option value="sarvam" disabled={!availableProviders.has('sarvam')}>Sarvam AI{availableProviders.has('sarvam') ? '' : ' · connect in Settings'}</option>
+              <option value="elevenlabs" disabled={!availableProviders.has('elevenlabs')}>ElevenLabs{availableProviders.has('elevenlabs') ? '' : providerStatus?.providers?.elevenlabs?.configured ? ' · voice catalog unavailable' : ' · connect in Settings'}</option>
             </select>
           </div>
           <div className="form-group">

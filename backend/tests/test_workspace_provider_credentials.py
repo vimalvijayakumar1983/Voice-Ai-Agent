@@ -6,12 +6,14 @@ from sqlalchemy import select
 from twilio.request_validator import RequestValidator
 
 from app.api.v1.endpoints import agents as agents_endpoint
+from app.api.v1.endpoints import runtime as runtime_endpoint
 from app.api.v1.endpoints import webhooks
 from app.core.config import settings
 from app.models.agent import Agent, AgentRuntimeProfile
 from app.models.call import Call
 from app.models.provider_credential import ProviderCredential
 from app.models.tenant import Tenant
+from app.providers.elevenlabs import ElevenLabsError
 from app.realtime.auth import verify_media_token
 from tests.conftest import test_session_factory as session_factory
 
@@ -85,6 +87,65 @@ async def test_workspace_provider_credentials_are_encrypted_write_only_and_remov
     )
     assert removed.status_code == 200
     assert removed.json()["source"] == "none"
+
+
+@pytest.mark.asyncio
+async def test_elevenlabs_workspace_key_is_verified_before_storage(
+    client,
+    auth_headers,
+    db,
+    monkeypatch,
+):
+    validated: list[str] = []
+
+    async def validate_ok(self):
+        validated.append(self.api_key)
+
+    monkeypatch.setattr(runtime_endpoint.ElevenLabsClient, "validate_connection", validate_ok)
+    api_key = "elevenlabs_workspace_key_123456789"
+
+    saved = await client.put(
+        "/api/v1/runtime/credentials/elevenlabs",
+        headers=auth_headers,
+        json={"api_key": api_key},
+    )
+
+    assert saved.status_code == 200
+    assert saved.json()["source"] == "workspace"
+    assert validated == [api_key]
+    credential = await db.scalar(
+        select(ProviderCredential).where(ProviderCredential.provider == "elevenlabs")
+    )
+    assert credential is not None
+    assert api_key not in credential.encrypted_config
+
+
+@pytest.mark.asyncio
+async def test_invalid_elevenlabs_workspace_key_is_not_stored(
+    client,
+    auth_headers,
+    db,
+    monkeypatch,
+):
+    async def validate_failed(self):
+        raise ElevenLabsError("invalid API key", status_code=401)
+
+    monkeypatch.setattr(runtime_endpoint.ElevenLabsClient, "validate_connection", validate_failed)
+
+    rejected = await client.put(
+        "/api/v1/runtime/credentials/elevenlabs",
+        headers=auth_headers,
+        json={"api_key": "elevenlabs_invalid_key_123456789"},
+    )
+
+    assert rejected.status_code == 422
+    assert rejected.json()["detail"] == (
+        "ElevenLabs API key validation failed: invalid API key"
+    )
+    credential = await db.scalar(
+        select(ProviderCredential).where(ProviderCredential.provider == "elevenlabs")
+    )
+    assert credential is None
 
 
 @pytest.mark.asyncio

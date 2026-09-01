@@ -118,6 +118,7 @@ class ElevenLabsTTSStream:
         connection = await self._connect(language_code)
         producer = asyncio.create_task(self._send_fragments(connection, fragments))
         completed = False
+        emitted_audio = False
         try:
             while not completed:
                 receiver = asyncio.create_task(connection.recv())
@@ -145,9 +146,12 @@ class ElevenLabsTTSStream:
                         base64.b64decode(audio, validate=True)
                     except ValueError:
                         continue
+                    emitted_audio = True
                     yield audio
                 completed = bool(payload.get("is_final"))
             await producer
+            if not emitted_audio:
+                raise ElevenLabsStreamError("ElevenLabs returned no speech audio")
         except asyncio.CancelledError:
             raise
         except Exception as exc:

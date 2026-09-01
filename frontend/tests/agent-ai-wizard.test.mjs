@@ -6,6 +6,7 @@ const agentsSource = readFileSync(new URL('../src/pages/agents.tsx', import.meta
 const layoutSource = readFileSync(new URL('../src/components/Layout.tsx', import.meta.url), 'utf8');
 const apiSource = readFileSync(new URL('../src/lib/api.ts', import.meta.url), 'utf8');
 const wizardSource = readFileSync(new URL('../src/components/AgentAIWizard.tsx', import.meta.url), 'utf8');
+const editorSource = readFileSync(new URL('../src/components/AgentEditor.tsx', import.meta.url), 'utf8');
 
 test('Create with AI opens a genuine review-first OpenAI wizard', () => {
   assert.match(layoutSource, /'\/agents\?create=ai'/);
@@ -14,4 +15,11 @@ test('Create with AI opens a genuine review-first OpenAI wizard', () => {
   assert.match(wizardSource, /review every field before anything is saved/i);
   assert.match(agentsSource, /Review the AI-generated draft/);
   assert.match(agentsSource, /aiDraftValues\(generatedDraft\)/);
+});
+
+test('unavailable ElevenLabs remains visible with a corrective action', () => {
+  assert.match(wizardSource, /ElevenLabs.*connect in Settings/);
+  assert.match(editorSource, /ElevenLabs.*voice catalog unavailable/);
+  assert.match(editorSource, /Unavailable providers show the corrective action instead of disappearing/);
+  assert.match(agentsSource, /providerStatus=\{provider\}/);
 });

@@ -4,6 +4,7 @@ import {
   AgentProviderCatalog,
   AgentTemplate,
   LanguageCatalogItem,
+  ProviderStatus,
 } from '@/lib/api';
 import VoiceLibrary from './VoiceLibrary';
 import {
@@ -74,6 +75,7 @@ interface AgentEditorProps {
   catalog: AgentProviderCatalog | null;
   initialValues?: AgentEditorValues;
   catalogError?: string | null;
+  providerStatus?: ProviderStatus | null;
   busy?: boolean;
   onCancel: () => void;
   onSubmit: (values: AgentEditorValues) => Promise<void>;
@@ -85,6 +87,7 @@ export default function AgentEditor({
   catalog,
   initialValues = defaultAgentValues,
   catalogError = null,
+  providerStatus = null,
   busy = false,
   onCancel,
   onSubmit,
@@ -318,11 +321,11 @@ export default function AgentEditor({
         <div className="form-group language-primary">
           <label htmlFor="voice-provider">Voice provider</label>
           <select id="voice-provider" value={form.voice_provider} onChange={(event) => updateVoiceProvider(event.target.value as AgentEditorValues['voice_provider'])}>
-            {availableProviders.includes('smallest') ? <option value="smallest">Smallest.ai · Lightning</option> : null}
-            {availableProviders.includes('sarvam') ? <option value="sarvam">Sarvam AI · Bulbul v3 Indian voices</option> : null}
-            {availableProviders.includes('elevenlabs') ? <option value="elevenlabs">ElevenLabs · Flash v2.5 voices</option> : null}
+            <option value="smallest" disabled={!availableProviders.includes('smallest')}>Smallest.ai · Lightning{availableProviders.includes('smallest') ? '' : ' · unavailable'}</option>
+            <option value="sarvam" disabled={!availableProviders.includes('sarvam')}>Sarvam AI · Bulbul v3 Indian voices{availableProviders.includes('sarvam') ? '' : ' · connect in Settings'}</option>
+            <option value="elevenlabs" disabled={!availableProviders.includes('elevenlabs')}>ElevenLabs · Flash v2.5 voices{availableProviders.includes('elevenlabs') ? '' : providerStatus?.providers?.elevenlabs?.configured ? ' · voice catalog unavailable' : ' · connect in Settings'}</option>
           </select>
-          <p className="form-hint">Smallest agents publish to Atoms. Sarvam and ElevenLabs voices use VAV realtime, VAV knowledge, and OpenAI behavior.</p>
+          <p className="form-hint">Smallest agents publish to Atoms. Sarvam and ElevenLabs voices use VAV realtime, VAV knowledge, and OpenAI behavior. Unavailable providers show the corrective action instead of disappearing.</p>
         </div>
         <div className="form-group language-primary">
           <label htmlFor={primaryLanguageId}>Primary language</label>

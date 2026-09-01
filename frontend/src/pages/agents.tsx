@@ -447,6 +447,7 @@ export default function Agents() {
           </aside>
           <AgentAIWizard
             catalog={catalog}
+            providerStatus={provider}
             busy={working === 'ai-draft'}
             onCancel={closeEditor}
             onGenerate={generateAIDraft}
@@ -492,6 +493,7 @@ export default function Agents() {
             mode={editingAgent ? 'edit' : 'create'}
             catalog={catalog}
             catalogError={loadErrors.catalog ?? null}
+            providerStatus={provider}
             initialValues={editingAgent ? editorValues(editingAgent) : generatedDraft ? aiDraftValues(generatedDraft) : defaultAgentValues}
             busy={working === (editingAgent ? `save-${editingAgent.id}` : 'save-new')}
             onCancel={closeEditor}

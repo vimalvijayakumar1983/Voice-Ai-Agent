@@ -132,6 +132,42 @@ class ElevenLabsClient:
     def is_configured(self) -> bool:
         return bool(self.api_key.strip())
 
+    async def validate_connection(self) -> None:
+        """Verify that a key can read the voice catalog without consuming TTS credits."""
+        if not self.is_configured:
+            raise ElevenLabsError(
+                "ElevenLabs is not configured. Add an API key in Settings.",
+                status_code=503,
+            )
+        try:
+            async with httpx.AsyncClient(
+                base_url=self.base_url,
+                timeout=self.timeout,
+                transport=self.transport,
+            ) as client:
+                response = await client.get(
+                    "/v2/voices",
+                    headers={"xi-api-key": self.api_key, "Accept": "application/json"},
+                    params={"page_size": 1, "include_total_count": False},
+                )
+        except httpx.TimeoutException as exc:
+            raise ElevenLabsError(
+                "ElevenLabs timed out while validating the API key.", status_code=504
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise ElevenLabsError("ElevenLabs could not be reached.") from exc
+        if response.status_code >= 400:
+            status_code = (
+                response.status_code if response.status_code in {400, 401, 403, 422, 429} else 502
+            )
+            raise ElevenLabsError(_bounded_error(response), status_code=status_code)
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise ElevenLabsError("ElevenLabs returned an invalid validation response.") from exc
+        if not isinstance(payload, dict) or not isinstance(payload.get("voices"), list):
+            raise ElevenLabsError("ElevenLabs returned an invalid validation response.")
+
     async def list_voices(self) -> list[dict[str, Any]]:
         if not self.is_configured:
             return []

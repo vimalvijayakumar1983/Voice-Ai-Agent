@@ -8,6 +8,7 @@ from app.models.agent import Agent
 from app.providers.elevenlabs import ElevenLabsClient, ElevenLabsError
 from app.realtime import elevenlabs_stream
 from app.realtime.elevenlabs_stream import ElevenLabsTTSStream
+from app.realtime.session import audio_with_fallback
 
 
 @pytest.mark.asyncio
@@ -57,6 +58,27 @@ async def test_elevenlabs_voice_catalog_is_paginated_and_namespaced():
     assert "en" in voices[1]["languages"]
     assert requests[0].headers["xi-api-key"] == "elevenlabs_test_key_123456789"
     assert requests[1].url.params["next_page_token"] == "page-2"
+
+
+@pytest.mark.asyncio
+async def test_elevenlabs_connection_validation_is_bounded_and_credit_free():
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"voices": [], "has_more": False})
+
+    client = ElevenLabsClient(
+        api_key="elevenlabs_test_key_123456789",
+        transport=httpx.MockTransport(handler),
+    )
+
+    await client.validate_connection()
+
+    assert len(requests) == 1
+    assert requests[0].method == "GET"
+    assert requests[0].url.path == "/v2/voices"
+    assert requests[0].url.params["page_size"] == "1"
 
 
 @pytest.mark.asyncio
@@ -147,6 +169,84 @@ async def test_elevenlabs_realtime_stream_requests_twilio_native_audio(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_elevenlabs_empty_stream_fails_instead_of_leaving_caller_silent(monkeypatch):
+    class EmptyConnection:
+        async def send(self, value: str):
+            return None
+
+        async def recv(self):
+            return json.dumps({"is_final": True})
+
+        async def close(self):
+            return None
+
+    async def fake_connect(url: str, **kwargs):
+        return EmptyConnection()
+
+    monkeypatch.setattr(elevenlabs_stream, "connect", fake_connect)
+    stream = ElevenLabsTTSStream(
+        api_key="elevenlabs_test_key_123456789",
+        base_url="https://api.elevenlabs.io",
+        voice_id="voice-a",
+        speed=1,
+    )
+
+    async def fragments():
+        yield "Hello there."
+
+    with pytest.raises(elevenlabs_stream.ElevenLabsStreamError) as caught:
+        _ = [chunk async for chunk in stream.audio_for(fragments(), language_code="en")]
+
+    assert str(caught.value) == "ElevenLabs returned no speech audio"
+
+
+@pytest.mark.asyncio
+async def test_tts_failure_before_audio_replays_complete_text_through_fallback():
+    events: list[str] = []
+
+    class FailingPrimary:
+        async def audio_for(self, fragments, *, language_code: str):
+            async for fragment in fragments:
+                events.append(f"primary:{fragment}")
+            raise RuntimeError("primary unavailable")
+            yield ""  # pragma: no cover
+
+    class WorkingFallback:
+        async def audio_for(self, fragments, *, language_code: str):
+            async for fragment in fragments:
+                events.append(f"fallback:{fragment}")
+            yield "ZmFsbGJhY2s="
+
+    async def fragments():
+        yield "Complete "
+        yield "answer."
+
+    failures: list[str] = []
+    fallbacks: list[str] = []
+    audio = [
+        chunk
+        async for chunk in audio_with_fallback(
+            FailingPrimary(),
+            WorkingFallback(),
+            fragments(),
+            language_code="en",
+            on_primary_failure=lambda: failures.append("failed"),
+            on_fallback=lambda: fallbacks.append("used"),
+        )
+    ]
+
+    assert audio == ["ZmFsbGJhY2s="]
+    assert events == [
+        "primary:Complete ",
+        "primary:answer.",
+        "fallback:Complete ",
+        "fallback:answer.",
+    ]
+    assert failures == ["failed"]
+    assert fallbacks == ["used"]
+
+
+@pytest.mark.asyncio
 async def test_elevenlabs_agent_runtime_uses_vav_readiness_pipeline(
     client,
     auth_headers,
@@ -154,6 +254,12 @@ async def test_elevenlabs_agent_runtime_uses_vav_readiness_pipeline(
     db,
     monkeypatch,
 ):
+    async def synthesize_ok(self, *, voice_id: str, language: str, speed: float = 1.0):
+        assert voice_id == "voice-a"
+        assert language == "en"
+        return b"preview"
+
+    monkeypatch.setattr(ElevenLabsClient, "synthesize_voice_preview", synthesize_ok)
     monkeypatch.setattr(settings, "sarvam_api_key", "sarvam-test-key-long-enough")
     monkeypatch.setattr(settings, "elevenlabs_api_key", "elevenlabs-test-key-long-enough")
     monkeypatch.setattr(settings, "openai_api_key", "openai-test-key-long-enough")
@@ -200,3 +306,52 @@ async def test_elevenlabs_agent_runtime_uses_vav_readiness_pipeline(
     assert tested.json()["checks"]["stt_credential"] is True
     assert tested.json()["checks"]["tts_credential"] is True
     assert tested.json()["checks"]["speech_provider_match"] is True
+    assert tested.json()["checks"]["tts_provider_live"] is True
+
+
+@pytest.mark.asyncio
+async def test_elevenlabs_live_readiness_fails_closed_when_synthesis_fails(
+    client,
+    auth_headers,
+    tenant,
+    db,
+    monkeypatch,
+):
+    async def synthesize_failed(self, *, voice_id: str, language: str, speed: float = 1.0):
+        raise ElevenLabsError("selected voice is unavailable", status_code=403)
+
+    monkeypatch.setattr(ElevenLabsClient, "synthesize_voice_preview", synthesize_failed)
+    monkeypatch.setattr(settings, "sarvam_api_key", "sarvam-test-key-long-enough")
+    monkeypatch.setattr(settings, "elevenlabs_api_key", "elevenlabs-test-key-long-enough")
+    monkeypatch.setattr(settings, "openai_api_key", "openai-test-key-long-enough")
+    monkeypatch.setattr(settings, "twilio_account_sid", "ACtest")
+    monkeypatch.setattr(settings, "twilio_auth_token", "twilio-test-token")
+    monkeypatch.setattr(settings, "base_url", "https://voice.example.com")
+    agent = Agent(
+        tenant_id=tenant.id,
+        name="Broken ElevenLabs voice",
+        system_prompt="Help callers.",
+        voice_provider="elevenlabs",
+        voice_id="elevenlabs:voice-a",
+        language="en",
+        supported_languages=["en"],
+    )
+    db.add(agent)
+    await db.commit()
+    await client.put(
+        f"/api/v1/runtime/agents/{agent.id}",
+        headers=auth_headers,
+        json={"assigned_numbers": ["+15551234567"], "primary_speech_provider": "elevenlabs"},
+    )
+
+    tested = await client.post(
+        f"/api/v1/runtime/agents/{agent.id}/test",
+        headers=auth_headers,
+    )
+
+    assert tested.status_code == 200
+    assert tested.json()["ready"] is False
+    assert tested.json()["checks"]["tts_provider_live"] is False
+    assert tested.json()["blockers"] == [
+        "ElevenLabs live synthesis failed: selected voice is unavailable"
+    ]

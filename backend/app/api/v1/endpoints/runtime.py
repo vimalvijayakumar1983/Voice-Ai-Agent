@@ -19,6 +19,7 @@ from app.models.agent import (
     KnowledgeBase,
     KnowledgeSource,
 )
+from app.providers.elevenlabs import ElevenLabsClient, ElevenLabsError
 from app.schemas.runtime import (
     ApiKeyCredentialRequest,
     RuntimeProfileResponse,
@@ -262,6 +263,37 @@ async def runtime_readiness(
     return [labels[name] for name, passed in checks.items() if not passed], checks
 
 
+async def live_runtime_readiness(
+    db: AsyncSession,
+    agent: Agent,
+    profile: AgentRuntimeProfile | None,
+) -> tuple[list[str], dict[str, bool]]:
+    """Run normal gates plus a real, low-cost synthesis probe where supported."""
+    blockers, checks = await runtime_readiness(db, agent, profile)
+    if agent.voice_provider != "elevenlabs":
+        return blockers, checks
+
+    checks["tts_provider_live"] = False
+    if not checks.get("tts_credential") or not checks.get("voice_selection"):
+        return blockers, checks
+    try:
+        config = await load_provider_config(db, agent.tenant_id, "elevenlabs")
+    except ProviderCredentialError:
+        config = None
+    api_key = str((config or {}).get("api_key") or settings.elevenlabs_api_key).strip()
+    try:
+        await ElevenLabsClient(api_key=api_key).synthesize_voice_preview(
+            voice_id=agent.voice_id.removeprefix("elevenlabs:"),
+            language=agent.language,
+            speed=agent.speech_rate,
+        )
+    except ElevenLabsError as exc:
+        blockers.append(f"ElevenLabs live synthesis failed: {exc}")
+        return blockers, checks
+    checks["tts_provider_live"] = True
+    return blockers, checks
+
+
 def _response(
     agent: Agent,
     profile: AgentRuntimeProfile | None,
@@ -365,7 +397,7 @@ async def test_runtime_profile(
     agent = await _agent(db, current_user.tenant_id, agent_id)
     profile = await _profile(db, current_user.tenant_id, agent_id, create=True)
     assert profile is not None
-    blockers, checks = await runtime_readiness(db, agent, profile)
+    blockers, checks = await live_runtime_readiness(db, agent, profile)
     tested_at = datetime.now(UTC)
     profile.last_tested_at = tested_at
     if blockers:
@@ -406,7 +438,7 @@ async def activate_runtime_profile(
     profile = await _profile(db, current_user.tenant_id, agent_id, create=True)
     assert profile is not None
     await _lock_number_routes(db, agent, profile)
-    blockers, _checks = await runtime_readiness(db, agent, profile)
+    blockers, _checks = await live_runtime_readiness(db, agent, profile)
     if blockers:
         profile.enabled = False
         profile.status = "blocked"
@@ -533,6 +565,17 @@ async def save_api_key_credential(
 ):
     if provider not in {"smallest", "sarvam", "elevenlabs", "openai"}:
         raise HTTPException(status_code=404, detail="Unsupported API-key provider")
+    if provider == "elevenlabs":
+        try:
+            await ElevenLabsClient(api_key=data.api_key).validate_connection()
+        except ElevenLabsError as exc:
+            # Provider authentication failures must not look like an expired VAV
+            # login to the browser. Return a field-level validation failure instead.
+            status_code = 422 if exc.status_code in {400, 401, 403, 422} else exc.status_code
+            raise HTTPException(
+                status_code=status_code,
+                detail=f"ElevenLabs API key validation failed: {exc}",
+            ) from exc
     existing = await get_provider_credential(db, current_user.tenant_id, provider)
     try:
         credential = await store_provider_config(
