@@ -133,9 +133,7 @@ async def audio_with_fallback(
             yield fragment
 
     try:
-        async for audio in primary.audio_for(
-            capture_fragments(), language_code=language_code
-        ):
+        async for audio in primary.audio_for(capture_fragments(), language_code=language_code):
             audio_started = True
             yield audio
         return

@@ -139,9 +139,7 @@ async def test_invalid_elevenlabs_workspace_key_is_not_stored(
     )
 
     assert rejected.status_code == 422
-    assert rejected.json()["detail"] == (
-        "ElevenLabs API key validation failed: invalid API key"
-    )
+    assert rejected.json()["detail"] == ("ElevenLabs API key validation failed: invalid API key")
     credential = await db.scalar(
         select(ProviderCredential).where(ProviderCredential.provider == "elevenlabs")
     )
