@@ -9,6 +9,7 @@ import pytest
 from app.providers.inworld import (
     INWORLD_TTS_SUPPORTED_LANGUAGES,
     MAX_PROBE_RESPONSE_BYTES,
+    ROUTER_AUTO_PROBE_MAX_TOKENS,
     InworldClient,
     InworldError,
 )
@@ -206,6 +207,100 @@ async def test_inworld_tts_probe_accepts_snake_case_audio_response_fields():
         voice_id="Ashley",
         model_id="inworld-tts-2",
     )
+
+
+@pytest.mark.asyncio
+async def test_inworld_auto_router_probe_budgets_reasoning_and_requires_visible_text():
+    captured: dict[str, object] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(await request.aread()))
+        return httpx.Response(
+            200,
+            json={
+                "model": "deepinfra/MiniMaxAI/MiniMax-M2.5",
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {
+                            "role": "assistant",
+                            "content": "OK",
+                            "reasoning": "The user requested a bounded readiness response.",
+                        },
+                    }
+                ],
+                "usage": {
+                    "completion_tokens": 67,
+                    "completion_tokens_details": {"reasoning_tokens": 65},
+                },
+            },
+        )
+
+    client = InworldClient(
+        api_key="workspace-inworld-key-123456",
+        transport=httpx.MockTransport(handler),
+    )
+
+    await client.router_readiness_probe(model_id="auto")
+
+    assert captured["max_tokens"] == ROUTER_AUTO_PROBE_MAX_TOKENS
+    assert captured["model"] == "auto"
+
+
+@pytest.mark.asyncio
+async def test_inworld_auto_router_probe_rejects_limits_reasoning_and_structured_output():
+    responses = iter(
+        [
+            httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "finish_reason": "length",
+                            "message": {"content": "", "reasoning": "Still reasoning."},
+                        }
+                    ]
+                },
+            ),
+            httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "finish_reason": "stop",
+                            "message": {"content": "", "reasoning": "Internal only."},
+                        }
+                    ]
+                },
+            ),
+            httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "finish_reason": "stop",
+                            "message": {"content": [{"type": "text", "text": "OK"}]},
+                        }
+                    ]
+                },
+            ),
+        ]
+    )
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return next(responses)
+
+    client = InworldClient(
+        api_key="workspace-inworld-key-123456",
+        transport=httpx.MockTransport(handler),
+    )
+
+    with pytest.raises(InworldError, match="exhausted its bounded output token budget"):
+        await client.router_readiness_probe(model_id="auto")
+    with pytest.raises(InworldError, match="returned an empty completion"):
+        await client.router_readiness_probe(model_id="auto")
+    with pytest.raises(InworldError, match="returned invalid content"):
+        await client.router_readiness_probe(model_id="auto")
 
 
 @pytest.mark.asyncio

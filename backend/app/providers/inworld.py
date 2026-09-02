@@ -20,6 +20,9 @@ PROBE_TIMEOUT_SECONDS = 10.0
 TTS_PROBE_TEXT = "OK."
 ROUTER_PROBE_PROMPT = "Reply OK."
 ROUTER_PROBE_MAX_TOKENS = 8
+# ``auto`` may select a reasoning model that spends a tiny completion budget
+# before producing visible text. Keep the larger bound isolated to that route.
+ROUTER_AUTO_PROBE_MAX_TOKENS = 128
 
 # Realtime TTS-2 is cross-lingual. The Voice API's ``langCode`` describes the
 # native prompt/accent of a voice; it is not that voice's complete synthesis
@@ -340,16 +343,19 @@ class InworldClient:
             )
 
     async def router_readiness_probe(self, *, model_id: str) -> None:
-        """Request at most eight output tokens from the selected Router model."""
+        """Request a small, bounded completion from the selected Router model."""
 
         selected_model = _probe_value(model_id, "Router model")
+        max_tokens = (
+            ROUTER_AUTO_PROBE_MAX_TOKENS if selected_model == "auto" else ROUTER_PROBE_MAX_TOKENS
+        )
         payload = await self._bounded_probe_json(
             path="/v1/chat/completions",
             probe_name="Router readiness probe",
             body={
                 "model": selected_model,
                 "messages": [{"role": "user", "content": ROUTER_PROBE_PROMPT}],
-                "max_tokens": ROUTER_PROBE_MAX_TOKENS,
+                "max_tokens": max_tokens,
                 "temperature": 0,
                 "stream": False,
             },
@@ -359,8 +365,14 @@ class InworldClient:
             raise InworldError("Inworld Router readiness probe returned no completion.")
         first = choices[0] if isinstance(choices[0], dict) else {}
         message = first.get("message") if isinstance(first.get("message"), dict) else {}
+        if first.get("finish_reason") == "length":
+            raise InworldError(
+                "Inworld Router readiness probe exhausted its bounded output token budget."
+            )
         content = message.get("content")
-        if not isinstance(content, str) or not content.strip():
+        if not isinstance(content, str):
+            raise InworldError("Inworld Router readiness probe returned invalid content.")
+        if not content.strip():
             raise InworldError("Inworld Router readiness probe returned an empty completion.")
 
     async def list_voices(self) -> list[dict[str, Any]]:
