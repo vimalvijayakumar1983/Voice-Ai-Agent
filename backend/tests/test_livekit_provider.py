@@ -787,6 +787,43 @@ async def test_livekit_agent_repairs_misheard_scoped_name_for_retrieval(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_livekit_agent_uses_cached_knowledge_terminology_and_conversation_variants(
+    monkeypatch,
+):
+    model = Agent(
+        tenant_id=uuid4(),
+        name="Cosmetic centre receptionist",
+        system_prompt="Answer from approved knowledge.",
+        voice_provider="inworld",
+        voice_id="inworld:Ashley",
+        language="en-GB",
+    )
+    terminology = AsyncMock(return_value=("Chemical Peeling", "Platelet Rich Plasma"))
+    retrieval = AsyncMock(return_value="Source: Treatments\nVerified treatment information.")
+    monkeypatch.setattr(livekit_worker, "load_agent_knowledge_terminology", terminology)
+    monkeypatch.setattr(livekit_worker, "retrieve_knowledge_context", retrieval)
+    monkeypatch.setattr(livekit_worker, "async_session_factory", session_factory)
+    agent = livekit_worker.VAVInworldAgent(model=model)
+    turn_ctx = livekit_worker.llm.ChatContext.empty()
+    turn_ctx.add_message(role="user", content="Tell me about facial treatments.")
+    turn_ctx.add_message(role="assistant", content="Which treatment would you like?")
+    follow_up = turn_ctx.add_message(role="user", content="What about chemical feeling?")
+
+    await agent.on_user_turn_completed(turn_ctx, follow_up)
+    await agent.on_user_turn_completed(turn_ctx, follow_up)
+
+    terminology.assert_awaited_once()
+    assert retrieval.await_count == 2
+    assert retrieval.await_args.kwargs["terminology"] == (
+        "Chemical Peeling",
+        "Platelet Rich Plasma",
+    )
+    assert "Tell me about facial treatments. What about chemical feeling?" in (
+        retrieval.await_args.kwargs["query_variants"]
+    )
+
+
+@pytest.mark.asyncio
 async def test_livekit_agent_resolves_elliptical_follow_up_before_retrieval(monkeypatch):
     model = Agent(
         tenant_id=uuid4(),

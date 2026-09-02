@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import re
 from collections import Counter
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from difflib import SequenceMatcher
+from urllib.parse import unquote, urlsplit
 from uuid import UUID
 
 from sqlalchemy import Text, case, cast, func, literal_column, or_, select
@@ -20,6 +22,9 @@ MAX_CONTEXT_CHARS = 6000
 MAX_SOURCE_CANDIDATES = 48
 MAX_RANKING_CORPUS_CHARS = 96_000
 MAX_RANKING_SOURCE_CHARS = 8_000
+MAX_CONTEXTUAL_QUERY_VARIANTS = 5
+MAX_TERMINOLOGY_SOURCES = 256
+MAX_TERMINOLOGY_VALUES = 1_024
 _FTS_CANDIDATE_LIMIT = 32
 _TITLE_CANDIDATE_LIMIT = 8
 _POSTGRES_HEADLINE_OPTIONS = (
@@ -206,6 +211,15 @@ class KnowledgeMatch:
     score: float
 
 
+@dataclass(frozen=True)
+class ContextualQueryPlan:
+    """Auditable retrieval queries derived without changing the raw transcript."""
+
+    primary_query: str
+    variants: tuple[str, ...]
+    recovered_terms: tuple[str, ...]
+
+
 def _base_tokens(value: str) -> list[str]:
     return [token.casefold() for token in _TOKEN.findall(value) if len(token) > 1]
 
@@ -232,6 +246,160 @@ def _token_forms(base_tokens: list[str]) -> set[str]:
 
 def _query_tokens(value: str) -> set[str]:
     return {_singular(token) for token in _base_tokens(value)} - _QUERY_STOP_WORDS
+
+
+def _deduplicated_queries(values: Iterable[str]) -> tuple[str, ...]:
+    selected: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        candidate = " ".join(str(value or "").split()).strip()
+        normalized = " ".join(_base_tokens(candidate))
+        if not normalized or normalized in seen:
+            continue
+        selected.append(candidate)
+        seen.add(normalized)
+        if len(selected) >= MAX_CONTEXTUAL_QUERY_VARIANTS:
+            break
+    return tuple(selected)
+
+
+def _terminology_text(value: object) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    if "://" in raw:
+        parsed = urlsplit(raw)
+        raw = " ".join((parsed.hostname or "", unquote(parsed.path)))
+    raw = re.sub(r"\.(?:docx?|html?|pdf|pptx?|txt|xlsx?)\b", " ", raw, flags=re.IGNORECASE)
+    raw = re.sub(r"[_/|:]+", " ", raw)
+    raw = re.sub(r"\s+-\s+", " ", raw)
+    return " ".join(raw.split())
+
+
+def _terminology_phrases(values: Iterable[object]) -> dict[str, str]:
+    """Build a bounded correction vocabulary from approved source metadata.
+
+    Source titles and URL slugs are authoritative enough to repair recognition,
+    while arbitrary document prose is deliberately excluded so ordinary words
+    cannot become accidental aliases.
+    """
+    phrases: dict[str, str] = {}
+    ignored = _SOURCE_NOISE_TOKENS | _QUERY_STOP_WORDS | _QUERY_INTENT_TOKENS
+    for value in values:
+        text = _terminology_text(value)
+        tokens = _TOKEN.findall(text)
+        if not tokens:
+            continue
+        bounded_tokens = tokens[:24]
+        for width in range(1, min(4, len(bounded_tokens)) + 1):
+            for start in range(len(bounded_tokens) - width + 1):
+                display_tokens = bounded_tokens[start : start + width]
+                normalized_tokens = [token.casefold() for token in display_tokens]
+                if any(token.isdigit() for token in normalized_tokens):
+                    continue
+                distinctive = [
+                    token
+                    for token in normalized_tokens
+                    if len(token) >= 4 and token not in ignored
+                ]
+                if not distinctive:
+                    continue
+                if width == 1 and len(normalized_tokens[0]) < 5:
+                    continue
+                normalized = " ".join(normalized_tokens)
+                phrases.setdefault(normalized, " ".join(display_tokens))
+                if len(phrases) >= MAX_TERMINOLOGY_VALUES:
+                    return phrases
+    return phrases
+
+
+def _phrase_similarity(query_tokens: Sequence[str], canonical_tokens: Sequence[str]) -> float:
+    if len(query_tokens) != len(canonical_tokens) or not query_tokens:
+        return 0.0
+    token_scores = [
+        SequenceMatcher(None, query_token, canonical_token).ratio()
+        for query_token, canonical_token in zip(query_tokens, canonical_tokens, strict=True)
+    ]
+    exact_count = sum(
+        query_token == canonical_token
+        for query_token, canonical_token in zip(query_tokens, canonical_tokens, strict=True)
+    )
+    if len(query_tokens) == 1:
+        if query_tokens[0][:1] != canonical_tokens[0][:1] or token_scores[0] < 0.86:
+            return 0.0
+        return token_scores[0]
+    same_initials = all(
+        query_token[:1] == canonical_token[:1]
+        for query_token, canonical_token in zip(query_tokens, canonical_tokens, strict=True)
+    )
+    compact_score = SequenceMatcher(
+        None,
+        "".join(query_tokens),
+        "".join(canonical_tokens),
+    ).ratio()
+    average_score = sum(token_scores) / len(token_scores)
+    if exact_count == 0 and not same_initials:
+        return 0.0
+    one_uncertain_word = len(query_tokens) >= 3 and exact_count >= len(query_tokens) - 1
+    minimum_score = 0.7 if one_uncertain_word else 0.78
+    if compact_score < minimum_score or average_score < minimum_score:
+        return 0.0
+    return average_score * 0.65 + compact_score * 0.35
+
+
+def _recover_terminology(query: str, terminology: Iterable[object]) -> tuple[str, str] | None:
+    matches = list(_TOKEN.finditer(query))
+    if not matches:
+        return None
+    query_tokens = [match.group(0).casefold() for match in matches]
+    best: tuple[float, int, int, str] | None = None
+    for normalized, display in _terminology_phrases(terminology).items():
+        canonical_tokens = normalized.split()
+        width = len(canonical_tokens)
+        if width > len(query_tokens) or normalized in " ".join(query_tokens):
+            continue
+        for start in range(len(query_tokens) - width + 1):
+            window = query_tokens[start : start + width]
+            score = _phrase_similarity(window, canonical_tokens)
+            if score <= 0:
+                continue
+            candidate = (score, start, width, display)
+            if best is None or candidate[0] > best[0]:
+                best = candidate
+    if best is None:
+        return None
+    _score, start, width, display = best
+    prefix = query[: matches[start].start()]
+    suffix = query[matches[start + width - 1].end() :]
+    corrected = f"{prefix}{display}{suffix}"
+    return " ".join(corrected.split()), display
+
+
+def build_contextual_query_plan(
+    query: str,
+    *,
+    supplied_variants: Iterable[str] = (),
+    terminology: Iterable[object] = (),
+) -> ContextualQueryPlan:
+    """Create safe retrieval alternatives while keeping ``query`` immutable."""
+    base_variants = _deduplicated_queries((query, *supplied_variants))
+    if not base_variants:
+        return ContextualQueryPlan(primary_query=query, variants=(), recovered_terms=())
+    recovered_variants: list[str] = []
+    recovered_terms: list[str] = []
+    for variant in base_variants:
+        recovered = _recover_terminology(variant, terminology)
+        if recovered is None:
+            continue
+        recovered_query, recovered_term = recovered
+        recovered_variants.append(recovered_query)
+        recovered_terms.append(recovered_term)
+    variants = _deduplicated_queries((*base_variants, *recovered_variants))
+    return ContextualQueryPlan(
+        primary_query=base_variants[0],
+        variants=variants,
+        recovered_terms=tuple(dict.fromkeys(recovered_terms)),
+    )
 
 
 def _compound_terms(tokens: list[str]) -> set[str]:
@@ -616,6 +784,38 @@ def _rank_bounded_knowledge(
     return rank_knowledge(query, _bounded_ranking_documents(query, documents), limit=limit)
 
 
+def _rank_contextual_knowledge(
+    queries: Sequence[str],
+    documents: list[tuple[str, str]],
+    limit: int,
+) -> list[KnowledgeMatch]:
+    """Merge independently ranked alternatives without weakening match safety."""
+    best_matches: dict[tuple[str, str], KnowledgeMatch] = {}
+    for query_index, query in enumerate(queries):
+        # Prefer a recovered/contextual query only when its evidence is at least
+        # as strong as the literal transcript. The tiny penalty is deterministic
+        # and keeps an exact raw-query result ahead on a tie.
+        variant_penalty = query_index * 0.004
+        for match in _rank_bounded_knowledge(query, documents, limit=max(limit, 6)):
+            key = (match.source.casefold(), match.text)
+            adjusted = KnowledgeMatch(match.source, match.text, match.score - variant_penalty)
+            existing = best_matches.get(key)
+            if existing is None or adjusted.score > existing.score:
+                best_matches[key] = adjusted
+
+    diversified: list[KnowledgeMatch] = []
+    chunks_per_source: Counter[str] = Counter()
+    for match in sorted(best_matches.values(), key=lambda item: -item.score):
+        source_key = " ".join(_base_tokens(match.source)) or match.source.casefold()
+        if chunks_per_source[source_key] >= 2:
+            continue
+        diversified.append(match)
+        chunks_per_source[source_key] += 1
+        if len(diversified) >= limit:
+            break
+    return diversified
+
+
 def _eligible_source_filters(*, tenant_id: UUID, knowledge_base_id: UUID) -> tuple:
     return (
         KnowledgeSource.knowledge_base_id == knowledge_base_id,
@@ -623,6 +823,81 @@ def _eligible_source_filters(*, tenant_id: UUID, knowledge_base_id: UUID) -> tup
         KnowledgeSource.status.in_(_ELIGIBLE_SOURCE_STATUSES),
         KnowledgeSource.content.is_not(None),
     )
+
+
+async def load_agent_knowledge_terminology(
+    db: AsyncSession,
+    *,
+    tenant_id: UUID,
+    agent_id: UUID,
+    hints: Iterable[object] = (),
+) -> tuple[str, ...]:
+    """Load a bounded, metadata-only vocabulary for one bound agent."""
+    row = (
+        await db.execute(
+            select(
+                KnowledgeBase.id,
+                KnowledgeBase.name,
+                KnowledgeBase.scope_label,
+                KnowledgeBase.tags,
+            )
+            .join(
+                AgentKnowledgeBinding,
+                AgentKnowledgeBinding.knowledge_base_id == KnowledgeBase.id,
+            )
+            .where(
+                AgentKnowledgeBinding.tenant_id == tenant_id,
+                AgentKnowledgeBinding.agent_id == agent_id,
+                KnowledgeBase.tenant_id == tenant_id,
+                KnowledgeBase.is_active.is_(True),
+                KnowledgeBase.approval_status == "approved",
+            )
+        )
+    ).one_or_none()
+    values: list[object] = list(hints)
+    if row is None:
+        return tuple(str(value) for value in values if str(value or "").strip())
+    knowledge_base_id, name, scope_label, tags = row
+    values.extend((name, scope_label))
+    if isinstance(tags, list):
+        values.extend(tags)
+    source_rows = (
+        await db.execute(
+            select(
+                KnowledgeSource.name,
+                KnowledgeSource.location,
+                KnowledgeSource.source_metadata,
+            )
+            .where(
+                *_eligible_source_filters(
+                    tenant_id=tenant_id,
+                    knowledge_base_id=knowledge_base_id,
+                )
+            )
+            .order_by(KnowledgeSource.updated_at.desc(), KnowledgeSource.id)
+            .limit(MAX_TERMINOLOGY_SOURCES)
+        )
+    ).all()
+    for source_name, location, source_metadata in source_rows:
+        values.extend((source_name, location))
+        if isinstance(source_metadata, dict):
+            values.extend(
+                source_metadata.get(key)
+                for key in ("title", "page_title", "display_name")
+                if source_metadata.get(key)
+            )
+    selected: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        normalized = _terminology_text(value)
+        folded = normalized.casefold()
+        if not normalized or folded in seen:
+            continue
+        selected.append(normalized)
+        seen.add(folded)
+        if len(selected) >= MAX_TERMINOLOGY_VALUES:
+            break
+    return tuple(selected)
 
 
 def _postgres_fts_terms(query: str) -> list[str]:
@@ -888,6 +1163,8 @@ async def retrieve_knowledge_context(
     tenant_id: UUID,
     agent_id: UUID,
     query: str,
+    query_variants: Iterable[str] = (),
+    terminology: Iterable[object] = (),
     limit: int = 6,
     max_context_chars: int = MAX_CONTEXT_CHARS,
 ) -> str | None:
@@ -909,17 +1186,37 @@ async def retrieve_knowledge_context(
     )
     if knowledge_base is None:
         return None
+    query_plan = build_contextual_query_plan(
+        query,
+        supplied_variants=query_variants,
+        terminology=(
+            *terminology,
+            knowledge_base.name,
+            knowledge_base.scope_label,
+            *(knowledge_base.tags if isinstance(knowledge_base.tags, list) else []),
+        ),
+    )
+    if not query_plan.variants:
+        return None
+    combined_query = " ".join(query_plan.variants)
     candidate_ids = await _candidate_source_ids(
         db,
         tenant_id=tenant_id,
         knowledge_base_id=knowledge_base.id,
-        query=query,
+        query=combined_query,
     )
+    if any(_is_broad_query(value, _query_tokens(value)) for value in query_plan.variants):
+        broad_ids = await _broad_title_candidate_ids(
+            db,
+            tenant_id=tenant_id,
+            knowledge_base_id=knowledge_base.id,
+        )
+        candidate_ids = _bounded_unique_ids(broad_ids, candidate_ids)
     source_rows = []
     if candidate_ids:
         content_expression = KnowledgeSource.content
         if db.get_bind().dialect.name == "postgresql":
-            content_expression = _postgres_source_excerpt(query)
+            content_expression = _postgres_source_excerpt(combined_query)
         source_rows = (
             await db.execute(
                 select(
@@ -948,8 +1245,23 @@ async def retrieve_knowledge_context(
     ]
     if knowledge_base.content:
         documents.append((knowledge_base.name, knowledge_base.content))
-    matches = await asyncio.to_thread(_rank_bounded_knowledge, query, documents, limit)
+    matches = await asyncio.to_thread(
+        _rank_contextual_knowledge,
+        query_plan.variants,
+        documents,
+        limit,
+    )
     if not matches:
         return None
-    context = "\n\n".join(f"Source: {match.source}\n{match.text}" for match in matches)
+    interpretation = ""
+    if query_plan.recovered_terms:
+        interpretation = (
+            "Contextual terminology considered: "
+            + ", ".join(query_plan.recovered_terms)
+            + ". Verify the intended term against the evidence below; ask a brief "
+            "clarifying question if it would materially change the answer.\n\n"
+        )
+    context = interpretation + "\n\n".join(
+        f"Source: {match.source}\n{match.text}" for match in matches
+    )
     return context[:max_context_chars]

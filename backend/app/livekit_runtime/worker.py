@@ -48,7 +48,10 @@ from app.services.integration_security import (
     IntegrationConfigUnavailableError,
     decrypt_integration_config,
 )
-from app.services.knowledge_retrieval import retrieve_knowledge_context
+from app.services.knowledge_retrieval import (
+    load_agent_knowledge_terminology,
+    retrieve_knowledge_context,
+)
 from app.services.provider_callback_outbox import persist_provider_callback_actions
 from app.services.provider_credentials import ProviderCredentialError, load_provider_config
 from app.services.provider_variables import ProviderVariables, validate_provider_variables
@@ -168,6 +171,15 @@ _REFERENTIAL_FOLLOW_UP_WORDS = frozenset(
 _AGENT_ROLE_WORDS = frozenset(
     {"agent", "assistant", "concierge", "customer", "receptionist", "support", "voice"}
 )
+_KNOWLEDGE_INTENT_EXPANSIONS = {
+    "address": ("location", "contact"),
+    "cost": ("price", "pricing"),
+    "doctor": ("specialist", "consultant", "directory"),
+    "hour": ("opening", "schedule"),
+    "price": ("cost", "pricing"),
+    "where": ("location", "address", "contact"),
+    "who": ("team", "management", "directory"),
+}
 
 
 def _normalized_utterance(value: str) -> str:
@@ -267,6 +279,70 @@ def _knowledge_query(turn_ctx: llm.ChatContext, new_message: llm.ChatMessage) ->
         ):
             return f"{previous} {text}"
     return None
+
+
+def _previous_explicit_user_topic(
+    turn_ctx: llm.ChatContext,
+    new_message: llm.ChatMessage,
+) -> str | None:
+    for message in reversed(turn_ctx.messages()):
+        if message.role != "user" or message.id == new_message.id:
+            continue
+        previous = (message.text_content or "").strip()
+        normalized = _normalized_utterance(previous)
+        if (
+            normalized
+            and normalized not in _BACKCHANNEL_UTTERANCES
+            and normalized not in _ELLIPTICAL_FOLLOW_UPS
+            and not _is_bare_hold_utterance(previous)
+            and not _is_conversation_control_utterance(previous)
+        ):
+            return previous
+    return None
+
+
+def _contextual_knowledge_queries(
+    *,
+    turn_ctx: llm.ChatContext,
+    new_message: llm.ChatMessage,
+    agent_name: str,
+) -> tuple[str, tuple[str, ...]] | None:
+    """Build bounded retrieval alternatives without mutating the transcript."""
+    raw_query = _knowledge_query(turn_ctx, new_message)
+    if raw_query is None:
+        return None
+    scoped_query = _scope_knowledge_query(agent_name=agent_name, query=raw_query)
+    variants: list[str] = [raw_query]
+    if scoped_query != raw_query:
+        variants.insert(0, scoped_query)
+
+    normalized = _normalized_utterance(raw_query)
+    tokens = set(normalized.split())
+    previous_topic = _previous_explicit_user_topic(turn_ctx, new_message)
+    if previous_topic and (
+        tokens & _REFERENTIAL_FOLLOW_UP_WORDS
+        or normalized in _ELLIPTICAL_FOLLOW_UPS
+        or len(tokens) <= 4
+    ):
+        variants.append(f"{previous_topic.rstrip(' .!?')}. {raw_query}")
+
+    expansions = {
+        expansion
+        for token in tokens
+        for expansion in _KNOWLEDGE_INTENT_EXPANSIONS.get(token, ())
+    }
+    if expansions:
+        variants.append(f"{scoped_query} {' '.join(sorted(expansions))}")
+
+    selected: list[str] = []
+    seen: set[str] = set()
+    for variant in variants:
+        folded = _normalized_utterance(variant)
+        if not folded or folded in seen:
+            continue
+        selected.append(variant)
+        seen.add(folded)
+    return scoped_query, tuple(selected)
 
 
 async def _run_bounded_cleanup(
@@ -705,6 +781,7 @@ class VAVInworldAgent(Agent):
         self._tenant_id = model.tenant_id
         self._agent_id = model.id
         self._agent_name = str(getattr(model, "name", "") or "")
+        self._knowledge_terminology: tuple[str, ...] | None = None
         call_variables = variables or {}
         rendered_prompt = _render_call_template(model.system_prompt, call_variables)
         primary_language = str(getattr(model, "language", "en-US") or "en-US").strip() or "en-US"
@@ -793,16 +870,29 @@ Knowledge policy:
             # turn that collides with the continuation.
             raise llm.StopResponse()
 
-        query = _knowledge_query(turn_ctx, new_message)
-        if query is None:
+        query_plan = _contextual_knowledge_queries(
+            turn_ctx=turn_ctx,
+            new_message=new_message,
+            agent_name=self._agent_name,
+        )
+        if query_plan is None:
             return
-        query = _scope_knowledge_query(agent_name=self._agent_name, query=query)
+        query, query_variants = query_plan
         async with async_session_factory() as db:
+            if self._knowledge_terminology is None:
+                self._knowledge_terminology = await load_agent_knowledge_terminology(
+                    db,
+                    tenant_id=self._tenant_id,
+                    agent_id=self._agent_id,
+                    hints=(self._agent_name,),
+                )
             context = await retrieve_knowledge_context(
                 db,
                 tenant_id=self._tenant_id,
                 agent_id=self._agent_id,
                 query=query,
+                query_variants=query_variants,
+                terminology=self._knowledge_terminology,
                 limit=VOICE_KNOWLEDGE_MATCH_LIMIT,
                 max_context_chars=VOICE_KNOWLEDGE_CONTEXT_CHARS,
             )
@@ -817,6 +907,7 @@ Knowledge policy:
                         tenant_id=self._tenant_id,
                         agent_id=self._agent_id,
                         query=fallback_query,
+                        terminology=self._knowledge_terminology,
                         limit=VOICE_KNOWLEDGE_MATCH_LIMIT,
                         max_context_chars=VOICE_KNOWLEDGE_CONTEXT_CHARS,
                     )
