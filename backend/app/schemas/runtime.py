@@ -5,7 +5,12 @@ from datetime import datetime
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+PRODUCTION_LLM_MODELS = {
+    "openai": ("gpt-4o-mini", "gpt-4o"),
+    "inworld": ("auto", "openai/gpt-4o-mini", "openai/gpt-4o"),
+}
 
 
 class RuntimeProfileUpdate(BaseModel):
@@ -37,6 +42,17 @@ class RuntimeProfileUpdate(BaseModel):
         if normalized == "auto" or re.fullmatch(r"[a-z]{2,3}(?:-[A-Z]{2})?", normalized):
             return normalized
         raise ValueError("STT language must be auto or a BCP-47 code such as en-GB or ar-AE")
+
+    @model_validator(mode="after")
+    def validate_llm_route(self):
+        model = self.llm_model.strip()
+        allowed = PRODUCTION_LLM_MODELS[self.llm_provider]
+        if model not in allowed:
+            choices = ", ".join(allowed)
+            provider_name = "OpenAI" if self.llm_provider == "openai" else "Inworld"
+            raise ValueError(f"{provider_name} LLM routes support only: {choices}")
+        self.llm_model = model
+        return self
 
 
 class RuntimeProfileResponse(BaseModel):

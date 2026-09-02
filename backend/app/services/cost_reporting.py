@@ -549,16 +549,20 @@ def _call_components(
         else:
             missing.append(f"{speech.title()} TTS characters")
 
+        llm_provider = str(
+            runtime.get("llm_provider") or ("inworld" if inworld_speech else "openai")
+        )
         llm_model = str(runtime.get("llm_model") or "gpt-4o-mini")
         priced_llm_model = llm_model.removeprefix("openai/")
-        auto_routed_model = inworld_speech and priced_llm_model == "auto"
-        if auto_routed_model:
-            # Auto routing may select any supported model. Do not present a
-            # convenient proxy as complete customer-facing cost coverage.
-            missing.append("Inworld Router selected model/rate")
+        unpriced_router = llm_provider == "inworld"
+        if unpriced_router:
+            # Router pricing is not the direct upstream model's public token
+            # rate. Keep it unpriced until Inworld exposes authoritative usage
+            # and rate data for this route.
+            missing.append("Inworld Router usage/rate")
         input_tokens = runtime.get("llm_input_tokens")
         output_tokens = runtime.get("llm_output_tokens")
-        model_rates = None if auto_routed_model else OPENAI_RATES.get(priced_llm_model)
+        model_rates = None if unpriced_router else OPENAI_RATES.get(priced_llm_model)
         if (
             model_rates
             and isinstance(input_tokens, (int, float))
@@ -568,24 +572,24 @@ def _call_components(
             if input_tokens:
                 components.append(
                     _component(
-                        "Inworld Router" if inworld_speech else "OpenAI",
+                        "Inworld Router" if llm_provider == "inworld" else "OpenAI",
                         f"{llm_model} input",
                         Decimal(str(input_tokens)) / Decimal("1000000"),
                         "1M tokens",
                         input_rate,
-                        INWORLD_SOURCE if inworld_speech else OPENAI_SOURCE,
+                        INWORLD_SOURCE if llm_provider == "inworld" else OPENAI_SOURCE,
                         "Runtime-metered input tokens",
                     )
                 )
             if output_tokens:
                 components.append(
                     _component(
-                        "Inworld Router" if inworld_speech else "OpenAI",
+                        "Inworld Router" if llm_provider == "inworld" else "OpenAI",
                         f"{llm_model} output",
                         Decimal(str(output_tokens)) / Decimal("1000000"),
                         "1M tokens",
                         output_rate,
-                        INWORLD_SOURCE if inworld_speech else OPENAI_SOURCE,
+                        INWORLD_SOURCE if llm_provider == "inworld" else OPENAI_SOURCE,
                         "Runtime-metered output tokens",
                     )
                 )

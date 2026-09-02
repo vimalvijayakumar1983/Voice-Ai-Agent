@@ -327,7 +327,7 @@ export default function AgentEditor({
             <option value="elevenlabs" disabled={!availableProviders.includes('elevenlabs')}>ElevenLabs · Flash v2.5 voices{availableProviders.includes('elevenlabs') ? '' : providerStatus?.providers?.elevenlabs?.configured ? ' · voice catalog unavailable' : ' · connect in Settings'}</option>
             <option value="inworld" disabled={!availableProviders.includes('inworld')}>Inworld · TTS 2 voices{availableProviders.includes('inworld') ? '' : providerStatus?.providers?.inworld?.configured ? ' · voice catalog unavailable' : ' · connect in Settings'}</option>
           </select>
-          <p className="form-hint">Smallest agents publish to Atoms. Sarvam and ElevenLabs use VAV realtime with VAV knowledge and OpenAI behavior. Inworld uses the VAV LiveKit SIP lane with direct Inworld speech and routing. Unavailable providers show the corrective action instead of disappearing.</p>
+          <p className="form-hint">Smallest agents publish to Atoms. Sarvam and ElevenLabs use VAV realtime with VAV knowledge and OpenAI behavior. Inworld uses the VAV LiveKit SIP lane with Inworld speech and a selectable OpenAI or Inworld Router response engine. Unavailable providers show the corrective action instead of disappearing.</p>
         </div>
         <div className="form-group language-primary">
           <label htmlFor={primaryLanguageId}>Primary language</label>
@@ -434,7 +434,7 @@ export default function AgentEditor({
           {form.voice_provider !== 'smallest' ? (
             <div className="form-group">
               <label htmlFor={modelId}>Live phone runtime</label>
-              <input id={modelId} value={form.voice_provider === 'inworld' ? 'LiveKit SIP + direct Inworld STT, Router, and TTS' : form.voice_provider === 'elevenlabs' ? 'ElevenLabs Flash v2.5 + Sarvam STT + OpenAI' : 'Sarvam Bulbul v3 + OpenAI'} readOnly aria-readonly="true" />
+              <input id={modelId} value={form.voice_provider === 'inworld' ? 'LiveKit SIP + Inworld STT/TTS + configurable LLM' : form.voice_provider === 'elevenlabs' ? 'ElevenLabs Flash v2.5 + Sarvam STT + OpenAI' : 'Sarvam Bulbul v3 + OpenAI'} readOnly aria-readonly="true" />
               <p className="form-hint">VAV keeps the agent prompt and knowledge retrieval; only speech output changes with the selected voice provider.</p>
             </div>
           ) : (

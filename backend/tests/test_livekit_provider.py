@@ -9,6 +9,7 @@ from uuid import uuid4
 import httpx
 import pytest
 from livekit import api
+from sqlalchemy import select
 
 from app.livekit_runtime import worker as livekit_worker
 from app.livekit_runtime.worker import (
@@ -18,7 +19,11 @@ from app.livekit_runtime.worker import (
     _worker_http_port,
     _worker_idle_processes,
 )
+from app.models.agent import Agent
+from app.models.call import Call
+from app.services.provider_credentials import ProviderCredentialError
 from app.telephony.livekit_provider import LiveKitSIPError, LiveKitSIPProvider
+from tests.conftest import test_session_factory as session_factory
 
 
 @pytest.mark.asyncio
@@ -225,7 +230,177 @@ async def test_outbound_livekit_sip_failure_remains_definitive_when_cleanup_fail
 
 
 @pytest.mark.asyncio
-async def test_worker_failure_after_call_persistence_finalizes_once_and_keeps_auto_stt(
+async def test_worker_preopen_failure_terminalizes_exact_outbound_call_once(
+    db,
+    tenant,
+    monkeypatch,
+):
+    agent = Agent(
+        tenant_id=tenant.id,
+        name="Outbound Inworld agent",
+        system_prompt="Use approved knowledge.",
+        voice_provider="inworld",
+        voice_id="inworld:Ashley",
+        language="en-GB",
+    )
+    db.add(agent)
+    await db.flush()
+    agent_id = agent.id
+    call_id = uuid4()
+    room_name = f"vav-call-{call_id}"
+    call = Call(
+        id=call_id,
+        tenant_id=tenant.id,
+        agent_id=agent_id,
+        direction="outbound",
+        status="dispatching",
+        from_number="+97141234567",
+        to_number="+971501234567",
+        provider="livekit_sip",
+        call_metadata={
+            "speech_provider": "inworld",
+            "runtime": {
+                "transport": "livekit_sip",
+                "speech_provider": "inworld",
+                "llm_provider": "openai",
+            },
+        },
+    )
+    db.add(call)
+    await db.commit()
+
+    class Room:
+        name = room_name
+
+    class Context:
+        job = SimpleNamespace(
+            metadata=json.dumps({"agent_id": str(agent_id), "call_id": str(call_id)})
+        )
+        room = Room()
+
+        async def connect(self):
+            return None
+
+        async def wait_for_participant(self):
+            return SimpleNamespace(
+                identity=f"sip-{call_id}",
+                attributes={
+                    "sip.callDirection": "outbound",
+                    "sip.callStatus": "active",
+                },
+            )
+
+    failure = RuntimeError("runtime key unavailable")
+    delete_room = AsyncMock(return_value=True)
+    finish_call = AsyncMock()
+    open_call = AsyncMock()
+    monkeypatch.setattr(livekit_worker, "async_session_factory", session_factory)
+    monkeypatch.setattr(livekit_worker, "_load_runtime", AsyncMock(side_effect=failure))
+    monkeypatch.setattr(livekit_worker, "_open_call", open_call)
+    monkeypatch.setattr(livekit_worker, "_finish_call", finish_call)
+    monkeypatch.setattr(livekit_worker, "delete_browser_room", delete_room)
+
+    with pytest.raises(RuntimeError, match="runtime key unavailable"):
+        await livekit_worker.vav_inworld_session(Context())
+
+    open_call.assert_not_awaited()
+    finish_call.assert_not_awaited()
+    delete_room.assert_awaited_once_with(
+        url=livekit_worker.settings.livekit_url,
+        api_key=livekit_worker.settings.livekit_api_key,
+        api_secret=livekit_worker.settings.livekit_api_secret,
+        room_name=room_name,
+    )
+    db.expire_all()
+    failed_call = await db.scalar(
+        select(Call).where(Call.id == call_id).execution_options(populate_existing=True)
+    )
+    assert failed_call is not None
+    assert failed_call.status == "failed"
+    assert failed_call.started_at is not None
+    assert failed_call.answered_at is not None
+    assert failed_call.ended_at is not None
+    assert failed_call.duration_seconds == 0
+    assert failed_call.call_metadata["livekit_room"] == room_name
+    assert failed_call.call_metadata["lifecycle_error"] == ("livekit_outbound_preopen_failure")
+    assert failed_call.call_metadata["runtime_failure_type"] == "RuntimeError"
+    assert "runtime key unavailable" not in json.dumps(failed_call.call_metadata)
+
+    ended_at = failed_call.ended_at
+    assert not await livekit_worker._fail_outbound_preopen_call(
+        agent_id=agent_id,
+        call_id=call_id,
+        room_name=room_name,
+        failure=RuntimeError("duplicate job"),
+    )
+    db.expire_all()
+    unchanged_call = await db.scalar(
+        select(Call).where(Call.id == call_id).execution_options(populate_existing=True)
+    )
+    assert unchanged_call is not None
+    assert unchanged_call.ended_at == ended_at
+
+
+@pytest.mark.asyncio
+async def test_worker_logs_only_keyed_inbound_route_references(caplog, monkeypatch):
+    trunk_id = "ST_sensitive_inbound_trunk"
+    called_number = "+97141234567"
+    room_name = "sensitive-livekit-room"
+
+    class Room:
+        name = room_name
+
+    class Context:
+        job = SimpleNamespace(metadata="{}")
+        room = Room()
+
+        async def connect(self):
+            return None
+
+        async def wait_for_participant(self):
+            return SimpleNamespace(
+                identity="inbound-caller",
+                attributes={
+                    "sip.callDirection": "inbound",
+                    "sip.callStatus": "active",
+                    "sip.trunkID": trunk_id,
+                    "sip.trunkPhoneNumber": called_number,
+                },
+            )
+
+    monkeypatch.setattr(
+        livekit_worker,
+        "_resolve_inbound_runtime",
+        AsyncMock(side_effect=RuntimeError("route unavailable")),
+    )
+    open_call = AsyncMock()
+    monkeypatch.setattr(livekit_worker, "_open_call", open_call)
+
+    with caplog.at_level("ERROR", logger=livekit_worker.__name__):
+        with pytest.raises(RuntimeError, match="route unavailable"):
+            await livekit_worker.vav_inworld_session(Context())
+
+    open_call.assert_not_awaited()
+    record = next(
+        record for record in caplog.records if record.message == "livekit_inbound_preopen_failed"
+    )
+    assert record.failure_type == "RuntimeError"
+    assert record.inbound_trunk_ref == livekit_worker._safe_log_identifier(
+        "inbound_trunk",
+        trunk_id,
+    )
+    assert record.called_number_ref == livekit_worker._safe_log_identifier(
+        "called_number",
+        called_number,
+    )
+    assert record.room_ref == livekit_worker._safe_log_identifier("room", room_name)
+    assert trunk_id not in caplog.text
+    assert called_number not in caplog.text
+    assert room_name not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_worker_failure_after_call_persistence_finalizes_once_and_resolves_auto_stt(
     monkeypatch,
 ):
     agent_id = uuid4()
@@ -233,7 +408,9 @@ async def test_worker_failure_after_call_persistence_finalizes_once_and_keeps_au
     shutdown_callbacks = []
     stt_options = {}
     tts_options = {}
+    llm_options = {}
     session_options = {}
+    turn_detector_options = {}
     model = SimpleNamespace(
         id=agent_id,
         tenant_id=uuid4(),
@@ -245,7 +422,11 @@ async def test_worker_failure_after_call_persistence_finalizes_once_and_keeps_au
         greeting_message="Hello",
         max_call_duration_seconds=60,
     )
-    profile = SimpleNamespace(stt_language="auto", llm_model="openai/gpt-4o-mini")
+    profile = SimpleNamespace(
+        stt_language="auto",
+        llm_provider="openai",
+        llm_model="gpt-4o-mini",
+    )
 
     class Room:
         name = "vav-call-test"
@@ -280,7 +461,14 @@ async def test_worker_failure_after_call_persistence_finalizes_once_and_keeps_au
             return None
 
     async def load_runtime(_agent_id):
-        return model, profile, "inworld-key"
+        return (
+            model,
+            profile,
+            livekit_worker._RuntimeApiKeys(
+                speech="inworld-key",
+                llm="tenant-openai-key",
+            ),
+        )
 
     def stt(**kwargs):
         stt_options.update(kwargs)
@@ -294,19 +482,30 @@ async def test_worker_failure_after_call_persistence_finalizes_once_and_keeps_au
         session_options.update(kwargs)
         raise RuntimeError("session construction failed")
 
+    def turn_detector(**kwargs):
+        turn_detector_options.update(kwargs)
+        return object()
+
     finalize = AsyncMock()
     monkeypatch.setattr(livekit_worker, "_load_runtime", load_runtime)
     monkeypatch.setattr(livekit_worker, "_open_call", AsyncMock(return_value=call_id))
     monkeypatch.setattr(livekit_worker, "_finish_call", finalize)
     monkeypatch.setattr(livekit_worker.inworld, "STT", stt)
     monkeypatch.setattr(livekit_worker.inworld, "TTS", tts)
-    monkeypatch.setattr(livekit_worker.openai, "LLM", lambda **_kwargs: object())
+    monkeypatch.setattr(livekit_worker.inference, "TurnDetector", turn_detector)
+
+    def llm(**kwargs):
+        llm_options.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(livekit_worker.openai, "LLM", llm)
     monkeypatch.setattr(livekit_worker, "AgentSession", agent_session)
 
     with pytest.raises(RuntimeError, match="session construction failed"):
         await livekit_worker.vav_inworld_session(Context())
 
-    assert "language" not in stt_options
+    assert stt_options["language"] == "en-GB"
+    assert stt_options["enable_voice_profile"] is False
     assert tts_options == {
         "api_key": "inworld-key",
         "model": "inworld-tts-2",
@@ -315,6 +514,10 @@ async def test_worker_failure_after_call_persistence_finalizes_once_and_keeps_au
         "speaking_rate": 1.0,
         "delivery_mode": "BALANCED",
         "text_normalization": "ON",
+    }
+    assert llm_options == {"api_key": "tenant-openai-key", "model": "gpt-4o-mini"}
+    assert turn_detector_options == {
+        "version": livekit_worker.LIVEKIT_TURN_DETECTOR_VERSION,
     }
     assert session_options["turn_handling"]["endpointing"] == {
         "mode": "fixed",
@@ -357,6 +560,37 @@ def test_livekit_usage_snapshot_reads_cumulative_model_usage_once():
         "tts_characters": 640,
         "stt_audio_seconds": 42.5,
     }
+
+
+@pytest.mark.asyncio
+async def test_hybrid_worker_prefers_tenant_openai_key_and_fails_closed_if_unreadable(
+    monkeypatch,
+):
+    tenant_id = uuid4()
+
+    async def tenant_credentials(_db, loaded_tenant_id, provider):
+        assert loaded_tenant_id == tenant_id
+        return {"api_key": f"tenant-{provider}-key"}
+
+    monkeypatch.setattr(livekit_worker, "load_provider_config", tenant_credentials)
+    monkeypatch.setattr(livekit_worker.settings, "openai_api_key", "platform-openai-key")
+    keys = await livekit_worker._load_runtime_api_keys(
+        object(), tenant_id=tenant_id, llm_provider="openai"
+    )
+    assert keys.speech == "tenant-inworld-key"
+    assert keys.llm == "tenant-openai-key"
+    assert "tenant-openai-key" not in repr(keys)
+
+    async def unreadable_openai(_db, _tenant_id, provider):
+        if provider == "openai":
+            raise ProviderCredentialError("cannot decrypt")
+        return {"api_key": "tenant-inworld-key"}
+
+    monkeypatch.setattr(livekit_worker, "load_provider_config", unreadable_openai)
+    with pytest.raises(RuntimeError, match="OpenAI credential is unavailable"):
+        await livekit_worker._load_runtime_api_keys(
+            object(), tenant_id=tenant_id, llm_provider="openai"
+        )
 
 
 def test_inworld_tts_options_keep_auto_language_for_multilingual_agents():

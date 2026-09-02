@@ -665,7 +665,7 @@ export default function Settings() {
                       <label htmlFor={`${provider}-api-key`}>{providerName} API key</label>
                       <input id={`${provider}-api-key`} type="password" autoComplete="new-password" placeholder={status?.configured ? 'Enter a new key to rotate' : 'Paste API key'} value={providerKeys[provider]} onChange={(event) => setProviderKeys((current) => ({ ...current, [provider]: event.target.value }))} minLength={20} maxLength={512} required />
                       <p className="form-hint">{provider === 'inworld'
-                        ? 'Direct key for Inworld STT, Router LLM, and TTS. VAV does not route these services through LiveKit Inference.'
+                        ? 'Direct key for Inworld STT and TTS, plus the optional Inworld Router route. VAV does not route these services through LiveKit Inference.'
                         : provider === 'elevenlabs'
                         ? 'Used only for outgoing speech. VAV verifies catalog access before storing the key; Sarvam remains the live transcription provider and VAV keeps the knowledge and agent behavior.'
                         : 'The saved value is never returned to the browser. A new value rotates the workspace credential.'}</p>

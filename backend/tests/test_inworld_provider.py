@@ -142,7 +142,23 @@ async def test_inworld_readiness_probes_use_selected_routes_and_minimal_bounded_
             200,
             json={
                 "model": "openai/gpt-4o-mini",
-                "choices": [{"message": {"role": "assistant", "content": "OK"}}],
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "type": "function",
+                                    "function": {
+                                        "name": "vav_readiness_check",
+                                        "arguments": "{}",
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                ],
             },
         )
 
@@ -176,8 +192,31 @@ async def test_inworld_readiness_probes_use_selected_routes_and_minimal_bounded_
             "/v1/chat/completions",
             {
                 "model": "openai/gpt-4o-mini",
-                "messages": [{"role": "user", "content": "Reply OK."}],
-                "max_tokens": 8,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "Call vav_readiness_check now. Do not reply with text.",
+                    }
+                ],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "vav_readiness_check",
+                            "description": "Confirms tool-calling capability.",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {},
+                                "additionalProperties": False,
+                            },
+                        },
+                    }
+                ],
+                "tool_choice": {
+                    "type": "function",
+                    "function": {"name": "vav_readiness_check"},
+                },
+                "max_tokens": 64,
                 "temperature": 0,
                 "stream": False,
             },
@@ -210,7 +249,7 @@ async def test_inworld_tts_probe_accepts_snake_case_audio_response_fields():
 
 
 @pytest.mark.asyncio
-async def test_inworld_auto_router_probe_budgets_reasoning_and_requires_visible_text():
+async def test_inworld_auto_router_probe_budgets_reasoning_and_requires_tool_call():
     captured: dict[str, object] = {}
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -224,7 +263,16 @@ async def test_inworld_auto_router_probe_budgets_reasoning_and_requires_visible_
                         "finish_reason": "stop",
                         "message": {
                             "role": "assistant",
-                            "content": "OK",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "type": "function",
+                                    "function": {
+                                        "name": "vav_readiness_check",
+                                        "arguments": "{}",
+                                    },
+                                }
+                            ],
                             "reasoning": "The user requested a bounded readiness response.",
                         },
                     }
@@ -248,7 +296,7 @@ async def test_inworld_auto_router_probe_budgets_reasoning_and_requires_visible_
 
 
 @pytest.mark.asyncio
-async def test_inworld_auto_router_probe_rejects_limits_reasoning_and_structured_output():
+async def test_inworld_auto_router_probe_rejects_limit_and_missing_tool_calls():
     responses = iter(
         [
             httpx.Response(
@@ -297,9 +345,9 @@ async def test_inworld_auto_router_probe_rejects_limits_reasoning_and_structured
 
     with pytest.raises(InworldError, match="exhausted its bounded output token budget"):
         await client.router_readiness_probe(model_id="auto")
-    with pytest.raises(InworldError, match="returned an empty completion"):
+    with pytest.raises(InworldError, match="required VAV knowledge tool call"):
         await client.router_readiness_probe(model_id="auto")
-    with pytest.raises(InworldError, match="returned invalid content"):
+    with pytest.raises(InworldError, match="required VAV knowledge tool call"):
         await client.router_readiness_probe(model_id="auto")
 
 

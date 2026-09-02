@@ -216,7 +216,8 @@ async def test_cost_report_attributes_livekit_and_direct_inworld_without_carrier
 
     assert response.status_code == 200
     providers = {row["provider"] for row in response.json()["provider_breakdown"]}
-    assert providers >= {"LiveKit", "Inworld", "Inworld Router"}
+    assert providers >= {"LiveKit", "Inworld"}
+    assert "Inworld Router" not in providers
     report = response.json()
     row = report["calls"][0]
     components = row["components"]
@@ -224,6 +225,7 @@ async def test_cost_report_attributes_livekit_and_direct_inworld_without_carrier
     assert services >= {"Third-party SIP", "Recording", "Speech to text", "TTS 2"}
     assert "Agent session" not in services
     assert "Railway LiveKit worker hosting allocation" in row["missing_cost_inputs"]
+    assert "Inworld Router usage/rate" in row["missing_cost_inputs"]
     assert row["pricing_completeness"] == "partial"
     assert report["summary"]["fully_priced_calls"] == 0
     assert all(rate["service"] != "Agent session" for rate in report["rate_cards"])
@@ -297,7 +299,7 @@ async def test_inworld_auto_router_cost_is_partial_without_actual_model(
     report = response.json()
     row = next(item for item in report["calls"] if item["call_id"] == str(call.id))
     assert row["pricing_completeness"] == "partial"
-    assert "Inworld Router selected model/rate" in row["missing_cost_inputs"]
+    assert "Inworld Router usage/rate" in row["missing_cost_inputs"]
     assert "Railway LiveKit worker hosting allocation" in row["missing_cost_inputs"]
     assert all(component["provider"] != "Inworld Router" for component in row["components"])
     assert report["summary"]["fully_priced_calls"] == 0

@@ -2,7 +2,7 @@
 
 An enterprise voice-agent workspace for building, governing, testing, and operating multilingual [Smallest.ai Atoms](https://docs.smallest.ai/voice-agents/developer-guide/get-started/build-with-a-coding-agent) agents.
 
-This repository combines a multi-tenant FastAPI control plane with a polished Next.js operator console. Its preferred production phone lane is customer-owned e& SIP through LiveKit with direct Inworld STT, Router LLM, and TTS; the existing Sarvam/Twilio path remains available for controlled rollback.
+This repository combines a multi-tenant FastAPI control plane with a polished Next.js operator console. Its preferred production phone lane is customer-owned e& SIP through LiveKit with direct Inworld STT/TTS and a tenant-selected direct OpenAI LLM; Inworld Router remains an explicitly tested option, and the existing Sarvam/Twilio path remains available for controlled rollback.
 
 ## What is included
 
@@ -15,7 +15,7 @@ This repository combines a multi-tenant FastAPI control plane with a polished Ne
 - Conversation reporting with accessible transcript and AI-summary review
 - Expiring single-use workspace invitations, team roles/access, one-time API-key reveal, revocation, and tenant-scoped audit history
 - Authenticated encryption at rest for write-only integration credentials, safe secret replacement, HTTPS/SSRF validation, and tenant-isolated CRUD
-- A separately deployable LiveKit worker that keeps VAV knowledge, actions, transcripts, usage, and cost attribution in the VAV control plane while using direct Inworld APIs (not LiveKit Inference)
+- A separately deployable LiveKit worker that keeps VAV knowledge, actions, transcripts, usage, and cost attribution in the VAV control plane while using direct Inworld speech plus a tenant-selected OpenAI or Inworld Router LLM (not LiveKit Inference)
 - Reproducible PostgreSQL migrations, worker queue registration tests, hardened browser/API headers, Docker builds, and PostgreSQL-backed CI migration checks
 
 The complete target product is defined in [the world-class platform blueprint](docs/WORLD_CLASS_VOICE_AI_PLATFORM.md). It specifies the 14-module information architecture, provider-neutral data and service contracts, security and compliance gates, SLOs, UAE/India/WhatsApp differentiation, and the staged R0-R5 implementation plan.
@@ -35,7 +35,8 @@ flowchart TD
     Hook --> API
     UI -. "single-use web-call token" .-> Atoms
     UI -. "short-lived room token" .-> LiveKit["LiveKit WebRTC / SIP"]
-    LiveKit --> Inworld["Direct Inworld STT / Router / TTS"]
+    LiveKit --> Inworld["Direct Inworld STT / TTS"]
+    LiveKit --> OpenAI["Direct OpenAI LLM + tools"]
     LiveKit --> LKWorker["VAV LiveKit worker"]
     LKWorker --> DB
     LKWorker --> Knowledge
@@ -101,7 +102,7 @@ Set these service variables with Railway references where shown:
 | API + worker + livekit-agent | `TRUST_RAILWAY_PROXY_HEADERS` | `true` (uses Railway's edge-injected `X-Real-IP` for auth limits) |
 | Frontend | `NEXT_PUBLIC_API_URL` | `https://${{api.RAILWAY_PUBLIC_DOMAIN}}` (build-time destination for the same-origin `/api/v1/*` proxy; it is not exposed as the browser request origin) |
 | API + worker + livekit-agent | `SECRET_KEY` | One identical generated, sealed production secret |
-| API + worker + livekit-agent | `INTEGRATION_ENCRYPTION_KEY` | One identical generated, sealed value on all three services; the LiveKit worker needs it to decrypt workspace Inworld credentials |
+| API + worker + livekit-agent | `INTEGRATION_ENCRYPTION_KEY` | One identical generated, sealed value on all three services; the LiveKit worker needs it to decrypt workspace Inworld and OpenAI credentials |
 | API + worker + livekit-agent | `REGISTRATION_MODE` | `bootstrap` for first launch or `invite_only`; production rejects `open` |
 | API + worker + livekit-agent | `BOOTSTRAP_OWNER_EMAIL` | Valid designated owner email, required only for `bootstrap` and never returned publicly |
 | API | `LEGACY_SESSION_MIGRATION_ENABLED` | `false` by default; temporarily `true` only for the planned pre-cookie session rollout window |
@@ -110,7 +111,7 @@ Set these service variables with Railway references where shown:
 | API + worker + livekit-agent | `SMALLEST_WEBHOOK_ID` | The Smallest.ai webhook ID whose signing secret is configured above |
 | API + worker | `SARVAM_API_KEY` | Optional platform fallback for VAV realtime transcription and Sarvam speech |
 | API + worker | `ELEVENLABS_API_KEY` | Optional platform fallback for ElevenLabs speech output only |
-| API + worker | `OPENAI_API_KEY` | Optional platform fallback for VAV conversation generation |
+| API + worker + livekit-agent | `OPENAI_API_KEY` | Optional platform fallback for VAV conversation generation; the encrypted tenant credential is preferred and an unreadable active tenant credential fails closed |
 | API + livekit-agent | `INWORLD_API_KEY` | Optional platform fallback; prefer an encrypted workspace key in Settings |
 | API + livekit-agent | `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET` | One shared LiveKit project; must match the project recorded in Settings |
 | API + livekit-agent | `LIVEKIT_AGENT_NAME` | `vav-inworld`; must match the SIP dispatch rule |

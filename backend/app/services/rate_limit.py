@@ -1,4 +1,4 @@
-"""Redis-backed fixed-window limits for unauthenticated security boundaries."""
+"""Redis-backed fixed-window limits for security and billable API boundaries."""
 
 import hashlib
 import hmac
@@ -71,6 +71,8 @@ async def enforce_rate_limit(
     window_seconds: int,
     subject: str | None = None,
     bind_to_client: bool = True,
+    limit_detail: str = "Too many authentication attempts",
+    unavailable_detail: str = "Authentication is temporarily unavailable",
 ) -> None:
     """Apply one production-only, privacy-preserving distributed limit."""
     if settings.app_env.strip().lower() != "production":
@@ -89,17 +91,18 @@ async def enforce_rate_limit(
             window_seconds + 5,
         )
     except RedisError as exc:
-        # Authentication endpoints fail closed when their abuse-control state
-        # is unavailable; normal authenticated API traffic remains unaffected.
+        # Protected boundaries fail closed when their shared abuse-control
+        # state is unavailable; ordinary authenticated API traffic is not
+        # routed through this limiter.
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Authentication is temporarily unavailable",
+            detail=unavailable_detail,
             headers={"Retry-After": "30"},
         ) from exc
 
     if int(count) > limit:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="Too many authentication attempts",
+            detail=limit_detail,
             headers={"Retry-After": str(window_seconds)},
         )

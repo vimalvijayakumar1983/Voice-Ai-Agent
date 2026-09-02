@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from urllib.parse import urlsplit
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -23,6 +23,7 @@ from app.models.agent import (
 from app.models.provider_credential import ProviderCredential
 from app.providers.elevenlabs import ElevenLabsClient, ElevenLabsError
 from app.providers.inworld import INWORLD_TTS_MODEL, InworldClient, InworldError
+from app.providers.openai import OpenAIProviderClient, OpenAIProviderError
 from app.schemas.runtime import (
     ApiKeyCredentialRequest,
     RuntimeProfileResponse,
@@ -45,6 +46,7 @@ from app.services.provider_credentials import (
     load_provider_config,
     store_provider_config,
 )
+from app.services.rate_limit import enforce_rate_limit
 from app.telephony.livekit_provider import LiveKitSIPError, LiveKitSIPProvider
 
 router = APIRouter(prefix="/runtime", tags=["Realtime Runtime"])
@@ -58,6 +60,13 @@ def _speech_provider_name(provider: str) -> str:
     }.get(provider, provider.title())
 
 
+def _api_key_configured(config: dict | None, platform_key: str) -> bool:
+    """Use the platform fallback only when no tenant credential exists."""
+    if config is not None:
+        return bool(str(config.get("api_key") or "").strip())
+    return bool(str(platform_key or "").strip())
+
+
 def _runtime_provider_blocker(
     agent: Agent,
     profile: AgentRuntimeProfile | None,
@@ -69,11 +78,11 @@ def _runtime_provider_blocker(
         if (
             profile.telephony_provider != "livekit_sip"
             or profile.primary_speech_provider != "inworld"
-            or profile.llm_provider != "inworld"
+            or profile.llm_provider not in {"inworld", "openai"}
         ):
             return (
                 "Inworld agents require LiveKit SIP telephony, Inworld speech, "
-                "and the Inworld Router LLM."
+                "and either the OpenAI LLM or Inworld Router."
             )
         return None
     if agent.voice_provider in {"sarvam", "elevenlabs"}:
@@ -193,13 +202,19 @@ async def runtime_readiness(
         inworld_config = await load_provider_config(db, agent.tenant_id, "inworld")
     except ProviderCredentialError:
         inworld_config = None
-    inworld_ready = bool(
-        (inworld_config and inworld_config.get("api_key")) or settings.inworld_api_key.strip()
+        inworld_config_unreadable = True
+    else:
+        inworld_config_unreadable = False
+    inworld_ready = not inworld_config_unreadable and _api_key_configured(
+        inworld_config, settings.inworld_api_key
     )
     try:
         openai_config = await load_provider_config(db, agent.tenant_id, "openai")
     except ProviderCredentialError:
         openai_config = None
+        openai_config_unreadable = True
+    else:
+        openai_config_unreadable = False
     try:
         twilio_config = await load_provider_config(db, agent.tenant_id, "twilio")
     except ProviderCredentialError:
@@ -253,9 +268,8 @@ async def runtime_readiness(
     llm_ready = (
         inworld_ready
         if profile and profile.llm_provider == "inworld"
-        else bool(
-            (openai_config and openai_config.get("api_key")) or settings.openai_api_key.strip()
-        )
+        else not openai_config_unreadable
+        and _api_key_configured(openai_config, settings.openai_api_key)
     )
     voice_ready = bool(
         agent.voice_id
@@ -438,11 +452,18 @@ async def live_runtime_readiness(
     try:
         config = await load_provider_config(db, agent.tenant_id, provider)
     except ProviderCredentialError:
+        if provider == "inworld":
+            blockers.append(
+                "Inworld workspace credential became unavailable during live readiness."
+            )
+            return blockers, checks
         config = None
     platform_key = (
         settings.elevenlabs_api_key if provider == "elevenlabs" else settings.inworld_api_key
     )
-    api_key = str((config or {}).get("api_key") or platform_key).strip()
+    api_key = str(
+        ((config or {}).get("api_key") or "") if config is not None else platform_key
+    ).strip()
     if provider == "elevenlabs":
         try:
             await ElevenLabsClient(api_key=api_key).synthesize_voice_preview(
@@ -468,10 +489,33 @@ async def live_runtime_readiness(
         checks["tts_provider_live"] = True
 
     assert profile is not None
+    if profile.llm_provider == "inworld":
+        try:
+            await inworld.router_readiness_probe(model_id=profile.llm_model)
+        except InworldError as exc:
+            blockers.append(f"Inworld Router tool-calling check failed: {exc}")
+        else:
+            checks["llm_provider_live"] = True
+        return blockers, checks
+
     try:
-        await inworld.router_readiness_probe(model_id=profile.llm_model)
-    except InworldError as exc:
-        blockers.append(f"Inworld Router live completion failed: {exc}")
+        openai_config = await load_provider_config(db, agent.tenant_id, "openai")
+    except ProviderCredentialError:
+        blockers.append("OpenAI workspace credential became unavailable during live readiness.")
+        return blockers, checks
+    openai_api_key = str(
+        ((openai_config or {}).get("api_key") or "")
+        if openai_config is not None
+        else settings.openai_api_key
+    ).strip()
+    if not openai_api_key:
+        return blockers, checks
+    try:
+        await OpenAIProviderClient(api_key=openai_api_key).tool_readiness_probe(
+            model_id=profile.llm_model
+        )
+    except OpenAIProviderError as exc:
+        blockers.append(f"OpenAI live tool-calling check failed: {exc}")
     else:
         checks["llm_provider_live"] = True
     return blockers, checks
@@ -490,8 +534,8 @@ def _response(
             else "sarvam"
         ),
         "fallback_speech_provider": None,
-        "llm_provider": "inworld" if agent.voice_provider == "inworld" else "openai",
-        "llm_model": "auto" if agent.voice_provider == "inworld" else "gpt-4o-mini",
+        "llm_provider": "openai",
+        "llm_model": "gpt-4o-mini",
         "stt_language": "auto",
         "max_concurrent_calls": 1,
         "daily_call_limit": 100,
@@ -582,9 +626,20 @@ async def update_runtime_profile(
 @router.post("/agents/{agent_id}/test", response_model=RuntimeReadinessResponse)
 async def test_runtime_profile(
     agent_id: UUID,
+    request: Request,
     current_user: CurrentUser = Depends(require_role("owner", "admin", "member")),
     db: AsyncSession = Depends(get_db),
 ):
+    await enforce_rate_limit(
+        request,
+        scope="runtime-live-readiness",
+        limit=5,
+        window_seconds=60,
+        subject=f"{current_user.tenant_id}:{current_user.id}",
+        bind_to_client=False,
+        limit_detail="Too many live readiness tests. Wait one minute and try again.",
+        unavailable_detail="Live readiness testing is temporarily unavailable.",
+    )
     agent = await _agent(db, current_user.tenant_id, agent_id)
     profile = await _profile(db, current_user.tenant_id, agent_id, create=True)
     assert profile is not None
@@ -624,9 +679,20 @@ async def test_runtime_profile(
 @router.post("/agents/{agent_id}/activate", response_model=RuntimeProfileResponse)
 async def activate_runtime_profile(
     agent_id: UUID,
+    request: Request,
     current_user: CurrentUser = Depends(require_role("owner", "admin")),
     db: AsyncSession = Depends(get_db),
 ):
+    await enforce_rate_limit(
+        request,
+        scope="runtime-live-readiness",
+        limit=5,
+        window_seconds=60,
+        subject=f"{current_user.tenant_id}:{current_user.id}",
+        bind_to_client=False,
+        limit_detail="Too many live readiness tests. Wait one minute and try again.",
+        unavailable_detail="Live readiness testing is temporarily unavailable.",
+    )
     agent = await _agent(db, current_user.tenant_id, agent_id)
     profile = await _profile(db, current_user.tenant_id, agent_id, create=True)
     assert profile is not None

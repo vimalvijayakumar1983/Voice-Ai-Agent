@@ -90,19 +90,20 @@ Railway injects `PORT`. The VAV worker passes that port to LiveKit Agents' built
 
 ### Full production variable contract
 
-The LiveKit process imports VAV's shared production settings and decrypts tenant-owned provider credentials from PostgreSQL. It therefore needs more than the four LiveKit values. Copy or reference the following values from the running API/worker configuration; never copy them through chat, logs or source control.
+The LiveKit process imports VAV's shared production settings and decrypts tenant-owned provider credentials from PostgreSQL. An Inworld voice can use direct OpenAI for reliable VAV knowledge and action tool calls while retaining Inworld STT/TTS; Inworld Router remains selectable only when its live tool-calling readiness gate passes. The worker therefore needs more than the four LiveKit values. Copy or reference the following values from the running API/worker configuration; never copy them through chat, logs or source control.
 
 | Variable group | Variables | Rule |
 | --- | --- | --- |
 | Data plane | `DATABASE_URL`, `REDIS_URL` | Use Railway references to the existing managed services |
 | Environment | `APP_ENV`, `BASE_URL`, `CORS_ORIGINS`, `TRUST_RAILWAY_PROXY_HEADERS`, `REGISTRATION_MODE` | Use the exact production values already accepted by API startup |
-| Encryption | `SECRET_KEY`, `INTEGRATION_ENCRYPTION_KEY` | Must be identical to API/worker; the integration key decrypts the workspace Inworld key |
+| Encryption | `SECRET_KEY`, `INTEGRATION_ENCRYPTION_KEY` | Must be identical to API/worker; the integration key decrypts workspace Inworld and OpenAI keys |
 | Shared startup gate | `SMALLEST_API_KEY`, `SMALLEST_WEBHOOK_SECRET`, `SMALLEST_WEBHOOK_ID` | Required by the current shared production validator even though this lane never calls Smallest |
 | Conditional bootstrap | `BOOTSTRAP_OWNER_EMAIL` | Required only while `REGISTRATION_MODE=bootstrap` |
 | LiveKit | `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`, `LIVEKIT_AGENT_NAME` | Same project on API and worker; agent name is exactly `vav-inworld` |
 | Frontend browser CSP | `LIVEKIT_BROWSER_CONNECT_ORIGIN` | Optional exact self-hosted LiveKit `wss://` or `https://` origin; omit for LiveKit Cloud and never place credentials in it |
 | API worker probe | `LIVEKIT_WORKER_HEALTH_URL` | Private HTTP origin and port of `livekit-agent`, with no path; on Railway use `http://${{livekit-agent.RAILWAY_PRIVATE_DOMAIN}}:${{livekit-agent.PORT}}`; set on API only and never expose publicly |
 | Inworld | `INWORLD_API_KEY` | Optional platform fallback; prefer the encrypted workspace credential in VAV Settings |
+| OpenAI | `OPENAI_API_KEY` | Optional platform fallback for direct OpenAI LLM routes. The worker first loads the encrypted tenant OpenAI credential from PostgreSQL and fails closed if that active credential cannot be decrypted; the key is never put in dispatch metadata, browser tokens, frontend variables, or logs. |
 | Operations | `LIVEKIT_LOG_LEVEL=info`, `LIVEKIT_NUM_IDLE_PROCESSES=1`, `VAV_RELEASE_SHA` | Keep registration evidence, cap Railway prewarming until load-tested, and record the exact deployed commit |
 
 The LiveKit project URL, key, and secret are platform-owned server variables on `api` and `livekit-agent`; tenants neither submit nor store copies. Tenant configuration contains only the e& SIP URI and LiveKit trunk/dispatch identifiers. `INTEGRATION_ENCRYPTION_KEY` must match across API, Celery and LiveKit; a mismatch makes saved provider route records and Inworld credentials unreadable and must be treated as a failed deployment.
