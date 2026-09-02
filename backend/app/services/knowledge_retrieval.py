@@ -596,8 +596,9 @@ def _bounded_ranking_documents(
 def _rank_bounded_knowledge(
     query: str,
     documents: list[tuple[str, str]],
+    limit: int = 6,
 ) -> list[KnowledgeMatch]:
-    return rank_knowledge(query, _bounded_ranking_documents(query, documents))
+    return rank_knowledge(query, _bounded_ranking_documents(query, documents), limit=limit)
 
 
 def _eligible_source_filters(*, tenant_id: UUID, knowledge_base_id: UUID) -> tuple:
@@ -872,6 +873,8 @@ async def retrieve_knowledge_context(
     tenant_id: UUID,
     agent_id: UUID,
     query: str,
+    limit: int = 6,
+    max_context_chars: int = MAX_CONTEXT_CHARS,
 ) -> str | None:
     binding = await db.scalar(
         select(AgentKnowledgeBinding).where(
@@ -930,8 +933,8 @@ async def retrieve_knowledge_context(
     ]
     if knowledge_base.content:
         documents.append((knowledge_base.name, knowledge_base.content))
-    matches = await asyncio.to_thread(_rank_bounded_knowledge, query, documents)
+    matches = await asyncio.to_thread(_rank_bounded_knowledge, query, documents, limit)
     if not matches:
         return None
     context = "\n\n".join(f"Source: {match.source}\n{match.text}" for match in matches)
-    return context[:MAX_CONTEXT_CHARS]
+    return context[:max_context_chars]

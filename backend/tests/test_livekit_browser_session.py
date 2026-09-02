@@ -890,7 +890,7 @@ def test_inworld_agent_requires_context_resolved_knowledge_searches():
     agent = livekit_worker.VAVInworldAgent(model=model)
 
     assert "{{ company_name }}" not in agent.instructions
-    assert "self-contained query" in agent.instructions
+    assert "automatically added to the current turn" in agent.instructions
     assert '"tell me more"' in agent.instructions
     assert "overview" in agent.instructions
 
