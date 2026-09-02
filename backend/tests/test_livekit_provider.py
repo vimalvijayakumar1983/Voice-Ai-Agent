@@ -11,7 +11,13 @@ import pytest
 from livekit import api
 
 from app.livekit_runtime import worker as livekit_worker
-from app.livekit_runtime.worker import _usage_snapshot, _worker_http_port, _worker_idle_processes
+from app.livekit_runtime.worker import (
+    _capture_turn_latency,
+    _inworld_tts_options,
+    _usage_snapshot,
+    _worker_http_port,
+    _worker_idle_processes,
+)
 from app.telephony.livekit_provider import LiveKitSIPError, LiveKitSIPProvider
 
 
@@ -226,11 +232,14 @@ async def test_worker_failure_after_call_persistence_finalizes_once_and_keeps_au
     call_id = uuid4()
     shutdown_callbacks = []
     stt_options = {}
+    tts_options = {}
+    session_options = {}
     model = SimpleNamespace(
         id=agent_id,
         tenant_id=uuid4(),
         voice_id="inworld:Ashley",
         language="en-GB",
+        language_switching_enabled=False,
         speech_rate=1.0,
         system_prompt="Answer with approved knowledge.",
         greeting_message="Hello",
@@ -277,23 +286,55 @@ async def test_worker_failure_after_call_persistence_finalizes_once_and_keeps_au
         stt_options.update(kwargs)
         return object()
 
+    def tts(**kwargs):
+        tts_options.update(kwargs)
+        return object()
+
+    def agent_session(**kwargs):
+        session_options.update(kwargs)
+        raise RuntimeError("session construction failed")
+
     finalize = AsyncMock()
     monkeypatch.setattr(livekit_worker, "_load_runtime", load_runtime)
     monkeypatch.setattr(livekit_worker, "_open_call", AsyncMock(return_value=call_id))
     monkeypatch.setattr(livekit_worker, "_finish_call", finalize)
     monkeypatch.setattr(livekit_worker.inworld, "STT", stt)
-    monkeypatch.setattr(livekit_worker.inworld, "TTS", lambda **_kwargs: object())
+    monkeypatch.setattr(livekit_worker.inworld, "TTS", tts)
     monkeypatch.setattr(livekit_worker.openai, "LLM", lambda **_kwargs: object())
-    monkeypatch.setattr(
-        livekit_worker,
-        "AgentSession",
-        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("session construction failed")),
-    )
+    monkeypatch.setattr(livekit_worker, "AgentSession", agent_session)
 
     with pytest.raises(RuntimeError, match="session construction failed"):
         await livekit_worker.vav_inworld_session(Context())
 
     assert "language" not in stt_options
+    assert tts_options == {
+        "api_key": "inworld-key",
+        "model": "inworld-tts-2",
+        "voice": "Ashley",
+        "language": "en-GB",
+        "speaking_rate": 1.0,
+        "delivery_mode": "BALANCED",
+        "text_normalization": "ON",
+    }
+    assert session_options["turn_handling"]["endpointing"] == {
+        "mode": "fixed",
+        "min_delay": 0.5,
+        "max_delay": 3.0,
+    }
+    assert session_options["turn_handling"]["interruption"] == {
+        "enabled": True,
+        "mode": "vad",
+        "min_duration": 0.5,
+        "min_words": 0,
+        "resume_false_interruption": True,
+        "false_interruption_timeout": 2.0,
+    }
+    assert session_options["turn_handling"]["preemptive_generation"] == {
+        "enabled": True,
+        "preemptive_tts": False,
+        "max_speech_duration": 10.0,
+        "max_retries": 3,
+    }
     assert len(shutdown_callbacks) == 1
     assert finalize.await_count == 1
     assert isinstance(finalize.await_args.kwargs["failure"], RuntimeError)
@@ -315,6 +356,61 @@ def test_livekit_usage_snapshot_reads_cumulative_model_usage_once():
         "llm_output_tokens": 300,
         "tts_characters": 640,
         "stt_audio_seconds": 42.5,
+    }
+
+
+def test_inworld_tts_options_keep_auto_language_for_multilingual_agents():
+    options = _inworld_tts_options(
+        api_key="inworld-key",
+        model=SimpleNamespace(
+            voice_id="inworld:Olivia",
+            language="en-GB",
+            language_switching_enabled=True,
+            speech_rate=0.95,
+        ),
+    )
+
+    assert options == {
+        "api_key": "inworld-key",
+        "model": "inworld-tts-2",
+        "voice": "Olivia",
+        "speaking_rate": 0.95,
+        "delivery_mode": "BALANCED",
+        "text_normalization": "ON",
+    }
+
+
+def test_livekit_turn_latency_is_recorded_as_public_runtime_metrics():
+    runtime_metrics = {"turn_count": 0}
+    samples = []
+
+    _capture_turn_latency(
+        role="assistant",
+        metrics={"llm_node_ttft": 0.24, "tts_node_ttfb": 0.31, "e2e_latency": 0.91},
+        runtime_metrics=runtime_metrics,
+        end_to_end_samples=samples,
+    )
+    _capture_turn_latency(
+        role="assistant",
+        metrics=SimpleNamespace(llm_node_ttft=0.2, tts_node_ttfb=0.3, e2e_latency=1.2),
+        runtime_metrics=runtime_metrics,
+        end_to_end_samples=samples,
+    )
+    _capture_turn_latency(
+        role="user",
+        metrics={"e2e_latency": 0.1},
+        runtime_metrics=runtime_metrics,
+        end_to_end_samples=samples,
+    )
+
+    assert runtime_metrics == {
+        "turn_count": 2,
+        "last_llm_first_token_ms": 200,
+        "last_tts_first_byte_ms": 300,
+        "last_transcript_to_first_audio_ms": 500,
+        "last_speech_end_to_first_audio_ms": 1200,
+        "turn_latency_p50_ms": 910,
+        "turn_latency_p95_ms": 1200,
     }
 
 
