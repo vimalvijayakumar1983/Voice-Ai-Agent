@@ -268,6 +268,13 @@ export default function Playground() {
   const multilingualConfigured = selectedLanguages.length > 1;
 
   useEffect(() => {
+    if (!selectedUsesLiveKitBrowser) return;
+    // Warm the media SDK while the operator is reviewing the selected agent.
+    // Microphone access and the short-lived room token still wait for the click.
+    void import('livekit-client');
+  }, [selectedUsesLiveKitBrowser]);
+
+  useEffect(() => {
     // Router-driven agent changes can occur even while the selector is locked.
     // Tear down the previous agent before resetting its visible state so no
     // microphone or provider session can continue behind the new selection.
@@ -356,8 +363,11 @@ export default function Playground() {
     });
 
     try {
-      // Permission and the lazy SDK download happen before token issuance so a
-      // short-lived credential is never spent waiting on either.
+      // Start the SDK download alongside permission readiness. Token issuance
+      // still waits for both, so no short-lived credential is consumed early.
+      const liveKitSdkPromise = browserTransport === 'livekit'
+        ? import('livekit-client')
+        : null;
       await requestMicrophoneReadiness();
       if (terminalStateRef.current === 'ended' || terminalStateRef.current === 'error') return;
       setDiagnostics((current) => ({ ...current, permission: 'granted', lastEvent: 'Microphone ready' }));
@@ -488,7 +498,7 @@ export default function Playground() {
           Room: LiveKitRoom,
           RoomEvent,
           Track,
-        } = await import('livekit-client');
+        } = await liveKitSdkPromise!;
         if (terminalStateRef.current === 'ended') return;
         setDiagnostics((current) => ({ ...current, token: 'requesting', lastEvent: 'Requesting secure LiveKit token' }));
         const session = await api.createLiveKitBrowserSession(selected.id, variables);

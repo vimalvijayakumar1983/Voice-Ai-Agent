@@ -14,6 +14,7 @@ from sqlalchemy import select
 from app.livekit_runtime import worker as livekit_worker
 from app.livekit_runtime.worker import (
     _capture_turn_latency,
+    _inworld_stt_model,
     _inworld_tts_options,
     _usage_snapshot,
     _worker_http_port,
@@ -577,6 +578,9 @@ async def test_worker_failure_after_call_persistence_finalizes_once_and_resolves
 
     assert stt_options["language"] == "en-GB"
     assert stt_options["enable_voice_profile"] is False
+    assert stt_options["model"] == "assemblyai/u3-rt-pro"
+    assert stt_options["min_end_of_turn_silence_when_confident"] == 300
+    assert stt_options["end_of_turn_confidence_threshold"] == 0.5
     assert tts_options == {
         "api_key": "inworld-key",
         "model": "inworld-tts-2",
@@ -592,16 +596,16 @@ async def test_worker_failure_after_call_persistence_finalizes_once_and_resolves
     }
     assert session_options["turn_handling"]["endpointing"] == {
         "mode": "fixed",
-        "min_delay": 0.8,
-        "max_delay": 1.2,
+        "min_delay": 0.65,
+        "max_delay": 1.0,
     }
     assert session_options["turn_handling"]["interruption"] == {
         "enabled": True,
         "mode": "vad",
-        "min_duration": 0.3,
+        "min_duration": 0.2,
         "min_words": 1,
-        "resume_false_interruption": False,
-        "false_interruption_timeout": None,
+        "resume_false_interruption": True,
+        "false_interruption_timeout": 1.0,
     }
     assert session_options["turn_handling"]["preemptive_generation"] == {
         "enabled": False,
@@ -846,6 +850,36 @@ def test_inworld_tts_options_use_native_profile_delivery_mode():
 
     assert options["delivery_mode"] == "CREATIVE"
     assert options["language"] == "en-GB"
+
+
+def test_inworld_stt_model_uses_fast_accurate_route_for_english():
+    selected = _inworld_stt_model(
+        model=SimpleNamespace(language="en-GB", supported_languages=["en-GB"]),
+        profile=SimpleNamespace(stt_language="en-GB", runtime_config=None),
+    )
+
+    assert selected == "assemblyai/u3-rt-pro"
+
+
+def test_inworld_stt_model_uses_wide_multilingual_route_for_arabic_and_hindi():
+    selected = _inworld_stt_model(
+        model=SimpleNamespace(language="ar-AE", supported_languages=["ar-AE", "hi-IN"]),
+        profile=SimpleNamespace(stt_language="auto", runtime_config=None),
+    )
+
+    assert selected == "soniox/stt-rt-v4"
+
+
+def test_inworld_stt_model_preserves_explicit_operator_choice():
+    selected = _inworld_stt_model(
+        model=SimpleNamespace(language="en", supported_languages=["en"]),
+        profile=SimpleNamespace(
+            stt_language="en",
+            runtime_config={"stt_model": "inworld/inworld-stt-1"},
+        ),
+    )
+
+    assert selected == "inworld/inworld-stt-1"
 
 
 def test_livekit_turn_latency_is_recorded_as_public_runtime_metrics():
