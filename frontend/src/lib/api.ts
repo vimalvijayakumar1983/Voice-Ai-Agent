@@ -176,6 +176,7 @@ export interface RuntimeProfile {
   llm_provider: 'openai' | 'inworld';
   llm_model: string;
   stt_language: string;
+  tts_delivery_mode: 'stable' | 'balanced' | 'creative';
   max_concurrent_calls: number;
   daily_call_limit: number;
   monthly_budget_cents: number;

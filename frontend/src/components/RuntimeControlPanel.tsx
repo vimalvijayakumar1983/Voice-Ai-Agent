@@ -41,6 +41,7 @@ export default function RuntimeControlPanel({ agent, profile, onClose, onChange 
     llm_provider: form.llm_provider,
     llm_model: form.llm_model,
     stt_language: form.stt_language,
+    tts_delivery_mode: form.tts_delivery_mode,
     max_concurrent_calls: Number(form.max_concurrent_calls),
     daily_call_limit: Number(form.daily_call_limit),
     monthly_budget_cents: Number(form.monthly_budget_cents),
@@ -53,6 +54,7 @@ export default function RuntimeControlPanel({ agent, profile, onClose, onChange 
     llm_provider: profile.llm_provider,
     llm_model: profile.llm_model,
     stt_language: profile.stt_language,
+    tts_delivery_mode: profile.tts_delivery_mode,
     max_concurrent_calls: Number(profile.max_concurrent_calls),
     daily_call_limit: Number(profile.daily_call_limit),
     monthly_budget_cents: Number(profile.monthly_budget_cents),
@@ -172,6 +174,18 @@ export default function RuntimeControlPanel({ agent, profile, onClose, onChange 
           <label htmlFor="runtime-language">Realtime STT language</label>
           <input id="runtime-language" value={form.stt_language} onChange={(event) => setForm({ ...form, stt_language: event.target.value })} placeholder="auto, en-GB, ar-AE, or hi-IN" />
         </div>
+        {inworldRuntime ? (
+          <div className="form-group">
+            <label htmlFor="runtime-delivery-mode">Inworld TTS delivery</label>
+            <select id="runtime-delivery-mode" value={form.tts_delivery_mode} onChange={(event) => setForm({ ...form, tts_delivery_mode: event.target.value as RuntimeProfile['tts_delivery_mode'] })}>
+              <option value="balanced">Balanced · recommended default</option>
+              <option value="creative">Creative · more expressive</option>
+              <option value="stable">Stable · most predictable</option>
+            </select>
+            <p className="form-hint">Uses Inworld TTS-2&apos;s native delivery mode. It has no separate feature fee; normal synthesized-character usage still applies.</p>
+            <p className="form-hint">LiveKit native dynamic turn detection, interruption recovery, and standard noise cancellation are applied automatically. Transport, SIP, and model usage remain billable.</p>
+          </div>
+        ) : null}
         <div className="form-group">
           <label htmlFor="runtime-numbers">Assigned phone numbers</label>
           <textarea id="runtime-numbers" rows={3} value={numbers} onChange={(event) => setNumbers(event.target.value)} placeholder="+971501234567\n+919876543210" />

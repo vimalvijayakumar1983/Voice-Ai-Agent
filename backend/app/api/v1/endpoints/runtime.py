@@ -537,13 +537,19 @@ def _response(
         "llm_provider": "openai",
         "llm_model": "gpt-4o-mini",
         "stt_language": "auto",
+        "tts_delivery_mode": "balanced",
         "max_concurrent_calls": 1,
         "daily_call_limit": 100,
         "monthly_budget_cents": 5000,
         "assigned_numbers": [],
     }
     if profile is not None:
-        values.update({key: getattr(profile, key) for key in values})
+        values.update({key: getattr(profile, key) for key in values if key != "tts_delivery_mode"})
+        runtime_config = profile.runtime_config if isinstance(profile.runtime_config, dict) else {}
+        delivery_mode = str(runtime_config.get("tts_delivery_mode") or "balanced").lower()
+        values["tts_delivery_mode"] = (
+            delivery_mode if delivery_mode in {"stable", "balanced", "creative"} else "balanced"
+        )
     return RuntimeProfileResponse(
         id=profile.id if profile else None,
         agent_id=agent.id,
@@ -599,8 +605,19 @@ async def update_runtime_profile(
     agent = await _agent(db, current_user.tenant_id, agent_id)
     profile = await _profile(db, current_user.tenant_id, agent_id, create=True)
     assert profile is not None
-    for key, value in data.model_dump().items():
+    payload = data.model_dump(exclude={"tts_delivery_mode"})
+    for key, value in payload.items():
         setattr(profile, key, value)
+    runtime_config = profile.runtime_config if isinstance(profile.runtime_config, dict) else {}
+    if "tts_delivery_mode" in data.model_fields_set:
+        runtime_config = {
+            **runtime_config,
+            "tts_delivery_mode": data.tts_delivery_mode,
+        }
+    profile.runtime_config = runtime_config
+    delivery_mode = str(runtime_config.get("tts_delivery_mode") or "balanced").lower()
+    if delivery_mode not in {"stable", "balanced", "creative"}:
+        delivery_mode = "balanced"
     provider_compatibility_blocker = _runtime_provider_blocker(agent, profile)
     if provider_compatibility_blocker:
         raise HTTPException(status_code=422, detail=provider_compatibility_blocker)
@@ -617,6 +634,7 @@ async def update_runtime_profile(
             "telephony_provider": profile.telephony_provider,
             "primary_speech_provider": profile.primary_speech_provider,
             "assigned_number_count": len(profile.assigned_numbers),
+            "tts_delivery_mode": delivery_mode,
         },
     )
     blockers, _checks = await runtime_readiness(db, agent, profile)

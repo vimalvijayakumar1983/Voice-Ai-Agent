@@ -686,6 +686,14 @@ async def initiate_outbound_call(
                     ),
                     "stt_language_configured": runtime_profile.stt_language,
                     "tts_model": "inworld-tts-2",
+                    "tts_delivery_mode": str(
+                        (
+                            runtime_profile.runtime_config.get("tts_delivery_mode")
+                            if isinstance(runtime_profile.runtime_config, dict)
+                            else None
+                        )
+                        or "balanced"
+                    ).lower(),
                     "recording_enabled": False,
                 }
                 if is_inworld and runtime_profile

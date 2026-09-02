@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
+from collections import Counter
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import Text, case, cast, func, literal_column, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.agent import AgentKnowledgeBinding, KnowledgeBase, KnowledgeSource
@@ -14,28 +17,170 @@ from app.models.agent import AgentKnowledgeBinding, KnowledgeBase, KnowledgeSour
 _TOKEN = re.compile(r"[^\W_]+", re.UNICODE)
 _SPLIT = re.compile(r"(?:\r?\n){2,}|(?<=[.!?।])\s+")
 MAX_CONTEXT_CHARS = 6000
+MAX_SOURCE_CANDIDATES = 48
+MAX_RANKING_CORPUS_CHARS = 96_000
+MAX_RANKING_SOURCE_CHARS = 8_000
+_FTS_CANDIDATE_LIMIT = 32
+_TITLE_CANDIDATE_LIMIT = 8
+_POSTGRES_HEADLINE_OPTIONS = (
+    "MaxWords=120, MinWords=20, ShortWord=2, MaxFragments=8, HighlightAll=FALSE"
+)
+_ELIGIBLE_SOURCE_STATUSES = ("processing", "indexed", "local_only")
 _QUERY_STOP_WORDS = {
     "a",
     "about",
+    "actually",
+    "again",
+    "also",
     "an",
     "and",
+    "anyway",
     "are",
+    "basically",
     "can",
     "could",
     "do",
     "does",
     "for",
     "from",
+    "give",
     "have",
+    "hello",
+    "hey",
+    "hi",
     "is",
+    "it",
+    "just",
+    "kind",
+    "know",
+    "like",
+    "maybe",
     "me",
+    "more",
+    "now",
     "of",
+    "ok",
+    "okay",
     "please",
+    "right",
+    "so",
+    "something",
     "tell",
+    "thank",
+    "thanks",
+    "that",
     "the",
+    "then",
+    "there",
+    "thing",
+    "this",
+    "to",
+    "us",
+    "want",
+    "we",
+    "well",
     "what",
     "which",
     "who",
+    "would",
+    "yeah",
+    "yes",
+    "you",
+    "your",
+}
+_SOURCE_NOISE_TOKENS = {
+    "base",
+    "content",
+    "converted",
+    "copy",
+    "crawl",
+    "crawled",
+    "doc",
+    "document",
+    "docx",
+    "extracted",
+    "final",
+    "html",
+    "indexed",
+    "knowledge",
+    "local",
+    "page",
+    "pages",
+    "pdf",
+    "searchable",
+    "source",
+    "text",
+    "txt",
+    "vav",
+    "voice",
+    "web",
+    "website",
+}
+_BROAD_QUERY_TOKENS = {
+    "about",
+    "business",
+    "company",
+    "corporate",
+    "division",
+    "group",
+    "organisation",
+    "organization",
+    "overview",
+    "profile",
+}
+_OVERVIEW_SOURCE_TOKENS = {"about", "homepage", "overview", "profile"}
+_DIVISIONS_SOURCE_TOKENS = {"business", "division"}
+_DIRECTORY_QUERY_TOKENS = {
+    "consultant",
+    "dermatologist",
+    "doctor",
+    "physician",
+    "specialist",
+    "surgeon",
+}
+_DIRECTORY_SOURCE_TOKENS = _DIRECTORY_QUERY_TOKENS | {"directory", "medical", "team"}
+_QUERY_INTENT_TOKENS = (
+    _BROAD_QUERY_TOKENS
+    | _DIRECTORY_QUERY_TOKENS
+    | {
+        "appointment",
+        "availability",
+        "available",
+        "book",
+        "booking",
+        "consultation",
+        "cost",
+        "detail",
+        "hour",
+        "information",
+        "location",
+        "open",
+        "opening",
+        "option",
+        "price",
+        "pricing",
+        "service",
+        "treatment",
+    }
+)
+_NAVIGATION_NOISE_TOKENS = {
+    "cookie",
+    "copyright",
+    "facebook",
+    "footer",
+    "home",
+    "instagram",
+    "linkedin",
+    "login",
+    "menu",
+    "navigation",
+    "next",
+    "previous",
+    "privacy",
+    "share",
+    "subscribe",
+    "twitter",
+    "youtube",
 }
 
 
@@ -46,24 +191,163 @@ class KnowledgeMatch:
     score: float
 
 
+def _base_tokens(value: str) -> list[str]:
+    return [token.casefold() for token in _TOKEN.findall(value) if len(token) > 1]
+
+
+def _singular(token: str) -> str:
+    if len(token) > 4 and token.endswith("ies"):
+        return f"{token[:-3]}y"
+    if len(token) > 3 and token.endswith("s") and not token.endswith(("is", "ss", "us")):
+        return token[:-1]
+    return token
+
+
 def _tokens(value: str) -> set[str]:
+    return _token_forms(_base_tokens(value))
+
+
+def _token_forms(base_tokens: list[str]) -> set[str]:
     tokens: set[str] = set()
-    for raw_token in _TOKEN.findall(value):
-        token = raw_token.casefold()
-        if len(token) <= 1:
-            continue
+    for token in base_tokens:
         tokens.add(token)
-        if len(token) > 4 and token.endswith("ies"):
-            tokens.add(f"{token[:-3]}y")
-        elif len(token) > 3 and token.endswith("s") and not token.endswith(("is", "ss", "us")):
-            tokens.add(token[:-1])
+        tokens.add(_singular(token))
     return tokens
 
 
 def _query_tokens(value: str) -> set[str]:
-    tokens = _tokens(value)
-    meaningful = tokens - _QUERY_STOP_WORDS
-    return meaningful or tokens
+    return {_singular(token) for token in _base_tokens(value)} - _QUERY_STOP_WORDS
+
+
+def _compound_terms(tokens: list[str]) -> set[str]:
+    compounds: set[str] = set()
+    for width in (2, 3):
+        for start in range(len(tokens) - width + 1):
+            compound = "".join(tokens[start : start + width])
+            if 5 <= len(compound) <= 32:
+                compounds.add(compound)
+    return compounds
+
+
+def _source_terms(value: str) -> set[str]:
+    base_tokens = _source_base_tokens(value)
+    return set(base_tokens) | _compound_terms(base_tokens)
+
+
+def _source_base_tokens(value: str) -> list[str]:
+    return [
+        _singular(token)
+        for token in _base_tokens(value)
+        if token not in _SOURCE_NOISE_TOKENS and not token.isdigit()
+    ]
+
+
+def _source_compounds(value: str) -> set[str]:
+    tokens = [_singular(token) for token in _base_tokens(value)]
+    compounds: set[str] = set()
+    for width in (2, 3):
+        for start in range(len(tokens) - width + 1):
+            parts = tokens[start : start + width]
+            if any(token in _SOURCE_NOISE_TOKENS or token.isdigit() for token in parts):
+                continue
+            compound = "".join(parts)
+            if 5 <= len(compound) <= 32:
+                compounds.add(compound)
+    return compounds
+
+
+def _best_fuzzy_source_match(
+    query_token: str, source_compounds: set[str]
+) -> tuple[float, str | None]:
+    if len(query_token) < 5:
+        return 0.0, None
+
+    best_score = 0.0
+    best_candidate: str | None = None
+    for candidate in source_compounds:
+        if len(candidate) < 5 or abs(len(query_token) - len(candidate)) > 2:
+            continue
+        # Requiring a shared four-character prefix keeps fuzzy matching narrow while
+        # recovering common streaming-STT truncations such as "Alzab" -> "Al Zaabi".
+        if query_token[:4] != candidate[:4]:
+            continue
+        shorter, longer = sorted((query_token, candidate), key=len)
+        if longer.startswith(shorter):
+            score = 0.84
+        else:
+            similarity = SequenceMatcher(None, query_token, candidate).ratio()
+            if similarity < 0.82:
+                continue
+            score = similarity * 0.9
+        if score > best_score:
+            best_score = score
+            best_candidate = candidate
+    return best_score, best_candidate
+
+
+def _best_source_match(
+    query_token: str,
+    source_terms: set[str],
+    source_compounds: set[str],
+) -> tuple[float, str | None]:
+    if query_token in source_terms:
+        return 1.0, query_token
+    return _best_fuzzy_source_match(query_token, source_compounds)
+
+
+def _ubiquitous_source_terms(documents: list[tuple[str, str]]) -> set[str]:
+    terms_by_source: dict[str, set[str]] = {}
+    for source, _content in documents:
+        terms_by_source.setdefault(source.casefold(), _source_terms(source))
+    if len(terms_by_source) < 2:
+        return set()
+    frequencies = Counter(term for terms in terms_by_source.values() for term in terms)
+    threshold = max(2, (len(terms_by_source) * 3 + 4) // 5)
+    return {term for term, frequency in frequencies.items() if frequency >= threshold}
+
+
+def _chunk_quality(value: str, *, words: list[str] | None = None) -> float:
+    if words is None:
+        words = _base_tokens(value)
+    word_count = len(words)
+    navigation_heavy = False
+    if word_count < 4:
+        quality = 0.35
+    elif word_count < 8:
+        quality = 0.65
+    elif word_count < 14:
+        quality = 0.82
+    else:
+        quality = 1.0
+
+    if words:
+        useful_ratio = sum(word not in _NAVIGATION_NOISE_TOKENS for word in words) / word_count
+        if useful_ratio < 0.5:
+            quality *= 0.55
+            navigation_heavy = True
+        elif useful_ratio < 0.7:
+            quality *= 0.78
+        if word_count >= 12 and len(set(words)) / word_count < 0.35:
+            quality *= 0.75
+
+    separators = sum(value.count(separator) for separator in ("|", "•", "›", "»"))
+    if separators >= 3 and separators >= max(word_count // 3, 1):
+        quality *= 0.7
+        if navigation_heavy:
+            quality *= 0.5
+    if len(re.findall(r"https?://|www\.", value.casefold())) >= 2:
+        quality *= 0.75
+    return max(quality, 0.2)
+
+
+def _is_broad_query(query: str, query_tokens: set[str]) -> bool:
+    raw_tokens = {_singular(token) for token in _base_tokens(query)}
+    return bool(raw_tokens & _BROAD_QUERY_TOKENS) and len(query_tokens - _BROAD_QUERY_TOKENS) <= 2
+
+
+def _is_group_overview_source(source: str) -> bool:
+    title_tokens = [_singular(token) for token in _base_tokens(source)]
+    return title_tokens[:2] == ["the", "group"]
 
 
 def _chunks(value: str, *, max_chars: int = 900) -> list[str]:
@@ -93,24 +377,493 @@ def rank_knowledge(
     limit: int = 6,
 ) -> list[KnowledgeMatch]:
     query_tokens = _query_tokens(query)
-    if not query_tokens:
+    if not query_tokens or limit <= 0:
         return []
+    ordered_query_tokens = sorted(query_tokens)
+    ubiquitous_source_terms = _ubiquitous_source_terms(documents)
+    broad_query = _is_broad_query(query, query_tokens)
+    directory_query = bool(query_tokens & _DIRECTORY_QUERY_TOKENS)
     matches: list[KnowledgeMatch] = []
     for source, content in documents:
-        source_tokens = _tokens(source)
-        source_overlap = query_tokens & source_tokens
+        source_terms = _source_terms(source)
+        source_compounds = _source_compounds(source)
         for chunk in _chunks(content):
-            chunk_tokens = _tokens(chunk)
-            content_overlap = query_tokens & chunk_tokens
-            overlap = content_overlap | source_overlap
-            if not overlap:
+            chunk_base_tokens = _base_tokens(chunk)
+            chunk_tokens = _token_forms(chunk_base_tokens)
+            quality = _chunk_quality(chunk, words=chunk_base_tokens)
+            content_scores: list[float] = []
+            source_scores: list[float] = []
+            combined_scores: list[float] = []
+            for query_token in ordered_query_tokens:
+                # Content is exact-only: a medical term must never be recovered from a
+                # similar operational word (for example, cancer from cancellation).
+                content_score = 1.0 if query_token in chunk_tokens else 0.0
+                source_score, source_term = _best_source_match(
+                    query_token, source_terms, source_compounds
+                )
+                source_weight = 0.18 if source_term in ubiquitous_source_terms else 1.0
+                effective_content_score = content_score * quality
+                effective_source_score = source_score * source_weight * (0.55 + quality * 0.45)
+                content_scores.append(effective_content_score)
+                source_scores.append(effective_source_score)
+                combined_scores.append(max(effective_content_score, effective_source_score))
+
+            if not any(combined_scores):
                 continue
-            coverage = len(overlap) / len(query_tokens)
-            density = len(content_overlap) / max(len(chunk_tokens), 1)
-            source_bonus = min(len(source_overlap), 2) * 0.03
-            score = coverage * 0.82 + density * 0.15 + source_bonus
+            if len(query_tokens) >= 3:
+                if sum(score > 0 for score in combined_scores) < 2:
+                    continue
+                # A long query usually contains an entity plus the requested fact.
+                # Entity/title evidence alone must not make an unrelated source look
+                # authoritative. Require exact content evidence for every term that
+                # the title could not explain (for example, ``cancer Alzab group``).
+                unexplained_topic_indexes = [
+                    index for index, source_score in enumerate(source_scores) if source_score == 0
+                ]
+                if unexplained_topic_indexes:
+                    substantive_topic_indexes = [
+                        index
+                        for index in unexplained_topic_indexes
+                        if ordered_query_tokens[index] not in _QUERY_INTENT_TOKENS
+                    ]
+                    if substantive_topic_indexes:
+                        if not all(
+                            content_scores[index] > 0 for index in substantive_topic_indexes
+                        ):
+                            continue
+                    elif not any(content_scores):
+                        continue
+            coverage = sum(combined_scores) / len(query_tokens)
+            content_coverage = sum(content_scores) / len(query_tokens)
+            density = sum(content_scores) / max(len(chunk_tokens), 1)
+            source_bonus = min(sum(source_scores) / len(query_tokens), 1.0) * 0.06
+            topic_bonus = 0.0
+            if broad_query:
+                if source_terms & _OVERVIEW_SOURCE_TOKENS or _is_group_overview_source(source):
+                    topic_bonus = 0.18
+                elif source_terms & _DIVISIONS_SOURCE_TOKENS:
+                    topic_bonus = 0.12
+            if directory_query and source_terms & _DIRECTORY_SOURCE_TOKENS:
+                topic_bonus = max(topic_bonus, 0.18)
+            score = (
+                coverage * 0.76
+                + content_coverage * 0.18
+                + min(density, 0.25) * 0.24
+                + source_bonus
+                + topic_bonus
+            )
             matches.append(KnowledgeMatch(source, chunk, score))
-    return sorted(matches, key=lambda item: -item.score)[:limit]
+
+    diversified: list[KnowledgeMatch] = []
+    chunks_per_source: Counter[str] = Counter()
+    for match in sorted(matches, key=lambda item: -item.score):
+        source_key = " ".join(_base_tokens(match.source)) or match.source.casefold()
+        if chunks_per_source[source_key] >= 2:
+            continue
+        diversified.append(match)
+        chunks_per_source[source_key] += 1
+        if len(diversified) >= limit:
+            break
+    return diversified
+
+
+def _query_aware_excerpt(content: str, query_tokens: set[str], *, limit: int) -> str:
+    if len(content) <= limit:
+        return content
+    # ``str.find``/``rfind`` run in C and avoid a full Python-level regex walk over
+    # large crawled documents. Keep both ends so repeated navigation near the start
+    # cannot hide a substantive answer near the end.
+    folded_content = content.casefold()
+    anchors: set[int] = set()
+    for token in sorted(query_tokens, key=lambda item: (-len(item), item))[:16]:
+        anchors.update(_bounded_token_positions(folded_content, token))
+    if not anchors:
+        return content[:limit]
+
+    ordered_anchors = sorted(anchors)
+    if len(ordered_anchors) > 128:
+        last_index = len(ordered_anchors) - 1
+        ordered_anchors = [ordered_anchors[round(index * last_index / 127)] for index in range(128)]
+
+    best_score: tuple[int, float, int, int] = (-1, -1.0, -1, -1)
+    best_excerpt = content[:limit]
+    for anchor in ordered_anchors:
+        start = max(0, min(anchor - limit // 3, len(content) - limit))
+        excerpt = content[start : start + limit]
+        excerpt_tokens = _token_forms(_base_tokens(excerpt))
+        local_start = max(0, anchor - 180)
+        local_evidence = content[local_start : min(len(content), anchor + 420)]
+        local_words = _base_tokens(local_evidence)
+        informative_words = {
+            word
+            for word in local_words
+            if word not in query_tokens
+            and word not in _QUERY_STOP_WORDS
+            and word not in _NAVIGATION_NOISE_TOKENS
+        }
+        score = (
+            len(query_tokens & excerpt_tokens),
+            _chunk_quality(local_evidence, words=local_words),
+            len(informative_words),
+            # On an otherwise equal score, later evidence is less likely to be
+            # duplicated header navigation and more likely to be page body text.
+            anchor,
+        )
+        if score > best_score:
+            best_score = score
+            best_excerpt = excerpt
+    return best_excerpt
+
+
+def _bounded_token_position(value: str, token: str, *, reverse: bool = False) -> int | None:
+    """Find a whole token without accepting substrings such as ``hair`` in ``chair``."""
+    positions = _bounded_token_positions(value, token, per_direction=1)
+    if not positions:
+        return None
+    return max(positions) if reverse else min(positions)
+
+
+def _bounded_token_positions(
+    value: str,
+    token: str,
+    *,
+    per_direction: int = 16,
+) -> set[int]:
+    """Sample whole-token occurrences from both ends of a potentially large document."""
+    positions: set[int] = set()
+    cursor = 0
+    while len(positions) < per_direction:
+        position = value.find(token, cursor)
+        if position < 0:
+            break
+        end = position + len(token)
+        if (position == 0 or not value[position - 1].isalnum()) and (
+            end == len(value) or not value[end].isalnum()
+        ):
+            positions.add(position)
+        cursor = end
+
+    reverse_count = 0
+    cursor = len(value)
+    while reverse_count < per_direction:
+        position = value.rfind(token, 0, cursor)
+        if position < 0:
+            break
+        end = position + len(token)
+        if (position == 0 or not value[position - 1].isalnum()) and (
+            end == len(value) or not value[end].isalnum()
+        ):
+            positions.add(position)
+            reverse_count += 1
+        cursor = position
+    return positions
+
+
+def _bounded_ranking_documents(
+    query: str,
+    documents: list[tuple[str, str]],
+) -> list[tuple[str, str]]:
+    eligible = [(source, content) for source, content in documents if content.strip()]
+    if not eligible:
+        return []
+
+    per_source_limits = [min(len(content), MAX_RANKING_SOURCE_CHARS) for _, content in eligible]
+    fair_share = max(1, MAX_RANKING_CORPUS_CHARS // len(eligible))
+    allocations = [min(limit, fair_share) for limit in per_source_limits]
+    remaining = MAX_RANKING_CORPUS_CHARS - sum(allocations)
+    while remaining > 0:
+        expandable = [
+            index for index, limit in enumerate(per_source_limits) if allocations[index] < limit
+        ]
+        if not expandable:
+            break
+        next_share = max(1, remaining // len(expandable))
+        for index in expandable:
+            additional = min(per_source_limits[index] - allocations[index], next_share, remaining)
+            allocations[index] += additional
+            remaining -= additional
+            if remaining == 0:
+                break
+
+    query_tokens = _query_tokens(query)
+    return [
+        (source, _query_aware_excerpt(content, query_tokens, limit=allocation))
+        for (source, content), allocation in zip(eligible, allocations, strict=True)
+        if allocation > 0
+    ]
+
+
+def _rank_bounded_knowledge(
+    query: str,
+    documents: list[tuple[str, str]],
+) -> list[KnowledgeMatch]:
+    return rank_knowledge(query, _bounded_ranking_documents(query, documents))
+
+
+def _eligible_source_filters(*, tenant_id: UUID, knowledge_base_id: UUID) -> tuple:
+    return (
+        KnowledgeSource.knowledge_base_id == knowledge_base_id,
+        KnowledgeSource.tenant_id == tenant_id,
+        KnowledgeSource.status.in_(_ELIGIBLE_SOURCE_STATUSES),
+        KnowledgeSource.content.is_not(None),
+    )
+
+
+def _postgres_fts_terms(query: str) -> list[str]:
+    return sorted(
+        token
+        for token in _tokens(query)
+        if _singular(token) not in _QUERY_STOP_WORDS and token.isalnum()
+    )[:16]
+
+
+def _postgres_ts_query(query: str):
+    return func.to_tsquery(
+        literal_column("'simple'::regconfig"),
+        " | ".join(_postgres_fts_terms(query)),
+    )
+
+
+def _postgres_source_excerpt(query: str):
+    headline = func.ts_headline(
+        literal_column("'simple'::regconfig"),
+        KnowledgeSource.content,
+        _postgres_ts_query(query),
+        _POSTGRES_HEADLINE_OPTIONS,
+    )
+    return func.substr(headline, 1, MAX_RANKING_SOURCE_CHARS)
+
+
+def _bounded_unique_ids(*candidate_groups: list[UUID]) -> list[UUID]:
+    selected: list[UUID] = []
+    seen: set[UUID] = set()
+    for candidates in candidate_groups:
+        for candidate_id in candidates:
+            if candidate_id in seen:
+                continue
+            selected.append(candidate_id)
+            seen.add(candidate_id)
+            if len(selected) >= MAX_SOURCE_CANDIDATES:
+                return selected
+    return selected
+
+
+async def _broad_title_candidate_ids(
+    db: AsyncSession,
+    *,
+    tenant_id: UUID,
+    knowledge_base_id: UUID,
+) -> list[UUID]:
+    lower_name = func.lower(KnowledgeSource.name)
+    broad_title = or_(
+        lower_name.like("the group%"),
+        lower_name.contains("overview"),
+        lower_name.contains("about"),
+        lower_name.contains("profile"),
+        lower_name.contains("division"),
+    )
+    priority = case(
+        (lower_name.like("the group%"), 0),
+        (lower_name.contains("overview"), 1),
+        (lower_name.contains("about"), 1),
+        (lower_name.contains("profile"), 2),
+        (lower_name.contains("division"), 3),
+        else_=4,
+    )
+    return list(
+        (
+            await db.scalars(
+                select(KnowledgeSource.id)
+                .where(
+                    *_eligible_source_filters(
+                        tenant_id=tenant_id,
+                        knowledge_base_id=knowledge_base_id,
+                    ),
+                    broad_title,
+                )
+                .order_by(priority, KnowledgeSource.updated_at.desc(), KnowledgeSource.id)
+                .limit(_TITLE_CANDIDATE_LIMIT)
+            )
+        ).all()
+    )
+
+
+async def _postgres_candidate_source_ids(
+    db: AsyncSession,
+    *,
+    tenant_id: UUID,
+    knowledge_base_id: UUID,
+    query: str,
+    query_tokens: set[str],
+) -> list[UUID]:
+    empty_text = literal_column("''", type_=Text())
+    search_text = (
+        func.coalesce(cast(KnowledgeSource.name, Text), empty_text)
+        + literal_column("' '", type_=Text())
+        + func.coalesce(KnowledgeSource.content, empty_text)
+    )
+    search_vector = func.to_tsvector(
+        literal_column("'simple'::regconfig"),
+        search_text,
+    )
+    fts_terms = _postgres_fts_terms(query)
+    fts_ids: list[UUID] = []
+    if fts_terms:
+        ts_query = _postgres_ts_query(query)
+        rank = func.ts_rank_cd(search_vector, ts_query)
+        fts_ids = list(
+            (
+                await db.scalars(
+                    select(KnowledgeSource.id)
+                    .where(
+                        *_eligible_source_filters(
+                            tenant_id=tenant_id,
+                            knowledge_base_id=knowledge_base_id,
+                        ),
+                        search_vector.op("@@")(ts_query),
+                    )
+                    .order_by(rank.desc(), KnowledgeSource.updated_at.desc(), KnowledgeSource.id)
+                    .limit(_FTS_CANDIDATE_LIMIT)
+                )
+            ).all()
+        )
+
+    broad_ids: list[UUID] = []
+    if _is_broad_query(query, query_tokens):
+        broad_ids = await _broad_title_candidate_ids(
+            db,
+            tenant_id=tenant_id,
+            knowledge_base_id=knowledge_base_id,
+        )
+
+    prefixes = sorted({token[:4] for token in query_tokens if len(token) >= 5})[:8]
+    fuzzy_title_ids: list[UUID] = []
+    if prefixes and not fts_ids:
+        normalized_name = func.regexp_replace(
+            func.lower(cast(KnowledgeSource.name, Text)),
+            "[^[:alnum:]]+",
+            "",
+            "g",
+        )
+        fuzzy_title_ids = list(
+            (
+                await db.scalars(
+                    select(KnowledgeSource.id)
+                    .where(
+                        *_eligible_source_filters(
+                            tenant_id=tenant_id,
+                            knowledge_base_id=knowledge_base_id,
+                        ),
+                        or_(*(normalized_name.contains(prefix) for prefix in prefixes)),
+                    )
+                    .order_by(KnowledgeSource.updated_at.desc(), KnowledgeSource.id)
+                    .limit(_TITLE_CANDIDATE_LIMIT)
+                )
+            ).all()
+        )
+    return _bounded_unique_ids(broad_ids, fuzzy_title_ids, fts_ids)
+
+
+async def _fallback_candidate_source_ids(
+    db: AsyncSession,
+    *,
+    tenant_id: UUID,
+    knowledge_base_id: UUID,
+    query: str,
+    query_tokens: set[str],
+) -> list[UUID]:
+    lower_name = func.lower(KnowledgeSource.name)
+    lower_content = func.lower(KnowledgeSource.content)
+    exact_terms = sorted(_tokens(query) - _QUERY_STOP_WORDS)[:16]
+    exact_ids: list[UUID] = []
+    if exact_terms:
+        exact_ids = list(
+            (
+                await db.scalars(
+                    select(KnowledgeSource.id)
+                    .where(
+                        *_eligible_source_filters(
+                            tenant_id=tenant_id,
+                            knowledge_base_id=knowledge_base_id,
+                        ),
+                        or_(
+                            *(
+                                predicate
+                                for token in exact_terms
+                                for predicate in (
+                                    lower_name.contains(token),
+                                    lower_content.contains(token),
+                                )
+                            )
+                        ),
+                    )
+                    .order_by(KnowledgeSource.updated_at.desc(), KnowledgeSource.id)
+                    .limit(_FTS_CANDIDATE_LIMIT)
+                )
+            ).all()
+        )
+
+    broad_ids: list[UUID] = []
+    if _is_broad_query(query, query_tokens):
+        broad_ids = await _broad_title_candidate_ids(
+            db,
+            tenant_id=tenant_id,
+            knowledge_base_id=knowledge_base_id,
+        )
+
+    # SQLite has no production-equivalent regexp/GIN path. Inspect a bounded metadata-only
+    # window so unit tests and local development retain fuzzy title recovery without loading
+    # an unbounded content corpus into the process.
+    recent_rows = (
+        await db.execute(
+            select(KnowledgeSource.id, KnowledgeSource.name)
+            .where(
+                *_eligible_source_filters(
+                    tenant_id=tenant_id,
+                    knowledge_base_id=knowledge_base_id,
+                )
+            )
+            .order_by(KnowledgeSource.updated_at.desc(), KnowledgeSource.id)
+            .limit(_TITLE_CANDIDATE_LIMIT)
+        )
+    ).all()
+    fuzzy_title_ids = [
+        source_id
+        for source_id, source_name in recent_rows
+        if any(
+            _best_fuzzy_source_match(query_token, _source_compounds(source_name))[0] > 0
+            for query_token in query_tokens
+        )
+    ]
+    return _bounded_unique_ids(broad_ids, fuzzy_title_ids, exact_ids)
+
+
+async def _candidate_source_ids(
+    db: AsyncSession,
+    *,
+    tenant_id: UUID,
+    knowledge_base_id: UUID,
+    query: str,
+) -> list[UUID]:
+    query_tokens = _query_tokens(query)
+    if not query_tokens:
+        return []
+    dialect = db.get_bind().dialect.name
+    if dialect == "postgresql":
+        return await _postgres_candidate_source_ids(
+            db,
+            tenant_id=tenant_id,
+            knowledge_base_id=knowledge_base_id,
+            query=query,
+            query_tokens=query_tokens,
+        )
+    return await _fallback_candidate_source_ids(
+        db,
+        tenant_id=tenant_id,
+        knowledge_base_id=knowledge_base_id,
+        query=query,
+        query_tokens=query_tokens,
+    )
 
 
 async def retrieve_knowledge_context(
@@ -138,26 +891,46 @@ async def retrieve_knowledge_context(
     )
     if knowledge_base is None:
         return None
-    sources = (
-        await db.scalars(
-            select(KnowledgeSource).where(
-                KnowledgeSource.knowledge_base_id == knowledge_base.id,
-                KnowledgeSource.tenant_id == tenant_id,
-                # Locally validated PDF text is safe to use immediately while
-                # the provider refreshes its own index after an in-place update.
-                KnowledgeSource.status.in_(("processing", "indexed", "local_only")),
-                KnowledgeSource.content.is_not(None),
+    candidate_ids = await _candidate_source_ids(
+        db,
+        tenant_id=tenant_id,
+        knowledge_base_id=knowledge_base.id,
+        query=query,
+    )
+    source_rows = []
+    if candidate_ids:
+        content_expression = KnowledgeSource.content
+        if db.get_bind().dialect.name == "postgresql":
+            content_expression = _postgres_source_excerpt(query)
+        source_rows = (
+            await db.execute(
+                select(
+                    KnowledgeSource.id,
+                    KnowledgeSource.name,
+                    content_expression.label("content"),
+                ).where(
+                    *_eligible_source_filters(
+                        tenant_id=tenant_id,
+                        knowledge_base_id=knowledge_base.id,
+                    ),
+                    KnowledgeSource.id.in_(candidate_ids),
+                )
             )
+        ).all()
+    sources_by_id = {
+        source_id: (
+            source_name,
+            source_content.replace("<b>", "").replace("</b>", ""),
         )
-    ).all()
+        for source_id, source_name, source_content in source_rows
+        if isinstance(source_content, str) and source_content.strip()
+    }
     documents = [
-        (source.name, source.content)
-        for source in sources
-        if isinstance(source.content, str) and source.content.strip()
+        sources_by_id[source_id] for source_id in candidate_ids if source_id in sources_by_id
     ]
     if knowledge_base.content:
         documents.append((knowledge_base.name, knowledge_base.content))
-    matches = rank_knowledge(query, documents)
+    matches = await asyncio.to_thread(_rank_bounded_knowledge, query, documents)
     if not matches:
         return None
     context = "\n\n".join(f"Source: {match.source}\n{match.text}" for match in matches)

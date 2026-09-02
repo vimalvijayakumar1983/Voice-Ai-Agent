@@ -437,6 +437,23 @@ async def test_livekit_inworld_runtime_requires_explicit_route_ids_and_can_activ
             "llm_provider": "inworld",
             "llm_model": "openai/gpt-4o-mini",
             "stt_language": "en-GB",
+            "tts_delivery_mode": "creative",
+            "max_concurrent_calls": 5,
+            "daily_call_limit": 500,
+            "monthly_budget_cents": 50000,
+        },
+    )
+    legacy_update = await client.put(
+        f"/api/v1/runtime/agents/{agent.id}",
+        headers=auth_headers,
+        json={
+            "assigned_numbers": ["+97141234567"],
+            "telephony_provider": "livekit_sip",
+            "primary_speech_provider": "inworld",
+            "fallback_speech_provider": "sarvam",
+            "llm_provider": "inworld",
+            "llm_model": "openai/gpt-4o-mini",
+            "stt_language": "en-GB",
             "max_concurrent_calls": 5,
             "daily_call_limit": 500,
             "monthly_budget_cents": 50000,
@@ -489,6 +506,9 @@ async def test_livekit_inworld_runtime_requires_explicit_route_ids_and_can_activ
     assert saved_sip.json()["gateway_provisioned"] is False
     assert duplicate_route.status_code == 409
     assert configured.json()["ready"] is True
+    assert configured.json()["tts_delivery_mode"] == "creative"
+    assert legacy_update.status_code == 200
+    assert legacy_update.json()["tts_delivery_mode"] == "creative"
     assert tested.json()["ready"] is True
     assert tested.json()["checks"]["tts_provider_live"] is True
     assert tested.json()["checks"]["llm_provider_live"] is True
@@ -509,6 +529,7 @@ async def test_livekit_inworld_runtime_requires_explicit_route_ids_and_can_activ
     ]
     assert inbound_model.id == agent.id
     assert inbound_profile.agent_id == agent.id
+    assert inbound_profile.runtime_config == {"tts_delivery_mode": "creative"}
     assert inbound_key.speech == "inworld-workspace-key-123456789"
     assert inbound_key.llm == "inworld-workspace-key-123456789"
     assert outbound.status_code == 201

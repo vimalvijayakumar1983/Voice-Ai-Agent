@@ -20,6 +20,7 @@ class RuntimeProfileUpdate(BaseModel):
     llm_provider: Literal["openai", "inworld"] = "openai"
     llm_model: str = Field("gpt-4o-mini", min_length=2, max_length=100)
     stt_language: str = Field("auto", min_length=2, max_length=30)
+    tts_delivery_mode: Literal["stable", "balanced", "creative"] = "balanced"
     max_concurrent_calls: int = Field(1, ge=1, le=100)
     daily_call_limit: int = Field(100, ge=1, le=100_000)
     monthly_budget_cents: int = Field(5000, ge=100, le=100_000_000)
@@ -65,6 +66,7 @@ class RuntimeProfileResponse(BaseModel):
     llm_provider: str
     llm_model: str
     stt_language: str
+    tts_delivery_mode: Literal["stable", "balanced", "creative"]
     max_concurrent_calls: int
     daily_call_limit: int
     monthly_budget_cents: int

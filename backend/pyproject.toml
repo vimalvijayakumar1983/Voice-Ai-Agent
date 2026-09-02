@@ -38,7 +38,8 @@ dependencies = [
     "structlog>=24.1.0",
     "aiosqlite>=0.20.0",
     "tzdata>=2025.2",
-    "livekit-agents[inworld,openai]~=1.6.0",
+    "livekit-agents[inworld,openai]~=1.6.1",
+    "livekit-plugins-noise-cancellation~=0.2",
 ]
 
 [project.optional-dependencies]

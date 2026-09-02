@@ -19,11 +19,82 @@ from app.livekit_runtime.worker import (
     _worker_http_port,
     _worker_idle_processes,
 )
-from app.models.agent import Agent
+from app.models.agent import Agent, AgentRuntimeProfile
 from app.models.call import Call
 from app.services.provider_credentials import ProviderCredentialError
 from app.telephony.livekit_provider import LiveKitSIPError, LiveKitSIPProvider
 from tests.conftest import test_session_factory as session_factory
+
+
+@pytest.mark.asyncio
+async def test_open_outbound_call_merges_durable_context_into_session_variables(
+    db,
+    tenant,
+    monkeypatch,
+):
+    agent = Agent(
+        tenant_id=tenant.id,
+        name="Context-aware outbound agent",
+        system_prompt="Welcome {{ customer_name }}.",
+        voice_provider="inworld",
+        voice_id="inworld:Ashley",
+        language="en-GB",
+        supported_languages=["en-GB"],
+        greeting_message="Hello {{ customer_name }}",
+        max_call_duration_seconds=60,
+    )
+    db.add(agent)
+    await db.flush()
+    profile = AgentRuntimeProfile(
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        enabled=True,
+        telephony_provider="livekit_sip",
+        primary_speech_provider="inworld",
+        llm_provider="openai",
+        llm_model="gpt-4o-mini",
+        stt_language="en-GB",
+        assigned_numbers=["+97141234567"],
+        status="active",
+    )
+    call = Call(
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        direction="outbound",
+        status="dispatching",
+        from_number="+97141234567",
+        to_number="+971501234567",
+        provider="livekit_sip",
+        call_metadata={
+            "request": {
+                "context": {
+                    "customer_name": "Maya",
+                    "balance": 125.5,
+                }
+            }
+        },
+    )
+    db.add_all([profile, call])
+    await db.commit()
+    variables = {}
+    monkeypatch.setattr(livekit_worker, "async_session_factory", session_factory)
+
+    opened_call_id = await livekit_worker._open_call(
+        model=agent,
+        profile=profile,
+        room_name="vav-outbound-context-test",
+        attributes={
+            "sip.callDirection": "outbound",
+            "sip.callStatus": "active",
+            "sip.phoneNumber": "+971501234567",
+            "sip.trunkPhoneNumber": "+97141234567",
+        },
+        dispatched_call_id=call.id,
+        variables=variables,
+    )
+
+    assert opened_call_id == call.id
+    assert variables == {"customer_name": "Maya", "balance": 125.5}
 
 
 @pytest.mark.asyncio
@@ -520,9 +591,9 @@ async def test_worker_failure_after_call_persistence_finalizes_once_and_resolves
         "version": livekit_worker.LIVEKIT_TURN_DETECTOR_VERSION,
     }
     assert session_options["turn_handling"]["endpointing"] == {
-        "mode": "fixed",
-        "min_delay": 0.5,
-        "max_delay": 3.0,
+        "mode": "dynamic",
+        "min_delay": 0.3,
+        "max_delay": 2.5,
     }
     assert session_options["turn_handling"]["interruption"] == {
         "enabled": True,
@@ -612,6 +683,22 @@ def test_inworld_tts_options_keep_auto_language_for_multilingual_agents():
         "delivery_mode": "BALANCED",
         "text_normalization": "ON",
     }
+
+
+def test_inworld_tts_options_use_native_profile_delivery_mode():
+    options = _inworld_tts_options(
+        api_key="inworld-key",
+        model=SimpleNamespace(
+            voice_id="inworld:Victoria",
+            language="en-GB",
+            language_switching_enabled=False,
+            speech_rate=1.0,
+        ),
+        profile=SimpleNamespace(runtime_config={"tts_delivery_mode": "creative"}),
+    )
+
+    assert options["delivery_mode"] == "CREATIVE"
+    assert options["language"] == "en-GB"
 
 
 def test_livekit_turn_latency_is_recorded_as_public_runtime_metrics():
