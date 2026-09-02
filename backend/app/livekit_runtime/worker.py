@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import json
 import logging
 import math
@@ -72,6 +73,10 @@ MAX_RENDERED_CALL_TEMPLATE_CHARS = 12_000
 SESSION_CLOSE_TIMEOUT_SECONDS = 5.0
 CALL_FINALIZE_TIMEOUT_SECONDS = 10.0
 ROOM_DELETE_TIMEOUT_SECONDS = 5.0
+# Keep turn detection deterministic and local in the standalone Railway worker.
+# The hosted ``v1`` route adds a network dependency and only falls back to this
+# same compact model when the inference gateway is unavailable.
+LIVEKIT_TURN_DETECTOR_VERSION = "v1-mini"
 
 
 async def _run_bounded_cleanup(
@@ -352,9 +357,7 @@ def _session_error_failure(event: object) -> BaseException | None:
         return underlying
     if isinstance(provider_error, BaseException):
         return provider_error
-    return RuntimeError(
-        f"LiveKit session received unrecoverable {type(provider_error).__name__}"
-    )
+    return RuntimeError(f"LiveKit session received unrecoverable {type(provider_error).__name__}")
 
 
 def _effective_stt_language(*, model: AgentModel, profile: AgentRuntimeProfile) -> str:
@@ -375,6 +378,20 @@ def _revision_timestamp(value: object) -> str | None:
 
 def _sha256_text(value: object) -> str:
     return hashlib.sha256(str(value or "").encode()).hexdigest()
+
+
+def _safe_log_identifier(label: str, value: object) -> str:
+    """Return a stable, secret-keyed correlation token without logging route data."""
+    normalized = str(value or "").strip()
+    if not normalized:
+        return "missing"
+    secret = str(settings.integration_encryption_key or settings.secret_key or "").strip()
+    if not secret:
+        # A production deployment cannot operate without either secret. Keep
+        # logging safe even in an incomplete local/test configuration.
+        return "present"
+    payload = f"vav-livekit-log:{label}:{normalized}".encode()
+    return hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()[:16]
 
 
 def _served_browser_configuration(
@@ -1015,6 +1032,122 @@ async def _abort_browser_preopen_despite_cancellation(
             continue
 
 
+async def _fail_outbound_preopen_call(
+    *,
+    agent_id: UUID,
+    call_id: UUID,
+    room_name: str,
+    failure: BaseException,
+) -> bool:
+    """Fail only the exact durable outbound call represented by this worker job."""
+    expected_room = f"vav-call-{call_id}"
+    if room_name != expected_room:
+        return False
+
+    async with async_session_factory() as db:
+        call = await db.scalar(
+            select(Call)
+            .where(
+                Call.id == call_id,
+                Call.agent_id == agent_id,
+                Call.direction == "outbound",
+                Call.provider == "livekit_sip",
+            )
+            .with_for_update()
+        )
+        if call is None or call.status in TERMINAL_CALL_STATUSES:
+            return False
+
+        metadata = call.call_metadata if isinstance(call.call_metadata, dict) else {}
+        runtime = metadata.get("runtime")
+        reserved_room = metadata.get("livekit_room")
+        if (
+            not isinstance(runtime, dict)
+            or runtime.get("transport") != "livekit_sip"
+            or metadata.get("speech_provider") != "inworld"
+            or reserved_room not in (None, expected_room)
+        ):
+            return False
+
+        # Outbound agent dispatch is created only after LiveKit reports the SIP
+        # participant answered. Preserve that billing fact even if the worker
+        # fails before `_open_call` can transition the row to in-progress.
+        ended_at = datetime.now(UTC)
+        call.started_at = call.started_at or ended_at
+        call.answered_at = call.answered_at or call.started_at
+        call.ended_at = ended_at
+        call.duration_seconds = max(
+            0,
+            int((ended_at - call.answered_at).total_seconds()),
+        )
+        call.status = "failed"
+        call.call_metadata = {
+            **metadata,
+            "channel": "phone",
+            "livekit_room": expected_room,
+            "lifecycle_error": "livekit_outbound_preopen_failure",
+            "runtime_failure_type": type(failure).__name__,
+            "automatic_redial_disabled": True,
+        }
+        await db.commit()
+        return True
+
+
+async def _abort_outbound_preopen_despite_cancellation(
+    *,
+    agent_id: UUID,
+    call_id: UUID,
+    room_name: str,
+    failure: BaseException,
+) -> None:
+    """Terminalize and hang up a failed, server-created outbound dispatch."""
+
+    async def cleanup() -> None:
+        cleanup_context = {"call_id": str(call_id), "room_name": room_name}
+        terminalized = await _run_bounded_cleanup(
+            _fail_outbound_preopen_call(
+                agent_id=agent_id,
+                call_id=call_id,
+                room_name=room_name,
+                failure=failure,
+            ),
+            timeout_seconds=CALL_FINALIZE_TIMEOUT_SECONDS,
+            timeout_event="livekit_outbound_preopen_terminalization_timed_out",
+            failure_event="livekit_outbound_preopen_terminalization_failed",
+            context=cleanup_context,
+        )
+        if terminalized is not True:
+            logger.warning(
+                "livekit_outbound_preopen_cleanup_not_owned",
+                extra=cleanup_context,
+            )
+            return
+        removed = await _run_bounded_cleanup(
+            delete_browser_room(
+                url=settings.livekit_url,
+                api_key=settings.livekit_api_key,
+                api_secret=settings.livekit_api_secret,
+                room_name=room_name,
+            ),
+            timeout_seconds=ROOM_DELETE_TIMEOUT_SECONDS,
+            timeout_event="livekit_outbound_preopen_room_cleanup_timed_out",
+            failure_event="livekit_outbound_preopen_room_cleanup_failed",
+            context=cleanup_context,
+        )
+        if removed is not True:
+            logger.warning(
+                "livekit_outbound_preopen_room_cleanup_unconfirmed",
+                extra=cleanup_context,
+            )
+
+    cleanup_task = asyncio.create_task(cleanup())
+    while not cleanup_task.done():
+        try:
+            await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError:
+            continue
+
+
 async def _finish_call(
     call_id: UUID,
     turns: list[dict[str, str]],
@@ -1088,6 +1221,8 @@ async def vav_inworld_session(ctx: JobContext) -> None:
     dispatch = _dispatch_metadata(ctx.job.metadata, room_name=ctx.room.name)
     browser_session = dispatch.channel == "browser"
     variables: ProviderVariables = {}
+    sip_direction: str | None = None
+    inbound_route_context: dict[str, str] | None = None
     try:
         await ctx.connect()
         participant = await ctx.wait_for_participant()
@@ -1121,18 +1256,33 @@ async def vav_inworld_session(ctx: JobContext) -> None:
             )
         else:
             direction = str(attributes.get("sip.callDirection") or "inbound").strip().lower()
+            sip_direction = "outbound" if direction == "outbound" else "inbound"
+            inbound_trunk_id = str(attributes.get("sip.trunkID") or "")
+            called_number = str(attributes.get("sip.trunkPhoneNumber") or "")
+            if sip_direction == "inbound":
+                inbound_route_context = {
+                    "room_ref": _safe_log_identifier("room", ctx.room.name),
+                    "inbound_trunk_ref": _safe_log_identifier(
+                        "inbound_trunk",
+                        inbound_trunk_id,
+                    ),
+                    "called_number_ref": _safe_log_identifier(
+                        "called_number",
+                        called_number,
+                    ),
+                }
             call_status = str(attributes.get("sip.callStatus") or "").strip().lower()
             if call_status != "active":
                 raise RuntimeError("LiveKit SIP participant is not in the active call state")
-            if direction == "outbound":
+            if sip_direction == "outbound":
                 if dispatch.agent_id is None or dispatch.call_id is None:
                     raise RuntimeError("Outbound LiveKit dispatch is missing VAV call metadata")
                 model, profile, api_keys = await _load_runtime(dispatch.agent_id)
                 dispatched_call_id = dispatch.call_id
             else:
                 model, profile, api_keys = await _resolve_inbound_runtime(
-                    inbound_trunk_id=str(attributes.get("sip.trunkID") or ""),
-                    called_number=str(attributes.get("sip.trunkPhoneNumber") or ""),
+                    inbound_trunk_id=inbound_trunk_id,
+                    called_number=called_number,
                 )
                 dispatched_call_id = None
             call_id = await _open_call(
@@ -1152,6 +1302,21 @@ async def vav_inworld_session(ctx: JobContext) -> None:
         ):
             await _abort_browser_preopen_despite_cancellation(
                 tenant_id=dispatch.tenant_id,
+                agent_id=dispatch.agent_id,
+                call_id=dispatch.call_id,
+                room_name=ctx.room.name,
+                failure=exc,
+            )
+        elif sip_direction == "inbound":
+            logger.error(
+                "livekit_inbound_preopen_failed",
+                extra={
+                    **(inbound_route_context or {}),
+                    "failure_type": type(exc).__name__,
+                },
+            )
+        elif not browser_session and dispatch.agent_id is not None and dispatch.call_id is not None:
+            await _abort_outbound_preopen_despite_cancellation(
                 agent_id=dispatch.agent_id,
                 call_id=dispatch.call_id,
                 room_name=ctx.room.name,
@@ -1223,7 +1388,9 @@ async def vav_inworld_session(ctx: JobContext) -> None:
             llm=openai.LLM(**llm_options),
             tts=inworld.TTS(**tts_options),
             turn_handling={
-                "turn_detection": inference.TurnDetector(),
+                "turn_detection": inference.TurnDetector(
+                    version=LIVEKIT_TURN_DETECTOR_VERSION,
+                ),
                 "endpointing": {
                     "mode": "fixed",
                     "min_delay": 0.5,
