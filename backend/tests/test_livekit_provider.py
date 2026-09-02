@@ -592,8 +592,8 @@ async def test_worker_failure_after_call_persistence_finalizes_once_and_resolves
     }
     assert session_options["turn_handling"]["endpointing"] == {
         "mode": "dynamic",
-        "min_delay": 0.3,
-        "max_delay": 2.5,
+        "min_delay": 0.6,
+        "max_delay": 3.0,
     }
     assert session_options["turn_handling"]["interruption"] == {
         "enabled": True,
@@ -614,6 +614,27 @@ async def test_worker_failure_after_call_persistence_finalizes_once_and_resolves
     assert isinstance(finalize.await_args.kwargs["failure"], RuntimeError)
     await shutdown_callbacks[0]()
     assert finalize.await_count == 1
+
+
+def test_livekit_agent_enforces_fixed_language_and_repairs_uncertain_transcripts():
+    model = Agent(
+        tenant_id=uuid4(),
+        name="English receptionist",
+        system_prompt="Detect and answer in any language when possible.",
+        voice_provider="inworld",
+        voice_id="inworld:Ashley",
+        language="en-GB",
+        supported_languages=["en-GB"],
+        language_switching_enabled=False,
+    )
+
+    instructions = livekit_worker.VAVInworldAgent(model=model).instructions
+
+    assert "Speak only in the configured primary language, en-GB" in instructions
+    assert "overrides any broader or conflicting language claim" in instructions
+    assert "do not call\n  search_approved_knowledge for them" in instructions
+    assert "Do not search corrupted text and do not guess" in instructions
+    assert "Never quote it" in instructions
 
 
 def test_livekit_usage_snapshot_reads_cumulative_model_usage_once():
