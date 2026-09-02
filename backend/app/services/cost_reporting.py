@@ -422,6 +422,17 @@ def _call_components(
                 )
             )
 
+    if call.provider == "livekit_webrtc":
+        # Browser sessions carry no PSTN/SIP carrier charge. VAV currently runs
+        # its worker on Railway, and project/hosting allocations are not known
+        # per call until operators supply invoice-backed rates.
+        missing.extend(
+            [
+                "LiveKit WebRTC project usage allocation",
+                "Railway LiveKit worker hosting allocation",
+            ]
+        )
+
     if call.provider == "smallest":
         destination = str(call.to_number or "")
         if destination.startswith("+91"):

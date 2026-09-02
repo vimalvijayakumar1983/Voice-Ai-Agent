@@ -5,7 +5,7 @@ import { readFileSync } from 'node:fs';
 import securityHeaders from '../src/lib/security-headers.cjs';
 import apiProxyTarget from '../src/lib/api-proxy-target.cjs';
 
-const { buildContentSecurityPolicy } = securityHeaders;
+const { buildContentSecurityPolicy, normalizeLiveKitConnectOrigin } = securityHeaders;
 const { normalizeApiProxyTarget } = apiProxyTarget;
 
 test('browser-readable storage never persists an access or refresh credential', () => {
@@ -25,7 +25,7 @@ test('browser-readable storage never persists an access or refresh credential', 
   assert.doesNotMatch(apiSource, /process\.env\.NEXT_PUBLIC_API_URL/);
 });
 
-test('production CSP uses a nonce and only same-origin API plus exact voice transport', () => {
+test('production CSP uses a nonce and only same-origin API plus trusted voice transports', () => {
   const policy = buildContentSecurityPolicy({
     nonce: '0123456789abcdef0123456789abcdef',
     production: true,
@@ -40,9 +40,34 @@ test('production CSP uses a nonce and only same-origin API plus exact voice tran
     policy,
     /connect-src 'self' wss:\/\/api\.smallest\.ai/,
   );
+  assert.match(policy, /https:\/\/\*\.livekit\.cloud/);
+  assert.match(policy, /wss:\/\/\*\.livekit\.cloud/);
   assert.doesNotMatch(policy, /connect-src[^;]*(?:https:|wss:)(?:;|\s*$)/);
   assert.match(policy, /media-src 'self' blob:/);
   assert.doesNotMatch(policy, /media-src[^;]*https:/);
+});
+
+test('production CSP permits only secure configured LiveKit origins', () => {
+  const policy = buildContentSecurityPolicy({
+    nonce: '0123456789abcdef0123456789abcdef',
+    production: true,
+    livekitConnectOrigin: 'wss://livekit.voice.example',
+  });
+  assert.match(policy, /wss:\/\/livekit\.voice\.example/);
+  assert.match(policy, /https:\/\/livekit\.voice\.example/);
+  assert.equal(normalizeLiveKitConnectOrigin('wss://livekit.voice.example'), 'wss://livekit.voice.example');
+  assert.throws(
+    () => buildContentSecurityPolicy({
+      nonce: '0123456789abcdef0123456789abcdef',
+      production: true,
+      livekitConnectOrigin: 'ws://livekit.voice.example',
+    }),
+    /HTTPS or WSS in production/,
+  );
+  assert.throws(
+    () => normalizeLiveKitConnectOrigin('wss://user:secret@livekit.voice.example/path'),
+    /origin without credentials/,
+  );
 });
 
 test('Next proxies API traffic to one validated deployment origin', () => {

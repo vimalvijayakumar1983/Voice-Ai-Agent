@@ -46,6 +46,21 @@ def conservative_call_reservation_cents(duration_seconds: int | float | None) ->
     return ceil(seconds / 60 * CALL_MINUTE_LEDGER_CENTS_PER_MINUTE)
 
 
+def _unsettled_call_duration_reservation(call: Call, fallback_seconds: int) -> int:
+    """Use an immutable browser-call cap instead of today's mutable agent cap."""
+    metadata = call.call_metadata if isinstance(call.call_metadata, dict) else {}
+    reserved_duration = metadata.get("reserved_max_duration_seconds")
+    if (
+        call.provider == "livekit_webrtc"
+        and metadata.get("channel") == "browser"
+        and not isinstance(reserved_duration, bool)
+        and isinstance(reserved_duration, int)
+        and 30 <= reserved_duration <= 7200
+    ):
+        return reserved_duration
+    return fallback_seconds
+
+
 async def lock_agent_runtime_limits(
     db: AsyncSession,
     *,
@@ -115,7 +130,10 @@ async def monthly_agent_budget_commitment(
             unprocessed_reservation += conservative_call_reservation_cents(call.duration_seconds)
         elif call.answered_at is not None or call.status not in TERMINAL_CALL_STATUSES:
             unprocessed_reservation += conservative_call_reservation_cents(
-                max_call_duration_seconds
+                _unsettled_call_duration_reservation(
+                    call,
+                    max_call_duration_seconds,
+                )
             )
 
     prospective_reservation = (

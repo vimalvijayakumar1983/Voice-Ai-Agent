@@ -133,13 +133,32 @@ function reduceTranscriptState(state, action) {
   if (action.type === 'delta') {
     const text = typeof action.text === 'string' ? action.text.trim() : '';
     if (!text) return state;
-    return { ...state, live: { role: action.role, text } };
+    return {
+      ...state,
+      live: {
+        role: action.role,
+        text,
+        ...(typeof action.language === 'string' && action.language.trim()
+          ? { language: action.language.trim() }
+          : {}),
+      },
+    };
   }
   if (action.type === 'settled') {
     const text = typeof action.text === 'string' ? action.text.trim() : '';
     if (!text) return state;
     return {
-      turns: [...state.turns, { id: action.id, role: action.role, text }],
+      turns: [
+        ...state.turns,
+        {
+          id: action.id,
+          role: action.role,
+          text,
+          ...(typeof action.language === 'string' && action.language.trim()
+            ? { language: action.language.trim() }
+            : {}),
+        },
+      ],
       live: state.live?.role === action.role ? null : state.live,
     };
   }

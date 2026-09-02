@@ -129,6 +129,73 @@ async def test_monthly_commitment_uses_usage_ledger_not_stale_call_cost(db, tena
 
 
 @pytest.mark.asyncio
+async def test_browser_budget_uses_reserved_cap_and_ignores_known_join_timeout(db, tenant):
+    now = datetime.now(UTC)
+    agent = Agent(
+        tenant_id=tenant.id,
+        name="Browser reservation accounting",
+        system_prompt="Keep each browser call within its reserved budget.",
+        voice_provider="inworld",
+        voice_id="inworld:Ashley",
+        max_call_duration_seconds=7200,
+    )
+    db.add(agent)
+    await db.flush()
+    common_metadata = {
+        "conversation_type": "webcall",
+        "channel": "browser",
+        "reserved_max_duration_seconds": 30,
+        "runtime": {"transport": "livekit_webrtc", "speech_provider": "inworld"},
+    }
+    db.add_all(
+        [
+            Call(
+                tenant_id=tenant.id,
+                agent_id=agent.id,
+                direction="inbound",
+                status="initiated",
+                from_number="browser",
+                to_number="voice-agent",
+                provider="livekit_webrtc",
+                provider_call_sid="vav-browser-active-budget",
+                call_metadata=common_metadata,
+                created_at=now,
+            ),
+            Call(
+                tenant_id=tenant.id,
+                agent_id=agent.id,
+                direction="inbound",
+                status="failed",
+                from_number="browser",
+                to_number="voice-agent",
+                provider="livekit_webrtc",
+                provider_call_sid="vav-browser-expired-budget",
+                duration_seconds=0,
+                ended_at=now,
+                call_metadata={
+                    **common_metadata,
+                    "lifecycle_error": "livekit_browser_join_timeout",
+                },
+                created_at=now,
+            ),
+        ]
+    )
+    await db.commit()
+
+    commitment = await monthly_agent_budget_commitment(
+        db,
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        month_start=_month_start(now),
+        max_call_duration_seconds=agent.max_call_duration_seconds,
+        include_prospective_call=False,
+    )
+
+    assert commitment.unprocessed_reservation_cents == 3
+    assert commitment.total_cents == 3
+
+
+@pytest.mark.asyncio
 async def test_outbound_budget_guard_reserves_unprocessed_and_prospective_calls(
     client,
     auth_headers,

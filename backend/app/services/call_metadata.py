@@ -47,7 +47,7 @@ def public_call_metadata(value: Any) -> dict[str, Any] | None:
     if switching_mode in {"disabled", "automatic"}:
         result["language_switching_mode"] = switching_mode
     speech_provider = value.get("speech_provider")
-    if speech_provider in {"smallest", "sarvam", "elevenlabs"}:
+    if speech_provider in {"smallest", "sarvam", "elevenlabs", "inworld"}:
         result["speech_provider"] = speech_provider
     runtime = value.get("runtime")
     if isinstance(runtime, dict):
@@ -60,6 +60,7 @@ def public_call_metadata(value: Any) -> dict[str, Any] | None:
             "cost_state",
         }
         numeric_fields = {
+            "max_duration_seconds",
             "turn_count",
             "llm_tokens",
             "inbound_audio_bytes",

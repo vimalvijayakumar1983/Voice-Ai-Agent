@@ -252,6 +252,31 @@ class SmallestSessionResponse(BaseModel):
     sample_rate: int = 24000
 
 
+class LiveKitSessionRequest(BaseModel):
+    variables: dict[str, str | int | float | bool] = Field(default_factory=dict)
+
+    model_config = {"extra": "forbid"}
+
+    @field_validator("variables")
+    @classmethod
+    def validate_variables(
+        cls,
+        value: dict[str, str | int | float | bool],
+    ) -> dict[str, str | int | float | bool]:
+        return validate_provider_variables(value, label="Session variables") or {}
+
+
+class LiveKitSessionResponse(BaseModel):
+    url: str
+    access_token: str
+    room_name: str
+    participant_identity: str
+    expires_in: int
+    call_id: UUID
+    session_id: str
+    max_duration_seconds: int
+
+
 class VoicePreviewRequest(BaseModel):
     provider: Literal["smallest", "sarvam", "elevenlabs", "inworld"] = "smallest"
     voice_id: str = Field(min_length=1, max_length=100)

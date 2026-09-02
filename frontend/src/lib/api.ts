@@ -388,6 +388,23 @@ export interface BrowserSession {
   sample_rate: number;
 }
 
+/**
+ * Ephemeral, backend-issued LiveKit browser credential.
+ *
+ * The frontend requests this only after microphone permission succeeds and
+ * keeps the access token in memory for the lifetime of the connection. The
+ * LiveKit API key and secret never cross the server boundary.
+ */
+export interface LiveKitBrowserSession {
+  access_token: string;
+  url: string;
+  room_name: string;
+  participant_identity: string;
+  call_id: string;
+  expires_in: number;
+  max_duration_seconds: number;
+}
+
 export type WorkspaceRole = 'owner' | 'admin' | 'member' | 'viewer';
 
 export interface CurrentUser {
@@ -730,7 +747,7 @@ export interface BillingPlan {
 
 export interface CostReportFilters {
   days?: number;
-  provider?: 'twilio' | 'smallest' | 'livekit_sip' | '';
+  provider?: 'twilio' | 'smallest' | 'livekit_sip' | 'livekit_webrtc' | '';
   speech_provider?: 'inworld' | 'sarvam' | 'elevenlabs' | 'smallest' | '';
   agent_id?: string;
   direction?: 'inbound' | 'outbound' | '';
@@ -1484,6 +1501,22 @@ class ApiClient {
     return this.request<RuntimeReadiness>(`/api/v1/runtime/agents/${agentId}/test`, {
       method: 'POST',
     });
+  }
+
+  async createLiveKitBrowserSession(
+    agentId: string,
+    variables: Record<string, string | number | boolean> = {},
+  ) {
+    const idempotencyKey = globalThis.crypto?.randomUUID?.();
+    if (!idempotencyKey) throw new Error('This browser cannot create a secure call identity.');
+    return this.request<LiveKitBrowserSession>(
+      `/api/v1/agents/${agentId}/livekit/session`,
+      {
+        method: 'POST',
+        headers: { 'Idempotency-Key': idempotencyKey },
+        body: JSON.stringify({ variables }),
+      },
+    );
   }
 
   async activateRuntimeProfile(agentId: string) {

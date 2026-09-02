@@ -1,15 +1,21 @@
 """Agent builder endpoints - CRUD for AI voice agents."""
 
+import asyncio
+import hashlib
+import hmac
+import json
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import PurePath
-from uuid import UUID, uuid4
+from typing import Annotated
+from uuid import UUID, uuid4, uuid5
 
 from fastapi import (
     APIRouter,
     Depends,
     File,
     Form,
+    Header,
     HTTPException,
     Request,
     Response,
@@ -21,8 +27,20 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.database import get_db
+from app.livekit_runtime.browser_session import (
+    BROWSER_TOKEN_TTL_SECONDS,
+    LiveKitBrowserSessionError,
+    LiveKitBrowserSessionProvider,
+    delete_browser_room,
+)
 from app.middleware.tenant import CurrentUser, get_current_user, require_role
-from app.models.agent import Agent, AgentKnowledgeBinding, AgentRuntimeProfile, KnowledgeBase
+from app.models.agent import (
+    Agent,
+    AgentKnowledgeBinding,
+    AgentRuntimeProfile,
+    KnowledgeBase,
+    KnowledgeSource,
+)
 from app.models.call import Call
 from app.models.campaign import Campaign, CampaignContactAttempt
 from app.models.provider_credential import ProviderCredential
@@ -59,6 +77,8 @@ from app.schemas.agent import (
     AgentUpdate,
     KnowledgeBaseCreate,
     KnowledgeBaseResponse,
+    LiveKitSessionRequest,
+    LiveKitSessionResponse,
     ProviderCredentialStatus,
     SarvamCredentialRequest,
     SmallestProviderResolution,
@@ -87,6 +107,7 @@ from app.services.agent_catalog_cache import (
     public_agent_catalog_cache,
 )
 from app.services.audit import record_audit_event
+from app.services.call_metadata import agent_configuration_snapshot
 from app.services.integration_security import (
     IntegrationConfigUnavailableError,
     decrypt_integration_config,
@@ -94,6 +115,43 @@ from app.services.integration_security import (
 )
 from app.services.provider_credentials import ProviderCredentialError, load_provider_config
 from app.services.rate_limit import enforce_rate_limit
+from app.services.runtime_capacity import RuntimeCapacityError, enforce_runtime_capacity
+from app.services.usage_ledger import lock_agent_runtime_limits
+from app.telephony.livekit_provider import LiveKitSIPError, LiveKitSIPProvider
+
+LIVEKIT_BROWSER_IDEMPOTENCY_NAMESPACE = UUID("6a46e850-91a5-4ca6-acf4-e51b3a504069")
+
+
+def _livekit_browser_request_fingerprint(
+    *,
+    tenant_id: UUID,
+    agent_id: UUID,
+    user_id: UUID,
+    idempotency_key: str,
+    variables: dict[str, str | int | float | bool],
+) -> str:
+    """Bind an idempotency key to one typed request without storing the raw key."""
+    payload = {
+        "tenant_id": str(tenant_id),
+        "agent_id": str(agent_id),
+        "user_id": str(user_id),
+        "idempotency_key": idempotency_key,
+        "variables": variables,
+    }
+    canonical = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    key_material = settings.integration_encryption_key.strip() or settings.secret_key.strip()
+    derived_key = hmac.new(
+        key_material.encode(),
+        b"vav-livekit-browser-idempotency-v1",
+        hashlib.sha256,
+    ).digest()
+    return hmac.new(derived_key, canonical, hashlib.sha256).hexdigest()
+
 
 router = APIRouter(prefix="/agents", tags=["Agents"])
 
@@ -213,7 +271,15 @@ PROVIDER_FAILED_STATES = frozenset(
 )
 PROVIDER_OPERATION_LEASE = timedelta(minutes=2)
 TERMINAL_CALL_STATUSES = frozenset(
-    {"completed", "failed", "busy", "no_answer", "canceled", "cancelled"}
+    {
+        "completed",
+        "failed",
+        "busy",
+        "no_answer",
+        "canceled",
+        "cancelled",
+        "terminal_unknown",
+    }
 )
 TERMINAL_CAMPAIGN_ATTEMPT_STATES = frozenset({"completed", "failed", "rejected", "cancelled"})
 MAX_VOICE_CLONE_BYTES = 5 * 1024 * 1024
@@ -801,6 +867,203 @@ async def _tenant_inworld_client(
         return InworldClient(api_key=api_key), "workspace", credential.updated_at
     client = InworldClient()
     return client, "platform" if client.is_configured else "none", None
+
+
+async def _livekit_browser_runtime(
+    db: AsyncSession,
+    *,
+    tenant_id: UUID,
+    agent_id: UUID,
+    for_update: bool = False,
+) -> tuple[Agent, AgentRuntimeProfile]:
+    """Load the exact active Inworld runtime and its governed searchable KB."""
+    agent_query = (
+        select(Agent)
+        .where(Agent.id == agent_id, Agent.tenant_id == tenant_id)
+        .execution_options(populate_existing=True)
+    )
+    profile_query = (
+        select(AgentRuntimeProfile)
+        .where(
+            AgentRuntimeProfile.agent_id == agent_id,
+            AgentRuntimeProfile.tenant_id == tenant_id,
+        )
+        .execution_options(populate_existing=True)
+    )
+    if for_update:
+        agent_query = agent_query.with_for_update()
+        profile_query = profile_query.with_for_update()
+    agent = await db.scalar(agent_query)
+    if agent is None:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    profile = await db.scalar(profile_query)
+    if not agent.is_active:
+        raise HTTPException(status_code=409, detail="Agent is inactive")
+    if agent.voice_provider != "inworld" or not agent.voice_id.startswith("inworld:"):
+        raise HTTPException(
+            status_code=409,
+            detail="LiveKit browser testing currently requires an Inworld voice agent",
+        )
+    if (
+        profile is None
+        or profile.status == "inactive"
+        or profile.telephony_provider != "livekit_sip"
+        or profile.primary_speech_provider != "inworld"
+        or profile.llm_provider != "inworld"
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=("Save a compatible LiveKit + Inworld runtime profile before browser testing"),
+        )
+    if not (
+        settings.livekit_url.strip()
+        and settings.livekit_api_key.strip()
+        and settings.livekit_api_secret.strip()
+        and settings.livekit_agent_name.strip()
+        and settings.livekit_worker_health_url.strip()
+    ):
+        raise HTTPException(
+            status_code=503,
+            detail="LiveKit browser runtime credentials or worker health routing are unavailable",
+        )
+    inworld, _source, _updated_at = await _tenant_inworld_client(db, tenant_id)
+    if not inworld.is_configured:
+        raise HTTPException(status_code=409, detail="Add a valid Inworld API key first")
+
+    binding_query = (
+        select(AgentKnowledgeBinding)
+        .where(
+            AgentKnowledgeBinding.agent_id == agent.id,
+            AgentKnowledgeBinding.tenant_id == tenant_id,
+        )
+        .execution_options(populate_existing=True)
+    )
+    if for_update:
+        binding_query = binding_query.with_for_update()
+    binding = await db.scalar(binding_query)
+    if binding is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Bind an approved searchable knowledge base before browser testing",
+        )
+    knowledge_query = (
+        select(KnowledgeBase)
+        .where(
+            KnowledgeBase.id == binding.knowledge_base_id,
+            KnowledgeBase.tenant_id == tenant_id,
+            KnowledgeBase.is_active.is_(True),
+            KnowledgeBase.approval_status == "approved",
+        )
+        .execution_options(populate_existing=True)
+    )
+    if for_update:
+        knowledge_query = knowledge_query.with_for_update()
+    knowledge = await db.scalar(knowledge_query)
+    if knowledge is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Approve the bound knowledge base before browser testing",
+        )
+    source_query = (
+        select(KnowledgeSource)
+        .where(
+            KnowledgeSource.knowledge_base_id == knowledge.id,
+            KnowledgeSource.tenant_id == tenant_id,
+        )
+        .execution_options(populate_existing=True)
+    )
+    if for_update:
+        source_query = source_query.with_for_update()
+    sources = (await db.scalars(source_query)).all()
+    if not sources or not all(
+        source.status in {"processing", "indexed", "local_only"}
+        and bool(str(source.content or "").strip())
+        for source in sources
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Repair the bound knowledge base so every source has searchable text",
+        )
+    return agent, profile
+
+
+async def _mark_livekit_browser_issuance_failed(
+    db: AsyncSession,
+    *,
+    tenant_id: UUID,
+    call_id: UUID,
+    ambiguous: bool,
+    failure_type: str,
+) -> None:
+    call = await db.scalar(
+        select(Call)
+        .where(Call.id == call_id, Call.tenant_id == tenant_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if call is None or call.status in TERMINAL_CALL_STATUSES:
+        return
+    now = datetime.now(UTC)
+    call.status = "terminal_unknown" if ambiguous else "failed"
+    call.ended_at = now
+    call.call_metadata = {
+        **(call.call_metadata or {}),
+        "lifecycle_error": "livekit_browser_session_issuance_failed",
+        "runtime_failure_type": failure_type,
+        "operator_review_required": ambiguous,
+        "automatic_redial_disabled": True,
+    }
+    await db.commit()
+
+
+async def _delete_browser_room_despite_cancellation(*, room_name: str) -> bool:
+    cleanup = asyncio.create_task(
+        delete_browser_room(
+            url=settings.livekit_url,
+            api_key=settings.livekit_api_key,
+            api_secret=settings.livekit_api_secret,
+            room_name=room_name,
+        )
+    )
+    while not cleanup.done():
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            continue
+    try:
+        return bool(cleanup.result())
+    except Exception:
+        return False
+
+
+async def _mark_livekit_browser_issuance_failed_despite_cancellation(
+    db: AsyncSession,
+    *,
+    tenant_id: UUID,
+    call_id: UUID,
+    ambiguous: bool,
+    failure_type: str,
+) -> bool:
+    """Release a committed reservation even while its request is being cancelled."""
+    cleanup = asyncio.create_task(
+        _mark_livekit_browser_issuance_failed(
+            db,
+            tenant_id=tenant_id,
+            call_id=call_id,
+            ambiguous=ambiguous,
+            failure_type=failure_type,
+        )
+    )
+    while not cleanup.done():
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            continue
+    try:
+        cleanup.result()
+    except BaseException:
+        return False
+    return True
 
 
 async def _require_tenant_voice(
@@ -3279,6 +3542,369 @@ async def create_smallest_browser_session(
         expires_in=session.expires_in,
         sample_rate=session.sample_rate,
     )
+
+
+@router.post(
+    "/{agent_id}/livekit/session",
+    response_model=LiveKitSessionResponse,
+)
+async def create_livekit_browser_session(
+    agent_id: UUID,
+    data: LiveKitSessionRequest,
+    request: Request,
+    idempotency_key: Annotated[
+        str,
+        Header(
+            alias="Idempotency-Key",
+            min_length=16,
+            max_length=128,
+            pattern=r"^[A-Za-z0-9._:-]+$",
+        ),
+    ],
+    current_user: CurrentUser = Depends(require_role("owner", "admin", "member")),
+    db: AsyncSession = Depends(get_db),
+):
+    """Reserve a governed call and mint one short-lived, room-scoped WebRTC token."""
+    await enforce_rate_limit(
+        request,
+        scope="livekit-browser-session",
+        limit=10,
+        window_seconds=60,
+        subject=f"{current_user.tenant_id}:{current_user.id}",
+        bind_to_client=False,
+    )
+    call_id = uuid5(
+        LIVEKIT_BROWSER_IDEMPOTENCY_NAMESPACE,
+        (f"{current_user.tenant_id}:{agent_id}:{current_user.id}:{idempotency_key}"),
+    )
+    request_fingerprint = _livekit_browser_request_fingerprint(
+        tenant_id=current_user.tenant_id,
+        agent_id=agent_id,
+        user_id=current_user.id,
+        idempotency_key=idempotency_key,
+        variables=dict(data.variables),
+    )
+    # Perform the first readiness pass without locks, then end its transaction
+    # before the external worker probe. The short locked pass below is the
+    # authoritative capacity reservation.
+    await _livekit_browser_runtime(
+        db,
+        tenant_id=current_user.tenant_id,
+        agent_id=agent_id,
+        for_update=False,
+    )
+    await db.rollback()
+    try:
+        await LiveKitSIPProvider(
+            url=settings.livekit_url,
+            api_key=settings.livekit_api_key,
+            api_secret=settings.livekit_api_secret,
+        ).verify_worker(
+            health_url=settings.livekit_worker_health_url,
+            agent_name=settings.livekit_agent_name,
+        )
+    except LiveKitSIPError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"LiveKit worker is unavailable: {exc}",
+        ) from exc
+
+    # Every call path takes the advisory runtime lock before any Agent row
+    # lock. This global order avoids advisory/FK row-lock deadlocks with
+    # concurrent inbound and outbound reservations on PostgreSQL.
+    await lock_agent_runtime_limits(
+        db,
+        tenant_id=current_user.tenant_id,
+        agent_id=agent_id,
+    )
+    agent, profile = await _livekit_browser_runtime(
+        db,
+        tenant_id=current_user.tenant_id,
+        agent_id=agent_id,
+        for_update=True,
+    )
+    existing_call = await db.scalar(
+        select(Call)
+        .where(Call.id == call_id, Call.tenant_id == current_user.tenant_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if existing_call is not None:
+        metadata = (
+            existing_call.call_metadata if isinstance(existing_call.call_metadata, dict) else {}
+        )
+        stored_fingerprint = metadata.get("browser_session_request_fingerprint")
+        if not isinstance(stored_fingerprint, str) or not hmac.compare_digest(
+            stored_fingerprint,
+            request_fingerprint,
+        ):
+            await db.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail="Idempotency key was already used for a different browser session",
+            )
+        dispatch_id = metadata.get("livekit_dispatch_id")
+        raw_deadline = metadata.get("join_expires_at")
+        try:
+            join_deadline = (
+                datetime.fromisoformat(raw_deadline.replace("Z", "+00:00")).astimezone(UTC)
+                if isinstance(raw_deadline, str)
+                else None
+            )
+        except ValueError:
+            join_deadline = None
+        remaining_seconds = (
+            int((join_deadline - datetime.now(UTC)).total_seconds())
+            if join_deadline is not None
+            else 0
+        )
+        room_name = str(existing_call.provider_call_sid or "")
+        participant_identity = str(metadata.get("browser_participant_identity") or "")
+        reserved_duration = metadata.get("reserved_max_duration_seconds")
+        can_reissue = (
+            existing_call.status == "initiated"
+            and metadata.get("session_issuance") == "issued"
+            and isinstance(dispatch_id, str)
+            and bool(dispatch_id.strip())
+            and room_name == f"vav-browser-{call_id}"
+            and participant_identity == f"browser-{call_id}"
+            and isinstance(reserved_duration, int)
+            and not isinstance(reserved_duration, bool)
+            and 30 <= reserved_duration <= 7200
+            and 1 <= remaining_seconds <= BROWSER_TOKEN_TTL_SECONDS
+        )
+        if not can_reissue:
+            await db.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "This browser-session attempt is still preparing, already used, "
+                    "terminal, or expired; start a new attempt"
+                ),
+            )
+        provider = LiveKitBrowserSessionProvider(
+            url=settings.livekit_url,
+            api_key=settings.livekit_api_key,
+            api_secret=settings.livekit_api_secret,
+        )
+        access_token = provider.mint_access_token(
+            room_name=room_name,
+            participant_identity=participant_identity,
+            expires_in=remaining_seconds,
+        )
+        await record_audit_event(
+            db,
+            tenant_id=current_user.tenant_id,
+            actor_user_id=current_user.id,
+            action="agent.browser_session_token_reissued",
+            resource_type="call",
+            resource_id=str(call_id),
+            details={"remaining_ttl_seconds": remaining_seconds},
+        )
+        await db.commit()
+        return LiveKitSessionResponse(
+            url=settings.livekit_url,
+            access_token=access_token,
+            room_name=room_name,
+            participant_identity=participant_identity,
+            expires_in=remaining_seconds,
+            call_id=call_id,
+            session_id=str(call_id),
+            max_duration_seconds=reserved_duration,
+        )
+    try:
+        await enforce_runtime_capacity(
+            db,
+            model=agent,
+            profile=profile,
+            lock_already_held=True,
+        )
+    except RuntimeCapacityError as exc:
+        await db.rollback()
+        raise HTTPException(
+            status_code=402 if exc.kind == "budget" else 429,
+            detail=str(exc),
+        ) from exc
+
+    reserved_max_duration_seconds = int(agent.max_call_duration_seconds)
+    room_name = f"vav-browser-{call_id}"
+    participant_identity = f"browser-{call_id}"
+    issued_at = datetime.now(UTC)
+    join_expires_at = issued_at + timedelta(seconds=BROWSER_TOKEN_TTL_SECONDS)
+    call = Call(
+        id=call_id,
+        tenant_id=current_user.tenant_id,
+        agent_id=agent.id,
+        direction="inbound",
+        status="initiated",
+        from_number="browser",
+        to_number="voice-agent",
+        provider="livekit_webrtc",
+        provider_call_sid=room_name,
+        call_metadata={
+            "agent_configuration": agent_configuration_snapshot(agent),
+            "conversation_type": "webcall",
+            "channel": "browser",
+            # Variables remain server-side. The worker reads them only from
+            # this tenant-bound row and applies matching prompt placeholders.
+            "browser_variables": dict(data.variables),
+            "browser_session_request_fingerprint": request_fingerprint,
+            "browser_participant_identity": participant_identity,
+            "join_expires_at": join_expires_at.isoformat(),
+            "reserved_max_duration_seconds": reserved_max_duration_seconds,
+            "speech_provider": "inworld",
+            "runtime": {
+                "transport": "livekit_webrtc",
+                "speech_provider": "inworld",
+                "llm_provider": "inworld",
+                "llm_model": profile.llm_model,
+                "stt_model": "inworld/inworld-stt-1",
+                "tts_model": "inworld-tts-2",
+                "recording_enabled": False,
+                "max_duration_seconds": reserved_max_duration_seconds,
+            },
+            "livekit_room": room_name,
+            "session_issuance": "reserved",
+        },
+    )
+    db.add(call)
+    await record_audit_event(
+        db,
+        tenant_id=current_user.tenant_id,
+        actor_user_id=current_user.id,
+        action="agent.browser_session_reserved",
+        resource_type="call",
+        resource_id=str(call.id),
+        details={"agent_id": str(agent.id), "transport": "livekit_webrtc"},
+    )
+    # The worker must be able to see the durable identity before dispatch can
+    # start. This commit also atomically consumes the capacity reservation.
+    await db.commit()
+
+    try:
+        # Revalidate after the reservation commit. A deactivation,
+        # credential removal, or knowledge revocation that won this race must
+        # prevent a usable browser credential from being returned.
+        current_agent, _current_profile = await _livekit_browser_runtime(
+            db,
+            tenant_id=current_user.tenant_id,
+            agent_id=agent_id,
+            for_update=False,
+        )
+        current_agent_id = current_agent.id
+        # Do not retain a read transaction while waiting for LiveKit. The
+        # signed durable reservation and worker join-time validation close the
+        # remaining readiness race without holding database locks over I/O.
+        await db.rollback()
+    except HTTPException as exc:
+        await db.rollback()
+        await _mark_livekit_browser_issuance_failed(
+            db,
+            tenant_id=current_user.tenant_id,
+            call_id=call_id,
+            ambiguous=False,
+            failure_type="RuntimeReadinessChanged",
+        )
+        raise exc
+
+    try:
+        session = await LiveKitBrowserSessionProvider(
+            url=settings.livekit_url,
+            api_key=settings.livekit_api_key,
+            api_secret=settings.livekit_api_secret,
+        ).create_session(
+            tenant_id=current_user.tenant_id,
+            agent_id=current_agent_id,
+            call_id=call_id,
+            agent_name=settings.livekit_agent_name,
+            max_call_duration_seconds=reserved_max_duration_seconds,
+        )
+    except asyncio.CancelledError:
+        await _mark_livekit_browser_issuance_failed_despite_cancellation(
+            db,
+            tenant_id=current_user.tenant_id,
+            call_id=call_id,
+            ambiguous=False,
+            failure_type="CancelledError",
+        )
+        raise
+    except LiveKitBrowserSessionError as exc:
+        await _mark_livekit_browser_issuance_failed(
+            db,
+            tenant_id=current_user.tenant_id,
+            call_id=call_id,
+            ambiguous=exc.ambiguous,
+            failure_type=type(exc).__name__,
+        )
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    try:
+        stored_call = await db.scalar(
+            select(Call)
+            .where(Call.id == call_id, Call.tenant_id == current_user.tenant_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if stored_call is None or stored_call.status in TERMINAL_CALL_STATUSES:
+            raise HTTPException(
+                status_code=409,
+                detail="Browser call reservation is no longer active",
+            )
+        stored_call.call_metadata = {
+            **(stored_call.call_metadata or {}),
+            "livekit_dispatch_id": session.dispatch_id,
+            "session_issuance": "issued",
+        }
+        await record_audit_event(
+            db,
+            tenant_id=current_user.tenant_id,
+            actor_user_id=current_user.id,
+            action="agent.browser_session_issued",
+            resource_type="call",
+            resource_id=str(call_id),
+            details={
+                "agent_id": str(current_agent_id),
+                "transport": "livekit_webrtc",
+                "expires_in": session.expires_in,
+            },
+        )
+        response = LiveKitSessionResponse(
+            url=settings.livekit_url,
+            access_token=session.access_token,
+            room_name=session.room_name,
+            participant_identity=session.participant_identity,
+            expires_in=session.expires_in,
+            call_id=call_id,
+            session_id=str(call_id),
+            max_duration_seconds=reserved_max_duration_seconds,
+        )
+        await db.commit()
+    except (Exception, asyncio.CancelledError) as exc:
+        cleanup_succeeded = await _delete_browser_room_despite_cancellation(
+            room_name=session.room_name
+        )
+        try:
+            await db.rollback()
+            await _mark_livekit_browser_issuance_failed(
+                db,
+                tenant_id=current_user.tenant_id,
+                call_id=call_id,
+                ambiguous=not cleanup_succeeded,
+                failure_type=type(exc).__name__,
+            )
+        except Exception:
+            # The committed reservation still has a bounded join deadline and
+            # Celery stale-session recovery if the database is unavailable.
+            pass
+        if isinstance(exc, asyncio.CancelledError):
+            raise
+        if isinstance(exc, HTTPException):
+            raise exc
+        raise HTTPException(
+            status_code=500,
+            detail="VAV could not finalize the LiveKit browser session",
+        ) from exc
+    return response
 
 
 @router.get("/{agent_id}", response_model=AgentResponse)

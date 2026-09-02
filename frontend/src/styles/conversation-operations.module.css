@@ -207,6 +207,67 @@
   color: #626a86;
 }
 
+.remoteAudio {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.carrierBoundaryNote {
+  margin-bottom: 10px;
+  padding: 10px 11px;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  color: #d8dcf0;
+  background: rgba(47, 53, 83, .54);
+  border: 1px solid rgba(190, 181, 255, .18);
+  border-radius: 9px;
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.carrierBoundaryNote > svg {
+  margin-top: 1px;
+  flex: 0 0 auto;
+  color: #d7cc72;
+}
+
+.carrierBoundaryNote p {
+  min-width: 0;
+  flex: 1;
+}
+
+.carrierBoundaryNote strong {
+  color: #fff;
+}
+
+.carrierBoundaryNote button {
+  min-height: 30px;
+  padding: 5px 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex: 0 0 auto;
+  color: #fff;
+  background: rgba(124, 103, 238, .45);
+  border: 1px solid rgba(196, 188, 255, .28);
+  border-radius: 7px;
+  font-size: 10px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.phoneAction {
+  color: #e8e5ff;
+  background: rgba(255, 255, 255, .08);
+  border: 1px solid rgba(255, 255, 255, .16);
+}
+
 .liveTurn {
   opacity: .78;
   border: 1px dashed rgba(255, 255, 255, .18);

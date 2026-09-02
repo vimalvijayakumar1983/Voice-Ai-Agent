@@ -434,7 +434,13 @@ async def test_realtime_watchdog_recovers_only_abandoned_inbound_media_sessions(
         system_prompt="Recover abandoned realtime sessions safely.",
         max_call_duration_seconds=30,
     )
-    db.add(agent)
+    edited_duration_agent = Agent(
+        tenant_id=tenant.id,
+        name="Edited duration recovery agent",
+        system_prompt="Honor the duration reserved by each browser call.",
+        max_call_duration_seconds=7200,
+    )
+    db.add_all([agent, edited_duration_agent])
     await db.flush()
 
     def inbound_call(name: str, **overrides):
@@ -464,6 +470,99 @@ async def test_realtime_watchdog_recovers_only_abandoned_inbound_media_sessions(
         provider="livekit_sip",
         call_metadata={"runtime": {"transport": "livekit_sip", "speech_provider": "inworld"}},
     )
+    stale_browser = inbound_call(
+        "stale-livekit-browser",
+        provider="livekit_webrtc",
+        status="initiated",
+        started_at=None,
+        answered_at=None,
+        from_number="browser",
+        to_number="voice-agent",
+        call_metadata={
+            "conversation_type": "webcall",
+            "channel": "browser",
+            "join_expires_at": (now - timedelta(minutes=5)).isoformat(),
+            "runtime": {"transport": "livekit_webrtc", "speech_provider": "inworld"},
+        },
+    )
+    edited_duration_browser = inbound_call(
+        "edited-duration-livekit-browser",
+        agent_id=edited_duration_agent.id,
+        provider="livekit_webrtc",
+        status="in_progress",
+        started_at=now - timedelta(minutes=3),
+        answered_at=now - timedelta(minutes=3),
+        from_number="browser",
+        to_number="voice-agent",
+        call_metadata={
+            "conversation_type": "webcall",
+            "channel": "browser",
+            "reserved_max_duration_seconds": 30,
+            "runtime": {"transport": "livekit_webrtc", "speech_provider": "inworld"},
+        },
+    )
+    fresh_browser = inbound_call(
+        "fresh-livekit-browser",
+        provider="livekit_webrtc",
+        status="initiated",
+        started_at=None,
+        answered_at=None,
+        from_number="browser",
+        to_number="voice-agent",
+        call_metadata={
+            "conversation_type": "webcall",
+            "channel": "browser",
+            "join_expires_at": (now + timedelta(minutes=1)).isoformat(),
+            "runtime": {"transport": "livekit_webrtc", "speech_provider": "inworld"},
+        },
+    )
+    missing_expiry_browser = inbound_call(
+        "missing-expiry-livekit-browser",
+        provider="livekit_webrtc",
+        status="initiated",
+        started_at=None,
+        answered_at=None,
+        created_at=now - timedelta(minutes=10),
+        from_number="browser",
+        to_number="voice-agent",
+        call_metadata={
+            "conversation_type": "webcall",
+            "channel": "browser",
+            "runtime": {"transport": "livekit_webrtc", "speech_provider": "inworld"},
+        },
+    )
+    malformed_expiry_browser = inbound_call(
+        "malformed-expiry-livekit-browser",
+        provider="livekit_webrtc",
+        status="initiated",
+        started_at=None,
+        answered_at=None,
+        created_at=now - timedelta(minutes=10),
+        from_number="browser",
+        to_number="voice-agent",
+        call_metadata={
+            "conversation_type": "webcall",
+            "channel": "browser",
+            "join_expires_at": "not-a-timestamp",
+            "runtime": {"transport": "livekit_webrtc", "speech_provider": "inworld"},
+        },
+    )
+    future_expiry_browser = inbound_call(
+        "future-expiry-livekit-browser",
+        provider="livekit_webrtc",
+        status="initiated",
+        started_at=None,
+        answered_at=None,
+        created_at=now - timedelta(minutes=10),
+        from_number="browser",
+        to_number="voice-agent",
+        call_metadata={
+            "conversation_type": "webcall",
+            "channel": "browser",
+            "join_expires_at": (now + timedelta(days=30)).isoformat(),
+            "runtime": {"transport": "livekit_webrtc", "speech_provider": "inworld"},
+        },
+    )
     fresh = inbound_call(
         "fresh-runtime",
         started_at=now - timedelta(seconds=10),
@@ -474,19 +573,53 @@ async def test_realtime_watchdog_recovers_only_abandoned_inbound_media_sessions(
         call_metadata={"conversation_type": "telephonyInbound", "channel": "phone"},
     )
     completed = inbound_call("completed-runtime", status="completed")
-    db.add_all([stale, stale_livekit, fresh, non_runtime, completed])
+    db.add_all(
+        [
+            stale,
+            stale_livekit,
+            stale_browser,
+            edited_duration_browser,
+            fresh_browser,
+            missing_expiry_browser,
+            malformed_expiry_browser,
+            future_expiry_browser,
+            fresh,
+            non_runtime,
+            completed,
+        ]
+    )
     await db.commit()
     ids = {
         call.provider_call_sid: call.id
-        for call in (stale, stale_livekit, fresh, non_runtime, completed)
+        for call in (
+            stale,
+            stale_livekit,
+            stale_browser,
+            edited_duration_browser,
+            fresh_browser,
+            missing_expiry_browser,
+            malformed_expiry_browser,
+            future_expiry_browser,
+            fresh,
+            non_runtime,
+            completed,
+        )
     }
     monkeypatch.setattr(database, "async_session_factory", session_factory)
+    delete_room = AsyncMock(return_value=True)
+    monkeypatch.setattr("app.tasks.call_tasks.delete_browser_room", delete_room)
 
-    assert await _sweep_stale_realtime_calls_async(now=now) == 2
+    assert await _sweep_stale_realtime_calls_async(now=now) == 7
 
     async with session_factory() as session:
         recovered = await session.get(Call, ids["stale-runtime"])
         recovered_livekit = await session.get(Call, ids["stale-livekit-runtime"])
+        recovered_browser = await session.get(Call, ids["stale-livekit-browser"])
+        edited_duration_result = await session.get(Call, ids["edited-duration-livekit-browser"])
+        fresh_browser_result = await session.get(Call, ids["fresh-livekit-browser"])
+        missing_expiry_result = await session.get(Call, ids["missing-expiry-livekit-browser"])
+        malformed_expiry_result = await session.get(Call, ids["malformed-expiry-livekit-browser"])
+        future_expiry_result = await session.get(Call, ids["future-expiry-livekit-browser"])
         fresh_result = await session.get(Call, ids["fresh-runtime"])
         non_runtime_result = await session.get(Call, ids["non-runtime"])
         completed_result = await session.get(Call, ids["completed-runtime"])
@@ -496,6 +629,89 @@ async def test_realtime_watchdog_recovers_only_abandoned_inbound_media_sessions(
     assert recovered.call_metadata["operator_review_required"] is True
     assert recovered_livekit.status == "terminal_unknown"
     assert recovered_livekit.call_metadata["lifecycle_error"] == "realtime_session_timeout"
+    assert recovered_browser.status == "failed"
+    assert recovered_browser.answered_at is None
+    assert recovered_browser.duration_seconds == 0
+    assert recovered_browser.call_metadata["lifecycle_error"] == ("livekit_browser_join_timeout")
+    assert recovered_browser.call_metadata["operator_review_required"] is False
+    assert edited_duration_result.status == "terminal_unknown"
+    assert fresh_browser_result.status == "initiated"
+    assert missing_expiry_result.status == "failed"
+    assert malformed_expiry_result.status == "failed"
+    assert future_expiry_result.status == "failed"
     assert fresh_result.status == "in_progress"
     assert non_runtime_result.status == "in_progress"
     assert completed_result.status == "completed"
+    assert delete_room.await_count == 5
+
+
+@pytest.mark.asyncio
+async def test_realtime_watchdog_handles_an_empty_candidate_set(db, monkeypatch):
+    monkeypatch.setattr(database, "async_session_factory", session_factory)
+    delete_room = AsyncMock(return_value=True)
+    monkeypatch.setattr("app.tasks.call_tasks.delete_browser_room", delete_room)
+
+    assert await _sweep_stale_realtime_calls_async() == 0
+    delete_room.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_realtime_watchdog_invalid_old_rows_cannot_starve_browser_recovery(
+    db,
+    tenant,
+    monkeypatch,
+):
+    now = datetime.now(UTC)
+    agent = Agent(
+        tenant_id=tenant.id,
+        name="Watchdog route filtering",
+        system_prompt="Recover only governed realtime routes.",
+        max_call_duration_seconds=60,
+    )
+    db.add(agent)
+    await db.flush()
+    invalid_calls = [
+        Call(
+            tenant_id=tenant.id,
+            agent_id=agent.id,
+            direction="inbound",
+            status="initiated",
+            from_number="browser",
+            to_number="voice-agent",
+            provider="livekit_webrtc",
+            provider_call_sid=f"invalid-old-browser-{index}",
+            call_metadata={},
+            created_at=now - timedelta(minutes=20),
+        )
+        for index in range(500)
+    ]
+    expired = Call(
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        direction="inbound",
+        status="initiated",
+        from_number="browser",
+        to_number="voice-agent",
+        provider="livekit_webrtc",
+        provider_call_sid="vav-browser-after-invalid-page",
+        call_metadata={
+            "conversation_type": "webcall",
+            "channel": "browser",
+            "join_expires_at": (now - timedelta(minutes=5)).isoformat(),
+            "reserved_max_duration_seconds": 60,
+            "runtime": {"transport": "livekit_webrtc", "speech_provider": "inworld"},
+        },
+        created_at=now - timedelta(minutes=10),
+    )
+    db.add_all([*invalid_calls, expired])
+    await db.commit()
+    expired_id = expired.id
+    monkeypatch.setattr(database, "async_session_factory", session_factory)
+    delete_room = AsyncMock(return_value=True)
+    monkeypatch.setattr("app.tasks.call_tasks.delete_browser_room", delete_room)
+
+    assert await _sweep_stale_realtime_calls_async(limit=500, now=now) == 1
+    async with session_factory() as session:
+        recovered = await session.get(Call, expired_id)
+    assert recovered.status == "failed"
+    delete_room.assert_awaited_once()
