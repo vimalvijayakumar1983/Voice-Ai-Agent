@@ -13,6 +13,7 @@ DISPATCH_RECONCILE_DELAY_SECONDS = 15 * 60
 DIRECT_TERMINAL_CALLBACK_GRACE_SECONDS = 120
 DIRECT_CALL_WATCHDOG_STATUSES = frozenset({"ringing", "in_progress"})
 DIRECT_CALL_UNKNOWN_STATUS = "terminal_unknown"
+REALTIME_CALL_WATCHDOG_PROVIDERS = frozenset({"sarvam", "elevenlabs", "inworld"})
 
 
 def _as_utc(value: datetime | None) -> datetime | None:
@@ -95,6 +96,21 @@ def _mark_direct_call_terminal_unknown(call, now: datetime) -> None:
         }
     )
     call.status = DIRECT_CALL_UNKNOWN_STATUS
+    call.call_metadata = metadata
+
+
+def _mark_realtime_call_terminal_unknown(call, now: datetime) -> None:
+    """Close an abandoned inbound media session without inventing a duration."""
+    metadata = dict(call.call_metadata or {})
+    metadata.update(
+        {
+            "lifecycle_error": "realtime_session_timeout",
+            "operator_review_required": True,
+            "recovered_at": now.isoformat(),
+        }
+    )
+    call.status = DIRECT_CALL_UNKNOWN_STATUS
+    call.ended_at = call.ended_at or now
     call.call_metadata = metadata
 
 
@@ -349,6 +365,87 @@ async def _sweep_stale_direct_calls_async(
         return timed_out
 
 
+@celery_app.task(name="app.tasks.call_tasks.sweep_stale_realtime_calls")
+def sweep_stale_realtime_calls():
+    """Recover inbound realtime sessions stranded by provider handshake failures."""
+    return _run_async(_sweep_stale_realtime_calls_async())
+
+
+async def _sweep_stale_realtime_calls_async(
+    limit: int = 500,
+    *,
+    now: datetime | None = None,
+) -> int:
+    from sqlalchemy import select
+
+    from app.core.database import async_session_factory
+    from app.models.agent import Agent
+    from app.models.call import Call
+
+    bounded_limit = min(max(int(limit), 1), 1000)
+    observed_at = _as_utc(now) or datetime.now(UTC)
+    async with async_session_factory() as db:
+        rows = (
+            await db.execute(
+                select(Call, Agent.max_call_duration_seconds)
+                .outerjoin(
+                    Agent,
+                    (Agent.id == Call.agent_id) & (Agent.tenant_id == Call.tenant_id),
+                )
+                .where(
+                    Call.direction == "inbound",
+                    Call.provider.in_(("twilio", "livekit_sip")),
+                    Call.status == "in_progress",
+                    Call.answered_at.is_not(None),
+                )
+                .order_by(Call.answered_at, Call.created_at)
+                .limit(bounded_limit)
+                .with_for_update(skip_locked=True, of=Call)
+            )
+        ).all()
+
+        recovered = 0
+        for call, max_duration in rows:
+            metadata = call.call_metadata if isinstance(call.call_metadata, dict) else {}
+            runtime_route = metadata.get("runtime_route")
+            runtime = metadata.get("runtime")
+            speech_provider = metadata.get("speech_provider")
+            if isinstance(runtime_route, dict):
+                speech_provider = runtime_route.get("speech_provider") or speech_provider
+            if isinstance(runtime, dict):
+                speech_provider = runtime.get("speech_provider") or speech_provider
+            is_twilio_realtime = (
+                call.provider == "twilio"
+                and metadata.get("conversation_type") == "telephonyInbound"
+                and metadata.get("channel") == "phone"
+            )
+            is_livekit_realtime = (
+                call.provider == "livekit_sip"
+                and isinstance(runtime, dict)
+                and runtime.get("transport") == "livekit_sip"
+            )
+            if not (
+                (is_twilio_realtime or is_livekit_realtime)
+                and speech_provider in REALTIME_CALL_WATCHDOG_PROVIDERS
+            ):
+                continue
+            answered_at = _as_utc(call.answered_at) or _as_utc(call.started_at)
+            if answered_at is None:
+                continue
+            deadline = answered_at + timedelta(
+                seconds=(
+                    _bounded_call_duration(max_duration) + DIRECT_TERMINAL_CALLBACK_GRACE_SECONDS
+                )
+            )
+            if deadline > observed_at:
+                continue
+            _mark_realtime_call_terminal_unknown(call, observed_at)
+            recovered += 1
+
+        await db.commit()
+        return recovered
+
+
 async def _process_completed_call_async(call_id: str, tenant_id: str):
     from datetime import datetime
 
@@ -367,6 +464,10 @@ async def _process_completed_call_async(call_id: str, tenant_id: str):
 
     async with async_session_factory() as db:
         from app.services.provider_credentials import load_provider_config
+        from app.services.usage_ledger import (
+            lock_agent_runtime_limits,
+            metered_call_cost_cents,
+        )
 
         openai_config = await load_provider_config(db, tenant_uuid, "openai")
         openai_api_key = str((openai_config or {}).get("api_key") or "").strip() or None
@@ -407,6 +508,12 @@ async def _process_completed_call_async(call_id: str, tenant_id: str):
         # Record usage
         if call.duration_seconds and call.duration_seconds > 0:
             now = datetime.now(UTC)
+            if call.agent_id is not None:
+                await lock_agent_runtime_limits(
+                    db,
+                    tenant_id=tenant_uuid,
+                    agent_id=call.agent_id,
+                )
             usage_result = await db.execute(
                 select(UsageRecord).where(
                     UsageRecord.tenant_id == tenant_uuid,
@@ -416,7 +523,7 @@ async def _process_completed_call_async(call_id: str, tenant_id: str):
             )
             usage = usage_result.scalar_one_or_none()
             quantity = call.duration_seconds / 60.0
-            cost_cents = int(quantity * 5)  # $0.05/min default
+            cost_cents = metered_call_cost_cents(call.duration_seconds)
             if usage is None:
                 usage = UsageRecord(
                     tenant_id=tenant_uuid,

@@ -590,7 +590,7 @@ export default function Agents() {
               </div>
               <div className="agent-card-actions">
                 <button className="btn btn-secondary btn-sm" disabled={!catalogReady || providerOperationUnresolved(agent.sync_status)} onClick={() => openEdit(agent)}><Pencil size={12} /> Edit</button>
-                {['sarvam', 'elevenlabs'].includes(agent.voice_provider) ? (
+                {['sarvam', 'elevenlabs', 'inworld'].includes(agent.voice_provider) ? (
                   <button
                     className={`btn btn-sm ${runtimeProfiles[agent.id]?.enabled ? 'btn-primary' : 'btn-secondary'}`}
                     disabled={!runtimeProfiles[agent.id]}
@@ -705,6 +705,7 @@ function syncStatusLabel(status: VoiceAgent['sync_status']) {
 function deploymentDescription(agent: VoiceAgent) {
   if (agent.voice_provider === 'sarvam') return 'Sarvam AI · VAV realtime runtime';
   if (agent.voice_provider === 'elevenlabs') return 'ElevenLabs voice · VAV realtime runtime';
+  if (agent.voice_provider === 'inworld') return 'LiveKit SIP · direct Inworld realtime runtime';
   if (!agent.provider_agent_id) return 'Local draft · not provisioned';
   const providerId = `Atoms ID · ${agent.provider_agent_id.slice(0, 12)}…`;
   if (agent.sync_status === 'synced') return `${providerId} · published revision recorded`;
@@ -715,6 +716,7 @@ function deploymentDescription(agent: VoiceAgent) {
 function voiceProviderName(provider: string) {
   if (provider === 'sarvam') return 'Sarvam AI';
   if (provider === 'elevenlabs') return 'ElevenLabs';
+  if (provider === 'inworld') return 'Inworld AI';
   return 'Smallest.ai';
 }
 

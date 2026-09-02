@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime
 from pathlib import PurePath
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urlsplit
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, status
@@ -43,6 +43,16 @@ from app.services.audit import record_audit_event
 from app.services.knowledge_ai_wizard import (
     KnowledgeAIWizardError,
     generate_knowledge_ai_draft,
+)
+from app.services.knowledge_sources import (
+    VAV_NATIVE_KNOWLEDGE_PROVIDERS,
+    canonical_source_url,
+    consolidate_duplicate_url_sources,
+    consolidate_smallest_url_duplicates,
+    has_searchable_content,
+    invalidate_knowledge_approval,
+    mark_remote_creation_outcome_unknown,
+    remote_creation_outcome_unknown,
 )
 from app.services.pdf_ingestion import PdfIngestionError, PreparedPdf, prepare_pdf
 from app.services.provider_credentials import ProviderCredentialError, load_provider_config
@@ -158,7 +168,7 @@ def _invalidate_bound_agent_deployments(kb: KnowledgeBase) -> list[UUID]:
     affected_agent_ids: list[UUID] = []
     for binding in kb.agent_bindings:
         agent = binding.agent
-        if getattr(agent, "voice_provider", "smallest") in {"sarvam", "elevenlabs"}:
+        if getattr(agent, "voice_provider", "smallest") in VAV_NATIVE_KNOWLEDGE_PROVIDERS:
             # VAV realtime sessions retrieve approved VAV knowledge directly on every
             # turn, so indexed source changes are live without an Atoms publish.
             binding.provider = agent.voice_provider
@@ -192,7 +202,11 @@ def _knowledge_query(tenant_id: UUID):
 
 
 async def _get_knowledge_base(db: AsyncSession, tenant_id: UUID, kb_id: UUID) -> KnowledgeBase:
-    result = await db.execute(_knowledge_query(tenant_id).where(KnowledgeBase.id == kb_id))
+    result = await db.execute(
+        _knowledge_query(tenant_id)
+        .where(KnowledgeBase.id == kb_id)
+        .execution_options(populate_existing=True)
+    )
     kb = result.scalar_one_or_none()
     if not kb:
         raise HTTPException(status_code=404, detail="Knowledge base not found")
@@ -218,22 +232,51 @@ async def _ensure_remote(
     kb: KnowledgeBase,
     client: SmallestAIClient,
 ) -> str:
-    if kb.provider_knowledge_base_id:
-        return kb.provider_knowledge_base_id
-    kb.sync_status = "provisioning"
-    kb.sync_error = None
-    await db.commit()
+    # Serialize creation across API requests and parallel crawl workers. Refresh
+    # the identity-map row after acquiring the lock so a waiter observes the ID
+    # committed by the creator ahead of it.
+    locked_kb = await db.scalar(
+        _knowledge_query(kb.tenant_id)
+        .where(KnowledgeBase.id == kb.id, KnowledgeBase.tenant_id == kb.tenant_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if locked_kb is None:
+        raise HTTPException(status_code=404, detail="Knowledge base not found")
+    if locked_kb.provider_knowledge_base_id:
+        remote_id = locked_kb.provider_knowledge_base_id
+        # Release the provisioning lock before the caller performs a longer
+        # scrape/upload, while durably preserving any approval invalidation.
+        await db.commit()
+        return remote_id
+    if remote_creation_outcome_unknown(locked_kb):
+        await db.commit()
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Provider knowledge-base creation previously had an unknown outcome. "
+                "Reconcile the Smallest.ai workspace before trying to create another copy."
+            ),
+        )
+    locked_kb.sync_status = "provisioning"
+    locked_kb.sync_error = None
+    await db.flush()
     try:
         remote_id = await client.create_knowledge_base(
-            name=kb.name,
-            description=kb.description or "",
+            name=locked_kb.name,
+            description=locked_kb.description or "",
         )
     except SmallestAIError as exc:
-        await _mark_provider_error(db, kb, exc)
+        if exc.ambiguous:
+            mark_remote_creation_outcome_unknown(locked_kb)
+            locked_kb.last_synced_at = datetime.now(UTC)
+            await db.commit()
+            raise _provider_error(exc) from exc
+        await _mark_provider_error(db, locked_kb, exc)
         raise _provider_error(exc) from exc
-    kb.provider_knowledge_base_id = remote_id
-    kb.sync_status = "processing" if kb.source_count else "local_only"
-    kb.last_synced_at = datetime.now(UTC)
+    locked_kb.provider_knowledge_base_id = remote_id
+    locked_kb.sync_status = "processing" if locked_kb.source_count else "local_only"
+    locked_kb.last_synced_at = datetime.now(UTC)
     # A remote resource now exists. Commit its mapping immediately so a later
     # scrape/upload failure cannot leave an orphaned provider knowledge base.
     await db.commit()
@@ -241,14 +284,19 @@ async def _ensure_remote(
 
 
 def _recount(kb: KnowledgeBase) -> None:
+    # Legacy pasted-text rows were stored as local_only even though their content
+    # is immediately searchable by VAV-native runtimes. Promote them lazily so an
+    # existing workspace is repaired the next time it is governed or refreshed.
+    for source in kb.sources:
+        if (
+            source.source_type == "text"
+            and source.status == "local_only"
+            and has_searchable_content(source)
+        ):
+            source.status = "indexed"
     kb.source_count = len(kb.sources)
     kb.indexed_source_count = sum(
-        source.status == "indexed"
-        and (
-            source.source_type not in {"file", "text"}
-            or bool(str(getattr(source, "content", None) or "").strip())
-        )
-        for source in kb.sources
+        source.status == "indexed" and has_searchable_content(source) for source in kb.sources
     )
     if not kb.source_count:
         kb.sync_status = "local_only"
@@ -264,6 +312,28 @@ def _recount(kb: KnowledgeBase) -> None:
         )
     elif any(source.status in {"pending", "processing"} for source in kb.sources):
         kb.sync_status = "processing"
+        kb.sync_error = None
+    else:
+        # An upstream provider status is not retrieval evidence. This also heals
+        # legacy rows that were previously marked ready with an empty content body.
+        kb.sync_status = "error"
+        kb.sync_error = "One or more sources have no VAV-searchable content."
+
+
+def _retrieval_signature(kb: KnowledgeBase) -> tuple[tuple[str, str, str, str, str], ...]:
+    """Capture all evidence that can change which source text agents retrieve."""
+    return tuple(
+        sorted(
+            (
+                str(source.id),
+                source.status,
+                canonical_source_url(source.location) or str(source.location or ""),
+                str(source.content or "").strip(),
+                str(source.provider_item_id or ""),
+            )
+            for source in kb.sources
+        )
+    )
 
 
 def _provider_source_status(item: dict | None) -> str:
@@ -282,21 +352,7 @@ def _provider_url_key(value: object) -> str:
     raw = str(value or "").strip()
     if not raw:
         return ""
-    parsed = urlsplit(raw)
-    if not parsed.scheme or not parsed.netloc:
-        return raw.rstrip("/")
-    scheme = parsed.scheme.lower()
-    host = (parsed.hostname or "").lower()
-    try:
-        port = parsed.port
-    except ValueError:
-        return raw.rstrip("/")
-    default_port = 80 if scheme == "http" else 443
-    netloc = host if port in {None, default_port} else f"{host}:{port}"
-    path = parsed.path or "/"
-    if path != "/":
-        path = path.rstrip("/") or "/"
-    return urlunsplit((scheme, netloc, path, parsed.query, ""))
+    return canonical_source_url(raw) or raw.rstrip("/")
 
 
 def _provider_item_urls(item: dict) -> list[object]:
@@ -431,15 +487,11 @@ def _reconcile_provider_sources(
                 source.error_message = str(
                     item.get("error") or item.get("errorMessage") or "Provider processing failed"
                 )
-            elif (
-                source.source_type == "file"
-                and source.status == "indexed"
-                and not str(getattr(source, "content", None) or "").strip()
-            ):
+            elif source.status == "indexed" and not has_searchable_content(source):
                 source.status = "failed"
                 source.error_message = (
                     "Provider indexing completed, but VAV found no retrievable text. "
-                    "Re-upload the PDF so VAV can extract or OCR it."
+                    "Repair or re-upload the source so VAV can extract it."
                 )
             continue
 
@@ -452,7 +504,7 @@ def _reconcile_provider_sources(
             and source.source_type in {"url", "file", "website", "sitemap"}
             and source.status in {"pending", "processing"}
         ):
-            if source.source_type != "file" or str(getattr(source, "content", None) or "").strip():
+            if has_searchable_content(source):
                 source.status = "indexed"
                 source.error_message = None
             else:
@@ -739,6 +791,7 @@ async def start_website_crawl(
             status_code=409,
             detail="This knowledge base already has an active website crawl.",
         )
+    approval_invalidated = invalidate_knowledge_approval(kb)
     homepage_url = str(data.homepage_url)
     host = (urlsplit(homepage_url).hostname or "").rstrip(".").lower()
     crawl = KnowledgeCrawl(
@@ -766,6 +819,7 @@ async def start_website_crawl(
             "max_pages": data.max_pages,
             "max_depth": data.max_depth,
             "include_subdomains": data.include_subdomains,
+            "approval_invalidated": approval_invalidated,
         },
     )
     await db.commit()
@@ -808,6 +862,7 @@ async def retry_website_crawl(
     if crawl.status in ACTIVE_CRAWL_STATUSES:
         raise HTTPException(status_code=409, detail="The website crawl is already active")
 
+    invalidate_knowledge_approval(kb)
     failed_pages = [page for page in crawl.pages if page.status == "failed"]
     source_by_id = {source.id: source for source in kb.sources}
     queued_sources: list[UUID] = []
@@ -879,13 +934,18 @@ async def add_url_sources(
 ):
     kb = await _get_knowledge_base(db, current_user.tenant_id, kb_id)
     _ensure_bound_agents_accept_knowledge_change(kb)
-    urls = list(dict.fromkeys(str(url) for url in data.urls))
-    existing = {source.location for source in kb.sources if source.location}
+    urls = list(dict.fromkeys(canonical_source_url(str(url)) or str(url) for url in data.urls))
+    existing = {
+        canonical_source_url(source.location) or source.location
+        for source in kb.sources
+        if source.location
+    }
     new_urls = [url for url in urls if url not in existing]
     if not new_urls:
         raise HTTPException(
             status_code=409, detail="Every selected URL is already in this knowledge base"
         )
+    approval_invalidated = invalidate_knowledge_approval(kb)
     client = await _tenant_smallest_client(db, current_user.tenant_id)
     remote_id = await _ensure_remote(db, kb, client)
     try:
@@ -916,6 +976,7 @@ async def add_url_sources(
         resource_id=str(kb.id),
         details={
             "count": len(new_urls),
+            "approval_invalidated": approval_invalidated,
             "agents_requiring_sync": [str(agent_id) for agent_id in affected_agent_ids],
         },
     )
@@ -930,6 +991,21 @@ async def add_text_source(
     db: AsyncSession = Depends(get_db),
 ):
     kb = await _get_knowledge_base(db, current_user.tenant_id, kb_id)
+    _ensure_bound_agents_accept_knowledge_change(kb)
+    smallest_bindings = [
+        binding.agent.name
+        for binding in kb.agent_bindings
+        if binding.agent.voice_provider not in VAV_NATIVE_KNOWLEDGE_PROVIDERS
+    ]
+    if smallest_bindings:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Pasted text is available to VAV-native agents only. Unbind the "
+                "Smallest.ai agent before adding it: " + ", ".join(sorted(smallest_bindings))
+            ),
+        )
+    approval_invalidated = invalidate_knowledge_approval(kb)
     kb.sources.append(
         KnowledgeSource(
             tenant_id=current_user.tenant_id,
@@ -937,11 +1013,15 @@ async def add_text_source(
             name=data.name,
             content=data.content,
             size_bytes=len(data.content.encode()),
-            status="local_only",
-            source_metadata={"provider_note": "Awaiting provider text-ingestion support"},
+            status="indexed",
+            source_metadata={
+                "retrieval_content_source": "vav_text",
+                "provider_note": "Available to VAV-native runtimes; not published to Smallest.ai",
+            },
         )
     )
     _recount(kb)
+    affected_agent_ids = _invalidate_bound_agent_deployments(kb)
     await db.flush()
     await record_audit_event(
         db,
@@ -950,7 +1030,12 @@ async def add_text_source(
         action="knowledge_source.text_added",
         resource_type="knowledge_base",
         resource_id=str(kb.id),
-        details={"name": data.name, "bytes": len(data.content.encode())},
+        details={
+            "name": data.name,
+            "bytes": len(data.content.encode()),
+            "approval_invalidated": approval_invalidated,
+            "agents_requiring_sync": [str(agent_id) for agent_id in affected_agent_ids],
+        },
     )
     return _knowledge_response(kb)
 
@@ -983,6 +1068,7 @@ async def repair_website_source(
     if isinstance(recovery, dict) and recovery.get("status") in {"queued", "processing"}:
         raise HTTPException(status_code=409, detail="This website page is already being repaired")
 
+    approval_invalidated = invalidate_knowledge_approval(kb)
     metadata = dict(source.source_metadata or {})
     attempts = int(metadata.get("recovery_attempts") or 0) + 1
     metadata["recovery_attempts"] = attempts
@@ -1003,7 +1089,7 @@ async def repair_website_source(
         action="knowledge_source.website_repair_queued",
         resource_type="knowledge_source",
         resource_id=str(source.id),
-        details={"attempt": attempts},
+        details={"attempt": attempts, "approval_invalidated": approval_invalidated},
     )
     # The worker must never race the request transaction that records the job.
     await db.commit()
@@ -1039,6 +1125,7 @@ async def upload_pdf_source(
 ):
     kb = await _get_knowledge_base(db, current_user.tenant_id, kb_id)
     _ensure_bound_agents_accept_knowledge_change(kb)
+    approval_invalidated = invalidate_knowledge_approval(kb)
     filename = PurePath(media.filename or "knowledge.pdf").name
     if media.content_type != "application/pdf" or not filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=422, detail="Only PDF documents are supported")
@@ -1160,6 +1247,7 @@ async def upload_pdf_source(
             "extraction_method": prepared.extraction_method,
             "ocr_pages": prepared.ocr_page_count,
             "replaced_existing": bool(existing_source),
+            "approval_invalidated": approval_invalidated,
             "agents_requiring_sync": [str(agent_id) for agent_id in affected_agent_ids],
         },
     )
@@ -1179,6 +1267,7 @@ async def delete_knowledge_source(
     source = next((item for item in kb.sources if item.id == source_id), None)
     if source is None:
         raise HTTPException(status_code=404, detail="Knowledge source not found")
+    approval_invalidated = invalidate_knowledge_approval(kb)
 
     provider_target: tuple[str, str] | None = None
     scraped: list[dict] = []
@@ -1254,6 +1343,7 @@ async def delete_knowledge_source(
             "removed_source_names": [candidate.name for candidate in removed_sources],
             "provider_collection": provider_target[0] if provider_target else None,
             "provider_item_id": provider_target[1] if provider_target else None,
+            "approval_invalidated": approval_invalidated,
             "agents_requiring_sync": [str(agent_id) for agent_id in affected_agent_ids],
         },
     )
@@ -1268,15 +1358,50 @@ async def refresh_knowledge_base(
 ):
     kb = await _get_knowledge_base(db, current_user.tenant_id, kb_id)
     if not kb.provider_knowledge_base_id:
+        before_signature = _retrieval_signature(kb)
+        removed = await consolidate_duplicate_url_sources(db, kb)
+        if removed or before_signature != _retrieval_signature(kb):
+            invalidate_knowledge_approval(kb)
+        _recount(kb)
         return _knowledge_response(kb)
     client = await _tenant_smallest_client(db, current_user.tenant_id)
     try:
         provider_knowledge_base = await client.get_knowledge_base(kb.provider_knowledge_base_id)
         scraped = await client.list_scraped_knowledge_urls(kb.provider_knowledge_base_id)
         items = await client.list_knowledge_items(kb.provider_knowledge_base_id)
+        before_signature = _retrieval_signature(kb)
+        before_consolidation = {
+            source.id: (source.status, source.error_message) for source in kb.sources
+        }
+        removed = await consolidate_smallest_url_duplicates(
+            db,
+            kb,
+            client,
+            scraped=scraped,
+            items=items,
+        )
+        after_consolidation = {
+            source.id: (source.status, source.error_message) for source in kb.sources
+        }
     except SmallestAIError as exc:
         await _mark_provider_error(db, kb, exc)
         raise _provider_error(exc) from exc
+    approval_invalidated = False
+    if removed or before_consolidation != after_consolidation:
+        approval_invalidated = invalidate_knowledge_approval(kb)
+        _recount(kb)
+        await record_audit_event(
+            db,
+            tenant_id=current_user.tenant_id,
+            actor_user_id=current_user.id,
+            action="knowledge_sources.consolidated",
+            resource_type="knowledge_base",
+            resource_id=str(kb.id),
+            details={"removed_source_count": removed},
+        )
+        # Provider deletion and local consolidation are not one distributed
+        # transaction. Persist the idempotent local half before continuing.
+        await db.commit()
     now = datetime.now(UTC)
     _reconcile_provider_sources(
         kb,
@@ -1285,6 +1410,9 @@ async def refresh_knowledge_base(
         provider_knowledge_base=provider_knowledge_base,
         now=now,
     )
+    after_signature = _retrieval_signature(kb)
+    if removed or before_signature != after_signature:
+        approval_invalidated = invalidate_knowledge_approval(kb) or approval_invalidated
     kb.last_synced_at = now
     await db.flush()
     await record_audit_event(
@@ -1297,6 +1425,7 @@ async def refresh_knowledge_base(
         details={
             "source_count": kb.source_count,
             "indexed_source_count": kb.indexed_source_count,
+            "approval_invalidated": approval_invalidated,
         },
     )
     return _knowledge_response(kb)
@@ -1310,10 +1439,11 @@ async def set_knowledge_approval(
     db: AsyncSession = Depends(get_db),
 ):
     kb = await _get_knowledge_base(db, current_user.tenant_id, kb_id)
+    _recount(kb)
     if data.approved and (kb.sync_status != "ready" or not kb.indexed_source_count):
         raise HTTPException(
             status_code=409,
-            detail="Index every provider source before approving this knowledge base",
+            detail="Make every source VAV-searchable before approving this knowledge base",
         )
     kb.approval_status = "approved" if data.approved else "draft"
     kb.published_at = datetime.now(UTC) if data.approved else None
@@ -1337,15 +1467,24 @@ async def bind_agent(
     db: AsyncSession = Depends(get_db),
 ):
     kb = await _get_knowledge_base(db, current_user.tenant_id, kb_id)
-    if kb.approval_status != "approved" or not kb.provider_knowledge_base_id:
-        raise HTTPException(
-            status_code=409, detail="Approve and provision this knowledge base first"
-        )
+    if kb.approval_status != "approved":
+        raise HTTPException(status_code=409, detail="Approve this knowledge base first")
     agent = await db.scalar(
         select(Agent).where(Agent.id == data.agent_id, Agent.tenant_id == current_user.tenant_id)
     )
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found")
+    native_consumer = agent.voice_provider in VAV_NATIVE_KNOWLEDGE_PROVIDERS
+    if not native_consumer and not kb.provider_knowledge_base_id:
+        raise HTTPException(
+            status_code=409,
+            detail="Provision this knowledge base in Smallest.ai before binding this agent",
+        )
+    if not native_consumer and any(source.source_type == "text" for source in kb.sources):
+        raise HTTPException(
+            status_code=409,
+            detail="Smallest.ai agents cannot use pasted VAV text sources in this knowledge base",
+        )
     binding = await db.scalar(
         select(AgentKnowledgeBinding).where(
             AgentKnowledgeBinding.agent_id == agent.id,
@@ -1363,7 +1502,7 @@ async def bind_agent(
             provider=agent.voice_provider,
         )
         db.add(binding)
-    if agent.voice_provider in {"sarvam", "elevenlabs"}:
+    if native_consumer:
         binding.sync_status = "synced"
         binding.last_synced_at = datetime.now(UTC)
     else:

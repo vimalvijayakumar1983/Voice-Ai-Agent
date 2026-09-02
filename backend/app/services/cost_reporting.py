@@ -33,6 +33,11 @@ TWILIO_MEDIA_STREAM_USD_PER_MINUTE = Decimal("0.0044")
 SARVAM_STT_INR_PER_HOUR = Decimal("30")
 SARVAM_TTS_INR_PER_10K_CHARACTERS = Decimal("30")
 ELEVENLABS_FLASH_USD_PER_1K_CHARACTERS = Decimal("0.05")
+LIVEKIT_THIRD_PARTY_SIP_USD_PER_MINUTE = Decimal("0.004")
+LIVEKIT_RECORDING_USD_PER_MINUTE = Decimal("0.005")
+INWORLD_STT_USD_PER_HOUR = Decimal("0.15")
+INWORLD_TTS2_FLASH_USD_PER_1K_CHARACTERS = Decimal("0.015")
+INWORLD_TTS2_USD_PER_1K_CHARACTERS = Decimal("0.025")
 
 TWILIO_UAE_SOURCE = "https://www.twilio.com/en-us/voice/pricing/ae"
 TWILIO_US_SOURCE = "https://www.twilio.com/en-us/voice/pricing/us"
@@ -41,6 +46,8 @@ ELEVENLABS_SOURCE = "https://elevenlabs.io/pricing/api"
 OPENAI_SOURCE = "https://developers.openai.com/api/docs/models/gpt-4o-mini"
 SMALLEST_SOURCE = "https://atoms-docs.smallest.ai/intro/admin/billing"
 CBUAE_SOURCE = "https://www.centralbank.ae/en/forex-eibor/exchange-rates/"
+LIVEKIT_SOURCE = "https://livekit.io/pricing"
+INWORLD_SOURCE = "https://inworld.ai/pricing"
 
 OPENAI_RATES: dict[str, tuple[Decimal, Decimal]] = {
     "gpt-4o-mini": (Decimal("0.15"), Decimal("0.60")),
@@ -219,6 +226,52 @@ def public_rate_cards() -> list[dict[str, Any]]:
             ),
         ),
         _rate_card(
+            "LiveKit",
+            "Third-party SIP",
+            LIVEKIT_THIRD_PARTY_SIP_USD_PER_MINUTE,
+            "USD",
+            "minute",
+            LIVEKIT_SOURCE,
+            "Media/SIP orchestration only; the customer-owned e& carrier invoice is excluded.",
+        ),
+        _rate_card(
+            "Inworld",
+            "Speech to text",
+            INWORLD_STT_USD_PER_HOUR,
+            "USD",
+            "audio hour",
+            INWORLD_SOURCE,
+            (
+                "Conservative current on-demand public list rate; paid or negotiated "
+                "tiers may reduce invoice cost. Connected duration is used when "
+                "provider audio usage is absent."
+            ),
+        ),
+        _rate_card(
+            "Inworld",
+            "TTS 2 Flash",
+            INWORLD_TTS2_FLASH_USD_PER_1K_CHARACTERS,
+            "USD",
+            "1,000 characters",
+            INWORLD_SOURCE,
+            (
+                "Conservative current on-demand public list rate ($15 per 1M characters); "
+                "paid or negotiated tiers may reduce invoice cost."
+            ),
+        ),
+        _rate_card(
+            "Inworld",
+            "TTS 2",
+            INWORLD_TTS2_USD_PER_1K_CHARACTERS,
+            "USD",
+            "1,000 characters",
+            INWORLD_SOURCE,
+            (
+                "Conservative current on-demand public list rate ($25 per 1M characters); "
+                "paid or negotiated tiers may reduce invoice cost."
+            ),
+        ),
+        _rate_card(
             "OpenAI",
             "GPT-4o mini input",
             Decimal("0.15"),
@@ -339,6 +392,36 @@ def _call_components(
             )
         )
 
+    if call.provider == "livekit_sip":
+        components.append(
+            _component(
+                "LiveKit",
+                "Third-party SIP",
+                minutes,
+                "minutes",
+                LIVEKIT_THIRD_PARTY_SIP_USD_PER_MINUTE,
+                LIVEKIT_SOURCE,
+                "Customer-owned e& SIP trunk; carrier charge excluded",
+            )
+        )
+        # VAV runs its LiveKit agent as an always-on Railway service, not as a
+        # LiveKit Cloud-deployed agent. Do not fabricate the Cloud $0.01/min
+        # agent-session charge; fixed Railway compute needs an operator-supplied
+        # allocation before this call can be described as fully priced.
+        missing.append("Railway LiveKit worker hosting allocation")
+        if runtime.get("recording_enabled") is True:
+            components.append(
+                _component(
+                    "LiveKit",
+                    "Recording",
+                    minutes,
+                    "minutes",
+                    LIVEKIT_RECORDING_USD_PER_MINUTE,
+                    LIVEKIT_SOURCE,
+                    "Runtime recording enabled",
+                )
+            )
+
     if call.provider == "smallest":
         destination = str(call.to_number or "")
         if destination.startswith("+91"):
@@ -368,17 +451,31 @@ def _call_components(
         else:
             missing.append("Smallest.ai region/plan rate")
 
-    if speech in {"sarvam", "elevenlabs"}:
-        stt_usd_per_hour = (SARVAM_STT_INR_PER_HOUR * INR_AED) / USD_AED
+    if speech in {"sarvam", "elevenlabs", "inworld"}:
+        inworld_speech = speech == "inworld"
+        stt_usd_per_hour = (
+            INWORLD_STT_USD_PER_HOUR
+            if inworld_speech
+            else (SARVAM_STT_INR_PER_HOUR * INR_AED) / USD_AED
+        )
+        tracked_stt_seconds = runtime.get("stt_audio_seconds")
+        if isinstance(tracked_stt_seconds, (int, float)) and tracked_stt_seconds > 0:
+            stt_hours = Decimal(str(tracked_stt_seconds)) / Decimal("3600")
+            stt_basis = "Runtime-metered provider audio"
+        else:
+            stt_hours = minutes / Decimal("60")
+            stt_basis = "Connected duration proxy"
+        if inworld_speech:
+            stt_basis += "; conservative public on-demand list rate"
         components.append(
             _component(
-                "Sarvam",
-                "Saaras speech to text",
-                minutes / Decimal("60"),
+                "Inworld" if inworld_speech else "Sarvam",
+                "Speech to text" if inworld_speech else "Saaras speech to text",
+                stt_hours,
                 "audio hours",
                 stt_usd_per_hour,
-                SARVAM_SOURCE,
-                "Connected duration proxy",
+                INWORLD_SOURCE if inworld_speech else SARVAM_SOURCE,
+                stt_basis,
             )
         )
 
@@ -395,7 +492,23 @@ def _call_components(
             )
         if tts_characters:
             thousands = Decimal(tts_characters) / Decimal("1000")
-            if speech == "elevenlabs":
+            if speech == "inworld":
+                tts_model = str(runtime.get("tts_model") or "inworld-tts-2")
+                flash = "flash" in tts_model.lower()
+                components.append(
+                    _component(
+                        "Inworld",
+                        "TTS 2 Flash" if flash else "TTS 2",
+                        thousands,
+                        "1,000 characters",
+                        INWORLD_TTS2_FLASH_USD_PER_1K_CHARACTERS
+                        if flash
+                        else INWORLD_TTS2_USD_PER_1K_CHARACTERS,
+                        INWORLD_SOURCE,
+                        f"{character_basis}; conservative public on-demand list rate",
+                    )
+                )
+            elif speech == "elevenlabs":
                 components.append(
                     _component(
                         "ElevenLabs",
@@ -426,9 +539,15 @@ def _call_components(
             missing.append(f"{speech.title()} TTS characters")
 
         llm_model = str(runtime.get("llm_model") or "gpt-4o-mini")
+        priced_llm_model = llm_model.removeprefix("openai/")
+        auto_routed_model = inworld_speech and priced_llm_model == "auto"
+        if auto_routed_model:
+            # Auto routing may select any supported model. Do not present a
+            # convenient proxy as complete customer-facing cost coverage.
+            missing.append("Inworld Router selected model/rate")
         input_tokens = runtime.get("llm_input_tokens")
         output_tokens = runtime.get("llm_output_tokens")
-        model_rates = OPENAI_RATES.get(llm_model)
+        model_rates = None if auto_routed_model else OPENAI_RATES.get(priced_llm_model)
         if (
             model_rates
             and isinstance(input_tokens, (int, float))
@@ -438,24 +557,24 @@ def _call_components(
             if input_tokens:
                 components.append(
                     _component(
-                        "OpenAI",
+                        "Inworld Router" if inworld_speech else "OpenAI",
                         f"{llm_model} input",
                         Decimal(str(input_tokens)) / Decimal("1000000"),
                         "1M tokens",
                         input_rate,
-                        OPENAI_SOURCE,
+                        INWORLD_SOURCE if inworld_speech else OPENAI_SOURCE,
                         "Runtime-metered input tokens",
                     )
                 )
             if output_tokens:
                 components.append(
                     _component(
-                        "OpenAI",
+                        "Inworld Router" if inworld_speech else "OpenAI",
                         f"{llm_model} output",
                         Decimal(str(output_tokens)) / Decimal("1000000"),
                         "1M tokens",
                         output_rate,
-                        OPENAI_SOURCE,
+                        INWORLD_SOURCE if inworld_speech else OPENAI_SOURCE,
                         "Runtime-metered output tokens",
                     )
                 )
@@ -707,7 +826,7 @@ async def build_cost_report(
             ),
             "not_included": (
                 "Taxes, credits, discounts, committed-use pricing, phone-number "
-                "rental, and plan fees unless explicitly listed."
+                "rental, custom-worker hosting, and plan fees unless explicitly listed."
             ),
             "invoice_status": (
                 "Estimates are not invoices. Reconcile with provider billing "

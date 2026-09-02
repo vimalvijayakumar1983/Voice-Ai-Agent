@@ -21,6 +21,7 @@ from app.tasks.call_tasks import (
     _reconcile_direct_call_terminal_async,
     _sweep_stale_call_dispatches_async,
     _sweep_stale_direct_calls_async,
+    _sweep_stale_realtime_calls_async,
     arm_direct_call_terminal_watchdog,
 )
 from tests.conftest import test_session_factory as session_factory
@@ -418,3 +419,83 @@ async def test_direct_call_watchdog_sweep_is_recovery_only_and_never_touches_cam
     assert statuses[None] == "ringing"
     assert statuses["dispatching-direct"] == "dispatching"
     assert statuses["completed-direct"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_realtime_watchdog_recovers_only_abandoned_inbound_media_sessions(
+    db,
+    tenant,
+    monkeypatch,
+):
+    now = datetime.now(UTC)
+    agent = Agent(
+        tenant_id=tenant.id,
+        name="Inbound recovery agent",
+        system_prompt="Recover abandoned realtime sessions safely.",
+        max_call_duration_seconds=30,
+    )
+    db.add(agent)
+    await db.flush()
+
+    def inbound_call(name: str, **overrides):
+        values = {
+            "tenant_id": tenant.id,
+            "agent_id": agent.id,
+            "direction": "inbound",
+            "status": "in_progress",
+            "from_number": "+971501234567",
+            "to_number": "+14142934703",
+            "provider": "twilio",
+            "provider_call_sid": name,
+            "started_at": now - timedelta(minutes=10),
+            "answered_at": now - timedelta(minutes=10),
+            "call_metadata": {
+                "conversation_type": "telephonyInbound",
+                "channel": "phone",
+                "speech_provider": "elevenlabs",
+            },
+        }
+        values.update(overrides)
+        return Call(**values)
+
+    stale = inbound_call("stale-runtime")
+    stale_livekit = inbound_call(
+        "stale-livekit-runtime",
+        provider="livekit_sip",
+        call_metadata={"runtime": {"transport": "livekit_sip", "speech_provider": "inworld"}},
+    )
+    fresh = inbound_call(
+        "fresh-runtime",
+        started_at=now - timedelta(seconds=10),
+        answered_at=now - timedelta(seconds=10),
+    )
+    non_runtime = inbound_call(
+        "non-runtime",
+        call_metadata={"conversation_type": "telephonyInbound", "channel": "phone"},
+    )
+    completed = inbound_call("completed-runtime", status="completed")
+    db.add_all([stale, stale_livekit, fresh, non_runtime, completed])
+    await db.commit()
+    ids = {
+        call.provider_call_sid: call.id
+        for call in (stale, stale_livekit, fresh, non_runtime, completed)
+    }
+    monkeypatch.setattr(database, "async_session_factory", session_factory)
+
+    assert await _sweep_stale_realtime_calls_async(now=now) == 2
+
+    async with session_factory() as session:
+        recovered = await session.get(Call, ids["stale-runtime"])
+        recovered_livekit = await session.get(Call, ids["stale-livekit-runtime"])
+        fresh_result = await session.get(Call, ids["fresh-runtime"])
+        non_runtime_result = await session.get(Call, ids["non-runtime"])
+        completed_result = await session.get(Call, ids["completed-runtime"])
+    assert recovered.status == "terminal_unknown"
+    assert recovered.ended_at.replace(tzinfo=UTC) == now
+    assert recovered.call_metadata["lifecycle_error"] == "realtime_session_timeout"
+    assert recovered.call_metadata["operator_review_required"] is True
+    assert recovered_livekit.status == "terminal_unknown"
+    assert recovered_livekit.call_metadata["lifecycle_error"] == "realtime_session_timeout"
+    assert fresh_result.status == "in_progress"
+    assert non_runtime_result.status == "in_progress"
+    assert completed_result.status == "completed"

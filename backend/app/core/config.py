@@ -84,6 +84,23 @@ class Settings(BaseSettings):
     elevenlabs_base_url: str = "https://api.elevenlabs.io"
     elevenlabs_request_timeout_seconds: float = 30.0
 
+    # Inworld is the preferred direct realtime AI provider. LiveKit carries
+    # media and SIP only; VAV supplies this key directly to Inworld's STT,
+    # Router, and TTS APIs so LiveKit Inference is never billed accidentally.
+    inworld_api_key: str = ""
+    inworld_base_url: str = "https://api.inworld.ai"
+    inworld_request_timeout_seconds: float = 30.0
+    # One VAV deployment connects its workers to one LiveKit project. Tenant
+    # routes must point at this same project; a running worker cannot safely
+    # switch LiveKit projects after a job has been dispatched.
+    livekit_url: str = ""
+    livekit_api_key: str = ""
+    livekit_api_secret: str = ""
+    livekit_agent_name: str = "vav-inworld"
+    # Private HTTP origin of the always-on LiveKit Agents service. The API
+    # probes both ``/`` and ``/worker`` before it permits activation.
+    livekit_worker_health_url: str = ""
+
     # AI Providers
     openai_api_key: str = ""
     anthropic_api_key: str = ""

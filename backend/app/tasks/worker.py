@@ -46,6 +46,10 @@ celery_app.conf.update(
             "task": "app.tasks.call_tasks.sweep_stale_direct_calls",
             "schedule": 300.0,
         },
+        "sweep-stale-realtime-calls": {
+            "task": "app.tasks.call_tasks.sweep_stale_realtime_calls",
+            "schedule": 300.0,
+        },
         "sweep-running-campaigns": {
             "task": "app.tasks.campaign_tasks.sweep_running_campaigns",
             "schedule": 300.0,

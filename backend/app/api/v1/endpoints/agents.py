@@ -33,6 +33,11 @@ from app.providers.elevenlabs import (
     ElevenLabsError,
     get_elevenlabs_client,
 )
+from app.providers.inworld import (
+    INWORLD_TTS_MODEL,
+    InworldClient,
+    InworldError,
+)
 from app.providers.sarvam import (
     SarvamAIClient,
     SarvamAIError,
@@ -771,6 +776,33 @@ async def _tenant_elevenlabs_client(
     return client, "platform" if client.is_configured else "none", None
 
 
+async def _tenant_inworld_client(
+    db: AsyncSession,
+    tenant_id: UUID,
+) -> tuple[InworldClient, str, datetime | None]:
+    credential = await db.scalar(
+        select(ProviderCredential).where(
+            ProviderCredential.tenant_id == tenant_id,
+            ProviderCredential.provider == "inworld",
+            ProviderCredential.is_active.is_(True),
+        )
+    )
+    if credential is not None:
+        try:
+            config = decrypt_integration_config(credential.encrypted_config)
+        except IntegrationConfigUnavailableError as exc:
+            raise HTTPException(
+                status_code=500,
+                detail="Inworld credential is unavailable; ask an administrator to rotate it",
+            ) from exc
+        api_key = config.get("api_key")
+        if not isinstance(api_key, str) or not api_key:
+            raise HTTPException(status_code=500, detail="Inworld credential is invalid")
+        return InworldClient(api_key=api_key), "workspace", credential.updated_at
+    client = InworldClient()
+    return client, "platform" if client.is_configured else "none", None
+
+
 async def _require_tenant_voice(
     client,
     db: AsyncSession,
@@ -927,6 +959,34 @@ async def _require_elevenlabs_voice(
     )
 
 
+async def _require_inworld_voice(
+    client: InworldClient,
+    voice_id: str,
+    selected_languages: list[str],
+) -> VoiceResolution:
+    try:
+        voices = await client.list_voices()
+    except InworldError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    selected_voice = next((voice for voice in voices if voice["id"] == voice_id), None)
+    if selected_voice is None:
+        raise HTTPException(
+            status_code=422, detail="Voice is not available to this Inworld workspace"
+        )
+    compatibility, unsupported = voice_language_compatibility(voices, voice_id, selected_languages)
+    if compatibility != LanguageCompatibilityStatus.COMPATIBLE:
+        detail = "Selected Inworld voice does not support every agent language"
+        if unsupported:
+            detail += ": " + ", ".join(unsupported)
+        raise HTTPException(status_code=422, detail=detail)
+    return VoiceResolution(
+        requested_voice_id=voice_id,
+        resolved_voice_id=voice_id,
+        synthesizer_model=INWORLD_TTS_MODEL,
+        source="operator",
+    )
+
+
 async def _require_provider_voice(
     provider: str,
     db: AsyncSession,
@@ -948,6 +1008,9 @@ async def _require_provider_voice(
     if provider == "elevenlabs":
         client, _, _ = await _tenant_elevenlabs_client(db, tenant_id)
         return await _require_elevenlabs_voice(client, voice_id, selected_languages)
+    if provider == "inworld":
+        client, _, _ = await _tenant_inworld_client(db, tenant_id)
+        return await _require_inworld_voice(client, voice_id, selected_languages)
     raise HTTPException(status_code=422, detail="Unsupported voice provider")
 
 
@@ -2202,6 +2265,9 @@ async def get_provider_status(
     elevenlabs, elevenlabs_source, elevenlabs_updated_at = await _tenant_elevenlabs_client(
         db, current_user.tenant_id
     )
+    inworld, inworld_source, inworld_updated_at = await _tenant_inworld_client(
+        db, current_user.tenant_id
+    )
     return {
         "provider": "smallest",
         "configured": client.is_configured,
@@ -2232,6 +2298,13 @@ async def get_provider_status(
                 "updated_at": (
                     elevenlabs_updated_at.isoformat() if elevenlabs_updated_at else None
                 ),
+            },
+            "inworld": {
+                "configured": inworld.is_configured,
+                "agent_runtime": True,
+                "voice_preview": inworld.is_configured,
+                "source": inworld_source,
+                "updated_at": inworld_updated_at.isoformat() if inworld_updated_at else None,
             },
         },
     }
@@ -2354,7 +2427,16 @@ async def get_provider_catalog(
             combined_voices.extend(await elevenlabs.list_voices())
         except ElevenLabsError as exc:
             elevenlabs_error = HTTPException(status_code=exc.status_code, detail=str(exc))
+    inworld_error: HTTPException | None = None
+    inworld, _, _ = await _tenant_inworld_client(db, current_user.tenant_id)
+    if inworld.is_configured:
+        try:
+            combined_voices.extend(await inworld.list_voices())
+        except InworldError as exc:
+            inworld_error = HTTPException(status_code=exc.status_code, detail=str(exc))
     if not combined_voices:
+        if inworld_error is not None:
+            raise inworld_error
         if elevenlabs_error is not None:
             raise elevenlabs_error
         if smallest_error is not None:
@@ -2721,6 +2803,23 @@ async def preview_provider_voice(
                 "Cache-Control": "private, no-store",
                 "X-Content-Type-Options": "nosniff",
             },
+        )
+
+    if data.provider == "inworld":
+        inworld, _, _ = await _tenant_inworld_client(db, current_user.tenant_id)
+        try:
+            voices = await inworld.list_voices()
+            if not any(item["id"] == data.voice_id for item in voices):
+                raise HTTPException(
+                    status_code=422, detail="Voice is not available to this Inworld workspace"
+                )
+            audio = await inworld.voice_preview(data.voice_id.removeprefix("inworld:"))
+        except InworldError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+        return Response(
+            content=audio,
+            media_type="audio/mpeg",
+            headers={"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"},
         )
 
     client, _, _ = await _tenant_smallest_client(db, current_user.tenant_id)
@@ -3345,8 +3444,12 @@ async def update_agent(
         if runtime_profile is not None:
             runtime_profile.enabled = False
             runtime_profile.status = "draft"
-            if agent.voice_provider in {"sarvam", "elevenlabs"}:
+            if agent.voice_provider in {"sarvam", "elevenlabs", "inworld"}:
                 runtime_profile.primary_speech_provider = agent.voice_provider
+                if agent.voice_provider == "inworld":
+                    runtime_profile.telephony_provider = "livekit_sip"
+                    runtime_profile.llm_provider = "inworld"
+                    runtime_profile.llm_model = "auto"
 
     if agent.provider_agent_id and SMALLEST_SYNC_FIELDS.intersection(effective_changes):
         agent.sync_status = "dirty"

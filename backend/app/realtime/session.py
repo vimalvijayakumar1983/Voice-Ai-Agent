@@ -9,6 +9,7 @@ import re
 import time
 from collections import deque
 from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from uuid import UUID
@@ -689,7 +690,25 @@ async def run_twilio_media_session(
             except Exception:
                 logger.exception("realtime_turn_failed", call_id=str(config.call_id))
 
+    @asynccontextmanager
+    async def finalize_session():
+        """Finalize even when a provider context fails while it is entering.
+
+        The finalizer is deliberately the first context in the stack. Python
+        then invokes it when a later Sarvam or TTS ``__aenter__`` raises, which
+        prevents answered inbound calls from remaining ``in_progress`` after
+        a provider handshake failure.
+        """
+        try:
+            yield
+        finally:
+            try:
+                await _store_metrics(config, metrics)
+            finally:
+                await _finalize_inbound_call(config)
+
     async with (
+        finalize_session(),
         SarvamSTTStream(
             api_key=config.sarvam_api_key,
             base_url=settings.sarvam_base_url,
@@ -717,5 +736,3 @@ async def run_twilio_media_session(
             if current_response is not None:
                 pending.append(current_response)
             await asyncio.gather(*pending, return_exceptions=True)
-            await _store_metrics(config, metrics)
-            await _finalize_inbound_call(config)

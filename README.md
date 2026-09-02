@@ -2,7 +2,7 @@
 
 An enterprise voice-agent workspace for building, governing, testing, and operating multilingual [Smallest.ai Atoms](https://docs.smallest.ai/voice-agents/developer-guide/get-started/build-with-a-coding-agent) agents.
 
-This repository combines a multi-tenant FastAPI control plane with a polished Next.js operator console. The Smallest.ai API key stays on the server; browsers receive only short-lived, single-use web-call tokens.
+This repository combines a multi-tenant FastAPI control plane with a polished Next.js operator console. Its preferred production phone lane is customer-owned e& SIP through LiveKit with direct Inworld STT, Router LLM, and TTS; the existing Sarvam/Twilio path remains available for controlled rollback.
 
 ## What is included
 
@@ -14,6 +14,7 @@ This repository combines a multi-tenant FastAPI control plane with a polished Ne
 - Conversation reporting with accessible transcript and AI-summary review
 - Expiring single-use workspace invitations, team roles/access, one-time API-key reveal, revocation, and tenant-scoped audit history
 - Authenticated encryption at rest for write-only integration credentials, safe secret replacement, HTTPS/SSRF validation, and tenant-isolated CRUD
+- A separately deployable LiveKit worker that keeps VAV knowledge, actions, transcripts, usage, and cost attribution in the VAV control plane while using direct Inworld APIs (not LiveKit Inference)
 - Reproducible PostgreSQL migrations, worker queue registration tests, hardened browser/API headers, Docker builds, and PostgreSQL-backed CI migration checks
 
 The complete target product is defined in [the world-class platform blueprint](docs/WORLD_CLASS_VOICE_AI_PLATFORM.md). It specifies the 14-module information architecture, provider-neutral data and service contracts, security and compliance gates, SLOs, UAE/India/WhatsApp differentiation, and the staged R0-R5 implementation plan.
@@ -71,12 +72,13 @@ npm run dev
 
 ## Railway deployment
 
-Deploy this isolated monorepo as five Railway services. For each GitHub service, select the production branch and set the root directory shown below in Railway's service settings:
+Deploy this isolated monorepo as six Railway services. For each GitHub service, select the production branch and set the root directory shown below in Railway's service settings:
 
 | Service | Source/root | Deployment settings | Public domain |
 | --- | --- | --- | --- |
 | `api` | GitHub, `/backend` | Dockerfile; pre-deploy `alembic upgrade head`; health check `/ready` | Yes |
 | `worker` | GitHub, `/backend` | Dockerfile; start `sh -c 'celery -A app.tasks.worker worker -B --loglevel=info --concurrency=${WORKER_CONCURRENCY:-2}'` (exactly one replica runs Beat) | No |
+| `livekit-agent` | GitHub, `/backend` | Dockerfile; start `python -m app.livekit_runtime.worker start`; health check `/`; at least one always-on replica | No |
 | `frontend` | GitHub, `/frontend` | Dockerfile; health check `/` | Yes |
 | `Postgres` | Railway database | Managed | No |
 | `Redis` | Railway database | Managed | No |
@@ -85,27 +87,39 @@ Set these service variables with Railway references where shown:
 
 | Service | Variable | Value |
 | --- | --- | --- |
-| API + worker | `DATABASE_URL` | `${{Postgres.DATABASE_URL}}` |
-| API + worker | `REDIS_URL` | `${{Redis.REDIS_URL}}` |
-| API + worker | `APP_ENV` | `production` |
-| API + worker | `CORS_ORIGINS` | `https://${{frontend.RAILWAY_PUBLIC_DOMAIN}}` |
-| API + worker | `BASE_URL` | `https://${{api.RAILWAY_PUBLIC_DOMAIN}}` |
-| API + worker | `TRUST_RAILWAY_PROXY_HEADERS` | `true` (uses Railway's edge-injected `X-Real-IP` for auth limits) |
+| API + worker + livekit-agent | `DATABASE_URL` | `${{Postgres.DATABASE_URL}}` |
+| API + worker + livekit-agent | `REDIS_URL` | `${{Redis.REDIS_URL}}` |
+| API + worker + livekit-agent | `APP_ENV` | `production` |
+| API + worker + livekit-agent | `CORS_ORIGINS` | `https://${{frontend.RAILWAY_PUBLIC_DOMAIN}}` |
+| API + worker + livekit-agent | `BASE_URL` | `https://${{api.RAILWAY_PUBLIC_DOMAIN}}` |
+| API + worker + livekit-agent | `TRUST_RAILWAY_PROXY_HEADERS` | `true` (uses Railway's edge-injected `X-Real-IP` for auth limits) |
 | Frontend | `NEXT_PUBLIC_API_URL` | `https://${{api.RAILWAY_PUBLIC_DOMAIN}}` (build-time destination for the same-origin `/api/v1/*` proxy; it is not exposed as the browser request origin) |
-| API + worker | `SECRET_KEY` | One identical generated, sealed production secret |
-| API + worker | `INTEGRATION_ENCRYPTION_KEY` | One identical generated, sealed value on both services |
-| API + worker | `REGISTRATION_MODE` | `bootstrap` for first launch or `invite_only`; production rejects `open` |
-| API + worker | `BOOTSTRAP_OWNER_EMAIL` | Valid designated owner email, required only for `bootstrap` and never returned publicly |
+| API + worker + livekit-agent | `SECRET_KEY` | One identical generated, sealed production secret |
+| API + worker + livekit-agent | `INTEGRATION_ENCRYPTION_KEY` | One identical generated, sealed value on all three services; the LiveKit worker needs it to decrypt workspace Inworld credentials |
+| API + worker + livekit-agent | `REGISTRATION_MODE` | `bootstrap` for first launch or `invite_only`; production rejects `open` |
+| API + worker + livekit-agent | `BOOTSTRAP_OWNER_EMAIL` | Valid designated owner email, required only for `bootstrap` and never returned publicly |
 | API | `LEGACY_SESSION_MIGRATION_ENABLED` | `false` by default; temporarily `true` only for the planned pre-cookie session rollout window |
-| API + worker | `SMALLEST_API_KEY` | A sealed Smallest.ai API key |
-| API + worker | `SMALLEST_WEBHOOK_SECRET` | One identical generated, sealed webhook signing secret |
-| API + worker | `SMALLEST_WEBHOOK_ID` | The Smallest.ai webhook ID whose signing secret is configured above |
+| API + worker + livekit-agent | `SMALLEST_API_KEY` | A sealed Smallest.ai API key; currently part of the shared production startup gate even though the LiveKit lane does not call Smallest |
+| API + worker + livekit-agent | `SMALLEST_WEBHOOK_SECRET` | One identical generated, sealed webhook signing secret |
+| API + worker + livekit-agent | `SMALLEST_WEBHOOK_ID` | The Smallest.ai webhook ID whose signing secret is configured above |
 | API + worker | `SARVAM_API_KEY` | Optional platform fallback for VAV realtime transcription and Sarvam speech |
 | API + worker | `ELEVENLABS_API_KEY` | Optional platform fallback for ElevenLabs speech output only |
 | API + worker | `OPENAI_API_KEY` | Optional platform fallback for VAV conversation generation |
+| API + livekit-agent | `INWORLD_API_KEY` | Optional platform fallback; prefer an encrypted workspace key in Settings |
+| API + livekit-agent | `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET` | One shared LiveKit project; must match the project recorded in Settings |
+| API + livekit-agent | `LIVEKIT_AGENT_NAME` | `vav-inworld`; must match the SIP dispatch rule |
+| livekit-agent | `LIVEKIT_NUM_IDLE_PROCESSES` | `1` initially; raise only after memory/load testing (VAV validates 1-16) |
+| API | `LIVEKIT_WORKER_HEALTH_URL` | `http://${{livekit-agent.RAILWAY_PRIVATE_DOMAIN}}:${{livekit-agent.PORT}}`; required for activation and never browser-exposed |
+| livekit-agent | `LIVEKIT_LOG_LEVEL` | `info` for production registration and dispatch evidence |
 | API | `MAX_REQUEST_BODY_BYTES` | `8388608` (8 MiB app-wide ceiling; provider webhooks retain their tighter 2 MiB limit) |
 
-Railway deprecated Config as Code for new services, so configure these settings in the dashboard instead of relying on `railway.toml`. The API migration must run before traffic switches, both web services use Railway's dynamic `PORT`, and the frontend build embeds the API's public HTTPS URL only as its fixed server-side rewrite destination. Browser requests remain on the frontend origin at `/api/v1/*`, keeping the refresh cookie first-party even when privacy controls block third-party cookies. Generate public Railway domains for `api` and `frontend`, then configure the Smallest.ai webhook as `https://YOUR_API_DOMAIN/api/v1/webhooks/smallest`.
+The LiveKit worker imports the same production settings object as the API and Celery worker. Its shared variables are therefore a startup contract, not optional duplication. Railway injects `PORT`; the worker binds LiveKit Agents' built-in health server to that port. Set its health path to `/`, do not create a public domain, and do not override `PORT`. Configure `LIVEKIT_WORKER_HEALTH_URL` on the API with the worker's Railway private origin and actual port, without a path. VAV checks both `/` (LiveKit connection health) and `/worker` (registered agent name/type) before activation. The URL must never use a public domain or a `NEXT_PUBLIC_*` variable.
+
+Railway deprecated Config as Code for new services. A repository-level `railway.toml` would also be shared by the existing API, Celery, frontend and agent services and could overwrite their different start commands, so this repository intentionally does not include one. Configure `livekit-agent` explicitly in the Railway dashboard: GitHub source, the same production branch as API, root `/backend`, Dockerfile builder, start `python -m app.livekit_runtime.worker start`, health `/`, one always-on replica, and no public domain.
+
+The API migration must run before traffic switches, both web services use Railway's dynamic `PORT`, and the frontend build embeds the API's public HTTPS URL only as its fixed server-side rewrite destination. Browser requests remain on the frontend origin at `/api/v1/*`, keeping the refresh cookie first-party even when privacy controls block third-party cookies. Generate public Railway domains for `api` and `frontend`, then configure the Smallest.ai webhook as `https://YOUR_API_DOMAIN/api/v1/webhooks/smallest`.
+
+After deploying the agent service, require all three checks before enabling a LiveKit runtime: Railway reports the deployment `SUCCESS`; `railway logs -s livekit-agent -e production --lines 100 --filter "registered worker"` includes `agent_name=vav-inworld`; and VAV **Test readiness** verifies the exact LiveKit project, trunk, dispatch rule, assigned DIDs, and live private worker registration. A running container or a saved agent name without a successful live probe is not ready for calls.
 
 Use `/health` only as the inexpensive process-liveness probe. Railway must use
 `/ready`: it returns `200` only when PostgreSQL is reachable and its
@@ -123,6 +137,8 @@ registration restrictions, or production startup validation. Keep the explicit
 verification are fixed to `HS256`; any other `ALGORITHM` value aborts startup.
 
 Production settings are a startup gate, not a warning: the API and worker refuse to boot with default/short secrets, open public registration, a missing bootstrap owner when bootstrap mode is selected, a missing dedicated integration key, local or non-HTTPS origins, a missing Smallest credential/webhook secret, or a partial Twilio credential pair.
+
+The LiveKit/Inworld deployment and e& SIP acceptance procedure is documented in [LiveKit + Inworld production runtime](docs/LIVEKIT_INWORLD_RUNTIME.md).
 
 For a new production database, set `REGISTRATION_MODE=bootstrap` and set
 `BOOTSTRAP_OWNER_EMAIL` to the designated initial owner. The register endpoint

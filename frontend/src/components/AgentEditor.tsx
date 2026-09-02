@@ -67,6 +67,7 @@ const fallbackLanguages: LanguageCatalogItem[] = [
 function voiceProviderName(provider: string) {
   if (provider === 'sarvam') return 'Sarvam AI';
   if (provider === 'elevenlabs') return 'ElevenLabs';
+  if (provider === 'inworld') return 'Inworld AI';
   return 'Smallest.ai';
 }
 
@@ -181,7 +182,7 @@ export default function AgentEditor({
       supported_languages: ['en'],
       language_switching_enabled: false,
       language_switching_mode: 'disabled',
-      speech_rate: provider === 'sarvam' ? 0.95 : provider === 'elevenlabs' ? 1 : current.speech_rate,
+      speech_rate: provider === 'sarvam' ? 0.95 : provider === 'elevenlabs' || provider === 'inworld' ? 1 : current.speech_rate,
     }));
     setVoiceNotice(`Voice and language selections were reset for the ${voiceProviderName(provider)} catalog.`);
   };
@@ -324,8 +325,9 @@ export default function AgentEditor({
             <option value="smallest" disabled={!availableProviders.includes('smallest')}>Smallest.ai · Lightning{availableProviders.includes('smallest') ? '' : ' · unavailable'}</option>
             <option value="sarvam" disabled={!availableProviders.includes('sarvam')}>Sarvam AI · Bulbul v3 Indian voices{availableProviders.includes('sarvam') ? '' : ' · connect in Settings'}</option>
             <option value="elevenlabs" disabled={!availableProviders.includes('elevenlabs')}>ElevenLabs · Flash v2.5 voices{availableProviders.includes('elevenlabs') ? '' : providerStatus?.providers?.elevenlabs?.configured ? ' · voice catalog unavailable' : ' · connect in Settings'}</option>
+            <option value="inworld" disabled={!availableProviders.includes('inworld')}>Inworld · TTS 2 voices{availableProviders.includes('inworld') ? '' : providerStatus?.providers?.inworld?.configured ? ' · voice catalog unavailable' : ' · connect in Settings'}</option>
           </select>
-          <p className="form-hint">Smallest agents publish to Atoms. Sarvam and ElevenLabs voices use VAV realtime, VAV knowledge, and OpenAI behavior. Unavailable providers show the corrective action instead of disappearing.</p>
+          <p className="form-hint">Smallest agents publish to Atoms. Sarvam and ElevenLabs use VAV realtime with VAV knowledge and OpenAI behavior. Inworld uses the VAV LiveKit SIP lane with direct Inworld speech and routing. Unavailable providers show the corrective action instead of disappearing.</p>
         </div>
         <div className="form-group language-primary">
           <label htmlFor={primaryLanguageId}>Primary language</label>
@@ -432,7 +434,7 @@ export default function AgentEditor({
           {form.voice_provider !== 'smallest' ? (
             <div className="form-group">
               <label htmlFor={modelId}>Live phone runtime</label>
-              <input id={modelId} value={form.voice_provider === 'elevenlabs' ? 'ElevenLabs Flash v2.5 + Sarvam STT + OpenAI' : 'Sarvam Bulbul v3 + OpenAI'} readOnly aria-readonly="true" />
+              <input id={modelId} value={form.voice_provider === 'inworld' ? 'LiveKit SIP + direct Inworld STT, Router, and TTS' : form.voice_provider === 'elevenlabs' ? 'ElevenLabs Flash v2.5 + Sarvam STT + OpenAI' : 'Sarvam Bulbul v3 + OpenAI'} readOnly aria-readonly="true" />
               <p className="form-hint">VAV keeps the agent prompt and knowledge retrieval; only speech output changes with the selected voice provider.</p>
             </div>
           ) : (
@@ -450,9 +452,10 @@ export default function AgentEditor({
           )}
           <div className="form-group range-control">
             <label htmlFor={speechRateId}>Speech rate <span>{form.speech_rate.toFixed(2)}×</span></label>
-            <input id={speechRateId} type="range" min={form.voice_provider === 'elevenlabs' ? 0.7 : 0.5} max={form.voice_provider === 'elevenlabs' ? 1.2 : 2} step="0.05" value={form.speech_rate} onChange={(event) => setForm({ ...form, speech_rate: Number(event.target.value) })} />
+            <input id={speechRateId} type="range" min={['elevenlabs', 'inworld'].includes(form.voice_provider) ? 0.7 : 0.5} max={['elevenlabs', 'inworld'].includes(form.voice_provider) ? 1.2 : 2} step="0.05" value={form.speech_rate} onChange={(event) => setForm({ ...form, speech_rate: Number(event.target.value) })} />
             {form.voice_provider === 'sarvam' && <p className="form-hint">For medical support, 0.95× gives callers the clearest balance of pace and natural delivery.</p>}
             {form.voice_provider === 'elevenlabs' && <p className="form-hint">Start at 1.00×. VAV streams ElevenLabs μ-law audio directly to Twilio without transcoding.</p>}
+            {form.voice_provider === 'inworld' && <p className="form-hint">Start at 1.00×. Tune only after a recorded en-GB, ar-AE, and hi-IN test-call scorecard.</p>}
           </div>
         </div>
       </section>

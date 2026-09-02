@@ -35,7 +35,12 @@ from app.services.compliance_policy import (
 from app.services.phone_numbers import is_number_on_tenant_dnc, tenant_phone_dnc_lock
 from app.services.provider_credentials import load_provider_config
 from app.services.recordings import RecordingError, fetch_call_recording
+from app.services.usage_ledger import (
+    lock_agent_runtime_limits,
+    monthly_agent_budget_commitment,
+)
 from app.telephony.base import CallRequest
+from app.telephony.livekit_provider import LiveKitSIPError, LiveKitSIPProvider
 from app.telephony.twilio_provider import get_telephony_provider
 
 router = APIRouter(prefix="/calls", tags=["Calls"])
@@ -487,7 +492,7 @@ async def initiate_outbound_call(
         raise HTTPException(status_code=404, detail="Agent not found")
     if not agent.is_active:
         raise HTTPException(status_code=409, detail="Agent is inactive")
-    if agent.voice_provider not in {"smallest", "sarvam", "elevenlabs", "twilio"}:
+    if agent.voice_provider not in {"smallest", "sarvam", "elevenlabs", "inworld", "twilio"}:
         raise HTTPException(status_code=422, detail="Agent voice provider is not supported")
 
     if await is_number_on_tenant_dnc(db, current_user.tenant_id, data.to_number):
@@ -502,19 +507,25 @@ async def initiate_outbound_call(
         )
 
     is_smallest = agent.voice_provider == "smallest"
+    is_inworld = agent.voice_provider == "inworld"
     smallest_config = (
         await load_provider_config(db, current_user.tenant_id, "smallest") if is_smallest else None
     )
     twilio_config = (
         await load_provider_config(db, current_user.tenant_id, "twilio")
-        if not is_smallest
+        if not is_smallest and not is_inworld
+        else None
+    )
+    sip_config = (
+        await load_provider_config(db, current_user.tenant_id, "livekit_sip")
+        if is_inworld
         else None
     )
     twilio_default_from_number = str(
         (twilio_config or {}).get("default_from_number") or settings.twilio_default_from_number
     ).strip()
     runtime_profile = None
-    if agent.voice_provider in {"sarvam", "elevenlabs"}:
+    if agent.voice_provider in {"sarvam", "elevenlabs", "inworld"}:
         runtime_profile = await db.scalar(
             select(AgentRuntimeProfile).where(
                 AgentRuntimeProfile.agent_id == agent.id,
@@ -531,14 +542,25 @@ async def initiate_outbound_call(
                 status_code=409,
                 detail="Activate and pass the VAV runtime readiness test before placing a call",
             )
-        if runtime_profile.telephony_provider != "twilio":
+        expected_telephony = "livekit_sip" if is_inworld else "twilio"
+        if runtime_profile.telephony_provider != expected_telephony:
             raise HTTPException(
                 status_code=409,
-                detail="Outbound LiveKit SIP dispatch requires the provisioned SIP edge",
+                detail=f"Outbound dispatch requires the active {expected_telephony} runtime",
+            )
+        if is_inworld and not (sip_config or {}).get("outbound_trunk_id"):
+            raise HTTPException(
+                status_code=409,
+                detail="Record a verified LiveKit outbound trunk ID before placing outbound calls",
             )
         now = datetime.now(UTC)
         day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         month_start = day_start.replace(day=1)
+        await lock_agent_runtime_limits(
+            db,
+            tenant_id=current_user.tenant_id,
+            agent_id=agent.id,
+        )
         daily_calls = await db.scalar(
             select(func.count())
             .select_from(Call)
@@ -557,12 +579,13 @@ async def initiate_outbound_call(
                 Call.status.notin_(TERMINAL_CALL_STATUSES),
             )
         )
-        monthly_cost = await db.scalar(
-            select(func.coalesce(func.sum(Call.cost_cents), 0)).where(
-                Call.tenant_id == current_user.tenant_id,
-                Call.agent_id == agent.id,
-                Call.created_at >= month_start,
-            )
+        monthly_budget = await monthly_agent_budget_commitment(
+            db,
+            tenant_id=current_user.tenant_id,
+            agent_id=agent.id,
+            month_start=month_start,
+            max_call_duration_seconds=agent.max_call_duration_seconds,
+            include_prospective_call=True,
         )
         if int(daily_calls or 0) >= runtime_profile.daily_call_limit:
             raise HTTPException(status_code=429, detail="Agent daily call limit has been reached")
@@ -571,7 +594,16 @@ async def initiate_outbound_call(
                 status_code=429,
                 detail="Agent concurrent call limit has been reached",
             )
-        if int(monthly_cost or 0) >= runtime_profile.monthly_budget_cents:
+        if monthly_budget.total_cents > runtime_profile.monthly_budget_cents:
+            logger.info(
+                "agent_monthly_budget_blocked",
+                tenant_id=str(current_user.tenant_id),
+                agent_id=str(agent.id),
+                budget_cents=runtime_profile.monthly_budget_cents,
+                ledger_cents=monthly_budget.ledger_cents,
+                unprocessed_reservation_cents=monthly_budget.unprocessed_reservation_cents,
+                prospective_reservation_cents=monthly_budget.prospective_reservation_cents,
+            )
             raise HTTPException(
                 status_code=402,
                 detail="Agent monthly call budget has been reached",
@@ -634,12 +666,24 @@ async def initiate_outbound_call(
         status="dispatching",
         from_number=from_number,
         to_number=data.to_number,
-        provider="smallest" if is_smallest else "twilio",
+        provider="smallest" if is_smallest else "livekit_sip" if is_inworld else "twilio",
         call_metadata={
             "request": request_identity,
             "agent_configuration": agent_configuration_snapshot(agent),
             "runtime_profile_id": str(runtime_profile.id) if runtime_profile else None,
             "speech_provider": agent.voice_provider,
+            "runtime": (
+                {
+                    "transport": "livekit_sip",
+                    "speech_provider": "inworld",
+                    "llm_provider": "inworld",
+                    "llm_model": runtime_profile.llm_model,
+                    "tts_model": "inworld-tts-2",
+                    "recording_enabled": False,
+                }
+                if is_inworld and runtime_profile
+                else {}
+            ),
         },
     )
     db.add(call)
@@ -686,6 +730,7 @@ async def initiate_outbound_call(
     provider_call_sid: str | None = None
     dispatch_error: Exception | None = None
     dispatch_is_ambiguous = True
+    dispatch_terminal_status: str | None = None
     async with tenant_phone_dnc_lock(db, current_user.tenant_id, data.to_number):
         # This check and provider invocation share the same tenant+number lock
         # as DNC POST/DELETE, closing the final check-to-call race across API
@@ -720,7 +765,7 @@ async def initiate_outbound_call(
             )
         ).scalar_one_or_none()
         current_runtime_profile = None
-        if current_agent and current_agent.voice_provider in {"sarvam", "elevenlabs"}:
+        if current_agent and current_agent.voice_provider in {"sarvam", "elevenlabs", "inworld"}:
             current_runtime_profile = await db.scalar(
                 select(AgentRuntimeProfile)
                 .where(
@@ -767,12 +812,13 @@ async def initiate_outbound_call(
         )
         runtime_not_ready = bool(
             current_agent
-            and current_agent.voice_provider in {"sarvam", "elevenlabs"}
+            and current_agent.voice_provider in {"sarvam", "elevenlabs", "inworld"}
             and (
                 current_runtime_profile is None
                 or not current_runtime_profile.enabled
                 or current_runtime_profile.status != "active"
-                or current_runtime_profile.telephony_provider != "twilio"
+                or current_runtime_profile.telephony_provider
+                != ("livekit_sip" if current_agent.voice_provider == "inworld" else "twilio")
                 or current_runtime_profile.primary_speech_provider != current_agent.voice_provider
             )
         )
@@ -810,6 +856,27 @@ async def initiate_outbound_call(
                     variables={**data.context, "_vav_call_id": str(call.id)},
                     version_id=current_agent.provider_revision_id,
                 )
+            elif is_inworld:
+                livekit_result = await LiveKitSIPProvider(
+                    url=settings.livekit_url,
+                    api_key=settings.livekit_api_key,
+                    api_secret=settings.livekit_api_secret,
+                ).make_call(
+                    call_id=call.id,
+                    agent_id=current_agent.id,
+                    to_number=data.to_number,
+                    from_number=from_number,
+                    outbound_trunk_id=str((sip_config or {}).get("outbound_trunk_id")),
+                    agent_name=str(
+                        (sip_config or {}).get("agent_name") or settings.livekit_agent_name
+                    ),
+                    max_call_duration_seconds=current_agent.max_call_duration_seconds,
+                )
+                provider_call_sid = livekit_result.provider_call_sid
+                call.call_metadata = {
+                    **(call.call_metadata or {}),
+                    "livekit_room": livekit_result.room_name,
+                }
             else:
                 provider = (
                     get_telephony_provider(
@@ -835,6 +902,10 @@ async def initiate_outbound_call(
         except SmallestAIError as exc:
             dispatch_error = exc
             dispatch_is_ambiguous = exc.ambiguous
+        except LiveKitSIPError as exc:
+            dispatch_error = exc
+            dispatch_is_ambiguous = exc.ambiguous
+            dispatch_terminal_status = exc.terminal_status
         except Exception as exc:
             dispatch_error = exc
         await db.commit()
@@ -864,7 +935,9 @@ async def initiate_outbound_call(
     elif dispatch_error is not None and current_call.status == "dispatching":
         # Transport/timeout/5xx failures are ambiguous because the provider may
         # already have accepted the call. A provider 4xx response is definitive.
-        current_call.status = "dispatch_unknown" if dispatch_is_ambiguous else "failed"
+        current_call.status = (
+            "dispatch_unknown" if dispatch_is_ambiguous else dispatch_terminal_status or "failed"
+        )
         current_call.call_metadata = {
             **(current_call.call_metadata or {}),
             "dispatch_error": type(dispatch_error).__name__,

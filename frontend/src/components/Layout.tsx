@@ -317,8 +317,8 @@ export default function Layout({ children }: { children: ReactNode }) {
         </nav>
 
         <div className="sidebar-footer">
-          <div className="provider-pill"><span className="status-dot" aria-hidden="true" /> Smallest.ai native</div>
-          <p>Powered by Atoms, Pulse & Lightning</p>
+          <div className="provider-pill"><span className="status-dot" aria-hidden="true" /> Multi-provider runtime</div>
+          <p>VAV orchestration, knowledge & governance</p>
         </div>
       </aside>
 

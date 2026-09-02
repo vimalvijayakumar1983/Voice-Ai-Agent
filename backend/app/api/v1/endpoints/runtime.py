@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from urllib.parse import urlsplit
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -19,7 +20,9 @@ from app.models.agent import (
     KnowledgeBase,
     KnowledgeSource,
 )
+from app.models.provider_credential import ProviderCredential
 from app.providers.elevenlabs import ElevenLabsClient, ElevenLabsError
+from app.providers.inworld import INWORLD_TTS_MODEL, InworldClient, InworldError
 from app.schemas.runtime import (
     ApiKeyCredentialRequest,
     RuntimeProfileResponse,
@@ -32,18 +35,59 @@ from app.schemas.runtime import (
     WorkspaceCredentialStatuses,
 )
 from app.services.audit import record_audit_event
+from app.services.integration_security import (
+    IntegrationConfigUnavailableError,
+    decrypt_integration_config,
+)
 from app.services.provider_credentials import (
     ProviderCredentialError,
     get_provider_credential,
     load_provider_config,
     store_provider_config,
 )
+from app.telephony.livekit_provider import LiveKitSIPError, LiveKitSIPProvider
 
 router = APIRouter(prefix="/runtime", tags=["Realtime Runtime"])
 
 
 def _speech_provider_name(provider: str) -> str:
-    return "ElevenLabs" if provider == "elevenlabs" else "Sarvam AI"
+    return {
+        "elevenlabs": "ElevenLabs",
+        "inworld": "Inworld",
+        "sarvam": "Sarvam AI",
+    }.get(provider, provider.title())
+
+
+def _runtime_provider_blocker(
+    agent: Agent,
+    profile: AgentRuntimeProfile | None,
+) -> str | None:
+    """Reject route combinations the deployed runtime does not implement."""
+    if profile is None:
+        return "Save a supported runtime provider route before testing readiness."
+    if agent.voice_provider == "inworld":
+        if (
+            profile.telephony_provider != "livekit_sip"
+            or profile.primary_speech_provider != "inworld"
+            or profile.llm_provider != "inworld"
+        ):
+            return (
+                "Inworld agents require LiveKit SIP telephony, Inworld speech, "
+                "and the Inworld Router LLM."
+            )
+        return None
+    if agent.voice_provider in {"sarvam", "elevenlabs"}:
+        if (
+            profile.telephony_provider != "twilio"
+            or profile.primary_speech_provider != agent.voice_provider
+            or profile.llm_provider != "openai"
+        ):
+            return (
+                f"{_speech_provider_name(agent.voice_provider)} agents require Twilio telephony, "
+                f"{_speech_provider_name(agent.voice_provider)} speech, and the OpenAI LLM."
+            )
+        return None
+    return "Select Inworld, Sarvam, or ElevenLabs before configuring a VAV realtime runtime."
 
 
 async def _agent(db: AsyncSession, tenant_id: UUID, agent_id: UUID) -> Agent:
@@ -146,6 +190,13 @@ async def runtime_readiness(
         or settings.elevenlabs_api_key.strip()
     )
     try:
+        inworld_config = await load_provider_config(db, agent.tenant_id, "inworld")
+    except ProviderCredentialError:
+        inworld_config = None
+    inworld_ready = bool(
+        (inworld_config and inworld_config.get("api_key")) or settings.inworld_api_key.strip()
+    )
+    try:
         openai_config = await load_provider_config(db, agent.tenant_id, "openai")
     except ProviderCredentialError:
         openai_config = None
@@ -159,7 +210,9 @@ async def runtime_readiness(
             AgentKnowledgeBinding.tenant_id == agent.tenant_id,
         )
     )
-    knowledge_ready = True
+    # The production Inworld lane is intended for governed customer-facing
+    # agents, so it fails closed unless approved searchable knowledge is bound.
+    knowledge_ready = not (profile and profile.primary_speech_provider == "inworld")
     if knowledge_binding is not None:
         bound_knowledge = await db.scalar(
             select(KnowledgeBase).where(
@@ -188,25 +241,39 @@ async def runtime_readiness(
 
     number_route_conflicts = await _number_route_conflicts(db, agent, profile)
 
-    vav_speech_agent = agent.voice_provider in {"sarvam", "elevenlabs"}
-    tts_ready = sarvam_ready if agent.voice_provider == "sarvam" else elevenlabs_ready
+    vav_speech_agent = agent.voice_provider in {"sarvam", "elevenlabs", "inworld"}
+    tts_ready = {
+        "sarvam": sarvam_ready,
+        "elevenlabs": elevenlabs_ready,
+        "inworld": inworld_ready,
+    }.get(agent.voice_provider, False)
+    stt_ready = (
+        inworld_ready if profile and profile.primary_speech_provider == "inworld" else sarvam_ready
+    )
+    llm_ready = (
+        inworld_ready
+        if profile and profile.llm_provider == "inworld"
+        else bool(
+            (openai_config and openai_config.get("api_key")) or settings.openai_api_key.strip()
+        )
+    )
     voice_ready = bool(
         agent.voice_id
         and vav_speech_agent
         and agent.voice_id.startswith(f"{agent.voice_provider}:")
     )
+    provider_compatibility_blocker = _runtime_provider_blocker(agent, profile)
     checks = {
         "agent_active": bool(agent.is_active),
         "vav_speech_agent": vav_speech_agent,
-        "stt_credential": sarvam_ready,
+        "provider_compatibility": provider_compatibility_blocker is None,
+        "stt_credential": stt_ready,
         "tts_credential": tts_ready,
         "voice_selection": voice_ready,
         "speech_provider_match": bool(
             profile and vav_speech_agent and profile.primary_speech_provider == agent.voice_provider
         ),
-        "openai_credential": bool(
-            (openai_config and openai_config.get("api_key")) or settings.openai_api_key.strip()
-        ),
+        "llm_credential": llm_ready,
         "public_runtime_url": settings.base_url.startswith("https://"),
         "telephony_credential": False,
         "number_assigned": bool(profile and profile.assigned_numbers),
@@ -226,18 +293,32 @@ async def runtime_readiness(
         checks["telephony_credential"] = bool(
             sip
             and sip.get("sip_uri")
-            and sip.get("livekit_url")
-            and sip.get("livekit_api_key")
-            and sip.get("livekit_api_secret")
+            and settings.livekit_url
+            and settings.livekit_api_key
+            and settings.livekit_api_secret
         )
         # Credentials alone don't create a public SIP/RTP edge. This flag is
         # set only by the infrastructure provisioner after trunk and dispatch
         # rules are verified outside the Railway web service.
-        checks["sip_gateway_provisioned"] = bool(sip and sip.get("gateway_provisioned"))
+        checks["sip_gateway_provisioned"] = bool(
+            sip and sip.get("inbound_trunk_id") and sip.get("dispatch_rule_id")
+        )
+        checks["livekit_agent_registered"] = bool(
+            sip and sip.get("agent_name") and sip.get("agent_name") == settings.livekit_agent_name
+        )
+        checks["livekit_worker_environment"] = bool(
+            settings.livekit_url and settings.livekit_api_key and settings.livekit_api_secret
+        )
+        worker_health = urlsplit(settings.livekit_worker_health_url.strip())
+        checks["livekit_worker_health_configured"] = bool(
+            worker_health.scheme in {"http", "https"} and worker_health.netloc
+        )
     labels = {
         "agent_active": "Activate the agent configuration.",
-        "vav_speech_agent": "Select Sarvam or ElevenLabs as this agent's voice provider.",
-        "stt_credential": "Add a valid Sarvam API key in Settings for live transcription.",
+        "vav_speech_agent": "Select Inworld, Sarvam, or ElevenLabs as this agent's voice provider.",
+        "provider_compatibility": provider_compatibility_blocker
+        or "Save a supported runtime provider route.",
+        "stt_credential": "Add a valid API key for the selected transcription provider.",
         "tts_credential": (
             f"Add a valid {_speech_provider_name(agent.voice_provider)} API key in Settings "
             "for speech output."
@@ -246,7 +327,7 @@ async def runtime_readiness(
         "speech_provider_match": (
             "Save the runtime so its primary speech provider matches the agent voice provider."
         ),
-        "openai_credential": "Add an OpenAI API key in Settings.",
+        "llm_credential": "Add a valid API key for the selected LLM route.",
         "public_runtime_url": "Configure BASE_URL as the public HTTPS API origin.",
         "telephony_credential": "Add credentials for the selected telephony provider in Settings.",
         "number_assigned": "Assign at least one E.164 phone number to the runtime.",
@@ -257,7 +338,18 @@ async def runtime_readiness(
             "Repair the bound knowledge base so every source has searchable text."
         ),
         "sip_gateway_provisioned": (
-            "Provision and verify the external LiveKit SIP/RTP gateway for the Etisalat trunk."
+            "Enter the verified LiveKit inbound trunk and dispatch-rule IDs for the e& SIP trunk."
+        ),
+        "livekit_agent_registered": (
+            f"Set the LiveKit dispatch agent name to {settings.livekit_agent_name}."
+        ),
+        "livekit_worker_environment": (
+            "Configure server-only LIVEKIT_URL, LIVEKIT_API_KEY, and LIVEKIT_API_SECRET "
+            "on the API and LiveKit worker."
+        ),
+        "livekit_worker_health_configured": (
+            "Configure LIVEKIT_WORKER_HEALTH_URL on the API with the LiveKit worker's "
+            "private HTTP origin."
         ),
     }
     return [labels[name] for name, passed in checks.items() if not passed], checks
@@ -268,29 +360,120 @@ async def live_runtime_readiness(
     agent: Agent,
     profile: AgentRuntimeProfile | None,
 ) -> tuple[list[str], dict[str, bool]]:
-    """Run normal gates plus a real, low-cost synthesis probe where supported."""
+    """Run normal gates plus explicit, tightly bounded live provider probes."""
     blockers, checks = await runtime_readiness(db, agent, profile)
-    if agent.voice_provider != "elevenlabs":
+    if profile and profile.telephony_provider == "livekit_sip":
+        checks["sip_route_live"] = False
+        checks["livekit_worker_live"] = False
+        try:
+            sip = await load_provider_config(db, agent.tenant_id, "livekit_sip")
+        except ProviderCredentialError:
+            sip = None
+        if all(
+            checks.get(name)
+            for name in (
+                "telephony_credential",
+                "sip_gateway_provisioned",
+                "livekit_agent_registered",
+                "livekit_worker_environment",
+            )
+        ):
+            try:
+                await LiveKitSIPProvider(
+                    url=settings.livekit_url,
+                    api_key=settings.livekit_api_key,
+                    api_secret=settings.livekit_api_secret,
+                ).verify_route(
+                    inbound_trunk_id=str((sip or {}).get("inbound_trunk_id")),
+                    dispatch_rule_id=str((sip or {}).get("dispatch_rule_id")),
+                    outbound_trunk_id=str((sip or {}).get("outbound_trunk_id") or "") or None,
+                    sip_uri=str((sip or {}).get("sip_uri") or ""),
+                    agent_name=str((sip or {}).get("agent_name")),
+                    assigned_numbers=list(profile.assigned_numbers or []),
+                )
+            except LiveKitSIPError as exc:
+                blockers.append(f"LiveKit SIP route validation failed: {exc}")
+            else:
+                checks["sip_route_live"] = True
+        else:
+            blockers.append(
+                "LiveKit SIP route cannot be tested until its configuration gates pass."
+            )
+        if all(
+            checks.get(name)
+            for name in (
+                "livekit_agent_registered",
+                "livekit_worker_environment",
+                "livekit_worker_health_configured",
+            )
+        ):
+            try:
+                await LiveKitSIPProvider(
+                    url=settings.livekit_url,
+                    api_key=settings.livekit_api_key,
+                    api_secret=settings.livekit_api_secret,
+                ).verify_worker(
+                    health_url=settings.livekit_worker_health_url,
+                    agent_name=str((sip or {}).get("agent_name")),
+                )
+            except LiveKitSIPError as exc:
+                blockers.append(f"LiveKit worker validation failed: {exc}")
+            else:
+                checks["livekit_worker_live"] = True
+        else:
+            blockers.append("LiveKit worker cannot be tested until its configuration gates pass.")
+    if agent.voice_provider not in {"elevenlabs", "inworld"}:
         return blockers, checks
 
     checks["tts_provider_live"] = False
+    provider = agent.voice_provider
+    if provider == "inworld":
+        checks["llm_provider_live"] = False
     if not checks.get("tts_credential") or not checks.get("voice_selection"):
         return blockers, checks
+    if provider == "inworld" and not all(
+        checks.get(name) for name in ("provider_compatibility", "llm_credential")
+    ):
+        return blockers, checks
     try:
-        config = await load_provider_config(db, agent.tenant_id, "elevenlabs")
+        config = await load_provider_config(db, agent.tenant_id, provider)
     except ProviderCredentialError:
         config = None
-    api_key = str((config or {}).get("api_key") or settings.elevenlabs_api_key).strip()
-    try:
-        await ElevenLabsClient(api_key=api_key).synthesize_voice_preview(
-            voice_id=agent.voice_id.removeprefix("elevenlabs:"),
-            language=agent.language,
-            speed=agent.speech_rate,
-        )
-    except ElevenLabsError as exc:
-        blockers.append(f"ElevenLabs live synthesis failed: {exc}")
+    platform_key = (
+        settings.elevenlabs_api_key if provider == "elevenlabs" else settings.inworld_api_key
+    )
+    api_key = str((config or {}).get("api_key") or platform_key).strip()
+    if provider == "elevenlabs":
+        try:
+            await ElevenLabsClient(api_key=api_key).synthesize_voice_preview(
+                voice_id=agent.voice_id.removeprefix("elevenlabs:"),
+                language=agent.language,
+                speed=agent.speech_rate,
+            )
+        except ElevenLabsError as exc:
+            blockers.append(f"ElevenLabs live synthesis failed: {exc}")
+            return blockers, checks
+        checks["tts_provider_live"] = True
         return blockers, checks
-    checks["tts_provider_live"] = True
+
+    inworld = InworldClient(api_key=api_key)
+    try:
+        await inworld.synthesize_readiness_probe(
+            voice_id=agent.voice_id.removeprefix("inworld:"),
+            model_id=INWORLD_TTS_MODEL,
+        )
+    except InworldError as exc:
+        blockers.append(f"Inworld live TTS synthesis failed: {exc}")
+    else:
+        checks["tts_provider_live"] = True
+
+    assert profile is not None
+    try:
+        await inworld.router_readiness_probe(model_id=profile.llm_model)
+    except InworldError as exc:
+        blockers.append(f"Inworld Router live completion failed: {exc}")
+    else:
+        checks["llm_provider_live"] = True
     return blockers, checks
 
 
@@ -300,13 +483,15 @@ def _response(
     blockers: list[str],
 ) -> RuntimeProfileResponse:
     values = {
-        "telephony_provider": "twilio",
+        "telephony_provider": "livekit_sip" if agent.voice_provider == "inworld" else "twilio",
         "primary_speech_provider": (
-            agent.voice_provider if agent.voice_provider in {"sarvam", "elevenlabs"} else "sarvam"
+            agent.voice_provider
+            if agent.voice_provider in {"sarvam", "elevenlabs", "inworld"}
+            else "sarvam"
         ),
         "fallback_speech_provider": None,
-        "llm_provider": "openai",
-        "llm_model": "gpt-4o-mini",
+        "llm_provider": "inworld" if agent.voice_provider == "inworld" else "openai",
+        "llm_model": "auto" if agent.voice_provider == "inworld" else "gpt-4o-mini",
         "stt_language": "auto",
         "max_concurrent_calls": 1,
         "daily_call_limit": 100,
@@ -320,7 +505,10 @@ def _response(
         agent_id=agent.id,
         enabled=bool(profile and profile.enabled),
         status=profile.status if profile else "draft",
-        ready=not blockers,
+        # A live provider/SIP probe can fail even when static configuration is
+        # complete. Keep that profile blocked until the operator reruns Test
+        # readiness successfully or activation itself passes every live gate.
+        ready=not blockers and not bool(profile and profile.status == "blocked"),
         blockers=blockers,
         last_tested_at=profile.last_tested_at if profile else None,
         created_at=profile.created_at if profile else None,
@@ -369,6 +557,9 @@ async def update_runtime_profile(
     assert profile is not None
     for key, value in data.model_dump().items():
         setattr(profile, key, value)
+    provider_compatibility_blocker = _runtime_provider_blocker(agent, profile)
+    if provider_compatibility_blocker:
+        raise HTTPException(status_code=422, detail=provider_compatibility_blocker)
     profile.enabled = False
     profile.status = "draft"
     await record_audit_event(
@@ -401,10 +592,12 @@ async def test_runtime_profile(
     tested_at = datetime.now(UTC)
     profile.last_tested_at = tested_at
     if blockers:
-        # A failed production readiness check must fail closed. Keeping enabled
-        # while changing only the status leaves the control plane inconsistent.
-        profile.enabled = False
-        profile.status = "blocked"
+        # A readiness test is observational for a route that is already live.
+        # Transient provider/API failures must be visible, but an ordinary test
+        # must never silently remove an active inbound route. Activation still
+        # fails closed, and administrators can deactivate explicitly.
+        if not profile.enabled:
+            profile.status = "blocked"
     else:
         # Testing an already-active runtime is observational; it must not demote
         # the profile to "ready" and silently remove it from inbound routing.
@@ -442,6 +635,19 @@ async def activate_runtime_profile(
     if blockers:
         profile.enabled = False
         profile.status = "blocked"
+        await record_audit_event(
+            db,
+            tenant_id=current_user.tenant_id,
+            actor_user_id=current_user.id,
+            action="agent.runtime_activation_blocked",
+            resource_type="agent",
+            resource_id=str(agent.id),
+            details={"blockers": blockers},
+        )
+        # FastAPI's session dependency rolls back on HTTPException. Commit the
+        # fail-closed state before returning 409 so a formerly active route
+        # cannot remain enabled after a failed re-activation check.
+        await db.commit()
         raise HTTPException(
             status_code=409,
             detail={"message": "Runtime is not ready", "blockers": blockers},
@@ -490,6 +696,8 @@ def _platform_credential_config(provider: str) -> dict[str, str]:
         return {"api_key": settings.sarvam_api_key}
     if provider == "elevenlabs":
         return {"api_key": settings.elevenlabs_api_key}
+    if provider == "inworld":
+        return {"api_key": settings.inworld_api_key}
     if provider == "openai":
         return {"api_key": settings.openai_api_key}
     if provider == "twilio":
@@ -549,7 +757,7 @@ async def list_workspace_credentials(
     db: AsyncSession = Depends(get_db),
 ):
     providers = {}
-    for provider in ("smallest", "sarvam", "elevenlabs", "openai", "twilio"):
+    for provider in ("smallest", "sarvam", "elevenlabs", "inworld", "openai", "twilio"):
         providers[provider] = await _workspace_credential_status(
             db, current_user.tenant_id, provider
         )
@@ -563,7 +771,7 @@ async def save_api_key_credential(
     current_user: CurrentUser = Depends(require_role("owner", "admin")),
     db: AsyncSession = Depends(get_db),
 ):
-    if provider not in {"smallest", "sarvam", "elevenlabs", "openai"}:
+    if provider not in {"smallest", "sarvam", "elevenlabs", "inworld", "openai"}:
         raise HTTPException(status_code=404, detail="Unsupported API-key provider")
     if provider == "elevenlabs":
         try:
@@ -575,6 +783,15 @@ async def save_api_key_credential(
             raise HTTPException(
                 status_code=status_code,
                 detail=f"ElevenLabs API key validation failed: {exc}",
+            ) from exc
+    if provider == "inworld":
+        try:
+            await InworldClient(api_key=data.api_key).validate_connection()
+        except InworldError as exc:
+            status_code = 422 if exc.status_code in {400, 401, 403, 422} else exc.status_code
+            raise HTTPException(
+                status_code=status_code,
+                detail=f"Inworld API key validation failed: {exc}",
             ) from exc
     existing = await get_provider_credential(db, current_user.tenant_id, provider)
     try:
@@ -629,7 +846,7 @@ async def delete_workspace_credential(
     current_user: CurrentUser = Depends(require_role("owner", "admin")),
     db: AsyncSession = Depends(get_db),
 ):
-    if provider not in {"smallest", "sarvam", "elevenlabs", "openai", "twilio"}:
+    if provider not in {"smallest", "sarvam", "elevenlabs", "inworld", "openai", "twilio"}:
         raise HTTPException(status_code=404, detail="Unsupported credential provider")
     credential = await get_provider_credential(
         db, current_user.tenant_id, provider, for_update=True
@@ -656,8 +873,21 @@ async def get_sip_credential_status(
     db: AsyncSession = Depends(get_db),
 ):
     credential = await get_provider_credential(db, current_user.tenant_id, "livekit_sip")
+    config = None
+    if credential and credential.is_active:
+        try:
+            config = await load_provider_config(db, current_user.tenant_id, "livekit_sip")
+        except ProviderCredentialError:
+            config = None
+    inbound_trunk = str((config or {}).get("inbound_trunk_id") or "")
+    dispatch_rule = str((config or {}).get("dispatch_rule_id") or "")
     return SipCredentialStatus(
         configured=bool(credential and credential.is_active),
+        route_recorded=bool(inbound_trunk and dispatch_rule),
+        gateway_provisioned=False,
+        inbound_trunk_hint=f"••••{inbound_trunk[-6:]}" if inbound_trunk else None,
+        dispatch_rule_hint=f"••••{dispatch_rule[-6:]}" if dispatch_rule else None,
+        agent_name=str((config or {}).get("agent_name") or "") or None,
         updated_at=credential.updated_at if credential else None,
     )
 
@@ -668,6 +898,38 @@ async def save_sip_credential(
     current_user: CurrentUser = Depends(require_role("owner", "admin")),
     db: AsyncSession = Depends(get_db),
 ):
+    if db.get_bind().dialect.name == "postgresql":
+        for route_id in sorted((data.inbound_trunk_id, data.dispatch_rule_id)):
+            await db.execute(
+                text("SELECT pg_advisory_xact_lock(hashtextextended(:route_key, 0))"),
+                {"route_key": f"livekit-route:{route_id}"},
+            )
+    other_routes = (
+        await db.execute(
+            select(ProviderCredential).where(
+                ProviderCredential.provider == "livekit_sip",
+                ProviderCredential.is_active.is_(True),
+                ProviderCredential.tenant_id != current_user.tenant_id,
+            )
+        )
+    ).scalars()
+    for other in other_routes:
+        try:
+            config = decrypt_integration_config(other.encrypted_config)
+        except IntegrationConfigUnavailableError:
+            # An unreadable active route cannot be proven non-conflicting.
+            raise HTTPException(
+                status_code=409,
+                detail="Another active LiveKit route cannot be safely validated",
+            ) from None
+        if (
+            str(config.get("inbound_trunk_id") or "") == data.inbound_trunk_id
+            or str(config.get("dispatch_rule_id") or "") == data.dispatch_rule_id
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="This LiveKit trunk or dispatch rule is already assigned",
+            )
     try:
         credential = await store_provider_config(
             db, current_user.tenant_id, "livekit_sip", data.model_dump()
@@ -683,7 +945,15 @@ async def save_sip_credential(
         resource_id=str(credential.id),
         details={"provider": "livekit_sip"},
     )
-    return SipCredentialStatus(configured=True, updated_at=credential.updated_at)
+    return SipCredentialStatus(
+        configured=True,
+        route_recorded=True,
+        gateway_provisioned=False,
+        inbound_trunk_hint=f"••••{data.inbound_trunk_id[-6:]}",
+        dispatch_rule_hint=f"••••{data.dispatch_rule_id[-6:]}",
+        agent_name=data.agent_name,
+        updated_at=credential.updated_at,
+    )
 
 
 @router.delete("/sip/credential", response_model=SipCredentialStatus)

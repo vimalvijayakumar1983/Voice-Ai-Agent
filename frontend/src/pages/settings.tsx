@@ -158,6 +158,7 @@ export default function Settings() {
     smallest: '',
     sarvam: '',
     elevenlabs: '',
+    inworld: '',
     openai: '',
   });
   const [twilioForm, setTwilioForm] = useState({
@@ -167,12 +168,10 @@ export default function Settings() {
   });
   const [sipForm, setSipForm] = useState({
     sip_uri: '',
-    username: '',
-    password: '',
-    inbound_number: '',
-    livekit_url: '',
-    livekit_api_key: '',
-    livekit_api_secret: '',
+    inbound_trunk_id: '',
+    dispatch_rule_id: '',
+    outbound_trunk_id: '',
+    agent_name: 'vav-inworld',
   });
 
   useEffect(() => {
@@ -437,14 +436,18 @@ export default function Settings() {
     resetMessages();
     setBusyAction('sip-key');
     try {
-      const next = await api.saveSipCredential(sipForm);
+      const next = await api.saveSipCredential({
+        ...sipForm,
+        outbound_trunk_id: sipForm.outbound_trunk_id || null,
+      });
       setSipStatus(next);
       setSipForm({
-        sip_uri: '', username: '', password: '', inbound_number: '',
-        livekit_url: '', livekit_api_key: '', livekit_api_secret: '',
+        sip_uri: '',
+        inbound_trunk_id: '', dispatch_rule_id: '', outbound_trunk_id: '',
+        agent_name: 'vav-inworld',
       });
       await refreshAudit();
-      setNotice('Etisalat SIP and LiveKit credentials saved securely. Assign the number in an agent runtime before activation.');
+      setNotice('Etisalat SIP route saved. Assign each DID in its agent runtime, then test readiness.');
     } catch (caught: unknown) {
       setActionError(caught instanceof Error ? caught.message : 'SIP credentials could not be saved.');
     } finally {
@@ -454,12 +457,12 @@ export default function Settings() {
 
   const handleDeleteSipCredential = async () => {
     resetMessages();
-    if (!window.confirm('Remove the Etisalat SIP and LiveKit credentials? SIP runtimes will fail readiness immediately.')) return;
+    if (!window.confirm('Remove the Etisalat SIP route? SIP runtimes will fail readiness immediately.')) return;
     setBusyAction('sip-delete');
     try {
       setSipStatus(await api.deleteSipCredential());
       await refreshAudit();
-      setNotice('Etisalat SIP and LiveKit credentials removed.');
+      setNotice('Etisalat SIP route removed.');
     } catch (caught: unknown) {
       setActionError(caught instanceof Error ? caught.message : 'SIP credentials could not be removed.');
     } finally {
@@ -633,17 +636,19 @@ export default function Settings() {
                 <p>Connect provider credentials for this workspace. Keys are encrypted on the server and are never returned to the browser.</p>
               </div>
               <span className={`badge ${connectedProviders ? 'badge-success' : 'badge-warning'}`}>
-                {connectedProviders}/5 connected
+                {connectedProviders}/6 connected
               </span>
             </div>
-            {(['smallest', 'sarvam', 'elevenlabs', 'openai'] as const).map((provider) => {
+            {(['smallest', 'sarvam', 'elevenlabs', 'inworld', 'openai'] as const).map((provider) => {
               const providerName = provider === 'smallest'
                 ? 'Smallest.ai'
                 : provider === 'sarvam'
                   ? 'Sarvam AI'
                   : provider === 'elevenlabs'
                     ? 'ElevenLabs'
-                    : 'OpenAI';
+                    : provider === 'inworld'
+                      ? 'Inworld AI'
+                      : 'OpenAI';
               const status = credentialStatuses?.providers[provider];
               return (
                 <div className="settings-subtable" key={provider}>
@@ -659,7 +664,9 @@ export default function Settings() {
                     <div className="form-group">
                       <label htmlFor={`${provider}-api-key`}>{providerName} API key</label>
                       <input id={`${provider}-api-key`} type="password" autoComplete="new-password" placeholder={status?.configured ? 'Enter a new key to rotate' : 'Paste API key'} value={providerKeys[provider]} onChange={(event) => setProviderKeys((current) => ({ ...current, [provider]: event.target.value }))} minLength={20} maxLength={512} required />
-                      <p className="form-hint">{provider === 'elevenlabs'
+                      <p className="form-hint">{provider === 'inworld'
+                        ? 'Direct key for Inworld STT, Router LLM, and TTS. VAV does not route these services through LiveKit Inference.'
+                        : provider === 'elevenlabs'
                         ? 'Used only for outgoing speech. VAV verifies catalog access before storing the key; Sarvam remains the live transcription provider and VAV keeps the knowledge and agent behavior.'
                         : 'The saved value is never returned to the browser. A new value rotates the workspace credential.'}</p>
                     </div>
@@ -690,24 +697,23 @@ export default function Settings() {
               <div className="settings-section-icon"><Radio size={18} /></div>
               <div>
                 <h3>Etisalat SIP edge</h3>
-                <p>Store the carrier trunk and LiveKit gateway credentials as write-only encrypted values.</p>
+                <p>Record the e& SIP endpoint and verified LiveKit routing IDs. DIDs are assigned per agent; carrier and LiveKit credentials stay server-side.</p>
               </div>
               <span className={`badge ${sipStatus?.configured ? 'badge-success' : 'badge-warning'}`}>
-                SIP {sipStatus?.configured ? 'connected' : 'not connected'}
+                SIP {sipStatus?.route_recorded ? 'route recorded · test required' : sipStatus?.configured ? 'route incomplete' : 'not connected'}
               </span>
             </div>
             <form className="api-key-form" onSubmit={handleSaveSipCredential}>
               <div className="form-grid">
                 <div className="form-group"><label htmlFor="sip-uri">Etisalat SIP URI</label><input id="sip-uri" placeholder="sip:trunk.example.ae" value={sipForm.sip_uri} onChange={(event) => setSipForm({ ...sipForm, sip_uri: event.target.value })} required /></div>
-                <div className="form-group"><label htmlFor="sip-user">SIP username</label><input id="sip-user" autoComplete="off" value={sipForm.username} onChange={(event) => setSipForm({ ...sipForm, username: event.target.value })} required /></div>
-                <div className="form-group"><label htmlFor="sip-password">SIP password</label><input id="sip-password" type="password" autoComplete="new-password" value={sipForm.password} onChange={(event) => setSipForm({ ...sipForm, password: event.target.value })} minLength={8} required /></div>
-                <div className="form-group"><label htmlFor="sip-number">Inbound DID</label><input id="sip-number" placeholder="+971…" value={sipForm.inbound_number} onChange={(event) => setSipForm({ ...sipForm, inbound_number: event.target.value })} required /></div>
-                <div className="form-group"><label htmlFor="livekit-url">LiveKit URL</label><input id="livekit-url" placeholder="wss://…livekit.cloud" value={sipForm.livekit_url} onChange={(event) => setSipForm({ ...sipForm, livekit_url: event.target.value })} required /></div>
-                <div className="form-group"><label htmlFor="livekit-key">LiveKit API key</label><input id="livekit-key" type="password" autoComplete="new-password" value={sipForm.livekit_api_key} onChange={(event) => setSipForm({ ...sipForm, livekit_api_key: event.target.value })} minLength={8} required /></div>
-                <div className="form-group"><label htmlFor="livekit-secret">LiveKit API secret</label><input id="livekit-secret" type="password" autoComplete="new-password" value={sipForm.livekit_api_secret} onChange={(event) => setSipForm({ ...sipForm, livekit_api_secret: event.target.value })} minLength={16} required /></div>
+                <div className="form-group"><label htmlFor="livekit-inbound-trunk">Verified inbound trunk ID</label><input id="livekit-inbound-trunk" placeholder="ST_…" value={sipForm.inbound_trunk_id} onChange={(event) => setSipForm({ ...sipForm, inbound_trunk_id: event.target.value })} minLength={4} required /></div>
+                <div className="form-group"><label htmlFor="livekit-dispatch-rule">Verified dispatch rule ID</label><input id="livekit-dispatch-rule" placeholder="SDR_…" value={sipForm.dispatch_rule_id} onChange={(event) => setSipForm({ ...sipForm, dispatch_rule_id: event.target.value })} minLength={4} required /></div>
+                <div className="form-group"><label htmlFor="livekit-outbound-trunk">Outbound trunk ID (optional)</label><input id="livekit-outbound-trunk" placeholder="ST_…" value={sipForm.outbound_trunk_id} onChange={(event) => setSipForm({ ...sipForm, outbound_trunk_id: event.target.value })} minLength={4} /></div>
+                <div className="form-group"><label htmlFor="livekit-agent-name">Dispatch agent name</label><input id="livekit-agent-name" value={sipForm.agent_name} onChange={(event) => setSipForm({ ...sipForm, agent_name: event.target.value })} minLength={2} required /><p className="form-hint">Must match the deployed worker: vav-inworld.</p></div>
               </div>
-              <button type="submit" className="btn btn-primary" disabled={busyAction === 'sip-key'}><KeyRound size={14} /> {busyAction === 'sip-key' ? 'Saving…' : sipStatus?.configured ? 'Rotate SIP credentials' : 'Connect SIP edge'}</button>
-              {sipStatus?.configured ? <button type="button" className="btn btn-danger" disabled={busyAction === 'sip-delete'} onClick={() => void handleDeleteSipCredential()}>{busyAction === 'sip-delete' ? 'Removing…' : 'Remove SIP credentials'}</button> : null}
+              {sipStatus?.route_recorded ? <p className="form-hint">Recorded route: trunk {sipStatus.inbound_trunk_hint} · dispatch {sipStatus.dispatch_rule_hint} · agent {sipStatus.agent_name}. Agent Test readiness performs the live verification.</p> : null}
+              <button type="submit" className="btn btn-primary" disabled={busyAction === 'sip-key'}><KeyRound size={14} /> {busyAction === 'sip-key' ? 'Saving…' : sipStatus?.configured ? 'Update SIP route' : 'Connect SIP edge'}</button>
+              {sipStatus?.configured ? <button type="button" className="btn btn-danger" disabled={busyAction === 'sip-delete'} onClick={() => void handleDeleteSipCredential()}>{busyAction === 'sip-delete' ? 'Removing…' : 'Remove SIP route'}</button> : null}
             </form>
           </section>
 

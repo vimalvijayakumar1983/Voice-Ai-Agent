@@ -132,8 +132,8 @@ export default function Dashboard() {
           <p>Provider credentials, signed callbacks, and a synced agent are separate requirements. These checks show configuration state, not end-to-end call certification.</p>
         </div>
         <div className="hero-provider">
-          <span>Primary voice provider</span>
-          <strong>{provider ? (provider.configured ? '● Smallest.ai key configured' : '○ Smallest.ai setup required') : '— Status unavailable'}</strong>
+          <span>Smallest.ai publish lane</span>
+          <strong>{provider ? (provider.configured ? '● Native publishing configured' : '○ Native publishing setup required') : '— Status unavailable'}</strong>
         </div>
       </section>
 
