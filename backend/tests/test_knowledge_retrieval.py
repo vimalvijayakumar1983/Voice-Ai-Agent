@@ -6,7 +6,39 @@ import pytest
 
 from app.models.agent import Agent, AgentKnowledgeBinding, KnowledgeBase, KnowledgeSource
 from app.services import knowledge_retrieval
-from app.services.knowledge_retrieval import rank_knowledge
+from app.services.knowledge_retrieval import build_contextual_query_plan, rank_knowledge
+
+
+def test_contextual_plan_recovers_domain_phrase_without_changing_raw_query():
+    plan = build_contextual_query_plan(
+        "Can you explain chemical feeling?",
+        terminology=("Chemical Peeling", "Laser Hair Removal"),
+    )
+
+    assert plan.primary_query == "Can you explain chemical feeling?"
+    assert plan.variants[0] == "Can you explain chemical feeling?"
+    assert "Can you explain Chemical Peeling?" in plan.variants
+    assert plan.recovered_terms == ("Chemical Peeling",)
+
+
+def test_contextual_plan_does_not_turn_medical_term_into_operational_term():
+    plan = build_contextual_query_plan(
+        "Do you provide cancer treatment?",
+        terminology=("Appointment Cancellation Policy",),
+    )
+
+    assert plan.variants == ("Do you provide cancer treatment?",)
+    assert plan.recovered_terms == ()
+
+
+def test_contextual_plan_recovers_one_uncertain_word_inside_known_entity():
+    plan = build_contextual_query_plan(
+        "Who is the chairman of Al Sabah Group?",
+        terminology=("Al Zaabi Group",),
+    )
+
+    assert "Who is the chairman of Al Zaabi Group?" in plan.variants
+    assert plan.recovered_terms == ("Al Zaabi Group",)
 
 
 def test_ranking_matches_compound_brand_name_from_short_stt_variant():
@@ -400,6 +432,108 @@ async def test_retrieval_keeps_query_evidence_near_end_of_large_source(db, tenan
 
     assert context is not None
     assert "Botox consultation requires an assessment" in context
+
+
+@pytest.mark.asyncio
+async def test_retrieval_uses_recovered_source_terminology_as_an_alternative(db, tenant):
+    agent = Agent(
+        tenant_id=tenant.id,
+        name="Cosmetic centre agent",
+        system_prompt="Use only approved knowledge.",
+    )
+    knowledge_base = KnowledgeBase(
+        tenant_id=tenant.id,
+        name="Cosmetic centre knowledge",
+        approval_status="approved",
+        is_active=True,
+    )
+    db.add_all([agent, knowledge_base])
+    await db.flush()
+    db.add(
+        AgentKnowledgeBinding(
+            tenant_id=tenant.id,
+            agent_id=agent.id,
+            knowledge_base_id=knowledge_base.id,
+        )
+    )
+    db.add(
+        KnowledgeSource(
+            tenant_id=tenant.id,
+            knowledge_base_id=knowledge_base.id,
+            source_type="website",
+            name="Chemical Peeling Treatment",
+            status="indexed",
+            content=(
+                "Chemical peeling is a clinician-led cosmetic treatment. A consultation is "
+                "required to assess suitability and explain aftercare."
+            ),
+        )
+    )
+    await db.commit()
+
+    context = await knowledge_retrieval.retrieve_knowledge_context(
+        db,
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        query="Tell me about chemical feeling",
+        terminology=("Chemical Peeling Treatment",),
+    )
+
+    assert context is not None
+    assert "Contextual terminology considered: Chemical Peeling" in context
+    assert "clinician-led cosmetic treatment" in context
+
+
+@pytest.mark.asyncio
+async def test_agent_terminology_is_derived_from_bound_approved_source_metadata(db, tenant):
+    agent = Agent(
+        tenant_id=tenant.id,
+        name="Clinic receptionist",
+        system_prompt="Use only approved knowledge.",
+    )
+    knowledge_base = KnowledgeBase(
+        tenant_id=tenant.id,
+        name="Aesthetic Clinic Knowledge",
+        scope_label="Cosmetic Centre",
+        tags=["PRP", "dermatology"],
+        approval_status="approved",
+        is_active=True,
+    )
+    db.add_all([agent, knowledge_base])
+    await db.flush()
+    db.add(
+        AgentKnowledgeBinding(
+            tenant_id=tenant.id,
+            agent_id=agent.id,
+            knowledge_base_id=knowledge_base.id,
+        )
+    )
+    db.add(
+        KnowledgeSource(
+            tenant_id=tenant.id,
+            knowledge_base_id=knowledge_base.id,
+            source_type="website",
+            name="Chemical Peeling - voice-searchable.pdf",
+            location="https://clinic.example/treatments/platelet-rich-plasma",
+            status="indexed",
+            content="Arbitrary prose must not be treated as a correction vocabulary.",
+            source_metadata={"page_title": "Dr Asha Dermatology Directory"},
+        )
+    )
+    await db.commit()
+
+    terminology = await knowledge_retrieval.load_agent_knowledge_terminology(
+        db,
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        hints=(agent.name,),
+    )
+
+    assert "Aesthetic Clinic Knowledge" in terminology
+    assert "Chemical Peeling voice-searchable" in terminology
+    assert "clinic.example treatments platelet-rich-plasma" in terminology
+    assert "Dr Asha Dermatology Directory" in terminology
+    assert not any("Arbitrary prose" in value for value in terminology)
 
 
 def test_query_excerpt_uses_token_boundaries_and_prefers_substantive_tail():
