@@ -6,6 +6,7 @@ from app.tasks.call_tasks import (
     reconcile_direct_call_terminal,
     sweep_stale_call_dispatches,
     sweep_stale_direct_calls,
+    sweep_stale_realtime_calls,
 )
 from app.tasks.campaign_tasks import (
     dispatch_provider_callback_outbox,
@@ -31,6 +32,7 @@ def test_worker_registers_all_application_tasks():
         "app.tasks.call_tasks.reconcile_direct_call_terminal",
         "app.tasks.call_tasks.sweep_stale_call_dispatches",
         "app.tasks.call_tasks.sweep_stale_direct_calls",
+        "app.tasks.call_tasks.sweep_stale_realtime_calls",
         "app.tasks.knowledge_tasks.repair_website_source",
         "app.tasks.webhook_tasks.fire_webhook_event",
         "app.tasks.webhook_tasks.sweep_pending_webhook_deliveries",
@@ -44,6 +46,7 @@ def test_worker_registers_all_application_tasks():
     assert reconcile_direct_call_terminal.app is celery_app
     assert sweep_stale_call_dispatches.app is celery_app
     assert sweep_stale_direct_calls.app is celery_app
+    assert sweep_stale_realtime_calls.app is celery_app
     assert repair_website_source.app is celery_app
     assert fire_webhook_event.app is celery_app
     assert sweep_pending_webhook_deliveries.app is celery_app
@@ -64,6 +67,7 @@ def test_default_worker_consumes_every_routed_queue():
             "app.tasks.call_tasks.reconcile_direct_call_terminal",
             "app.tasks.call_tasks.sweep_stale_call_dispatches",
             "app.tasks.call_tasks.sweep_stale_direct_calls",
+            "app.tasks.call_tasks.sweep_stale_realtime_calls",
             "app.tasks.knowledge_tasks.repair_website_source",
             "app.tasks.webhook_tasks.fire_webhook_event",
             "app.tasks.webhook_tasks.sweep_pending_webhook_deliveries",
@@ -76,6 +80,7 @@ def test_default_worker_consumes_every_routed_queue():
     assert celery_app.conf.task_create_missing_queues is False
     assert celery_app.conf.beat_schedule["sweep-stale-call-dispatches"]["schedule"] == 300.0
     assert celery_app.conf.beat_schedule["sweep-stale-direct-calls"]["schedule"] == 300.0
+    assert celery_app.conf.beat_schedule["sweep-stale-realtime-calls"]["schedule"] == 300.0
     assert celery_app.conf.beat_schedule["sweep-running-campaigns"]["schedule"] == 300.0
     assert celery_app.conf.beat_schedule["sweep-provider-callback-outbox"]["schedule"] == 60.0
     assert celery_app.conf.beat_schedule["sweep-pending-webhook-deliveries"]["schedule"] == 60.0

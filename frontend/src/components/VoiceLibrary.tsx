@@ -127,7 +127,9 @@ export default function VoiceLibrary({
     ? 'Sarvam AI'
     : voices[0]?.provider === 'elevenlabs'
       ? 'ElevenLabs'
-      : 'Smallest.ai';
+      : voices[0]?.provider === 'inworld'
+        ? 'Inworld AI'
+        : 'Smallest.ai';
   const selectedCompatibility = selectedVoice
     ? voiceCompatibility(selectedVoice, selectedLanguages)
     : null;

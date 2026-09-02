@@ -166,3 +166,138 @@ async def test_cost_report_filters_speech_provider_and_exports_csv(
     assert exported.headers["content-type"].startswith("text/csv")
     assert "estimated_cost_aed" in exported.text
     assert str(call.id) in exported.text
+
+
+@pytest.mark.asyncio
+async def test_cost_report_attributes_livekit_and_direct_inworld_without_carrier_markup(
+    client,
+    auth_headers,
+    db,
+    tenant,
+):
+    agent = Agent(
+        tenant_id=tenant.id,
+        name="Inworld concierge",
+        system_prompt="Use approved knowledge.",
+        voice_provider="inworld",
+        voice_id="inworld:Ashley",
+    )
+    db.add(agent)
+    await db.flush()
+    call = Call(
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        direction="inbound",
+        status="completed",
+        from_number="+971501234567",
+        to_number="+97141234567",
+        provider="livekit_sip",
+        duration_seconds=60,
+        call_metadata={
+            "runtime": {
+                "speech_provider": "inworld",
+                "llm_provider": "inworld",
+                "llm_model": "openai/gpt-4o-mini",
+                "tts_model": "inworld-tts-2",
+                "tts_characters": 1000,
+                "llm_input_tokens": 1000,
+                "llm_output_tokens": 500,
+                "recording_enabled": True,
+            }
+        },
+    )
+    db.add(call)
+    await db.commit()
+
+    response = await client.get(
+        "/api/v1/billing/cost-report?provider=livekit_sip&speech_provider=inworld&days=30",
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200
+    providers = {row["provider"] for row in response.json()["provider_breakdown"]}
+    assert providers >= {"LiveKit", "Inworld", "Inworld Router"}
+    report = response.json()
+    row = report["calls"][0]
+    components = row["components"]
+    services = {item["service"] for item in components}
+    assert services >= {"Third-party SIP", "Recording", "Speech to text", "TTS 2"}
+    assert "Agent session" not in services
+    assert "Railway LiveKit worker hosting allocation" in row["missing_cost_inputs"]
+    assert row["pricing_completeness"] == "partial"
+    assert report["summary"]["fully_priced_calls"] == 0
+    assert all(rate["service"] != "Agent session" for rate in report["rate_cards"])
+    assert all("e&" not in item["provider"] for item in components)
+    stt = next(item for item in components if item["service"] == "Speech to text")
+    tts = next(item for item in components if item["service"] == "TTS 2")
+    assert stt["rate_usd"] == pytest.approx(0.15)
+    assert tts["rate_usd"] == pytest.approx(0.025)
+    assert "conservative public on-demand list rate" in stt["basis"]
+    assert "conservative public on-demand list rate" in tts["basis"]
+    inworld_rates = {
+        item["service"]: item
+        for item in response.json()["rate_cards"]
+        if item["provider"] == "Inworld"
+    }
+    assert inworld_rates["Speech to text"]["native_amount"] == pytest.approx(0.15)
+    assert inworld_rates["TTS 2 Flash"]["native_amount"] == pytest.approx(0.015)
+    assert inworld_rates["TTS 2"]["native_amount"] == pytest.approx(0.025)
+    assert all(
+        item["source_url"] == "https://inworld.ai/pricing" for item in inworld_rates.values()
+    )
+    assert all("negotiated tiers may reduce" in item["notes"] for item in inworld_rates.values())
+
+
+@pytest.mark.asyncio
+async def test_inworld_auto_router_cost_is_partial_without_actual_model(
+    client,
+    auth_headers,
+    db,
+    tenant,
+):
+    agent = Agent(
+        tenant_id=tenant.id,
+        name="Auto-routed concierge",
+        system_prompt="Use approved knowledge.",
+        voice_provider="inworld",
+        voice_id="inworld:Ashley",
+    )
+    db.add(agent)
+    await db.flush()
+    call = Call(
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        direction="inbound",
+        status="completed",
+        from_number="+971501234567",
+        to_number="+97141234567",
+        provider="livekit_sip",
+        duration_seconds=60,
+        call_metadata={
+            "runtime": {
+                "speech_provider": "inworld",
+                "llm_provider": "inworld",
+                "llm_model": "auto",
+                "tts_model": "inworld-tts-2",
+                "tts_characters": 1000,
+                "llm_input_tokens": 1000,
+                "llm_output_tokens": 500,
+            }
+        },
+    )
+    db.add(call)
+    await db.commit()
+
+    response = await client.get(
+        "/api/v1/billing/cost-report?provider=livekit_sip&days=30",
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200
+    report = response.json()
+    row = next(item for item in report["calls"] if item["call_id"] == str(call.id))
+    assert row["pricing_completeness"] == "partial"
+    assert "Inworld Router selected model/rate" in row["missing_cost_inputs"]
+    assert "Railway LiveKit worker hosting allocation" in row["missing_cost_inputs"]
+    assert all(component["provider"] != "Inworld Router" for component in row["components"])
+    assert report["summary"]["fully_priced_calls"] == 0

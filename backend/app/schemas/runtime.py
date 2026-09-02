@@ -10,10 +10,10 @@ from pydantic import BaseModel, Field, field_validator
 
 class RuntimeProfileUpdate(BaseModel):
     telephony_provider: Literal["twilio", "livekit_sip"] = "twilio"
-    primary_speech_provider: Literal["sarvam", "elevenlabs"] = "sarvam"
-    fallback_speech_provider: Literal["smallest", "sarvam", "elevenlabs"] | None = None
-    llm_provider: Literal["openai"] = "openai"
-    llm_model: Literal["gpt-4o-mini", "gpt-4o"] = "gpt-4o-mini"
+    primary_speech_provider: Literal["sarvam", "elevenlabs", "inworld"] = "sarvam"
+    fallback_speech_provider: Literal["smallest", "sarvam", "elevenlabs", "inworld"] | None = None
+    llm_provider: Literal["openai", "inworld"] = "openai"
+    llm_model: str = Field("gpt-4o-mini", min_length=2, max_length=100)
     stt_language: str = Field("auto", min_length=2, max_length=30)
     max_concurrent_calls: int = Field(1, ge=1, le=100)
     daily_call_limit: int = Field(100, ge=1, le=100_000)
@@ -34,9 +34,9 @@ class RuntimeProfileUpdate(BaseModel):
     @classmethod
     def validate_stt_language(cls, value: str) -> str:
         normalized = value.strip()
-        if normalized == "auto" or re.fullmatch(r"[a-z]{2}-IN", normalized):
+        if normalized == "auto" or re.fullmatch(r"[a-z]{2,3}(?:-[A-Z]{2})?", normalized):
             return normalized
-        raise ValueError("STT language must be auto or an Indian locale such as en-IN")
+        raise ValueError("STT language must be auto or a BCP-47 code such as en-GB or ar-AE")
 
 
 class RuntimeProfileResponse(BaseModel):
@@ -72,18 +72,21 @@ class RuntimeReadinessResponse(BaseModel):
 
 class SipCredentialRequest(BaseModel):
     sip_uri: str = Field(min_length=4, max_length=500)
-    username: str = Field(min_length=1, max_length=255)
-    password: str = Field(min_length=8, max_length=512)
-    inbound_number: str = Field(pattern=r"^\+[1-9]\d{7,14}$")
-    livekit_url: str = Field(min_length=8, max_length=500)
-    livekit_api_key: str = Field(min_length=8, max_length=255)
-    livekit_api_secret: str = Field(min_length=16, max_length=512)
+    inbound_trunk_id: str = Field(min_length=4, max_length=255)
+    dispatch_rule_id: str = Field(min_length=4, max_length=255)
+    outbound_trunk_id: str | None = Field(default=None, min_length=4, max_length=255)
+    agent_name: str = Field(default="vav-inworld", min_length=2, max_length=100)
 
     model_config = {"extra": "forbid", "str_strip_whitespace": True}
 
 
 class SipCredentialStatus(BaseModel):
     configured: bool
+    route_recorded: bool = False
+    gateway_provisioned: bool = False
+    inbound_trunk_hint: str | None = None
+    dispatch_rule_hint: str | None = None
+    agent_name: str | None = None
     updated_at: datetime | None = None
 
 

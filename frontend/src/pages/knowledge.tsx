@@ -413,7 +413,7 @@ export default function KnowledgeStudio() {
     await runAction(
       'add-text',
       () => api.addKnowledgeText(selected.id, String(form.get('text_name') || ''), String(form.get('text_content') || '')),
-      'The text source was saved locally. Provider indexing will remain clearly marked unavailable.',
+      'The text source is searchable and ready for VAV-native agents. Smallest.ai bindings do not support pasted text.',
     );
     event.currentTarget.reset();
   };
@@ -557,7 +557,12 @@ export default function KnowledgeStudio() {
         <Metric icon={BookOpenCheck} label="Knowledge bases" value={knowledgeBases.length} detail={`${knowledgeBases.filter((kb) => kb.approval_status === 'approved').length} approved`} />
         <Metric icon={BadgeCheck} label="Indexed sources" value={indexed} detail="Provider-confirmed" tone="success" />
         <Metric icon={RefreshCw} label="Processing" value={processing} detail="Awaiting provider" tone={processing ? 'warning' : 'neutral'} />
-        <Metric icon={Bot} label="Bound agents" value={boundAgents} detail={`${agents.length - boundAgents} available`} />
+        <Metric
+          icon={Bot}
+          label="Bound agents"
+          value={boundAgents}
+          detail={agents.length > 0 && boundAgents === agents.length ? 'All agents have knowledge access' : `${agents.length - boundAgents} not yet bound`}
+        />
       </section>
 
       {loading ? (
@@ -678,7 +683,7 @@ export default function KnowledgeStudio() {
                   <div className={styles.approvalCard}>
                     <span className={styles.miniLabel}>Release gate</span>
                     <strong>{selected.approval_status === 'approved' ? 'Approved for agent use' : 'Draft—not available to agents'}</strong>
-                    <p>{selected.sync_status === 'ready' ? 'Provider indexing is complete. An owner or admin may change approval.' : 'Complete provider indexing before approval becomes available.'}</p>
+                    <p>{selected.sync_status === 'ready' ? 'Every source has VAV-searchable content. An owner or admin may change approval.' : 'Make every source VAV-searchable before approval becomes available.'}</p>
                     {canGovernKnowledge && <button type="button" className={`btn ${selected.approval_status === 'approved' ? 'btn-secondary' : 'btn-primary'} btn-sm`} disabled={working !== null || (selected.approval_status !== 'approved' && selected.sync_status !== 'ready')} onClick={() => runAction('approve', () => api.approveKnowledgeBase(selected.id, selected.approval_status !== 'approved'), selected.approval_status === 'approved' ? 'Approval removed; bound agents require review.' : 'Knowledge approved for agent binding.')}>
                       {selected.approval_status === 'approved' ? <X size={12} /> : <Check size={12} />}{selected.approval_status === 'approved' ? 'Return to draft' : 'Approve knowledge'}
                     </button>}
@@ -780,12 +785,12 @@ function CrawlRuns({ crawls, busy, canRepair, onRetry }: { crawls: KnowledgeCraw
 }
 
 function TextForm({ busy, onSubmit }: { busy: boolean; onSubmit: (event: FormEvent<HTMLFormElement>) => void }) {
-  return <form onSubmit={onSubmit} className={styles.builderForm}><div><label htmlFor="text-name">Internal text note</label><p>Saved with clear “local only” status until the selected provider supports text ingestion.</p></div><input id="text-name" name="text_name" required maxLength={255} placeholder="Approved returns FAQ" /><textarea id="text-content" name="text_content" required minLength={20} maxLength={100000} placeholder="Paste approved question-and-answer content here…" /><button type="submit" className="btn btn-secondary" disabled={busy}>{busy ? <Loader2 className="spin" size={14} /> : <Plus size={14} />} Save local source</button></form>;
+  return <form onSubmit={onSubmit} className={styles.builderForm}><div><label htmlFor="text-name">Approved searchable text</label><p>Immediately usable by Inworld, Sarvam, and ElevenLabs VAV runtimes. Smallest.ai agents require provider-indexed sources.</p></div><input id="text-name" name="text_name" required maxLength={255} placeholder="Approved returns FAQ" /><textarea id="text-content" name="text_content" required minLength={20} maxLength={100000} placeholder="Paste approved question-and-answer content here…" /><button type="submit" className="btn btn-secondary" disabled={busy}>{busy ? <Loader2 className="spin" size={14} /> : <Plus size={14} />} Add searchable text</button></form>;
 }
 
 function SourcesSection({ sources, canRepair, canRemove, busy, onRepair, onRemove }: { sources: KnowledgeSource[]; canRepair: boolean; canRemove: boolean; busy: boolean; onRepair: (source: KnowledgeSource) => void; onRemove: (source: KnowledgeSource) => void }) {
   const readyCount = sources.filter((source) => source.retrieval_ready && source.status === 'indexed').length;
-  return <section className={styles.section} aria-labelledby="sources-heading"><div className={styles.sectionHeading}><div><span className={styles.sectionIcon}><Layers3 size={15} /></span><div><h3 id="sources-heading">Source inventory</h3><p>One row per document. “Ready for agents” requires provider indexing and searchable VAV text.</p></div></div><span className="badge badge-neutral">{sources.length} documents · {readyCount} ready</span></div>{sources.length === 0 ? <div className={styles.sourceEmpty}><FileText size={20} /><div><strong>No sources yet</strong><p>Add curated web pages or an approved PDF to begin indexing.</p></div></div> : <div className={styles.sourceList}>{sources.map((source) => {
+  return <section className={styles.section} aria-labelledby="sources-heading"><div className={styles.sectionHeading}><div><span className={styles.sectionIcon}><Layers3 size={15} /></span><div><h3 id="sources-heading">Source inventory</h3><p>One canonical row per document. “Ready for agents” always requires searchable VAV text.</p></div></div><span className="badge badge-neutral">{sources.length} documents · {readyCount} ready</span></div>{sources.length === 0 ? <div className={styles.sourceEmpty}><FileText size={20} /><div><strong>No sources yet</strong><p>Add curated web pages, searchable text, or an approved PDF to begin.</p></div></div> : <div className={styles.sourceList}>{sources.map((source) => {
     const method = typeof source.source_metadata?.extraction_method === 'string' ? source.source_metadata.extraction_method : null;
     const isReady = source.retrieval_ready && source.status === 'indexed';
     const recovery = sourceRecovery(source);

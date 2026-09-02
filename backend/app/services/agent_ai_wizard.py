@@ -38,7 +38,7 @@ class _GeneratedAgentSpec(BaseModel):
     description: str = Field(min_length=10, max_length=2000)
     system_prompt: str = Field(min_length=50, max_length=4000)
     greeting_message: str = Field(min_length=5, max_length=500)
-    provider: Literal["smallest", "sarvam", "elevenlabs"]
+    provider: Literal["smallest", "sarvam", "elevenlabs", "inworld"]
     speech_rate: float = Field(ge=0.8, le=1.2)
     voice_gender: Literal["female", "male", "neutral", "any"]
     voice_accent: str = Field(max_length=80)
@@ -140,7 +140,7 @@ async def generate_agent_ai_draft(
         {
             str(voice.get("provider"))
             for voice in voices
-            if voice.get("provider") in {"smallest", "sarvam", "elevenlabs"}
+            if voice.get("provider") in {"smallest", "sarvam", "elevenlabs", "inworld"}
             and voice.get("synthesizer_model")
             and not voice.get("unavailability_reason")
         }
@@ -176,7 +176,7 @@ Use only the supplied provider names, language codes, and exact knowledge-base n
             "description": "string",
             "system_prompt": "string",
             "greeting_message": "string",
-            "provider": "smallest, sarvam, or elevenlabs",
+            "provider": "smallest, sarvam, elevenlabs, or inworld",
             "speech_rate": "number from 0.8 to 1.2",
             "voice_gender": "female, male, neutral, or any",
             "voice_accent": "string",

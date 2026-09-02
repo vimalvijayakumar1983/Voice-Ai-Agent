@@ -100,7 +100,7 @@ export interface VoiceAgent {
 
 export interface AgentAIDraftRequest {
   brief: string;
-  provider_preference: 'auto' | 'smallest' | 'sarvam' | 'elevenlabs';
+  provider_preference: 'auto' | 'smallest' | 'sarvam' | 'elevenlabs' | 'inworld';
   primary_language: string;
   timezone: string;
 }
@@ -113,7 +113,7 @@ export interface AgentAIDraftResponse {
     greeting_message: string | null;
     model_provider: string;
     model_name: string;
-    voice_provider: 'smallest' | 'sarvam' | 'elevenlabs';
+    voice_provider: 'smallest' | 'sarvam' | 'elevenlabs' | 'inworld';
     voice_id: string;
     temperature: number;
     language: string;
@@ -135,7 +135,7 @@ export interface ProviderStatus {
   configured: boolean;
   webhook_configured: boolean;
   base_url: string;
-  providers?: Record<'smallest' | 'sarvam' | 'elevenlabs', {
+  providers?: Record<'smallest' | 'sarvam' | 'elevenlabs' | 'inworld', {
     configured: boolean;
     agent_runtime: boolean;
     voice_preview: boolean;
@@ -151,7 +151,7 @@ export interface ProviderCredentialStatus {
   updated_at: string | null;
 }
 
-export type WorkspaceProviderName = 'smallest' | 'sarvam' | 'elevenlabs' | 'openai' | 'twilio';
+export type WorkspaceProviderName = 'smallest' | 'sarvam' | 'elevenlabs' | 'inworld' | 'openai' | 'twilio';
 
 export interface WorkspaceCredentialStatus {
   provider: WorkspaceProviderName;
@@ -171,10 +171,10 @@ export interface RuntimeProfile {
   agent_id: string;
   enabled: boolean;
   telephony_provider: 'twilio' | 'livekit_sip';
-  primary_speech_provider: 'sarvam' | 'elevenlabs';
-  fallback_speech_provider: 'smallest' | 'sarvam' | 'elevenlabs' | null;
-  llm_provider: 'openai';
-  llm_model: 'gpt-4o-mini' | 'gpt-4o';
+  primary_speech_provider: 'sarvam' | 'elevenlabs' | 'inworld';
+  fallback_speech_provider: 'smallest' | 'sarvam' | 'elevenlabs' | 'inworld' | null;
+  llm_provider: 'openai' | 'inworld';
+  llm_model: string;
   stt_language: string;
   max_concurrent_calls: number;
   daily_call_limit: number;
@@ -199,11 +199,16 @@ export interface RuntimeReadiness {
 
 export interface SipCredentialStatus {
   configured: boolean;
+  route_recorded: boolean;
+  gateway_provisioned: boolean;
+  inbound_trunk_hint: string | null;
+  dispatch_rule_hint: string | null;
+  agent_name: string | null;
   updated_at: string | null;
 }
 
 export interface VoiceCatalogItem {
-  provider: 'smallest' | 'sarvam' | 'elevenlabs';
+  provider: 'smallest' | 'sarvam' | 'elevenlabs' | 'inworld';
   id: string;
   name: string;
   languages: string[];
@@ -725,8 +730,8 @@ export interface BillingPlan {
 
 export interface CostReportFilters {
   days?: number;
-  provider?: 'twilio' | 'smallest' | '';
-  speech_provider?: 'sarvam' | 'elevenlabs' | 'smallest' | '';
+  provider?: 'twilio' | 'smallest' | 'livekit_sip' | '';
+  speech_provider?: 'inworld' | 'sarvam' | 'elevenlabs' | 'smallest' | '';
   agent_id?: string;
   direction?: 'inbound' | 'outbound' | '';
   status?: string;
@@ -1499,12 +1504,10 @@ class ApiClient {
 
   async saveSipCredential(data: {
     sip_uri: string;
-    username: string;
-    password: string;
-    inbound_number: string;
-    livekit_url: string;
-    livekit_api_key: string;
-    livekit_api_secret: string;
+    inbound_trunk_id: string;
+    dispatch_rule_id: string;
+    outbound_trunk_id: string | null;
+    agent_name: string;
   }) {
     return this.request<SipCredentialStatus>('/api/v1/runtime/sip/credential', {
       method: 'PUT',
@@ -1522,7 +1525,7 @@ class ApiClient {
     return this.request<AgentProviderCatalog>('/api/v1/agents/provider/catalog');
   }
 
-  async previewVoice(provider: 'smallest' | 'sarvam' | 'elevenlabs', voiceId: string, language?: string) {
+  async previewVoice(provider: 'smallest' | 'sarvam' | 'elevenlabs' | 'inworld', voiceId: string, language?: string) {
     return this.requestBlob('/api/v1/agents/provider/voice-preview', {
       method: 'POST',
       body: JSON.stringify({ provider, voice_id: voiceId, language }),

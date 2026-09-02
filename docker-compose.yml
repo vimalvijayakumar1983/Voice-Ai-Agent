@@ -35,6 +35,8 @@ services:
       - "8000:8000"
     env_file:
       - .env
+    environment:
+      LIVEKIT_WORKER_HEALTH_URL: http://livekit-agent:8081
     depends_on:
       db:
         condition: service_healthy
@@ -58,6 +60,33 @@ services:
     volumes:
       - ./backend:/app
     command: celery -A app.tasks.worker worker -B --loglevel=info --concurrency=4
+
+  livekit-agent:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    environment:
+      PORT: "8081"
+      LIVEKIT_NUM_IDLE_PROCESSES: "${LIVEKIT_NUM_IDLE_PROCESSES:-1}"
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+    command: python -m app.livekit_runtime.worker dev
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/', timeout=3)",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
 
   frontend:
     build:

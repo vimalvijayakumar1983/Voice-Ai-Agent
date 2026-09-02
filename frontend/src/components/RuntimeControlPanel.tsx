@@ -21,10 +21,17 @@ type Props = {
 };
 
 export default function RuntimeControlPanel({ agent, profile, onClose, onChange }: Props) {
-  const speechProvider: RuntimeProfile['primary_speech_provider'] = agent.voice_provider === 'elevenlabs'
-    ? 'elevenlabs'
-    : 'sarvam';
-  const [form, setForm] = useState({ ...profile, primary_speech_provider: speechProvider });
+  const speechProvider: RuntimeProfile['primary_speech_provider'] = agent.voice_provider === 'inworld'
+    ? 'inworld'
+    : agent.voice_provider === 'elevenlabs' ? 'elevenlabs' : 'sarvam';
+  const inworldRuntime = speechProvider === 'inworld';
+  const [form, setForm] = useState({
+    ...profile,
+    telephony_provider: inworldRuntime ? 'livekit_sip' as const : profile.telephony_provider,
+    primary_speech_provider: speechProvider,
+    llm_provider: inworldRuntime ? 'inworld' as const : profile.llm_provider,
+    llm_model: inworldRuntime && profile.llm_provider !== 'inworld' ? 'auto' : profile.llm_model,
+  });
   const [numbers, setNumbers] = useState(profile.assigned_numbers.join('\n'));
   const [working, setWorking] = useState('');
   const [notice, setNotice] = useState<{ type: 'success' | 'error' | 'info'; text: string } | null>(null);
@@ -33,7 +40,7 @@ export default function RuntimeControlPanel({ agent, profile, onClose, onChange 
     telephony_provider: form.telephony_provider,
     primary_speech_provider: speechProvider,
     fallback_speech_provider: form.fallback_speech_provider,
-    llm_provider: form.llm_provider,
+    llm_provider: inworldRuntime ? 'inworld' as const : form.llm_provider,
     llm_model: form.llm_model,
     stt_language: form.stt_language,
     max_concurrent_calls: Number(form.max_concurrent_calls),
@@ -41,6 +48,19 @@ export default function RuntimeControlPanel({ agent, profile, onClose, onChange 
     monthly_budget_cents: Number(form.monthly_budget_cents),
     assigned_numbers: numbers.split(/[,\n]/).map((value) => value.trim()).filter(Boolean),
   });
+  const persistedPayload = {
+    telephony_provider: profile.telephony_provider,
+    primary_speech_provider: profile.primary_speech_provider,
+    fallback_speech_provider: profile.fallback_speech_provider,
+    llm_provider: profile.llm_provider,
+    llm_model: profile.llm_model,
+    stt_language: profile.stt_language,
+    max_concurrent_calls: Number(profile.max_concurrent_calls),
+    daily_call_limit: Number(profile.daily_call_limit),
+    monthly_budget_cents: Number(profile.monthly_budget_cents),
+    assigned_numbers: profile.assigned_numbers,
+  };
+  const hasUnsavedChanges = JSON.stringify(payload()) !== JSON.stringify(persistedPayload);
 
   const run = async (action: 'save' | 'test' | 'activate' | 'deactivate') => {
     setWorking(action);
@@ -51,11 +71,16 @@ export default function RuntimeControlPanel({ agent, profile, onClose, onChange 
         next = await api.updateRuntimeProfile(agent.id, payload());
         setNotice({ type: 'success', text: 'Runtime policy saved. Run readiness before activation.' });
       } else if (action === 'test') {
+        if (hasUnsavedChanges) {
+          await api.updateRuntimeProfile(agent.id, payload());
+        }
         const result = await api.testRuntimeProfile(agent.id);
         next = await api.getRuntimeProfile(agent.id);
         setNotice({
           type: result.ready ? 'success' : 'error',
-          text: result.ready ? 'Every serving dependency passed.' : result.blockers.join(' '),
+          text: result.ready
+            ? `${hasUnsavedChanges ? 'Runtime policy saved. ' : ''}Every serving dependency passed.`
+            : result.blockers.join(' '),
         });
       } else if (action === 'activate') {
         next = await api.activateRuntimeProfile(agent.id);
@@ -84,7 +109,7 @@ export default function RuntimeControlPanel({ agent, profile, onClose, onChange 
         <div>
           <span className="page-kicker">Production serving</span>
           <h2 id="runtime-panel-title">{agent.name} runtime</h2>
-          <p>Configure the VAV-owned {speechProvider === 'elevenlabs' ? 'ElevenLabs voice and Sarvam transcription' : 'Sarvam speech'} pipeline, telephony route, capacity, and spend guardrails.</p>
+          <p>Configure the VAV-owned {inworldRuntime ? 'LiveKit SIP + direct Inworld STT, Router, and TTS' : speechProvider === 'elevenlabs' ? 'ElevenLabs voice and Sarvam transcription' : 'Sarvam speech'} pipeline, capacity, and spend guardrails.</p>
         </div>
         <span className={`badge ${profile.enabled ? 'badge-success' : profile.ready ? 'badge-info' : 'badge-warning'}`}>
           {profile.enabled ? 'Active' : profile.ready ? 'Ready' : profile.status}
@@ -102,7 +127,7 @@ export default function RuntimeControlPanel({ agent, profile, onClose, onChange 
       <div className={styles.grid}>
         <div className="form-group">
           <label htmlFor="runtime-telephony">Telephony edge</label>
-          <select id="runtime-telephony" value={form.telephony_provider} onChange={(event) => setForm({ ...form, telephony_provider: event.target.value as RuntimeProfile['telephony_provider'] })}>
+          <select id="runtime-telephony" value={form.telephony_provider} disabled={inworldRuntime} onChange={(event) => setForm({ ...form, telephony_provider: event.target.value as RuntimeProfile['telephony_provider'] })}>
             <option value="twilio">Twilio Media Streams</option>
             <option value="livekit_sip">Etisalat SIP via LiveKit</option>
           </select>
@@ -112,22 +137,29 @@ export default function RuntimeControlPanel({ agent, profile, onClose, onChange 
           <label htmlFor="runtime-speech-provider">Speech output</label>
           <input
             id="runtime-speech-provider"
-            value={speechProvider === 'elevenlabs' ? 'ElevenLabs Flash v2.5' : 'Sarvam Bulbul v3'}
+            value={inworldRuntime ? 'Inworld STT + TTS 2 (direct)' : speechProvider === 'elevenlabs' ? 'ElevenLabs Flash v2.5' : 'Sarvam Bulbul v3'}
             readOnly
             aria-readonly="true"
           />
-          <p className="form-hint">This follows the agent&apos;s selected voice provider; Sarvam handles live transcription.</p>
+          <p className="form-hint">This follows the agent&apos;s selected voice provider. Inworld uses one direct workspace credential for STT and TTS.</p>
         </div>
         <div className="form-group">
           <label htmlFor="runtime-llm">LLM route</label>
           <select id="runtime-llm" value={form.llm_model} onChange={(event) => setForm({ ...form, llm_model: event.target.value as RuntimeProfile['llm_model'] })}>
-            <option value="gpt-4o-mini">OpenAI GPT-4o mini · lower cost</option>
-            <option value="gpt-4o">OpenAI GPT-4o · higher quality</option>
+            {inworldRuntime ? <>
+              <option value="auto">Inworld Router auto · best value</option>
+              <option value="openai/gpt-4o-mini">Inworld Router → GPT-4o mini</option>
+              <option value="openai/gpt-4o">Inworld Router → GPT-4o</option>
+            </> : <>
+              <option value="gpt-4o-mini">OpenAI GPT-4o mini · lower cost</option>
+              <option value="gpt-4o">OpenAI GPT-4o · higher quality</option>
+            </>}
           </select>
+          <p className="form-hint">{inworldRuntime ? 'Direct Inworld Router endpoint; no LiveKit Inference markup.' : 'Direct OpenAI endpoint.'}</p>
         </div>
         <div className="form-group">
           <label htmlFor="runtime-language">Realtime STT language</label>
-          <input id="runtime-language" value={form.stt_language} onChange={(event) => setForm({ ...form, stt_language: event.target.value })} placeholder="auto or en-IN" />
+          <input id="runtime-language" value={form.stt_language} onChange={(event) => setForm({ ...form, stt_language: event.target.value })} placeholder="auto, en-GB, ar-AE, or hi-IN" />
         </div>
         <div className="form-group">
           <label htmlFor="runtime-numbers">Assigned phone numbers</label>
@@ -155,7 +187,7 @@ export default function RuntimeControlPanel({ agent, profile, onClose, onChange 
 
       <footer className={styles.actions}>
         <button type="button" className="btn btn-secondary" disabled={Boolean(working)} onClick={() => void run('save')}>{working === 'save' ? <Loader2 className="spin" size={14} /> : <Save size={14} />} Save policy</button>
-        <button type="button" className="btn btn-secondary" disabled={Boolean(working)} onClick={() => void run('test')}>{working === 'test' ? <Loader2 className="spin" size={14} /> : <Phone size={14} />} Test readiness</button>
+        <button type="button" className="btn btn-secondary" disabled={Boolean(working)} onClick={() => void run('test')}>{working === 'test' ? <Loader2 className="spin" size={14} /> : <Phone size={14} />} {hasUnsavedChanges ? 'Save & test readiness' : 'Test readiness'}</button>
         {profile.enabled ? (
           <button type="button" className="btn btn-danger" disabled={Boolean(working)} onClick={() => void run('deactivate')}><Power size={14} /> Deactivate</button>
         ) : (

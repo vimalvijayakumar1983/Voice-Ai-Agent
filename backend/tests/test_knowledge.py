@@ -22,6 +22,9 @@ from app.models.agent import (
     KnowledgeCrawlPage,
     KnowledgeSource,
 )
+from app.providers.smallest import SmallestAIError
+from app.services.knowledge_retrieval import retrieve_knowledge_context
+from app.services.knowledge_sources import consolidate_smallest_url_duplicates
 from app.services.pdf_ingestion import PreparedPdf
 
 
@@ -75,6 +78,7 @@ def test_reconcile_matches_normalized_provider_url():
                 "_id": "provider-source-1",
                 "url": "https://www.aesmc.com",
                 "status": "indexed",
+                "content": "Approved AESMC services and appointment information.",
             }
         ],
         items=[],
@@ -102,6 +106,7 @@ def test_reconcile_matches_completed_url_returned_as_knowledge_item():
                 "_id": "provider-item-1",
                 "processingStatus": "completed",
                 "metadata": {"sourceUrl": "https://www.aesmc.com"},
+                "content": "Approved AESMC doctor and treatment information.",
             }
         ],
         provider_knowledge_base={"processingStatus": "processing"},
@@ -227,7 +232,12 @@ def test_reconcile_matches_smallest_completed_scrape_batch():
                 "_id": "provider-scrape-batch-1",
                 "knowledgeBaseId": "provider-kb-1",
                 "hostUrl": "https://www.aesmc.com/",
-                "scrapedUrls": ["https://www.aesmc.com/"],
+                "scrapedUrls": [
+                    {
+                        "url": "https://www.aesmc.com/",
+                        "content": "Approved AESMC clinic information.",
+                    }
+                ],
                 "processingStatus": "completed",
                 "totalUrls": 1,
             }
@@ -244,7 +254,7 @@ def test_reconcile_matches_smallest_completed_scrape_batch():
     assert knowledge.indexed_source_count == 1
 
 
-def test_reconcile_uses_completed_knowledge_base_as_safe_fallback():
+def test_reconcile_completed_knowledge_base_without_text_fails_closed():
     source = _url_source()
     knowledge = _knowledge(source)
     now = datetime.now(UTC)
@@ -257,10 +267,11 @@ def test_reconcile_uses_completed_knowledge_base_as_safe_fallback():
         now=now,
     )
 
-    assert source.status == "indexed"
+    assert source.status == "failed"
     assert source.last_synced_at == now
-    assert knowledge.sync_status == "ready"
-    assert knowledge.indexed_source_count == 1
+    assert knowledge.sync_status == "error"
+    assert knowledge.indexed_source_count == 0
+    assert "no retrievable text" in source.error_message
 
 
 def test_new_provider_source_invalidates_bound_agent_deployment():
@@ -307,12 +318,13 @@ def test_new_provider_source_keeps_unprovisioned_bound_agent_local():
     assert binding.last_synced_at is None
 
 
-def test_new_provider_source_is_immediately_live_for_sarvam_runtime():
+@pytest.mark.parametrize("provider", ["sarvam", "elevenlabs", "inworld"])
+def test_new_provider_source_is_immediately_live_for_vav_native_runtime(provider):
     agent = SimpleNamespace(
         id=uuid4(),
-        name="Sarvam concierge",
+        name=f"{provider} concierge",
         provider_agent_id=None,
-        voice_provider="sarvam",
+        voice_provider=provider,
         sync_status="local_only",
     )
     binding = SimpleNamespace(
@@ -325,10 +337,33 @@ def test_new_provider_source_is_immediately_live_for_sarvam_runtime():
     affected = _invalidate_bound_agent_deployments(SimpleNamespace(agent_bindings=[binding]))
 
     assert affected == []
-    assert binding.provider == "sarvam"
+    assert binding.provider == provider
     assert binding.sync_status == "synced"
     assert binding.last_synced_at is not None
     assert agent.sync_status == "local_only"
+
+
+def test_crawl_invalidation_keeps_inworld_knowledge_binding_live():
+    from app.tasks.knowledge_tasks import _invalidate_crawl_bindings
+
+    agent = SimpleNamespace(
+        id=uuid4(),
+        provider_agent_id=None,
+        voice_provider="inworld",
+        sync_status="local_only",
+    )
+    binding = SimpleNamespace(
+        agent=agent,
+        provider="smallest",
+        sync_status="pending",
+        last_synced_at=None,
+    )
+
+    _invalidate_crawl_bindings(SimpleNamespace(agent_bindings=[binding]))
+
+    assert binding.provider == "inworld"
+    assert binding.sync_status == "synced"
+    assert binding.last_synced_at is not None
 
 
 def test_source_change_rejects_race_with_agent_publish():
@@ -774,3 +809,454 @@ async def test_permanent_non_content_page_is_excluded_without_failing_the_crawl(
     assert refreshed_crawl.skipped_count == 4
     assert refreshed_knowledge.sync_status == "ready"
     assert refreshed_knowledge.source_count == 1
+
+
+@pytest.mark.asyncio
+async def test_pasted_text_can_be_approved_bound_and_retrieved_by_inworld(
+    client,
+    auth_headers,
+    tenant,
+    db,
+):
+    agent = Agent(
+        tenant_id=tenant.id,
+        name="Inworld knowledge concierge",
+        system_prompt="Answer only from approved knowledge.",
+        voice_provider="inworld",
+        voice_id="inworld:default",
+    )
+    knowledge = KnowledgeBase(
+        tenant_id=tenant.id,
+        name="Native text knowledge",
+        provider="smallest",
+        sync_status="local_only",
+        approval_status="draft",
+    )
+    db.add_all([agent, knowledge])
+    await db.commit()
+
+    added = await client.post(
+        f"/api/v1/knowledge/{knowledge.id}/sources/text",
+        headers=auth_headers,
+        json={
+            "name": "Approved clinic FAQ",
+            "content": "PRP consultations are available after a doctor completes an assessment.",
+        },
+    )
+    assert added.status_code == 200
+    assert added.json()["sync_status"] == "ready"
+    assert added.json()["sources"][0]["status"] == "indexed"
+    assert added.json()["sources"][0]["retrieval_ready"] is True
+
+    approved = await client.post(
+        f"/api/v1/knowledge/{knowledge.id}/approval",
+        headers=auth_headers,
+        json={"approved": True},
+    )
+    assert approved.status_code == 200
+
+    bound = await client.post(
+        f"/api/v1/knowledge/{knowledge.id}/bindings",
+        headers=auth_headers,
+        json={"agent_id": str(agent.id)},
+    )
+    assert bound.status_code == 200
+    assert bound.json()["agent_bindings"][0]["sync_status"] == "synced"
+
+    context = await retrieve_knowledge_context(
+        db,
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        query="Are PRP consultations available?",
+    )
+    assert context is not None
+    assert "doctor completes an assessment" in context
+
+
+@pytest.mark.asyncio
+async def test_smallest_binding_rejects_vav_native_text_sources(
+    client,
+    auth_headers,
+    tenant,
+    db,
+):
+    agent = Agent(
+        tenant_id=tenant.id,
+        name="Smallest provider agent",
+        system_prompt="Answer approved questions.",
+        voice_provider="smallest",
+    )
+    knowledge = KnowledgeBase(
+        tenant_id=tenant.id,
+        name="Mixed provider knowledge",
+        provider="smallest",
+        provider_knowledge_base_id="provider-kb-text-constraint",
+        sync_status="ready",
+        approval_status="approved",
+        source_count=1,
+        indexed_source_count=1,
+    )
+    knowledge.sources.append(
+        KnowledgeSource(
+            tenant_id=tenant.id,
+            source_type="text",
+            name="Local FAQ",
+            content="Approved locally searchable FAQ content for a VAV runtime.",
+            status="indexed",
+        )
+    )
+    db.add_all([agent, knowledge])
+    await db.commit()
+
+    response = await client.post(
+        f"/api/v1/knowledge/{knowledge.id}/bindings",
+        headers=auth_headers,
+        json={"agent_id": str(agent.id)},
+    )
+
+    assert response.status_code == 409
+    assert "cannot use pasted VAV text" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_approval_recounts_and_rejects_provider_indexed_url_without_vav_text(
+    client,
+    auth_headers,
+    tenant,
+    db,
+):
+    knowledge = KnowledgeBase(
+        tenant_id=tenant.id,
+        name="False ready website knowledge",
+        provider="smallest",
+        provider_knowledge_base_id="provider-false-ready",
+        sync_status="ready",
+        approval_status="draft",
+        source_count=1,
+        indexed_source_count=1,
+    )
+    knowledge.sources.append(
+        KnowledgeSource(
+            tenant_id=tenant.id,
+            source_type="url",
+            name="Provider-only page",
+            location="https://example.com/provider-only",
+            status="indexed",
+        )
+    )
+    db.add(knowledge)
+    await db.commit()
+
+    response = await client.post(
+        f"/api/v1/knowledge/{knowledge.id}/approval",
+        headers=auth_headers,
+        json={"approved": True},
+    )
+
+    assert response.status_code == 409
+    assert "VAV-searchable" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_refresh_consolidates_canonical_url_duplicates_and_keeps_searchable_copy(
+    client,
+    auth_headers,
+    tenant,
+    db,
+):
+    knowledge = KnowledgeBase(
+        tenant_id=tenant.id,
+        name="Canonical website knowledge",
+        provider="smallest",
+        sync_status="ready",
+        approval_status="draft",
+    )
+    usable = KnowledgeSource(
+        tenant_id=tenant.id,
+        source_type="website",
+        name="Services",
+        location="https://example.com/services",
+        content="Approved treatment and appointment information.",
+        status="indexed",
+    )
+    duplicate = KnowledgeSource(
+        tenant_id=tenant.id,
+        source_type="url",
+        name="Duplicate services",
+        location="https://EXAMPLE.com/services/?utm_source=campaign#details",
+        status="indexed",
+        provider_item_id="provider-services-item",
+    )
+    knowledge.sources.extend([duplicate, usable])
+    knowledge.source_count = 2
+    knowledge.indexed_source_count = 2
+    crawl = KnowledgeCrawl(
+        tenant_id=tenant.id,
+        root_url="https://example.com/",
+        allowed_host="example.com",
+        status="completed",
+        discovered_count=1,
+        indexed_count=1,
+    )
+    knowledge.crawls.append(crawl)
+    db.add(knowledge)
+    await db.flush()
+    page = KnowledgeCrawlPage(
+        tenant_id=tenant.id,
+        crawl_id=crawl.id,
+        knowledge_source_id=duplicate.id,
+        url=duplicate.location,
+        canonical_url="https://example.com/services",
+        status="indexed",
+    )
+    db.add(page)
+    await db.commit()
+
+    response = await client.post(
+        f"/api/v1/knowledge/{knowledge.id}/refresh",
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["source_count"] == 1
+    assert body["indexed_source_count"] == 1
+    assert body["sources"][0]["location"] == "https://example.com/services"
+    assert body["sources"][0]["retrieval_ready"] is True
+    assert body["sources"][0]["provider_item_id"] == "provider-services-item"
+    await db.refresh(page)
+    assert page.knowledge_source_id == UUID(body["sources"][0]["id"])
+
+
+@pytest.mark.asyncio
+async def test_preferred_repair_content_wins_and_shared_remote_batch_is_retired_once(
+    tenant,
+    db,
+):
+    deleted_batches: list[str] = []
+
+    class Provider:
+        async def delete_scraped_knowledge_url(self, **kwargs):
+            batch_id = kwargs["scraped_url_id"]
+            if batch_id in deleted_batches:
+                raise AssertionError("A shared stale batch must be retired only once")
+            deleted_batches.append(batch_id)
+
+        async def delete_knowledge_item(self, **_kwargs):
+            raise AssertionError("The fresh replacement item must be retained")
+
+    knowledge = KnowledgeBase(
+        tenant_id=tenant.id,
+        name="Repair freshness knowledge",
+        provider="smallest",
+        provider_knowledge_base_id="provider-kb-repair",
+        sync_status="ready",
+        approval_status="draft",
+    )
+    preferred = KnowledgeSource(
+        tenant_id=tenant.id,
+        source_type="website",
+        name="Current services",
+        location="https://example.com/services",
+        content="Current shorter service information.",
+        status="indexed",
+        provider_item_id="current-item",
+    )
+    old_content = "Obsolete service information. " * 20
+    duplicates = [
+        KnowledgeSource(
+            tenant_id=tenant.id,
+            source_type="url",
+            name=f"Old services {index}",
+            location=f"https://EXAMPLE.com/services/?utm_source=old-{index}",
+            content=old_content,
+            status="indexed",
+            provider_item_id="old-scrape-batch",
+        )
+        for index in range(2)
+    ]
+    knowledge.sources.extend([*duplicates, preferred])
+    db.add(knowledge)
+    await db.flush()
+
+    removed = await consolidate_smallest_url_duplicates(
+        db,
+        knowledge,
+        Provider(),
+        scraped=[
+            {
+                "_id": "old-scrape-batch",
+                "hostUrl": "https://example.com/services",
+                "scrapedUrls": [{"url": "https://example.com/services"}],
+            }
+        ],
+        items=[
+            {
+                "_id": "current-item",
+                "metadata": {"sourceUrl": "https://example.com/services"},
+            }
+        ],
+        preferred_source=preferred,
+    )
+    await db.flush()
+
+    assert removed == 2
+    assert deleted_batches == ["old-scrape-batch"]
+    assert list(knowledge.sources) == [preferred]
+    assert preferred.content == "Current shorter service information."
+    assert preferred.provider_item_id == "current-item"
+
+
+@pytest.mark.asyncio
+async def test_adding_content_revokes_existing_knowledge_approval(
+    client,
+    auth_headers,
+    tenant,
+    db,
+):
+    knowledge = KnowledgeBase(
+        tenant_id=tenant.id,
+        name="Approved clinic knowledge",
+        provider="smallest",
+        sync_status="ready",
+        approval_status="approved",
+        published_at=datetime.now(UTC),
+    )
+    db.add(knowledge)
+    await db.commit()
+
+    response = await client.post(
+        f"/api/v1/knowledge/{knowledge.id}/sources/text",
+        headers=auth_headers,
+        json={
+            "name": "New clinic policy",
+            "content": "Appointments require confirmation before the scheduled visit.",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["approval_status"] == "draft"
+    assert response.json()["published_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_refresh_retrieval_evidence_change_revokes_approval(
+    client,
+    auth_headers,
+    tenant,
+    db,
+    monkeypatch,
+):
+    content = "Current approved clinic hours are nine in the morning until six in the evening."
+
+    class Provider:
+        async def get_knowledge_base(self, knowledge_base_id):
+            assert knowledge_base_id == "provider-kb-status-change"
+            return {"processingStatus": "completed"}
+
+        async def list_scraped_knowledge_urls(self, knowledge_base_id):
+            assert knowledge_base_id == "provider-kb-status-change"
+            return [
+                {
+                    "_id": "provider-hours",
+                    "url": "https://example.com/hours",
+                    "processingStatus": "completed",
+                    "content": content,
+                }
+            ]
+
+        async def list_knowledge_items(self, knowledge_base_id):
+            assert knowledge_base_id == "provider-kb-status-change"
+            return []
+
+    monkeypatch.setattr(knowledge_endpoint, "get_smallest_client", Provider)
+    knowledge = KnowledgeBase(
+        tenant_id=tenant.id,
+        name="Approved status-change knowledge",
+        provider="smallest",
+        provider_knowledge_base_id="provider-kb-status-change",
+        sync_status="processing",
+        approval_status="approved",
+        published_at=datetime.now(UTC),
+    )
+    knowledge.sources.append(
+        KnowledgeSource(
+            tenant_id=tenant.id,
+            source_type="url",
+            name="Clinic hours",
+            location="https://example.com/hours",
+            content=content,
+            status="processing",
+            provider_item_id="provider-hours",
+        )
+    )
+    db.add(knowledge)
+    await db.commit()
+
+    response = await client.post(
+        f"/api/v1/knowledge/{knowledge.id}/refresh",
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200
+    assert response.json()["sources"][0]["status"] == "indexed"
+    assert response.json()["approval_status"] == "draft"
+    assert response.json()["published_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_remote_knowledge_base_provisioning_is_idempotent_under_lock(tenant, db):
+    created: list[str] = []
+
+    class Provider:
+        async def create_knowledge_base(self, **_kwargs):
+            created.append("provider-kb-serialized")
+            return "provider-kb-serialized"
+
+    knowledge = KnowledgeBase(
+        tenant_id=tenant.id,
+        name="Serialized provisioning knowledge",
+        provider="smallest",
+        sync_status="local_only",
+        approval_status="draft",
+    )
+    db.add(knowledge)
+    await db.flush()
+
+    first = await knowledge_endpoint._ensure_remote(db, knowledge, Provider())
+    second = await knowledge_endpoint._ensure_remote(db, knowledge, Provider())
+
+    assert first == second == "provider-kb-serialized"
+    assert created == ["provider-kb-serialized"]
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_remote_provisioning_blocks_duplicate_creation(tenant, db):
+    attempts = 0
+
+    class Provider:
+        async def create_knowledge_base(self, **_kwargs):
+            nonlocal attempts
+            attempts += 1
+            raise SmallestAIError(
+                "Provider response was lost after submission.",
+                ambiguous=True,
+            )
+
+    knowledge = KnowledgeBase(
+        tenant_id=tenant.id,
+        name="Ambiguous provisioning knowledge",
+        provider="smallest",
+        sync_status="local_only",
+        approval_status="draft",
+    )
+    db.add(knowledge)
+    await db.flush()
+
+    with pytest.raises(HTTPException):
+        await knowledge_endpoint._ensure_remote(db, knowledge, Provider())
+    with pytest.raises(HTTPException) as blocked:
+        await knowledge_endpoint._ensure_remote(db, knowledge, Provider())
+
+    assert blocked.value.status_code == 409
+    assert attempts == 1

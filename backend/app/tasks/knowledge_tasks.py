@@ -21,8 +21,18 @@ from app.models.agent import (
 )
 from app.providers.smallest import SmallestAIClient, SmallestAIError, get_smallest_client
 from app.services.audit import record_audit_event
+from app.services.knowledge_sources import (
+    VAV_NATIVE_KNOWLEDGE_PROVIDERS,
+    canonical_source_url,
+    consolidate_duplicate_url_sources,
+    consolidate_smallest_url_duplicates,
+    has_searchable_content,
+    invalidate_knowledge_approval,
+    mark_remote_creation_outcome_unknown,
+    remote_creation_outcome_unknown,
+)
 from app.services.provider_credentials import load_provider_config
-from app.services.website_crawler import canonicalize_page_url, discover_website
+from app.services.website_crawler import discover_website
 from app.services.website_recovery import (
     RecoveredPage,
     WebsiteRecoveryError,
@@ -119,9 +129,16 @@ async def _provider_poll_wait(seconds: float) -> None:
 
 
 def _recount(knowledge_base: KnowledgeBase) -> None:
+    for source in knowledge_base.sources:
+        if (
+            source.source_type == "text"
+            and source.status == "local_only"
+            and has_searchable_content(source)
+        ):
+            source.status = "indexed"
     knowledge_base.source_count = len(knowledge_base.sources)
     knowledge_base.indexed_source_count = sum(
-        source.status == "indexed" and bool(str(source.content or "").strip())
+        source.status == "indexed" and has_searchable_content(source)
         for source in knowledge_base.sources
     )
     if not knowledge_base.source_count:
@@ -185,6 +202,7 @@ async def _set_stage(
         )
         knowledge_base.sync_status = "processing"
         knowledge_base.sync_error = None
+        invalidate_knowledge_approval(knowledge_base)
         await session.commit()
     finally:
         await session.close()
@@ -322,6 +340,7 @@ async def _mark_non_content_skipped(
         if source in knowledge_base.sources:
             knowledge_base.sources.remove(source)
         await session.delete(source)
+        invalidate_knowledge_approval(knowledge_base)
         _recount(knowledge_base)
         await record_audit_event(
             session,
@@ -343,7 +362,7 @@ def _invalidate_crawl_bindings(knowledge_base: KnowledgeBase) -> None:
     now = datetime.now(UTC)
     for binding in knowledge_base.agent_bindings:
         agent = binding.agent
-        if getattr(agent, "voice_provider", "smallest") in {"sarvam", "elevenlabs"}:
+        if getattr(agent, "voice_provider", "smallest") in VAV_NATIVE_KNOWLEDGE_PROVIDERS:
             binding.provider = agent.voice_provider
             binding.sync_status = "synced"
             binding.last_synced_at = now
@@ -405,10 +424,16 @@ async def _crawl_website(tenant_id: UUID, kb_id: UUID, crawl_id: UUID) -> None:
         )
         if crawl is None or knowledge_base is None or crawl.status == "cancelled":
             return
+        invalidate_knowledge_approval(knowledge_base)
+        if knowledge_base.provider_knowledge_base_id:
+            provider = await _tenant_client(session, tenant_id)
+            await consolidate_smallest_url_duplicates(session, knowledge_base, provider)
+        else:
+            await consolidate_duplicate_url_sources(session, knowledge_base)
         existing_by_url = {
             canonical: source
             for source in knowledge_base.sources
-            if source.location and (canonical := canonicalize_page_url(source.location))
+            if source.location and (canonical := canonical_source_url(source.location))
         }
         for discovered in discovery.pages:
             source = existing_by_url.get(discovered.canonical_url)
@@ -541,6 +566,66 @@ async def _tenant_client(session, tenant_id: UUID) -> SmallestAIClient:
     return SmallestAIClient(api_key=api_key) if api_key else get_smallest_client()
 
 
+async def _ensure_remote_locked(
+    session,
+    knowledge_base: KnowledgeBase,
+    provider: SmallestAIClient,
+) -> str:
+    """Create one provider KB across all concurrent page-repair workers."""
+    locked = await session.scalar(
+        select(KnowledgeBase)
+        .where(
+            KnowledgeBase.id == knowledge_base.id,
+            KnowledgeBase.tenant_id == knowledge_base.tenant_id,
+        )
+        .options(
+            selectinload(KnowledgeBase.sources),
+            selectinload(KnowledgeBase.agent_bindings).selectinload(AgentKnowledgeBinding.agent),
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if locked is None:
+        raise WebsiteRecoveryError(
+            "The knowledge base no longer exists.",
+            code="knowledge_base_missing",
+        )
+    if locked.provider_knowledge_base_id:
+        remote_id = locked.provider_knowledge_base_id
+        await session.commit()
+        return remote_id
+    if remote_creation_outcome_unknown(locked):
+        await session.commit()
+        raise WebsiteRecoveryError(
+            "Provider knowledge-base creation has an unresolved outcome; automatic creation is "
+            "paused to prevent duplicates.",
+            code="provider_provision_unknown",
+        )
+
+    locked.sync_status = "provisioning"
+    locked.sync_error = None
+    await session.flush()
+    try:
+        remote_id = await provider.create_knowledge_base(
+            name=locked.name,
+            description=locked.description or "",
+        )
+    except SmallestAIError as exc:
+        if exc.ambiguous:
+            mark_remote_creation_outcome_unknown(locked)
+        else:
+            locked.sync_status = "error"
+            locked.sync_error = str(exc)
+        locked.last_synced_at = datetime.now(UTC)
+        await session.commit()
+        raise
+    locked.provider_knowledge_base_id = remote_id
+    locked.sync_status = "processing" if locked.source_count else "local_only"
+    locked.last_synced_at = datetime.now(UTC)
+    await session.commit()
+    return remote_id
+
+
 async def _repair(tenant_id: UUID, kb_id: UUID, source_id: UUID) -> None:
     await _set_stage(
         tenant_id,
@@ -618,14 +703,7 @@ async def _repair(tenant_id: UUID, kb_id: UUID, source_id: UUID) -> None:
     session, knowledge_base, source = await _context(tenant_id, kb_id, source_id)
     try:
         provider = await _tenant_client(session, tenant_id)
-        remote_id = knowledge_base.provider_knowledge_base_id
-        if not remote_id:
-            remote_id = await provider.create_knowledge_base(
-                name=knowledge_base.name,
-                description=knowledge_base.description or "",
-            )
-            knowledge_base.provider_knowledge_base_id = remote_id
-            await session.commit()
+        remote_id = await _ensure_remote_locked(session, knowledge_base, provider)
 
         content_sha256 = hashlib.sha256(page.text.encode("utf-8")).hexdigest()
         artifact_prefix = f"vav-web-recovery-{source.id}-"
@@ -705,7 +783,7 @@ async def _repair(tenant_id: UUID, kb_id: UUID, source_id: UUID) -> None:
         affected_agent_ids: list[str] = []
         for binding in knowledge_base.agent_bindings:
             agent = binding.agent
-            if agent.voice_provider in {"sarvam", "elevenlabs"}:
+            if agent.voice_provider in VAV_NATIVE_KNOWLEDGE_PROVIDERS:
                 binding.provider = agent.voice_provider
                 binding.sync_status = "synced"
                 binding.last_synced_at = now
@@ -716,6 +794,16 @@ async def _repair(tenant_id: UUID, kb_id: UUID, source_id: UUID) -> None:
                 agent.sync_status = "dirty"
                 affected_agent_ids.append(str(agent.id))
 
+        cleanup_scraped = await provider.list_scraped_knowledge_urls(remote_id)
+        cleanup_items = await provider.list_knowledge_items(remote_id)
+        await consolidate_smallest_url_duplicates(
+            session,
+            knowledge_base,
+            provider,
+            scraped=cleanup_scraped,
+            items=cleanup_items,
+            preferred_source=source,
+        )
         _recount(knowledge_base)
         await record_audit_event(
             session,

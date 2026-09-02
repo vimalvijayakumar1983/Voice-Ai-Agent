@@ -67,6 +67,7 @@ export default function AgentAIWizard({ catalog, providerStatus = null, busy, on
               <option value="smallest" disabled={!availableProviders.has('smallest')}>Smallest.ai{availableProviders.has('smallest') ? '' : ' · unavailable'}</option>
               <option value="sarvam" disabled={!availableProviders.has('sarvam')}>Sarvam AI{availableProviders.has('sarvam') ? '' : ' · connect in Settings'}</option>
               <option value="elevenlabs" disabled={!availableProviders.has('elevenlabs')}>ElevenLabs{availableProviders.has('elevenlabs') ? '' : providerStatus?.providers?.elevenlabs?.configured ? ' · voice catalog unavailable' : ' · connect in Settings'}</option>
+              <option value="inworld" disabled={!availableProviders.has('inworld')}>Inworld AI{availableProviders.has('inworld') ? '' : providerStatus?.providers?.inworld?.configured ? ' · voice catalog unavailable' : ' · connect in Settings'}</option>
             </select>
           </div>
           <div className="form-group">
