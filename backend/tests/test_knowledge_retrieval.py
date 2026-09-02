@@ -1,0 +1,406 @@
+"""Focused tests for provider-neutral knowledge ranking."""
+
+from collections import Counter
+
+import pytest
+
+from app.models.agent import Agent, AgentKnowledgeBinding, KnowledgeBase, KnowledgeSource
+from app.services import knowledge_retrieval
+from app.services.knowledge_retrieval import rank_knowledge
+
+
+def test_ranking_matches_compound_brand_name_from_short_stt_variant():
+    matches = rank_knowledge(
+        "Alzab",
+        [
+            (
+                "The Group - Al Zaabi Group.pdf",
+                "The organisation has operated diversified businesses in the UAE for many years.",
+            )
+        ],
+    )
+
+    assert matches
+    assert matches[0].source == "The Group - Al Zaabi Group.pdf"
+
+
+def test_ranking_never_fuzzy_matches_medical_cancer_to_cancellation_content():
+    matches = rank_knowledge(
+        "cancer",
+        [
+            (
+                "Appointment Cancellation Policy.pdf",
+                "Patients may cancel or reschedule an appointment with advance notice.",
+            )
+        ],
+    )
+
+    assert matches == []
+
+
+def test_ranking_requires_two_distinct_terms_for_longer_queries():
+    weak_matches = rank_knowledge(
+        "cancer treatment specialist",
+        [
+            (
+                "Treatment Policy.pdf",
+                "A treatment appointment can be changed by contacting reception.",
+            )
+        ],
+    )
+    supported_matches = rank_knowledge(
+        "cancer treatment specialist",
+        [
+            (
+                "Oncology Treatment Guide.pdf",
+                "Cancer treatment is planned by the clinical care team after consultation.",
+            )
+        ],
+    )
+
+    assert weak_matches == []
+    assert supported_matches
+
+
+def test_ranking_requires_content_evidence_for_topic_not_explained_by_title():
+    matches = rank_knowledge(
+        "cancer Alzab group",
+        [
+            (
+                "The Group - Al Zaabi Group.pdf",
+                "The organisation operates real-estate and hospitality businesses in the UAE.",
+            )
+        ],
+    )
+
+    assert matches == []
+
+
+def test_ranking_requires_each_substantive_topic_not_explained_by_title():
+    matches = rank_knowledge(
+        "cancer treatment Alzab group",
+        [
+            (
+                "The Group - Al Zaabi Group.pdf",
+                "General treatment appointments support the real-estate and hospitality teams.",
+            )
+        ],
+    )
+
+    assert matches == []
+
+
+def test_ranking_handles_compound_stt_brand_variant_and_follow_up_fillers():
+    matches = rank_knowledge(
+        "Okay, can you tell me more about Alzab group please?",
+        [
+            (
+                "Al Zaabi Group - Social Media - voice-searchable.pdf",
+                "Al Zaabi Group | Home | Facebook | Instagram | LinkedIn | YouTube | Share",
+            ),
+            (
+                "Al Zaabi Group - Company Overview - voice-searchable.pdf",
+                "The Al Zaabi Group is a diversified UAE business group. Its operating companies "
+                "serve healthcare, trading, real estate, and other sectors through dedicated "
+                "divisions with a shared commitment to customers and long-term growth.",
+            ),
+            (
+                "Al Zaabi Group - Cosmetics Offers - voice-searchable.pdf",
+                "Al Zaabi Group publishes selected cosmetics promotions and seasonal treatment "
+                "offers for customers through its approved clinic channels.",
+            ),
+        ],
+    )
+
+    assert matches
+    assert matches[0].source == "Al Zaabi Group - Company Overview - voice-searchable.pdf"
+
+
+def test_ranking_recognizes_the_group_title_without_boosting_group_suffixes():
+    matches = rank_knowledge(
+        "Please tell me about Alzab group",
+        [
+            (
+                "Social Media - Al Zaabi Group - voice-searchable.pdf",
+                "Al Zaabi Group | Home | Facebook | Instagram | LinkedIn | YouTube | Share",
+            ),
+            (
+                "The Group - Al Zaabi Group - voice-searchable.pdf",
+                "This corporate profile explains the organisation's history, purpose, operating "
+                "model, leadership principles, and long-term contribution across the UAE.",
+            ),
+            (
+                "Divisions - Al Zaabi Group - voice-searchable.pdf",
+                "The healthcare, trading, real estate, and hospitality divisions operate through "
+                "dedicated companies with specialist teams and customer services.",
+            ),
+            (
+                "Cosmetics Offers - Al Zaabi Group - voice-searchable.pdf",
+                "Selected cosmetics promotions are published through approved clinic channels.",
+            ),
+        ],
+    )
+
+    assert {match.source for match in matches[:2]} == {
+        "The Group - Al Zaabi Group - voice-searchable.pdf",
+        "Divisions - Al Zaabi Group - voice-searchable.pdf",
+    }
+    social_score = next(match.score for match in matches if match.source.startswith("Social Media"))
+    assert all(match.score > social_score for match in matches[:2])
+
+
+def test_ranking_ignores_generic_source_title_suffixes():
+    matches = rank_knowledge(
+        "Is it voice searchable?",
+        [
+            ("Clinic Hours - voice-searchable.pdf", "The clinic opens daily at nine."),
+            ("Doctor Directory - voice-searchable.pdf", "Dr Rao works in dermatology."),
+        ],
+    )
+
+    assert matches == []
+
+
+def test_ranking_penalizes_thin_navigation_and_boosts_divisions_source():
+    matches = rank_knowledge(
+        "What are the Alzab group divisions?",
+        [
+            (
+                "Al Zaabi Group - Social Links - voice-searchable.pdf",
+                "Al Zaabi Group | Divisions | Home | Facebook | Instagram | LinkedIn | YouTube | "
+                "Share",
+            ),
+            (
+                "Al Zaabi Group - Divisions - voice-searchable.pdf",
+                "Al Zaabi Group operates several divisions, including healthcare, medical centres, "
+                "trading, real estate, and hospitality. Each division has dedicated operating "
+                "companies, management teams, services, and customer contact channels.",
+            ),
+        ],
+    )
+
+    assert matches[0].source == "Al Zaabi Group - Divisions - voice-searchable.pdf"
+    assert matches[0].score > matches[1].score
+
+
+def test_ranking_limits_each_source_to_two_chunks():
+    detailed_paragraph = (
+        "Botox treatment guidance covers consultation, suitability, preparation, aftercare, and "
+        "clinic follow-up. "
+    ) * 6
+    matches = rank_knowledge(
+        "Botox treatment guidance",
+        [
+            ("Detailed Botox Guide.pdf", "\n\n".join([detailed_paragraph] * 4)),
+            (
+                "Botox Safety FAQ.pdf",
+                "Botox treatment requires a clinician consultation and approved aftercare "
+                "guidance.",
+            ),
+            (
+                "Clinic Treatment Overview.pdf",
+                "The treatment overview lists Botox consultations among the clinic services.",
+            ),
+        ],
+        limit=6,
+    )
+
+    counts = Counter(match.source for match in matches)
+    assert counts["Detailed Botox Guide.pdf"] == 2
+    assert max(counts.values()) <= 2
+    assert len(counts) >= 2
+
+
+def test_ranking_preserves_doctor_directory_routing():
+    matches = rank_knowledge(
+        "Which doctors are available?",
+        [
+            ("PRP_Treatment.pdf", "Appointments are available at the clinic."),
+            (
+                "Adam_and_Eve_Doctors_Directory.pdf",
+                "Dr Rao — Dermatology. Dr Khan — Plastic Surgery.",
+            ),
+        ],
+    )
+
+    assert matches[0].source == "Adam_and_Eve_Doctors_Directory.pdf"
+    assert "Dr Rao" in matches[0].text
+
+
+def test_ranking_drops_filler_only_follow_up():
+    assert (
+        rank_knowledge(
+            "Okay, yes, please tell me more about it.",
+            [("General Information.pdf", "Please tell us what information you need.")],
+        )
+        == []
+    )
+
+
+@pytest.mark.asyncio
+async def test_retrieval_bounds_candidates_and_offloads_ranking(db, tenant, monkeypatch):
+    agent = Agent(
+        tenant_id=tenant.id,
+        name="Bounded retrieval agent",
+        system_prompt="Use only approved knowledge.",
+    )
+    knowledge_base = KnowledgeBase(
+        tenant_id=tenant.id,
+        name="Bounded retrieval knowledge",
+        approval_status="approved",
+        is_active=True,
+        content=(
+            "Clinic hours are part of the approved workspace summary. "
+            + "Approved reception schedule. " * 500
+        ),
+    )
+    db.add_all([agent, knowledge_base])
+    await db.flush()
+    db.add(
+        AgentKnowledgeBinding(
+            tenant_id=tenant.id,
+            agent_id=agent.id,
+            knowledge_base_id=knowledge_base.id,
+        )
+    )
+    db.add_all(
+        [
+            KnowledgeSource(
+                tenant_id=tenant.id,
+                knowledge_base_id=knowledge_base.id,
+                source_type="text",
+                name=f"Clinic Hours {index}",
+                status="indexed",
+                content=(
+                    f"Clinic hours source {index} confirms reception opens at nine each day. "
+                    + "Approved reception schedule and operating-hours detail. " * 300
+                ),
+            )
+            for index in range(knowledge_retrieval.MAX_SOURCE_CANDIDATES + 20)
+        ]
+    )
+    await db.commit()
+
+    ranked_document_sets: list[list[tuple[str, str]]] = []
+    original_bounded_ranking_documents = knowledge_retrieval._bounded_ranking_documents
+
+    def capture_bounded_ranking_documents(query, documents):
+        ranked_documents = original_bounded_ranking_documents(query, documents)
+        ranked_document_sets.append(ranked_documents)
+        return ranked_documents
+
+    async def capture_to_thread(function, *args):
+        return function(*args)
+
+    monkeypatch.setattr(
+        knowledge_retrieval,
+        "_bounded_ranking_documents",
+        capture_bounded_ranking_documents,
+    )
+    monkeypatch.setattr(knowledge_retrieval.asyncio, "to_thread", capture_to_thread)
+
+    context = await knowledge_retrieval.retrieve_knowledge_context(
+        db,
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        query="clinic hours",
+    )
+
+    assert context is not None
+    assert ranked_document_sets
+    ranked_documents = ranked_document_sets[0]
+    assert len(ranked_documents) <= knowledge_retrieval.MAX_SOURCE_CANDIDATES + 1
+    assert sum(len(content) for _, content in ranked_documents) <= (
+        knowledge_retrieval.MAX_RANKING_CORPUS_CHARS
+    )
+    assert all(
+        len(content) <= knowledge_retrieval.MAX_RANKING_SOURCE_CHARS
+        for _, content in ranked_documents
+    )
+    allocated_lengths = [len(content) for _, content in ranked_documents]
+    assert max(allocated_lengths) - min(allocated_lengths) <= 1
+    assert any(source == knowledge_base.name for source, _ in ranked_documents)
+
+
+@pytest.mark.asyncio
+async def test_retrieval_keeps_query_evidence_near_end_of_large_source(db, tenant):
+    agent = Agent(
+        tenant_id=tenant.id,
+        name="Long source retrieval agent",
+        system_prompt="Use only approved knowledge.",
+    )
+    knowledge_base = KnowledgeBase(
+        tenant_id=tenant.id,
+        name="Long treatment knowledge",
+        approval_status="approved",
+        is_active=True,
+    )
+    db.add_all([agent, knowledge_base])
+    await db.flush()
+    db.add(
+        AgentKnowledgeBinding(
+            tenant_id=tenant.id,
+            agent_id=agent.id,
+            knowledge_base_id=knowledge_base.id,
+        )
+    )
+    db.add(
+        KnowledgeSource(
+            tenant_id=tenant.id,
+            knowledge_base_id=knowledge_base.id,
+            source_type="website",
+            name="Treatment Guide",
+            status="indexed",
+            content=(
+                "Botox | Treatments | Botox | Home | Contact. "
+                + "General clinic navigation and introductory information. " * 220
+                + "Botox consultation requires an assessment by an approved clinician."
+            ),
+        )
+    )
+    await db.commit()
+
+    context = await knowledge_retrieval.retrieve_knowledge_context(
+        db,
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        query="Botox consultation",
+    )
+
+    assert context is not None
+    assert "Botox consultation requires an assessment" in context
+
+
+def test_query_excerpt_uses_token_boundaries_and_prefers_substantive_tail():
+    content = (
+        "Hair | Home | Hair | Chair catalogue. "
+        + "General navigation and introductory information. " * 220
+        + "The approved hair restoration consultation includes a clinician assessment."
+    )
+
+    excerpt = knowledge_retrieval._query_aware_excerpt(
+        content,
+        {"hair", "restoration"},
+        limit=800,
+    )
+
+    assert "approved hair restoration consultation" in excerpt
+    assert knowledge_retrieval._bounded_token_position("chair only", "hair") is None
+
+
+def test_query_excerpt_keeps_substantive_middle_between_navigation_and_footer():
+    content = (
+        "Botox treatment | Home | Contact. "
+        + "Introductory filler without treatment details. " * 110
+        + "Botox treatment is clinician-led and starts with a suitability assessment. "
+        + "More generic site filler. " * 160
+        + "Footer | Botox treatment | Privacy | Contact"
+    )
+
+    excerpt = knowledge_retrieval._query_aware_excerpt(
+        content,
+        {"botox", "treatment"},
+        limit=800,
+    )
+
+    assert "clinician-led" in excerpt

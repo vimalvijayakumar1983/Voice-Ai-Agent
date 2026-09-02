@@ -3779,6 +3779,14 @@ async def create_livekit_browser_session(
                 ),
                 "stt_language_configured": profile.stt_language,
                 "tts_model": "inworld-tts-2",
+                "tts_delivery_mode": str(
+                    (
+                        profile.runtime_config.get("tts_delivery_mode")
+                        if isinstance(profile.runtime_config, dict)
+                        else None
+                    )
+                    or "balanced"
+                ).lower(),
                 "recording_enabled": False,
                 "max_duration_seconds": reserved_max_duration_seconds,
             },

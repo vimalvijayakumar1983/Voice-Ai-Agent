@@ -13,13 +13,17 @@ def validate_provider_variables(
 ) -> ProviderVariables | None:
     if value is None:
         return None
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} must be a JSON object")
     if len(value) > 50:
         raise ValueError(f"{label} can contain at most 50 variables")
     for key, item in value.items():
-        if not key or len(key) > 100:
+        if not isinstance(key, str) or not key or len(key) > 100:
             raise ValueError("Context variable keys must be 1-100 characters")
         if key == "_vav_call_id" or key.startswith("_voice_ai_"):
             raise ValueError("Context variable key is reserved by the platform")
+        if not isinstance(item, (str, int, float, bool)):
+            raise ValueError("Context variable values must be strings, numbers, or booleans")
         if isinstance(item, float) and not math.isfinite(item):
             raise ValueError("Context variable numbers must be finite")
         if isinstance(item, str) and len(item) > 1_000:

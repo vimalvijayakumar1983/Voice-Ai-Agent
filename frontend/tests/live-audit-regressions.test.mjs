@@ -47,6 +47,18 @@ test('Inworld speech can use direct OpenAI tools without losing the Router optio
   assert.match(playgroundSource, /selectedRuntimeProfile\?\.llm_provider === 'openai' \? 'OpenAI' : 'Inworld Router'/);
 });
 
+test('Inworld runtime exposes native delivery modes with honest cost guidance', () => {
+  assert.match(runtimeSource, /id="runtime-delivery-mode"/);
+  assert.match(runtimeSource, /value="balanced">Balanced · recommended default/);
+  assert.match(runtimeSource, /value="creative">Creative · more expressive/);
+  assert.match(runtimeSource, /value="stable">Stable · most predictable/);
+  assert.match(runtimeSource, /no separate feature fee/);
+  assert.match(runtimeSource, /normal synthesized-character usage still applies/);
+  assert.match(runtimeSource, /LiveKit native dynamic turn detection/);
+  assert.match(runtimeSource, /Transport, SIP, and model usage remain billable/);
+  assert.match(apiSource, /tts_delivery_mode: 'stable' \| 'balanced' \| 'creative'/);
+});
+
 test('knowledge health explains when every agent already has access', () => {
   assert.match(knowledgeSource, /All agents have knowledge access/);
   assert.doesNotMatch(knowledgeSource, /detail=\{`\$\{agents\.length - boundAgents\} available`\}/);
@@ -61,6 +73,8 @@ test('tenant SIP routes never collect platform LiveKit or carrier credentials', 
 
 test('VAV-managed agents show runtime lifecycle instead of Smallest draft state', () => {
   assert.match(agentsSource, /agentStateLabel\(agent, runtimeProfiles\[agent\.id\]\)/);
+  assert.match(agentsSource, /LiveKit AgentSession · Inworld STT\/TTS/);
+  assert.doesNotMatch(agentsSource, /direct Inworld realtime runtime/);
   assert.match(agentsSource, /if \(runtime\.enabled && runtime\.status === 'active'\) return 'Runtime active'/);
   assert.match(agentsSource, /if \(runtime\.status === 'inactive'\) return 'Runtime inactive'/);
   assert.match(agentsSource, /Serving or provider synced/);
