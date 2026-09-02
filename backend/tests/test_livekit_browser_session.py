@@ -38,6 +38,20 @@ from app.telephony.livekit_provider import LiveKitSIPProvider
 from tests.conftest import test_session_factory as session_factory
 
 
+class _CompletedSpeechHandle:
+    def __init__(self, failure: BaseException | None = None):
+        self.failure = failure
+
+    def __await__(self):
+        async def done():
+            return None
+
+        return done().__await__()
+
+    def exception(self):
+        return self.failure
+
+
 async def _configured_browser_agent(db, tenant) -> Agent:
     agent = Agent(
         tenant_id=tenant.id,
@@ -717,7 +731,8 @@ async def test_worker_loads_draft_browser_profile_from_durable_reservation(
     assert model.id == agent.id
     assert profile.status == "draft"
     assert profile.enabled is False
-    assert api_key == "inworld-test-key-123456789"
+    assert api_key.speech == "inworld-test-key-123456789"
+    assert api_key.llm == "inworld-test-key-123456789"
     assert variables == {"customer_name": "Maya"}
 
     call = await db.get(Call, call_id)
@@ -854,7 +869,11 @@ async def test_worker_browser_branch_uses_signed_identity_not_participant_metada
         greeting_message="Hello {{ customer_name }}",
         max_call_duration_seconds=60,
     )
-    profile = SimpleNamespace(stt_language="auto", llm_model="openai/gpt-4o-mini")
+    profile = SimpleNamespace(
+        stt_language="auto",
+        llm_provider="inworld",
+        llm_model="openai/gpt-4o-mini",
+    )
     shutdown_callbacks = []
 
     class Room:
@@ -883,7 +902,7 @@ async def test_worker_browser_branch_uses_signed_identity_not_participant_metada
         return_value=(
             model,
             profile,
-            "inworld-key",
+            livekit_worker._RuntimeApiKeys(speech="inworld-key", llm="inworld-key"),
             {"customer_name": "Maya"},
             {"version": 1, "agent_id": str(agent_id)},
         )
@@ -963,7 +982,11 @@ async def test_browser_disconnect_deletes_room_and_shuts_down_when_close_and_fin
         greeting_message="Hello",
         max_call_duration_seconds=60,
     )
-    profile = SimpleNamespace(stt_language="auto", llm_model="openai/gpt-4o-mini")
+    profile = SimpleNamespace(
+        stt_language="auto",
+        llm_provider="inworld",
+        llm_model="openai/gpt-4o-mini",
+    )
     participant = SimpleNamespace(identity=participant_identity, attributes={})
     room_callbacks = {}
     shutdown_callbacks = []
@@ -1000,8 +1023,8 @@ async def test_browser_disconnect_deletes_room_and_shuts_down_when_close_and_fin
         async def start(self, **_kwargs):
             return None
 
-        async def generate_reply(self, **_kwargs):
-            return None
+        def say(self, *_args, **_kwargs):
+            return _CompletedSpeechHandle()
 
         async def aclose(self):
             await asyncio.Event().wait()
@@ -1021,7 +1044,7 @@ async def test_browser_disconnect_deletes_room_and_shuts_down_when_close_and_fin
             return_value=(
                 model,
                 profile,
-                "inworld-key",
+                livekit_worker._RuntimeApiKeys(speech="inworld-key", llm="inworld-key"),
                 {},
                 {"version": 1, "agent_id": str(agent_id)},
             )
@@ -1052,6 +1075,132 @@ async def test_browser_disconnect_deletes_room_and_shuts_down_when_close_and_fin
     await asyncio.wait_for(shutdown_callbacks[0](), timeout=0.1)
     assert shutdown_reasons == ["Browser participant disconnected"]
     assert delete_room.await_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider_event", ["error", "close"])
+async def test_async_provider_failure_fails_call_deletes_browser_room_and_finalizes_once(
+    monkeypatch,
+    provider_event,
+):
+    _configure_platform(monkeypatch)
+    tenant_id = uuid4()
+    agent_id = uuid4()
+    call_id = uuid4()
+    room_name = f"vav-browser-{call_id}"
+    participant_identity = f"browser-{call_id}"
+    metadata = create_browser_dispatch_metadata(
+        tenant_id=tenant_id,
+        agent_id=agent_id,
+        call_id=call_id,
+        room_name=room_name,
+        participant_identity=participant_identity,
+    )
+    model = SimpleNamespace(
+        id=agent_id,
+        tenant_id=tenant_id,
+        voice_id="inworld:Ashley",
+        language="en-GB",
+        speech_rate=1.0,
+        system_prompt="Use approved knowledge.",
+        greeting_message="Hello",
+        max_call_duration_seconds=60,
+    )
+    profile = SimpleNamespace(
+        stt_language="en-GB",
+        llm_provider="openai",
+        llm_model="gpt-4o-mini",
+    )
+    callbacks = {}
+    shutdown_callbacks = []
+    shutdown_called = asyncio.Event()
+
+    class Room:
+        name = room_name
+
+        def on(self, event, callback):
+            callbacks[f"room:{event}"] = callback
+
+    class Context:
+        job = SimpleNamespace(metadata=metadata)
+        room = Room()
+
+        async def connect(self):
+            return None
+
+        async def wait_for_participant(self):
+            return SimpleNamespace(identity=participant_identity, attributes={})
+
+        def add_shutdown_callback(self, callback):
+            shutdown_callbacks.append(callback)
+
+        def shutdown(self, reason=""):
+            assert reason == "VAV provider failure"
+            shutdown_called.set()
+
+    class Session:
+        def on(self, event):
+            return lambda callback: callbacks.__setitem__(f"session:{event}", callback)
+
+        async def start(self, **_kwargs):
+            return None
+
+        def say(self, *_args, **_kwargs):
+            if provider_event == "error":
+                callbacks["session:error"](
+                    SimpleNamespace(
+                        error=SimpleNamespace(
+                            recoverable=False,
+                            error=RuntimeError("provider rejected tool call"),
+                        )
+                    )
+                )
+            else:
+                callbacks["session:close"](
+                    SimpleNamespace(
+                        reason=SimpleNamespace(value="error"),
+                        error=SimpleNamespace(error=RuntimeError("provider rejected tool call")),
+                    )
+                )
+            return _CompletedSpeechHandle()
+
+        async def aclose(self):
+            return None
+
+    finish_call = AsyncMock()
+    delete_room = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        livekit_worker,
+        "_load_browser_runtime",
+        AsyncMock(
+            return_value=(
+                model,
+                profile,
+                livekit_worker._RuntimeApiKeys(
+                    speech="tenant-inworld-key",
+                    llm="tenant-openai-key",
+                ),
+                {},
+                {"version": 1, "agent_id": str(agent_id)},
+            )
+        ),
+    )
+    monkeypatch.setattr(livekit_worker, "_open_browser_call", AsyncMock(return_value=call_id))
+    monkeypatch.setattr(livekit_worker, "_finish_call", finish_call)
+    monkeypatch.setattr(livekit_worker, "delete_browser_room", delete_room)
+    monkeypatch.setattr(livekit_worker.inworld, "STT", lambda **_kwargs: object())
+    monkeypatch.setattr(livekit_worker.inworld, "TTS", lambda **_kwargs: object())
+    monkeypatch.setattr(livekit_worker.openai, "LLM", lambda **_kwargs: object())
+    monkeypatch.setattr(livekit_worker, "AgentSession", lambda **_kwargs: Session())
+
+    await livekit_worker.vav_inworld_session(Context())
+    await asyncio.wait_for(shutdown_called.wait(), timeout=2)
+
+    assert finish_call.await_count == 1
+    assert isinstance(finish_call.await_args.kwargs["failure"], RuntimeError)
+    delete_room.assert_awaited_once()
+    await shutdown_callbacks[0]()
+    assert finish_call.await_count == 1
 
 
 @pytest.mark.asyncio

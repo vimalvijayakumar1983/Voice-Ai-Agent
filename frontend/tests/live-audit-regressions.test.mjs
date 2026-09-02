@@ -39,6 +39,14 @@ test('runtime readiness tests the values currently visible in the form', () => {
   assert.match(runtimeSource, /Save & test readiness/);
 });
 
+test('Inworld speech can use direct OpenAI tools without losing the Router option', () => {
+  assert.match(runtimeSource, /value="openai:gpt-4o-mini"/);
+  assert.match(runtimeSource, /value="inworld:auto"/);
+  assert.match(runtimeSource, /llm_provider: llmProvider/);
+  assert.doesNotMatch(runtimeSource, /llm_provider: inworldRuntime \? 'inworld'/);
+  assert.match(playgroundSource, /selectedRuntimeProfile\?\.llm_provider === 'openai' \? 'OpenAI' : 'Inworld Router'/);
+});
+
 test('knowledge health explains when every agent already has access', () => {
   assert.match(knowledgeSource, /All agents have knowledge access/);
   assert.doesNotMatch(knowledgeSource, /detail=\{`\$\{agents\.length - boundAgents\} available`\}/);

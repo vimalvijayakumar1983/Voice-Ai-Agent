@@ -549,9 +549,12 @@ def _call_components(
         else:
             missing.append(f"{speech.title()} TTS characters")
 
+        llm_provider = str(
+            runtime.get("llm_provider") or ("inworld" if inworld_speech else "openai")
+        )
         llm_model = str(runtime.get("llm_model") or "gpt-4o-mini")
         priced_llm_model = llm_model.removeprefix("openai/")
-        auto_routed_model = inworld_speech and priced_llm_model == "auto"
+        auto_routed_model = llm_provider == "inworld" and priced_llm_model == "auto"
         if auto_routed_model:
             # Auto routing may select any supported model. Do not present a
             # convenient proxy as complete customer-facing cost coverage.
@@ -568,24 +571,24 @@ def _call_components(
             if input_tokens:
                 components.append(
                     _component(
-                        "Inworld Router" if inworld_speech else "OpenAI",
+                        "Inworld Router" if llm_provider == "inworld" else "OpenAI",
                         f"{llm_model} input",
                         Decimal(str(input_tokens)) / Decimal("1000000"),
                         "1M tokens",
                         input_rate,
-                        INWORLD_SOURCE if inworld_speech else OPENAI_SOURCE,
+                        INWORLD_SOURCE if llm_provider == "inworld" else OPENAI_SOURCE,
                         "Runtime-metered input tokens",
                     )
                 )
             if output_tokens:
                 components.append(
                     _component(
-                        "Inworld Router" if inworld_speech else "OpenAI",
+                        "Inworld Router" if llm_provider == "inworld" else "OpenAI",
                         f"{llm_model} output",
                         Decimal(str(output_tokens)) / Decimal("1000000"),
                         "1M tokens",
                         output_rate,
-                        INWORLD_SOURCE if inworld_speech else OPENAI_SOURCE,
+                        INWORLD_SOURCE if llm_provider == "inworld" else OPENAI_SOURCE,
                         "Runtime-metered output tokens",
                     )
                 )

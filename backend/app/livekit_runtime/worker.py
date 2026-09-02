@@ -1,4 +1,4 @@
-"""Production LiveKit SIP worker using direct Inworld STT, Router, and TTS.
+"""Production LiveKit SIP worker using Inworld speech with a selectable LLM.
 
 Run as a separate long-lived service:
     python -m app.livekit_runtime.worker start
@@ -48,7 +48,7 @@ from app.services.integration_security import (
 )
 from app.services.knowledge_retrieval import retrieve_knowledge_context
 from app.services.provider_callback_outbox import persist_provider_callback_actions
-from app.services.provider_credentials import load_provider_config
+from app.services.provider_credentials import ProviderCredentialError, load_provider_config
 from app.services.provider_variables import ProviderVariables, validate_provider_variables
 from app.services.usage_ledger import (
     lock_agent_runtime_limits,
@@ -103,6 +103,49 @@ class _DispatchContext:
     call_id: UUID | None
     tenant_id: UUID | None = None
     participant_identity: str | None = None
+
+
+@dataclass(frozen=True, repr=False)
+class _RuntimeApiKeys:
+    speech: str
+    llm: str
+
+
+async def _load_runtime_api_keys(
+    db,
+    *,
+    tenant_id: UUID,
+    llm_provider: str,
+) -> _RuntimeApiKeys:
+    """Resolve only server-side tenant credentials, with an explicit platform fallback."""
+    if llm_provider not in {"inworld", "openai"}:
+        raise RuntimeError("Selected LLM provider is unsupported")
+
+    async def selected_key(provider: str, platform_key: str) -> str:
+        provider_name = "OpenAI" if provider == "openai" else provider.title()
+        try:
+            config = await load_provider_config(db, tenant_id, provider)
+        except ProviderCredentialError as exc:
+            raise RuntimeError(f"{provider_name} credential is unavailable") from exc
+        if config is not None:
+            key = str(config.get("api_key") or "").strip()
+            if not key:
+                # An active but malformed tenant credential must never fall
+                # through to another account's platform credential.
+                raise RuntimeError(f"{provider_name} workspace credential is invalid")
+            return key
+        key = str(platform_key or "").strip()
+        if not key:
+            raise RuntimeError(f"{provider_name} credential is unavailable")
+        return key
+
+    speech_key = await selected_key("inworld", settings.inworld_api_key)
+    llm_key = (
+        speech_key
+        if llm_provider == "inworld"
+        else await selected_key("openai", settings.openai_api_key)
+    )
+    return _RuntimeApiKeys(speech=speech_key, llm=llm_key)
 
 
 class BrowserReservationAlreadyClaimedError(RuntimeError):
@@ -284,6 +327,44 @@ def _inworld_tts_options(*, model: AgentModel, api_key: str) -> dict[str, Any]:
     return options
 
 
+def _session_close_failure(event: object) -> BaseException | None:
+    """Return a content-free failure marker only for an error-closed session."""
+    reason = getattr(event, "reason", None)
+    if getattr(reason, "value", reason) != "error":
+        return None
+    error = getattr(event, "error", None)
+    underlying = getattr(error, "error", None)
+    if isinstance(underlying, BaseException):
+        return underlying
+    if isinstance(error, BaseException):
+        return error
+    error_type = type(error).__name__ if error is not None else "ProviderError"
+    return RuntimeError(f"LiveKit session closed after {error_type}")
+
+
+def _session_error_failure(event: object) -> BaseException | None:
+    """Return the underlying failure only for a non-recoverable provider error."""
+    provider_error = getattr(event, "error", None)
+    if provider_error is None or bool(getattr(provider_error, "recoverable", False)):
+        return None
+    underlying = getattr(provider_error, "error", None)
+    if isinstance(underlying, BaseException):
+        return underlying
+    if isinstance(provider_error, BaseException):
+        return provider_error
+    return RuntimeError(
+        f"LiveKit session received unrecoverable {type(provider_error).__name__}"
+    )
+
+
+def _effective_stt_language(*, model: AgentModel, profile: AgentRuntimeProfile) -> str:
+    """Resolve `auto` to the agent's configured primary locale for Inworld STT."""
+    configured = str(profile.stt_language or "").strip()
+    if configured and configured != "auto":
+        return configured
+    return str(model.language or "en-US").strip() or "en-US"
+
+
 def _revision_timestamp(value: object) -> str | None:
     if not isinstance(value, datetime):
         return None
@@ -377,7 +458,9 @@ Knowledge policy:
         return context or "NO_VERIFIED_KNOWLEDGE_MATCH"
 
 
-async def _load_runtime(agent_id: UUID) -> tuple[AgentModel, AgentRuntimeProfile, str]:
+async def _load_runtime(
+    agent_id: UUID,
+) -> tuple[AgentModel, AgentRuntimeProfile, _RuntimeApiKeys]:
     async with async_session_factory() as db:
         row = (
             await db.execute(
@@ -390,18 +473,19 @@ async def _load_runtime(agent_id: UUID) -> tuple[AgentModel, AgentRuntimeProfile
                     AgentRuntimeProfile.status == "active",
                     AgentRuntimeProfile.telephony_provider == "livekit_sip",
                     AgentRuntimeProfile.primary_speech_provider == "inworld",
-                    AgentRuntimeProfile.llm_provider == "inworld",
+                    AgentRuntimeProfile.llm_provider.in_(("inworld", "openai")),
                 )
             )
         ).one_or_none()
         if row is None:
             raise RuntimeError("The dispatched VAV agent is not active on LiveKit + Inworld")
         model, profile = row
-        provider = await load_provider_config(db, model.tenant_id, "inworld")
-        api_key = str((provider or {}).get("api_key") or settings.inworld_api_key).strip()
-        if not api_key:
-            raise RuntimeError("Inworld credential is unavailable")
-        return model, profile, api_key
+        api_keys = await _load_runtime_api_keys(
+            db,
+            tenant_id=model.tenant_id,
+            llm_provider=profile.llm_provider,
+        )
+        return model, profile, api_keys
 
 
 async def _load_browser_runtime(
@@ -414,7 +498,7 @@ async def _load_browser_runtime(
 ) -> tuple[
     AgentModel,
     AgentRuntimeProfile,
-    str,
+    _RuntimeApiKeys,
     ProviderVariables,
     dict[str, Any],
 ]:
@@ -441,7 +525,7 @@ async def _load_browser_runtime(
                     AgentRuntimeProfile.status != "inactive",
                     AgentRuntimeProfile.telephony_provider == "livekit_sip",
                     AgentRuntimeProfile.primary_speech_provider == "inworld",
-                    AgentRuntimeProfile.llm_provider == "inworld",
+                    AgentRuntimeProfile.llm_provider.in_(("inworld", "openai")),
                     Call.id == call_id,
                     Call.direction == "inbound",
                     Call.provider == "livekit_webrtc",
@@ -463,6 +547,7 @@ async def _load_browser_runtime(
             or not isinstance(runtime, dict)
             or runtime.get("transport") != "livekit_webrtc"
             or runtime.get("speech_provider") != "inworld"
+            or runtime.get("llm_provider") not in {None, profile.llm_provider}
         ):
             raise RuntimeError("The browser dispatch does not match its durable VAV reservation")
         reserved_duration = metadata.get("reserved_max_duration_seconds")
@@ -528,24 +613,25 @@ async def _load_browser_runtime(
             )
         except ValueError as exc:
             raise RuntimeError("The browser call variables are invalid") from exc
-        provider = await load_provider_config(db, model.tenant_id, "inworld")
-        api_key = str((provider or {}).get("api_key") or settings.inworld_api_key).strip()
-        if not api_key:
-            raise RuntimeError("Inworld credential is unavailable")
+        api_keys = await _load_runtime_api_keys(
+            db,
+            tenant_id=model.tenant_id,
+            llm_provider=profile.llm_provider,
+        )
         served_configuration = _served_browser_configuration(
             model=model,
             profile=profile,
             knowledge=knowledge,
             sources=sources,
         )
-        return model, profile, api_key, variables or {}, served_configuration
+        return model, profile, api_keys, variables or {}, served_configuration
 
 
 async def _resolve_inbound_runtime(
     *,
     inbound_trunk_id: str,
     called_number: str,
-) -> tuple[AgentModel, AgentRuntimeProfile, str]:
+) -> tuple[AgentModel, AgentRuntimeProfile, _RuntimeApiKeys]:
     """Resolve inbound calls from operator-owned route data, never dispatch metadata."""
     trunk_id = str(inbound_trunk_id or "").strip()
     did = str(called_number or "").strip()
@@ -585,7 +671,7 @@ async def _resolve_inbound_runtime(
                     AgentRuntimeProfile.status == "active",
                     AgentRuntimeProfile.telephony_provider == "livekit_sip",
                     AgentRuntimeProfile.primary_speech_provider == "inworld",
-                    AgentRuntimeProfile.llm_provider == "inworld",
+                    AgentRuntimeProfile.llm_provider.in_(("inworld", "openai")),
                 )
             )
         ).all()
@@ -593,11 +679,12 @@ async def _resolve_inbound_runtime(
         if len(matches) != 1:
             raise RuntimeError("Inbound LiveKit DID does not resolve to exactly one active agent")
         model, profile = matches[0]
-        provider = await load_provider_config(db, tenant_id, "inworld")
-        api_key = str((provider or {}).get("api_key") or settings.inworld_api_key).strip()
-        if not api_key:
-            raise RuntimeError("Inworld credential is unavailable")
-        return model, profile, api_key
+        api_keys = await _load_runtime_api_keys(
+            db,
+            tenant_id=tenant_id,
+            llm_provider=profile.llm_provider,
+        )
+        return model, profile, api_keys
 
 
 async def _enforce_inbound_limits(
@@ -693,6 +780,7 @@ async def _open_call(
             )
             existing.call_metadata = {
                 **(existing.call_metadata or {}),
+                "agent_configuration": agent_configuration_snapshot(model),
                 "conversation_type": f"telephony{direction.title()}",
                 "channel": "phone",
                 "speech_provider": "inworld",
@@ -702,9 +790,11 @@ async def _open_call(
                     **dict((existing.call_metadata or {}).get("runtime") or {}),
                     "transport": "livekit_sip",
                     "speech_provider": "inworld",
-                    "llm_provider": "inworld",
+                    "llm_provider": profile.llm_provider,
                     "llm_model": profile.llm_model,
                     "stt_model": "inworld/inworld-stt-1",
+                    "stt_language": _effective_stt_language(model=model, profile=profile),
+                    "stt_language_configured": profile.stt_language,
                     "tts_model": "inworld-tts-2",
                     "recording_enabled": False,
                 },
@@ -730,15 +820,18 @@ async def _open_call(
             started_at=now,
             answered_at=now,
             call_metadata={
+                "agent_configuration": agent_configuration_snapshot(model),
                 "conversation_type": f"telephony{direction.title()}",
                 "channel": "phone",
                 "speech_provider": "inworld",
                 "runtime": {
                     "transport": "livekit_sip",
                     "speech_provider": "inworld",
-                    "llm_provider": "inworld",
+                    "llm_provider": profile.llm_provider,
                     "llm_model": profile.llm_model,
                     "stt_model": "inworld/inworld-stt-1",
+                    "stt_language": _effective_stt_language(model=model, profile=profile),
+                    "stt_language_configured": profile.stt_language,
                     "tts_model": "inworld-tts-2",
                     "recording_enabled": False,
                 },
@@ -805,9 +898,11 @@ async def _open_browser_call(
                 **dict(metadata.get("runtime") or {}),
                 "transport": "livekit_webrtc",
                 "speech_provider": "inworld",
-                "llm_provider": "inworld",
+                "llm_provider": profile.llm_provider,
                 "llm_model": profile.llm_model,
                 "stt_model": "inworld/inworld-stt-1",
+                "stt_language": _effective_stt_language(model=model, profile=profile),
+                "stt_language_configured": profile.stt_language,
                 "tts_model": "inworld-tts-2",
                 "recording_enabled": False,
                 "max_duration_seconds": model.max_call_duration_seconds,
@@ -1009,7 +1104,7 @@ async def vav_inworld_session(ctx: JobContext) -> None:
                 raise RuntimeError("LiveKit browser participant identity is unauthorized")
             if any(str(key).startswith("sip.") for key in attributes):
                 raise RuntimeError("A SIP participant cannot enter a browser dispatch")
-            model, profile, api_key, variables, served_configuration = await _load_browser_runtime(
+            model, profile, api_keys, variables, served_configuration = await _load_browser_runtime(
                 tenant_id=dispatch.tenant_id,
                 agent_id=dispatch.agent_id,
                 call_id=dispatch.call_id,
@@ -1032,10 +1127,10 @@ async def vav_inworld_session(ctx: JobContext) -> None:
             if direction == "outbound":
                 if dispatch.agent_id is None or dispatch.call_id is None:
                     raise RuntimeError("Outbound LiveKit dispatch is missing VAV call metadata")
-                model, profile, api_key = await _load_runtime(dispatch.agent_id)
+                model, profile, api_keys = await _load_runtime(dispatch.agent_id)
                 dispatched_call_id = dispatch.call_id
             else:
-                model, profile, api_key = await _resolve_inbound_runtime(
+                model, profile, api_keys = await _resolve_inbound_runtime(
                     inbound_trunk_id=str(attributes.get("sip.trunkID") or ""),
                     called_number=str(attributes.get("sip.trunkPhoneNumber") or ""),
                 )
@@ -1076,6 +1171,7 @@ async def vav_inworld_session(ctx: JobContext) -> None:
     close_lock = asyncio.Lock()
     finalized = False
     closing = False
+    runtime_failure: BaseException | None = None
     max_duration_task: asyncio.Task[None] | None = None
     session: AgentSession | None = None
 
@@ -1084,7 +1180,12 @@ async def vav_inworld_session(ctx: JobContext) -> None:
         async with finalization_lock:
             if finalized:
                 return
-            await _finish_call(call_id, turns, usage_totals, failure=failure)
+            await _finish_call(
+                call_id,
+                turns,
+                usage_totals,
+                failure=failure or runtime_failure,
+            )
             finalized = True
 
     async def _shutdown() -> None:
@@ -1104,20 +1205,22 @@ async def vav_inworld_session(ctx: JobContext) -> None:
         # LiveKit begins its normal job shutdown sequence.
         ctx.add_shutdown_callback(_shutdown)
         stt_options: dict[str, Any] = {
-            "api_key": api_key,
+            "api_key": api_keys.speech,
             "model": "inworld/inworld-stt-1",
-            "enable_voice_profile": True,
+            # VAV does not use inferred age/gender/emotion/accent attributes.
+            "enable_voice_profile": False,
+            "language": _effective_stt_language(model=model, profile=profile),
         }
-        if profile.stt_language != "auto":
-            stt_options["language"] = profile.stt_language
-        tts_options = _inworld_tts_options(model=model, api_key=api_key)
+        tts_options = _inworld_tts_options(model=model, api_key=api_keys.speech)
+        llm_options: dict[str, Any] = {
+            "api_key": api_keys.llm,
+            "model": profile.llm_model,
+        }
+        if getattr(profile, "llm_provider", "inworld") == "inworld":
+            llm_options["base_url"] = f"{settings.inworld_base_url.rstrip('/')}/v1"
         session = AgentSession(
             stt=inworld.STT(**stt_options),
-            llm=openai.LLM(
-                api_key=api_key,
-                base_url=f"{settings.inworld_base_url.rstrip('/')}/v1",
-                model=profile.llm_model,
-            ),
+            llm=openai.LLM(**llm_options),
             tts=inworld.TTS(**tts_options),
             turn_handling={
                 "turn_detection": inference.TurnDetector(),
@@ -1190,6 +1293,92 @@ async def vav_inworld_session(ctx: JobContext) -> None:
                             # failure may leave this job accepting more audio.
                             ctx.shutdown(reason=reason)
 
+        async def _terminate_failed_session(failure: BaseException) -> None:
+            """Persist an async model failure and force the browser out of stale listening."""
+            nonlocal closing
+            async with close_lock:
+                if closing:
+                    return
+                closing = True
+                try:
+                    await _run_bounded_cleanup(
+                        session.aclose(),
+                        timeout_seconds=SESSION_CLOSE_TIMEOUT_SECONDS,
+                        timeout_event="livekit_error_session_close_timed_out",
+                        failure_event="livekit_error_session_close_failed",
+                        context={"call_id": str(call_id)},
+                    )
+                    await _run_bounded_cleanup(
+                        _finalize_once(failure=failure),
+                        timeout_seconds=CALL_FINALIZE_TIMEOUT_SECONDS,
+                        timeout_event="livekit_error_finalization_timed_out",
+                        failure_event="livekit_error_finalization_failed",
+                        context={"call_id": str(call_id)},
+                    )
+                finally:
+                    try:
+                        if browser_session:
+                            await _run_bounded_cleanup(
+                                delete_browser_room(
+                                    url=settings.livekit_url,
+                                    api_key=settings.livekit_api_key,
+                                    api_secret=settings.livekit_api_secret,
+                                    room_name=ctx.room.name,
+                                ),
+                                timeout_seconds=ROOM_DELETE_TIMEOUT_SECONDS,
+                                timeout_event="livekit_error_room_delete_timed_out",
+                                failure_event="livekit_error_room_delete_failed",
+                                context={"call_id": str(call_id), "room_name": ctx.room.name},
+                            )
+                    finally:
+                        ctx.shutdown(reason="VAV provider failure")
+
+        @session.on("close")
+        def _on_session_close(event: Any) -> None:
+            nonlocal runtime_failure
+            failure = _session_close_failure(event)
+            if failure is None:
+                return
+            runtime_failure = failure
+            task = asyncio.create_task(_terminate_failed_session(failure))
+            task.add_done_callback(
+                lambda done: (
+                    logger.error(
+                        "livekit_error_cleanup_failed",
+                        extra={
+                            "call_id": str(call_id),
+                            "error_type": type(done.exception()).__name__,
+                        },
+                    )
+                    if not done.cancelled() and done.exception() is not None
+                    else None
+                )
+            )
+
+        @session.on("error")
+        def _on_session_error(event: Any) -> None:
+            nonlocal runtime_failure
+            failure = _session_error_failure(event)
+            if failure is None:
+                return
+            # Make the failure sticky synchronously. A participant disconnect
+            # racing this task will still finalize the call as failed.
+            runtime_failure = failure
+            task = asyncio.create_task(_terminate_failed_session(failure))
+            task.add_done_callback(
+                lambda done: (
+                    logger.error(
+                        "livekit_error_cleanup_failed",
+                        extra={
+                            "call_id": str(call_id),
+                            "error_type": type(done.exception()).__name__,
+                        },
+                    )
+                    if not done.cancelled() and done.exception() is not None
+                    else None
+                )
+            )
+
         def _participant_disconnected(disconnected_participant: Any) -> None:
             if getattr(disconnected_participant, "identity", None) != getattr(
                 participant, "identity", None
@@ -1255,13 +1444,16 @@ async def vav_inworld_session(ctx: JobContext) -> None:
             room=ctx.room,
             agent=VAVInworldAgent(model=model, variables=variables),
         )
-        await session.generate_reply(
-            instructions=(
-                _render_call_template(model.greeting_message, variables)
-                if model.greeting_message
-                else "Greet the caller and ask how you can help."
-            )
+        greeting = (
+            _render_call_template(model.greeting_message, variables)
+            if model.greeting_message
+            else "Hello. How can I help you today?"
         )
+        greeting_handle = session.say(greeting, add_to_chat_ctx=True)
+        await greeting_handle
+        greeting_failure = greeting_handle.exception()
+        if greeting_failure is not None:
+            raise greeting_failure
     except BaseException as exc:
         if max_duration_task is not None:
             max_duration_task.cancel()

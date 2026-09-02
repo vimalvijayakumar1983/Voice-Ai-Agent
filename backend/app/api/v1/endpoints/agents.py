@@ -909,7 +909,7 @@ async def _livekit_browser_runtime(
         or profile.status == "inactive"
         or profile.telephony_provider != "livekit_sip"
         or profile.primary_speech_provider != "inworld"
-        or profile.llm_provider != "inworld"
+        or profile.llm_provider not in {"inworld", "openai"}
     ):
         raise HTTPException(
             status_code=409,
@@ -929,6 +929,21 @@ async def _livekit_browser_runtime(
     inworld, _source, _updated_at = await _tenant_inworld_client(db, tenant_id)
     if not inworld.is_configured:
         raise HTTPException(status_code=409, detail="Add a valid Inworld API key first")
+    if profile.llm_provider == "openai":
+        try:
+            openai_config = await load_provider_config(db, tenant_id, "openai")
+        except ProviderCredentialError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail="OpenAI credential is unavailable; ask an administrator to rotate it",
+            ) from exc
+        openai_key = str(
+            ((openai_config or {}).get("api_key") or "")
+            if openai_config is not None
+            else settings.openai_api_key
+        ).strip()
+        if not openai_key:
+            raise HTTPException(status_code=409, detail="Add a valid OpenAI API key first")
 
     binding_query = (
         select(AgentKnowledgeBinding)
@@ -3756,9 +3771,13 @@ async def create_livekit_browser_session(
             "runtime": {
                 "transport": "livekit_webrtc",
                 "speech_provider": "inworld",
-                "llm_provider": "inworld",
+                "llm_provider": profile.llm_provider,
                 "llm_model": profile.llm_model,
                 "stt_model": "inworld/inworld-stt-1",
+                "stt_language": (
+                    agent.language if profile.stt_language == "auto" else profile.stt_language
+                ),
+                "stt_language_configured": profile.stt_language,
                 "tts_model": "inworld-tts-2",
                 "recording_enabled": False,
                 "max_duration_seconds": reserved_max_duration_seconds,
@@ -3976,6 +3995,7 @@ async def update_agent(
     # authoritative, so a full editor payload must behave like a semantic PATCH:
     # unchanged values neither trigger provider I/O nor dirty a published agent.
     effective_changes = _effective_agent_changes(agent, changes)
+    voice_provider_changed = "voice_provider" in effective_changes
     provider_switch_requested = bool(
         "voice_provider" in effective_changes
         and agent.provider_agent_id
@@ -4072,10 +4092,10 @@ async def update_agent(
             runtime_profile.status = "draft"
             if agent.voice_provider in {"sarvam", "elevenlabs", "inworld"}:
                 runtime_profile.primary_speech_provider = agent.voice_provider
-                if agent.voice_provider == "inworld":
+                if agent.voice_provider == "inworld" and voice_provider_changed:
                     runtime_profile.telephony_provider = "livekit_sip"
-                    runtime_profile.llm_provider = "inworld"
-                    runtime_profile.llm_model = "auto"
+                    runtime_profile.llm_provider = "openai"
+                    runtime_profile.llm_model = "gpt-4o-mini"
 
     if agent.provider_agent_id and SMALLEST_SYNC_FIELDS.intersection(effective_changes):
         agent.sync_status = "dirty"

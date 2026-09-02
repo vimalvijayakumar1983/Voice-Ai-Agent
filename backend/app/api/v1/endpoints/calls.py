@@ -676,8 +676,15 @@ async def initiate_outbound_call(
                 {
                     "transport": "livekit_sip",
                     "speech_provider": "inworld",
-                    "llm_provider": "inworld",
+                    "llm_provider": runtime_profile.llm_provider,
                     "llm_model": runtime_profile.llm_model,
+                    "stt_model": "inworld/inworld-stt-1",
+                    "stt_language": (
+                        agent.language
+                        if runtime_profile.stt_language == "auto"
+                        else runtime_profile.stt_language
+                    ),
+                    "stt_language_configured": runtime_profile.stt_language,
                     "tts_model": "inworld-tts-2",
                     "recording_enabled": False,
                 }

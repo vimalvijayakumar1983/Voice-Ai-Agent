@@ -18,6 +18,7 @@ from app.livekit_runtime.worker import (
     _worker_http_port,
     _worker_idle_processes,
 )
+from app.services.provider_credentials import ProviderCredentialError
 from app.telephony.livekit_provider import LiveKitSIPError, LiveKitSIPProvider
 
 
@@ -225,7 +226,7 @@ async def test_outbound_livekit_sip_failure_remains_definitive_when_cleanup_fail
 
 
 @pytest.mark.asyncio
-async def test_worker_failure_after_call_persistence_finalizes_once_and_keeps_auto_stt(
+async def test_worker_failure_after_call_persistence_finalizes_once_and_resolves_auto_stt(
     monkeypatch,
 ):
     agent_id = uuid4()
@@ -233,6 +234,7 @@ async def test_worker_failure_after_call_persistence_finalizes_once_and_keeps_au
     shutdown_callbacks = []
     stt_options = {}
     tts_options = {}
+    llm_options = {}
     session_options = {}
     model = SimpleNamespace(
         id=agent_id,
@@ -245,7 +247,11 @@ async def test_worker_failure_after_call_persistence_finalizes_once_and_keeps_au
         greeting_message="Hello",
         max_call_duration_seconds=60,
     )
-    profile = SimpleNamespace(stt_language="auto", llm_model="openai/gpt-4o-mini")
+    profile = SimpleNamespace(
+        stt_language="auto",
+        llm_provider="openai",
+        llm_model="gpt-4o-mini",
+    )
 
     class Room:
         name = "vav-call-test"
@@ -280,7 +286,10 @@ async def test_worker_failure_after_call_persistence_finalizes_once_and_keeps_au
             return None
 
     async def load_runtime(_agent_id):
-        return model, profile, "inworld-key"
+        return model, profile, livekit_worker._RuntimeApiKeys(
+            speech="inworld-key",
+            llm="tenant-openai-key",
+        )
 
     def stt(**kwargs):
         stt_options.update(kwargs)
@@ -300,13 +309,18 @@ async def test_worker_failure_after_call_persistence_finalizes_once_and_keeps_au
     monkeypatch.setattr(livekit_worker, "_finish_call", finalize)
     monkeypatch.setattr(livekit_worker.inworld, "STT", stt)
     monkeypatch.setattr(livekit_worker.inworld, "TTS", tts)
-    monkeypatch.setattr(livekit_worker.openai, "LLM", lambda **_kwargs: object())
+    def llm(**kwargs):
+        llm_options.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(livekit_worker.openai, "LLM", llm)
     monkeypatch.setattr(livekit_worker, "AgentSession", agent_session)
 
     with pytest.raises(RuntimeError, match="session construction failed"):
         await livekit_worker.vav_inworld_session(Context())
 
-    assert "language" not in stt_options
+    assert stt_options["language"] == "en-GB"
+    assert stt_options["enable_voice_profile"] is False
     assert tts_options == {
         "api_key": "inworld-key",
         "model": "inworld-tts-2",
@@ -316,6 +330,7 @@ async def test_worker_failure_after_call_persistence_finalizes_once_and_keeps_au
         "delivery_mode": "BALANCED",
         "text_normalization": "ON",
     }
+    assert llm_options == {"api_key": "tenant-openai-key", "model": "gpt-4o-mini"}
     assert session_options["turn_handling"]["endpointing"] == {
         "mode": "fixed",
         "min_delay": 0.5,
@@ -357,6 +372,37 @@ def test_livekit_usage_snapshot_reads_cumulative_model_usage_once():
         "tts_characters": 640,
         "stt_audio_seconds": 42.5,
     }
+
+
+@pytest.mark.asyncio
+async def test_hybrid_worker_prefers_tenant_openai_key_and_fails_closed_if_unreadable(
+    monkeypatch,
+):
+    tenant_id = uuid4()
+
+    async def tenant_credentials(_db, loaded_tenant_id, provider):
+        assert loaded_tenant_id == tenant_id
+        return {"api_key": f"tenant-{provider}-key"}
+
+    monkeypatch.setattr(livekit_worker, "load_provider_config", tenant_credentials)
+    monkeypatch.setattr(livekit_worker.settings, "openai_api_key", "platform-openai-key")
+    keys = await livekit_worker._load_runtime_api_keys(
+        object(), tenant_id=tenant_id, llm_provider="openai"
+    )
+    assert keys.speech == "tenant-inworld-key"
+    assert keys.llm == "tenant-openai-key"
+    assert "tenant-openai-key" not in repr(keys)
+
+    async def unreadable_openai(_db, _tenant_id, provider):
+        if provider == "openai":
+            raise ProviderCredentialError("cannot decrypt")
+        return {"api_key": "tenant-inworld-key"}
+
+    monkeypatch.setattr(livekit_worker, "load_provider_config", unreadable_openai)
+    with pytest.raises(RuntimeError, match="OpenAI credential is unavailable"):
+        await livekit_worker._load_runtime_api_keys(
+            object(), tenant_id=tenant_id, llm_provider="openai"
+        )
 
 
 def test_inworld_tts_options_keep_auto_language_for_multilingual_agents():

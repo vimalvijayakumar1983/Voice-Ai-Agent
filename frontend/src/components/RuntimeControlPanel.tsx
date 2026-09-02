@@ -29,8 +29,6 @@ export default function RuntimeControlPanel({ agent, profile, onClose, onChange 
     ...profile,
     telephony_provider: inworldRuntime ? 'livekit_sip' as const : profile.telephony_provider,
     primary_speech_provider: speechProvider,
-    llm_provider: inworldRuntime ? 'inworld' as const : profile.llm_provider,
-    llm_model: inworldRuntime && profile.llm_provider !== 'inworld' ? 'auto' : profile.llm_model,
   });
   const [numbers, setNumbers] = useState(profile.assigned_numbers.join('\n'));
   const [working, setWorking] = useState('');
@@ -40,7 +38,7 @@ export default function RuntimeControlPanel({ agent, profile, onClose, onChange 
     telephony_provider: form.telephony_provider,
     primary_speech_provider: speechProvider,
     fallback_speech_provider: form.fallback_speech_provider,
-    llm_provider: inworldRuntime ? 'inworld' as const : form.llm_provider,
+    llm_provider: form.llm_provider,
     llm_model: form.llm_model,
     stt_language: form.stt_language,
     max_concurrent_calls: Number(form.max_concurrent_calls),
@@ -109,7 +107,7 @@ export default function RuntimeControlPanel({ agent, profile, onClose, onChange 
         <div>
           <span className="page-kicker">Production serving</span>
           <h2 id="runtime-panel-title">{agent.name} runtime</h2>
-          <p>Configure the VAV-owned {inworldRuntime ? 'LiveKit SIP + direct Inworld STT, Router, and TTS' : speechProvider === 'elevenlabs' ? 'ElevenLabs voice and Sarvam transcription' : 'Sarvam speech'} pipeline, capacity, and spend guardrails.</p>
+          <p>Configure the VAV-owned {inworldRuntime ? 'LiveKit SIP + Inworld speech + selectable response engine' : speechProvider === 'elevenlabs' ? 'ElevenLabs voice and Sarvam transcription' : 'Sarvam speech'} pipeline, capacity, and spend guardrails.</p>
         </div>
         <span className={`badge ${profile.enabled ? 'badge-success' : profile.ready ? 'badge-info' : 'badge-warning'}`}>
           {profile.enabled ? 'Active' : profile.ready ? 'Ready' : profile.status}
@@ -145,17 +143,30 @@ export default function RuntimeControlPanel({ agent, profile, onClose, onChange 
         </div>
         <div className="form-group">
           <label htmlFor="runtime-llm">LLM route</label>
-          <select id="runtime-llm" value={form.llm_model} onChange={(event) => setForm({ ...form, llm_model: event.target.value as RuntimeProfile['llm_model'] })}>
+          <select id="runtime-llm" value={`${form.llm_provider}:${form.llm_model}`} onChange={(event) => {
+            const [llmProvider, ...modelParts] = event.target.value.split(':');
+            setForm({
+              ...form,
+              llm_provider: llmProvider as RuntimeProfile['llm_provider'],
+              llm_model: modelParts.join(':'),
+            });
+          }}>
             {inworldRuntime ? <>
-              <option value="auto">Inworld Router auto · best value</option>
-              <option value="openai/gpt-4o-mini">Inworld Router → GPT-4o mini</option>
-              <option value="openai/gpt-4o">Inworld Router → GPT-4o</option>
+              <optgroup label="Recommended · full VAV knowledge and actions">
+                <option value="openai:gpt-4o-mini">OpenAI GPT-4o mini · fast and economical</option>
+                <option value="openai:gpt-4o">OpenAI GPT-4o · higher quality</option>
+              </optgroup>
+              <optgroup label="Inworld Router · requires tool-calling access">
+                <option value="inworld:auto">Inworld Router auto</option>
+                <option value="inworld:openai/gpt-4o-mini">Inworld Router → GPT-4o mini</option>
+                <option value="inworld:openai/gpt-4o">Inworld Router → GPT-4o</option>
+              </optgroup>
             </> : <>
-              <option value="gpt-4o-mini">OpenAI GPT-4o mini · lower cost</option>
-              <option value="gpt-4o">OpenAI GPT-4o · higher quality</option>
+              <option value="openai:gpt-4o-mini">OpenAI GPT-4o mini · lower cost</option>
+              <option value="openai:gpt-4o">OpenAI GPT-4o · higher quality</option>
             </>}
           </select>
-          <p className="form-hint">{inworldRuntime ? 'Direct Inworld Router endpoint; no LiveKit Inference markup.' : 'Direct OpenAI endpoint.'}</p>
+          <p className="form-hint">{inworldRuntime ? 'OpenAI is recommended for reliable VAV knowledge search and actions. Inworld Router remains available only when its workspace can pass the live tool-calling gate.' : 'Direct OpenAI endpoint.'}</p>
         </div>
         <div className="form-group">
           <label htmlFor="runtime-language">Realtime STT language</label>

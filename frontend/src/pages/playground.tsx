@@ -201,8 +201,7 @@ export default function Playground() {
     && selectedRuntimeProfile?.id
     && selectedRuntimeProfile.status !== 'inactive'
     && selectedRuntimeProfile.telephony_provider === 'livekit_sip'
-    && selectedRuntimeProfile.primary_speech_provider === 'inworld'
-    && selectedRuntimeProfile.llm_provider === 'inworld',
+    && selectedRuntimeProfile.primary_speech_provider === 'inworld',
   );
   const browserTransport: BrowserTransport = selectedUsesLiveKitBrowser
     ? 'livekit'
@@ -274,7 +273,7 @@ export default function Playground() {
       setError({
         title: 'Agent is not ready to test',
         message: selectedIsVav && !selectedUsesLiveKitBrowser
-          ? 'This VAV realtime configuration supports phone testing only. LiveKit browser testing requires an active Inworld + LiveKit runtime.'
+          ? 'This VAV realtime configuration supports phone testing only. LiveKit browser testing requires an active LiveKit + Inworld speech runtime.'
           : selectedUsesLiveKitBrowser
             ? 'The browser lane is available independently from the phone route. Retry to receive the exact LiveKit, Inworld, worker, knowledge, capacity, or budget blocker.'
             : selected ? agentTestReadinessMessage(selected, selectedRuntimeProfile) : 'Select a voice agent before testing.',
@@ -903,8 +902,7 @@ export default function Playground() {
                   && runtime?.id
                   && runtime.status !== 'inactive'
                   && runtime.telephony_provider === 'livekit_sip'
-                  && runtime.primary_speech_provider === 'inworld'
-                  && runtime.llm_provider === 'inworld',
+                  && runtime.primary_speech_provider === 'inworld',
                 );
                 const isVav = ['sarvam', 'elevenlabs', 'inworld'].includes(agent.voice_provider);
                 const status = liveKitBrowser && !ready
@@ -927,7 +925,7 @@ export default function Playground() {
               <div>
                 <strong>{selected.name}</strong>
                 <p>{selectedUsesLiveKitBrowser
-                  ? `LiveKit + Inworld browser test candidate, independent from e& SIP; live checks run when you start${phoneTestReady ? ` · phone ready at ${selectedPhoneNumber}` : ` · phone not ready: ${agentTestReadinessMessage(selected, selectedRuntimeProfile)}`}`
+                  ? `LiveKit + Inworld speech browser test candidate using ${selectedRuntimeProfile?.llm_provider === 'openai' ? 'OpenAI' : 'Inworld Router'} reasoning, independent from e& SIP; live checks run when you start${phoneTestReady ? ` · phone ready at ${selectedPhoneNumber}` : ` · phone not ready: ${agentTestReadinessMessage(selected, selectedRuntimeProfile)}`}`
                   : selectedReady
                   ? selectedIsVav
                     ? `${selected.voice_provider === 'inworld' ? 'Inworld phone' : selected.voice_provider === 'elevenlabs' ? 'ElevenLabs voice phone' : 'Sarvam AI phone'} runtime active${selectedPhoneNumber ? ` · ${selectedPhoneNumber}` : ''}`
@@ -1026,7 +1024,7 @@ export default function Playground() {
             <div>
               <h2 id="voice-stage-heading" className={styles.stageHeading}>{selected?.name || 'Select an agent'}</h2>
               <p>{browserTransport === 'livekit'
-                ? 'LiveKit WebRTC · Inworld STT, Router, and TTS'
+                ? `LiveKit WebRTC · Inworld STT/TTS · ${selectedRuntimeProfile?.llm_provider === 'openai' ? 'OpenAI' : 'Inworld Router'} reasoning`
                 : browserTransport === 'smallest'
                   ? 'Smallest.ai Atoms browser session'
                   : `${selected?.voice_provider === 'inworld' ? 'Inworld' : selected?.voice_provider === 'elevenlabs' ? 'ElevenLabs' : 'Sarvam AI'} phone session`}</p>
@@ -1063,7 +1061,7 @@ export default function Playground() {
               </div>
               <div className={styles.diagnosticLine} aria-live="polite">
                 <span>{selectedRuntimeProfile?.telephony_provider === 'livekit_sip' ? 'LiveKit SIP' : 'Twilio Media Streams'}</span>
-                <span>{selected?.voice_provider === 'inworld' ? 'Direct Inworld STT · Router · TTS' : selected?.voice_provider === 'elevenlabs' ? 'ElevenLabs speech · Sarvam transcription' : 'Sarvam speech'}</span>
+                <span>{selected?.voice_provider === 'inworld' ? 'Direct Inworld STT · TTS' : selected?.voice_provider === 'elevenlabs' ? 'ElevenLabs speech · Sarvam transcription' : 'Sarvam speech'}</span>
                 <span>{selectedRuntimeProfile?.llm_provider === 'inworld' ? 'Inworld Router response engine' : 'OpenAI response engine'}</span>
                 <span>Completed calls appear in Conversations</span>
               </div>

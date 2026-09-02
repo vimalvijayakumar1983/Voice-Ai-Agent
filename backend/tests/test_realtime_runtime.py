@@ -1,6 +1,7 @@
 """VAV realtime runtime control-plane and protocol tests."""
 
 from datetime import UTC, datetime
+from unittest.mock import AsyncMock
 
 import pytest
 from httpx import AsyncClient
@@ -21,10 +22,12 @@ from app.models.agent import (
 from app.models.tenant import Tenant
 from app.models.user import User
 from app.providers.inworld import InworldClient, InworldError
+from app.providers.openai import OpenAIProviderClient
 from app.realtime.auth import create_media_token, verify_media_token
 from app.realtime.sarvam_stream import is_speech_start, parse_transcript_event
 from app.schemas.runtime import RuntimeProfileUpdate
 from app.services.knowledge_retrieval import rank_knowledge
+from app.services.provider_credentials import ProviderCredentialError
 from app.telephony.livekit_provider import LiveKitSIPError, LiveKitSIPProvider, LiveKitSIPResult
 
 
@@ -44,6 +47,8 @@ def test_runtime_model_identifier_matches_database_column_limit():
     assert RuntimeProfileUpdate(llm_model="m" * 100).llm_model == "m" * 100
     with pytest.raises(ValidationError):
         RuntimeProfileUpdate(llm_model="m" * 101)
+    with pytest.raises(ValidationError, match="direct OpenAI model"):
+        RuntimeProfileUpdate(llm_provider="openai", llm_model="openai/gpt-4o-mini")
 
 
 def test_twilio_media_token_is_read_from_start_custom_parameters():
@@ -469,7 +474,8 @@ async def test_livekit_inworld_runtime_requires_explicit_route_ids_and_can_activ
     ]
     assert inbound_model.id == agent.id
     assert inbound_profile.agent_id == agent.id
-    assert inbound_key == "inworld-workspace-key-123456789"
+    assert inbound_key.speech == "inworld-workspace-key-123456789"
+    assert inbound_key.llm == "inworld-workspace-key-123456789"
     assert outbound.status_code == 201
     assert outbound.json()["provider"] == "livekit_sip"
     assert outbound.json()["provider_call_sid"] == "livekit-sip-call-1"
@@ -538,8 +544,154 @@ async def test_inworld_readiness_reports_tts_and_router_failures_independently(
     assert checks["llm_provider_live"] is False
     assert blockers == [
         "Inworld live TTS synthesis failed: selected voice cannot synthesize the probe",
-        "Inworld Router live completion failed: selected Router model was not found",
+        "Inworld Router tool-calling check failed: selected Router model was not found",
     ]
+
+
+@pytest.mark.asyncio
+async def test_inworld_speech_openai_route_runs_live_tool_capability_probe(
+    tenant,
+    db,
+    monkeypatch,
+):
+    from app.api.v1.endpoints import runtime as runtime_endpoint
+
+    agent = Agent(
+        tenant_id=tenant.id,
+        name="Hybrid concierge",
+        system_prompt="Use the knowledge tool.",
+        voice_provider="inworld",
+        voice_id="inworld:Ashley",
+    )
+    profile = AgentRuntimeProfile(
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        telephony_provider="twilio",
+        primary_speech_provider="inworld",
+        llm_provider="openai",
+        llm_model="gpt-4o-mini",
+    )
+    probed_models = []
+
+    async def static_readiness(*_args):
+        return [], {
+            "provider_compatibility": True,
+            "tts_credential": True,
+            "voice_selection": True,
+            "llm_credential": True,
+        }
+
+    async def provider_config(_db, _tenant_id, provider):
+        return {"api_key": f"tenant-{provider}-key"}
+
+    async def tool_probe(_self, *, model_id):
+        probed_models.append(model_id)
+
+    monkeypatch.setattr(runtime_endpoint, "runtime_readiness", static_readiness)
+    monkeypatch.setattr(runtime_endpoint, "load_provider_config", provider_config)
+    monkeypatch.setattr(InworldClient, "synthesize_readiness_probe", AsyncMock())
+    monkeypatch.setattr(OpenAIProviderClient, "tool_readiness_probe", tool_probe)
+
+    blockers, checks = await runtime_endpoint.live_runtime_readiness(db, agent, profile)
+
+    assert blockers == []
+    assert checks["tts_provider_live"] is True
+    assert checks["llm_provider_live"] is True
+    assert probed_models == ["gpt-4o-mini"]
+
+
+@pytest.mark.asyncio
+async def test_readiness_never_falls_back_when_workspace_inworld_key_is_unreadable(
+    tenant,
+    db,
+    monkeypatch,
+):
+    from app.api.v1.endpoints import runtime as runtime_endpoint
+
+    agent = Agent(
+        tenant_id=tenant.id,
+        name="Fail-closed Inworld concierge",
+        system_prompt="Use approved knowledge.",
+        voice_provider="inworld",
+        voice_id="inworld:Ashley",
+    )
+    db.add(agent)
+    await db.flush()
+    profile = AgentRuntimeProfile(
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        telephony_provider="livekit_sip",
+        primary_speech_provider="inworld",
+        llm_provider="openai",
+        llm_model="gpt-4o-mini",
+    )
+    monkeypatch.setattr(settings, "inworld_api_key", "platform-inworld-key")
+    monkeypatch.setattr(settings, "openai_api_key", "platform-openai-key")
+
+    async def provider_config(_db, _tenant_id, provider):
+        if provider == "inworld":
+            raise ProviderCredentialError("cannot decrypt")
+        return None
+
+    monkeypatch.setattr(runtime_endpoint, "load_provider_config", provider_config)
+    _blockers, checks = await runtime_endpoint.runtime_readiness(db, agent, profile)
+
+    assert checks["stt_credential"] is False
+    assert checks["tts_credential"] is False
+    assert checks["llm_credential"] is True
+
+
+@pytest.mark.asyncio
+async def test_live_readiness_never_falls_back_when_workspace_inworld_key_is_unreadable(
+    tenant,
+    db,
+    monkeypatch,
+):
+    from app.api.v1.endpoints import runtime as runtime_endpoint
+
+    agent = Agent(
+        tenant_id=tenant.id,
+        name="Fail-closed live Inworld concierge",
+        system_prompt="Use approved knowledge.",
+        voice_provider="inworld",
+        voice_id="inworld:Ashley",
+    )
+    profile = AgentRuntimeProfile(
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        telephony_provider="twilio",
+        primary_speech_provider="inworld",
+        llm_provider="openai",
+        llm_model="gpt-4o-mini",
+    )
+
+    async def static_readiness(*_args):
+        return [], {
+            "provider_compatibility": True,
+            "tts_credential": True,
+            "voice_selection": True,
+            "llm_credential": True,
+        }
+
+    async def provider_config(_db, _tenant_id, provider):
+        if provider == "inworld":
+            raise ProviderCredentialError("cannot decrypt")
+        return {"api_key": f"tenant-{provider}-key"}
+
+    synthesize = AsyncMock()
+    monkeypatch.setattr(settings, "inworld_api_key", "platform-inworld-key")
+    monkeypatch.setattr(runtime_endpoint, "runtime_readiness", static_readiness)
+    monkeypatch.setattr(runtime_endpoint, "load_provider_config", provider_config)
+    monkeypatch.setattr(InworldClient, "synthesize_readiness_probe", synthesize)
+
+    blockers, checks = await runtime_endpoint.live_runtime_readiness(db, agent, profile)
+
+    assert checks["tts_provider_live"] is False
+    assert checks["llm_provider_live"] is False
+    assert blockers == [
+        "Inworld workspace credential became unavailable during live readiness."
+    ]
+    synthesize.assert_not_awaited()
 
 
 @pytest.mark.asyncio

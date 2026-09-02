@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class RuntimeProfileUpdate(BaseModel):
@@ -37,6 +37,13 @@ class RuntimeProfileUpdate(BaseModel):
         if normalized == "auto" or re.fullmatch(r"[a-z]{2,3}(?:-[A-Z]{2})?", normalized):
             return normalized
         raise ValueError("STT language must be auto or a BCP-47 code such as en-GB or ar-AE")
+
+    @model_validator(mode="after")
+    def validate_llm_route(self):
+        model = self.llm_model.strip()
+        if self.llm_provider == "openai" and (model == "auto" or "/" in model):
+            raise ValueError("OpenAI routes require a direct OpenAI model such as gpt-4o-mini")
+        return self
 
 
 class RuntimeProfileResponse(BaseModel):

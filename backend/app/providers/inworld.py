@@ -19,7 +19,8 @@ MAX_PROBE_AUDIO_BYTES = 256 * 1024
 PROBE_TIMEOUT_SECONDS = 10.0
 TTS_PROBE_TEXT = "OK."
 ROUTER_PROBE_PROMPT = "Reply OK."
-ROUTER_PROBE_MAX_TOKENS = 8
+ROUTER_TOOL_NAME = "vav_readiness_check"
+ROUTER_PROBE_MAX_TOKENS = 64
 # ``auto`` may select a reasoning model that spends a tiny completion budget
 # before producing visible text. Keep the larger bound isolated to that route.
 ROUTER_AUTO_PROBE_MAX_TOKENS = 128
@@ -343,7 +344,7 @@ class InworldClient:
             )
 
     async def router_readiness_probe(self, *, model_id: str) -> None:
-        """Request a small, bounded completion from the selected Router model."""
+        """Prove Router can execute the tool calls every VAV knowledge agent needs."""
 
         selected_model = _probe_value(model_id, "Router model")
         max_tokens = (
@@ -354,7 +355,30 @@ class InworldClient:
             probe_name="Router readiness probe",
             body={
                 "model": selected_model,
-                "messages": [{"role": "user", "content": ROUTER_PROBE_PROMPT}],
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": f"Call {ROUTER_TOOL_NAME} now. Do not reply with text.",
+                    }
+                ],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": ROUTER_TOOL_NAME,
+                            "description": "Confirms tool-calling capability.",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {},
+                                "additionalProperties": False,
+                            },
+                        },
+                    }
+                ],
+                "tool_choice": {
+                    "type": "function",
+                    "function": {"name": ROUTER_TOOL_NAME},
+                },
                 "max_tokens": max_tokens,
                 "temperature": 0,
                 "stream": False,
@@ -369,11 +393,29 @@ class InworldClient:
             raise InworldError(
                 "Inworld Router readiness probe exhausted its bounded output token budget."
             )
-        content = message.get("content")
-        if not isinstance(content, str):
-            raise InworldError("Inworld Router readiness probe returned invalid content.")
-        if not content.strip():
-            raise InworldError("Inworld Router readiness probe returned an empty completion.")
+        tool_calls = message.get("tool_calls")
+        matching_calls = [
+            call
+            for call in tool_calls or []
+            if isinstance(call, dict)
+            and isinstance(call.get("function"), dict)
+            and call["function"].get("name") == ROUTER_TOOL_NAME
+        ]
+        if not matching_calls:
+            raise InworldError(
+                "Inworld Router model did not return the required VAV knowledge tool call.",
+                status_code=422,
+            )
+        try:
+            arguments = json.loads(matching_calls[0]["function"].get("arguments") or "")
+        except (TypeError, ValueError) as exc:
+            raise InworldError(
+                "Inworld Router returned invalid tool-call arguments.", status_code=422
+            ) from exc
+        if not isinstance(arguments, dict):
+            raise InworldError(
+                "Inworld Router returned invalid tool-call arguments.", status_code=422
+            )
 
     async def list_voices(self) -> list[dict[str, Any]]:
         payload = await self._voices_payload()

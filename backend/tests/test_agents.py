@@ -5,6 +5,7 @@ from uuid import UUID, uuid4
 import pytest
 from httpx import AsyncClient
 
+from app.models.agent import Agent, AgentRuntimeProfile
 from app.models.call import Call
 from app.models.campaign import Campaign, CampaignContact, CampaignContactAttempt
 
@@ -62,6 +63,49 @@ async def test_update_agent(client: AsyncClient, auth_headers):
     assert response.status_code == 200
     assert response.json()["name"] == "Updated"
     assert response.json()["temperature"] == 0.5
+
+
+@pytest.mark.asyncio
+async def test_inworld_voice_tuning_preserves_explicit_runtime_llm_choice(
+    client: AsyncClient,
+    auth_headers,
+    tenant,
+    db,
+):
+    created = await client.post(
+        "/api/v1/agents",
+        headers=auth_headers,
+        json={"name": "Hybrid support", "system_prompt": "Use approved knowledge."},
+    )
+    agent_id = UUID(created.json()["id"])
+    agent = await db.get(Agent, agent_id)
+    agent.voice_provider = "inworld"
+    agent.voice_id = "inworld:Ashley"
+    profile = AgentRuntimeProfile(
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        telephony_provider="livekit_sip",
+        primary_speech_provider="inworld",
+        llm_provider="inworld",
+        llm_model="openai/gpt-4o",
+        status="active",
+        enabled=True,
+    )
+    db.add(profile)
+    await db.commit()
+
+    response = await client.patch(
+        f"/api/v1/agents/{agent_id}",
+        headers=auth_headers,
+        json={"speech_rate": 0.95},
+    )
+
+    assert response.status_code == 200
+    await db.refresh(profile)
+    assert profile.llm_provider == "inworld"
+    assert profile.llm_model == "openai/gpt-4o"
+    assert profile.status == "draft"
+    assert profile.enabled is False
 
 
 @pytest.mark.asyncio
