@@ -33,6 +33,7 @@ from app.livekit_runtime.browser_session import (
     LiveKitBrowserSessionProvider,
     delete_browser_room,
 )
+from app.livekit_runtime.dispatch_auth import create_browser_dispatch_metadata
 from app.middleware.tenant import CurrentUser, get_current_user, require_role
 from app.models.agent import (
     Agent,
@@ -3658,7 +3659,6 @@ async def create_livekit_browser_session(
                 status_code=409,
                 detail="Idempotency key was already used for a different browser session",
             )
-        dispatch_id = metadata.get("livekit_dispatch_id")
         raw_deadline = metadata.get("join_expires_at")
         try:
             join_deadline = (
@@ -3679,8 +3679,7 @@ async def create_livekit_browser_session(
         can_reissue = (
             existing_call.status == "initiated"
             and metadata.get("session_issuance") == "issued"
-            and isinstance(dispatch_id, str)
-            and bool(dispatch_id.strip())
+            and metadata.get("livekit_dispatch_mode") == "token"
             and room_name == f"vav-browser-{call_id}"
             and participant_identity == f"browser-{call_id}"
             and isinstance(reserved_duration, int)
@@ -3706,6 +3705,15 @@ async def create_livekit_browser_session(
             room_name=room_name,
             participant_identity=participant_identity,
             expires_in=remaining_seconds,
+            agent_name=settings.livekit_agent_name,
+            dispatch_metadata=create_browser_dispatch_metadata(
+                tenant_id=current_user.tenant_id,
+                agent_id=agent_id,
+                call_id=call_id,
+                room_name=room_name,
+                participant_identity=participant_identity,
+                ttl_seconds=remaining_seconds + 60,
+            ),
         )
         await record_audit_event(
             db,
@@ -3886,9 +3894,11 @@ async def create_livekit_browser_session(
             )
         stored_call.call_metadata = {
             **(stored_call.call_metadata or {}),
-            "livekit_dispatch_id": session.dispatch_id,
+            "livekit_dispatch_mode": "token",
             "session_issuance": "issued",
         }
+        if session.dispatch_id:
+            stored_call.call_metadata["livekit_dispatch_id"] = session.dispatch_id
         await record_audit_event(
             db,
             tenant_id=current_user.tenant_id,

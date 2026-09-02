@@ -81,7 +81,11 @@ ROOM_DELETE_TIMEOUT_SECONDS = 5.0
 LIVEKIT_TURN_DETECTOR_VERSION = "v1-mini"
 VOICE_KNOWLEDGE_MATCH_LIMIT = 4
 VOICE_KNOWLEDGE_CONTEXT_CHARS = 3600
-DEFAULT_ENDPOINTING = {"mode": "fixed", "min_delay": 0.65, "max_delay": 1.0}
+DEFAULT_ENDPOINTING = {"mode": "fixed", "min_delay": 0.3, "max_delay": 0.8}
+# U3 Pro already emits a semantic final-turn event. LiveKit's endpointing delay
+# is additive in STT mode, so keep only a tiny debounce instead of waiting for
+# a second, independent turn detector.
+ASSEMBLYAI_ENDPOINTING = {"mode": "fixed", "min_delay": 0.1, "max_delay": 0.35}
 BARGE_IN_ENDPOINTING = {"mode": "fixed", "min_delay": 1.35, "max_delay": 2.0}
 BARGE_IN_ENDPOINTING_RESET_SECONDS = 4.0
 INWORLD_STT_FIRST_PARTY = "inworld/inworld-stt-1"
@@ -157,8 +161,9 @@ _CONVERSATION_CONTROL_PATTERNS = (
     "what can you help",
     "who are you",
 )
-_ELLIPTICAL_FOLLOW_UPS = frozenset(
-    {"give me that", "tell me more", "what about it", "what else"}
+_ELLIPTICAL_FOLLOW_UPS = frozenset({"give me that", "tell me more", "what about it", "what else"})
+_REFERENTIAL_FOLLOW_UP_WORDS = frozenset(
+    {"he", "her", "hers", "him", "his", "it", "its", "she", "their", "theirs", "them", "they"}
 )
 _AGENT_ROLE_WORDS = frozenset(
     {"agent", "assistant", "concierge", "customer", "receptionist", "support", "voice"}
@@ -195,6 +200,44 @@ def _broad_knowledge_fallback_query(*, agent_name: str, query: str) -> str | Non
     if not scope_name:
         return None
     return f"{scope_name} overview divisions companies services"
+
+
+def _scope_knowledge_query(*, agent_name: str, query: str) -> str:
+    """Anchor noisy business follow-ups to the agent's own approved scope.
+
+    The rewrite affects retrieval only; the caller transcript remains verbatim.
+    It intentionally handles the two common voice failures seen in production:
+    pronoun follow-ups (``do they have...``) and a misheard ``Al <name> Group``.
+    """
+    scope_name = _agent_scope_name(agent_name)
+    if len(_normalized_utterance(scope_name).split()) < 2:
+        return query
+    scoped = query
+    normalized_scope = _normalized_utterance(scope_name)
+    normalized_query = _normalized_utterance(scoped)
+    scope_words = set(normalized_scope.split())
+    query_words = set(normalized_query.split())
+
+    if "group" in scope_words and "group" in query_words and not scope_words <= query_words:
+        # Keep the authoritative agent scope when STT turns, for example,
+        # ``Al Zaabi Group`` into ``Al Sabah Group`` or ``also a group``.
+        scoped = re.sub(
+            r"\b(?:al\s+[^\W_]+|also\s+a)\s+group\b",
+            scope_name,
+            scoped,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+        normalized_query = _normalized_utterance(scoped)
+        query_words = set(normalized_query.split())
+
+    if query_words & _REFERENTIAL_FOLLOW_UP_WORDS and not scope_words <= query_words:
+        scoped = f"{scope_name}. {scoped}"
+
+    normalized_scoped = _normalized_utterance(scoped)
+    if "hierarchy" in normalized_scoped.split():
+        scoped = f"{scoped} management chairman leadership"
+    return scoped
 
 
 def _knowledge_query(turn_ctx: llm.ChatContext, new_message: llm.ChatMessage) -> str | None:
@@ -753,6 +796,7 @@ Knowledge policy:
         query = _knowledge_query(turn_ctx, new_message)
         if query is None:
             return
+        query = _scope_knowledge_query(agent_name=self._agent_name, query=query)
         async with async_session_factory() as db:
             context = await retrieve_knowledge_context(
                 db,
@@ -1692,9 +1736,20 @@ async def vav_inworld_session(ctx: JobContext) -> None:
         # The explicit exception path below covers failures that occur before
         # LiveKit begins its normal job shutdown sequence.
         ctx.add_shutdown_callback(_shutdown)
+        resolved_stt_model = _inworld_stt_model(model=model, profile=profile)
+        normal_endpointing = (
+            ASSEMBLYAI_ENDPOINTING
+            if resolved_stt_model == INWORLD_STT_FAST_ACCURATE
+            else DEFAULT_ENDPOINTING
+        )
+        turn_detection: Any = (
+            "stt"
+            if resolved_stt_model == INWORLD_STT_FAST_ACCURATE
+            else inference.TurnDetector(version=LIVEKIT_TURN_DETECTOR_VERSION)
+        )
         stt_options: dict[str, Any] = {
             "api_key": api_keys.speech,
-            "model": _inworld_stt_model(model=model, profile=profile),
+            "model": resolved_stt_model,
             # VAV does not use inferred age/gender/emotion/accent attributes.
             "enable_voice_profile": False,
             "language": _effective_stt_language(model=model, profile=profile),
@@ -1719,11 +1774,9 @@ async def vav_inworld_session(ctx: JobContext) -> None:
             llm=openai.LLM(**llm_options),
             tts=inworld.TTS(**tts_options),
             turn_handling={
-                "turn_detection": inference.TurnDetector(
-                    version=LIVEKIT_TURN_DETECTOR_VERSION,
-                ),
+                "turn_detection": turn_detection,
                 "endpointing": {
-                    **DEFAULT_ENDPOINTING,
+                    **normal_endpointing,
                 },
                 "interruption": {
                     "enabled": True,
@@ -1760,7 +1813,7 @@ async def vav_inworld_session(ctx: JobContext) -> None:
             if barge_in_reset_task is not None and barge_in_reset_task is not current_task:
                 barge_in_reset_task.cancel()
             barge_in_reset_task = None
-            session.update_options(endpointing_opts=DEFAULT_ENDPOINTING)
+            session.update_options(endpointing_opts=normal_endpointing)
 
         async def _restore_normal_endpointing_later() -> None:
             await asyncio.sleep(BARGE_IN_ENDPOINTING_RESET_SECONDS)
