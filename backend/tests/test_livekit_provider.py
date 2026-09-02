@@ -591,13 +591,12 @@ async def test_worker_failure_after_call_persistence_finalizes_once_and_resolves
         "text_normalization": "ON",
     }
     assert llm_options == {"api_key": "tenant-openai-key", "model": "gpt-4o-mini"}
-    assert turn_detector_options == {
-        "version": livekit_worker.LIVEKIT_TURN_DETECTOR_VERSION,
-    }
+    assert turn_detector_options == {}
+    assert session_options["turn_handling"]["turn_detection"] == "stt"
     assert session_options["turn_handling"]["endpointing"] == {
         "mode": "fixed",
-        "min_delay": 0.65,
-        "max_delay": 1.0,
+        "min_delay": 0.1,
+        "max_delay": 0.35,
     }
     assert session_options["turn_handling"]["interruption"] == {
         "enabled": True,
@@ -725,9 +724,7 @@ async def test_livekit_agent_recovers_group_knowledge_from_mistranscribed_entity
     monkeypatch.setattr(livekit_worker, "async_session_factory", session_factory)
     agent = livekit_worker.VAVInworldAgent(model=model)
     turn_ctx = livekit_worker.llm.ChatContext.empty()
-    message = turn_ctx.add_message(
-        role="user", content="What companies are part of Alzebra Group?"
-    )
+    message = turn_ctx.add_message(role="user", content="What companies are part of Alzebra Group?")
 
     await agent.on_user_turn_completed(turn_ctx, message)
 
@@ -739,6 +736,54 @@ async def test_livekit_agent_recovers_group_knowledge_from_mistranscribed_entity
         "Al Zaabi Group overview divisions companies services"
     )
     assert "Verified group companies" in turn_ctx.messages()[-1].text_content
+
+
+@pytest.mark.asyncio
+async def test_livekit_agent_anchors_pronoun_follow_up_to_business_scope(monkeypatch):
+    model = Agent(
+        tenant_id=uuid4(),
+        name="Al Zaabi Group Receptionist",
+        system_prompt="Answer from approved knowledge.",
+        voice_provider="inworld",
+        voice_id="inworld:Ashley",
+        language="en-GB",
+    )
+    retrieval = AsyncMock(return_value="Source: Trading\nVerified building materials division.")
+    monkeypatch.setattr(livekit_worker, "retrieve_knowledge_context", retrieval)
+    monkeypatch.setattr(livekit_worker, "async_session_factory", session_factory)
+    agent = livekit_worker.VAVInworldAgent(model=model)
+    turn_ctx = livekit_worker.llm.ChatContext.empty()
+    message = turn_ctx.add_message(
+        role="user", content="Do they have a building materials division?"
+    )
+
+    await agent.on_user_turn_completed(turn_ctx, message)
+
+    assert retrieval.await_args.kwargs["query"] == (
+        "Al Zaabi Group. Do they have a building materials division?"
+    )
+
+
+@pytest.mark.asyncio
+async def test_livekit_agent_repairs_misheard_scoped_name_for_retrieval(monkeypatch):
+    model = Agent(
+        tenant_id=uuid4(),
+        name="Al Zaabi Group Receptionist",
+        system_prompt="Answer from approved knowledge.",
+        voice_provider="inworld",
+        voice_id="inworld:Ashley",
+        language="en-GB",
+    )
+    retrieval = AsyncMock(return_value="Source: Management\nVerified chairman.")
+    monkeypatch.setattr(livekit_worker, "retrieve_knowledge_context", retrieval)
+    monkeypatch.setattr(livekit_worker, "async_session_factory", session_factory)
+    agent = livekit_worker.VAVInworldAgent(model=model)
+    turn_ctx = livekit_worker.llm.ChatContext.empty()
+    message = turn_ctx.add_message(role="user", content="Who is the chairman of Al Sabah Group?")
+
+    await agent.on_user_turn_completed(turn_ctx, message)
+
+    assert retrieval.await_args.kwargs["query"] == ("Who is the chairman of Al Zaabi Group?")
 
 
 @pytest.mark.asyncio

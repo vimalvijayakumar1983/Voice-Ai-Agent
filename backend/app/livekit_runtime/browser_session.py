@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import timedelta
@@ -27,7 +26,7 @@ class LiveKitBrowserSession:
     access_token: str
     room_name: str
     participant_identity: str
-    dispatch_id: str
+    dispatch_id: str | None
     expires_in: int
 
 
@@ -53,78 +52,34 @@ class LiveKitBrowserSessionProvider:
             raise LiveKitBrowserSessionError("VAV maximum browser call duration is invalid")
         room_name = f"vav-browser-{call_id}"
         participant_identity = f"browser-{call_id}"
-        livekit = api.LiveKitAPI(
-            url=self.url,
-            api_key=self.api_key,
-            api_secret=self.api_secret,
+        metadata = create_browser_dispatch_metadata(
+            tenant_id=tenant_id,
+            agent_id=agent_id,
+            call_id=call_id,
+            room_name=room_name,
+            participant_identity=participant_identity,
+            ttl_seconds=BROWSER_TOKEN_TTL_SECONDS + 60,
         )
-        room_created = False
         try:
-            await livekit.room.create_room(
-                api.CreateRoomRequest(
-                    name=room_name,
-                    # An unused token cannot retain a room indefinitely.
-                    empty_timeout=BROWSER_TOKEN_TTL_SECONDS + 60,
-                    departure_timeout=30,
-                    # One standard browser participant plus the VAV agent.
-                    max_participants=2,
-                )
-            )
-            room_created = True
-            metadata = create_browser_dispatch_metadata(
-                tenant_id=tenant_id,
-                agent_id=agent_id,
-                call_id=call_id,
-                room_name=room_name,
-                participant_identity=participant_identity,
-                ttl_seconds=BROWSER_TOKEN_TTL_SECONDS + 60,
-            )
-            dispatch = await livekit.agent_dispatch.create_dispatch(
-                api.CreateAgentDispatchRequest(
-                    agent_name=agent_name,
-                    room=room_name,
-                    metadata=metadata,
-                )
-            )
-            dispatch_id = str(dispatch.id or "").strip()
-            if not dispatch_id:
-                raise RuntimeError("LiveKit returned no browser dispatch identifier")
             token = self.mint_access_token(
                 room_name=room_name,
                 participant_identity=participant_identity,
                 expires_in=BROWSER_TOKEN_TTL_SECONDS,
+                agent_name=agent_name,
+                dispatch_metadata=metadata,
             )
-        except asyncio.CancelledError:
-            if room_created:
-                # Cleanup must complete even though the request task is already
-                # cancelled. Shielding preserves CancelledError for the caller
-                # while preventing an orphaned dispatch/room from retaining
-                # capacity or provider usage until its timeout.
-                cleanup = asyncio.create_task(self._delete_room(livekit, room_name))
-                while not cleanup.done():
-                    try:
-                        await asyncio.shield(cleanup)
-                    except asyncio.CancelledError:
-                        continue
-            raise
         except Exception as exc:
-            cleanup_succeeded = not room_created or await self._delete_room(livekit, room_name)
             raise LiveKitBrowserSessionError(
-                "LiveKit could not create the browser voice session",
-                ambiguous=not cleanup_succeeded,
+                "LiveKit could not issue the browser voice session",
+                ambiguous=False,
             ) from exc
-        finally:
-            try:
-                await livekit.aclose()
-            except Exception:
-                # Transport cleanup must never replace the authoritative
-                # room/dispatch result with an unrelated client-close error.
-                logger.warning("livekit_browser_api_client_close_failed", exc_info=True)
         return LiveKitBrowserSession(
             access_token=token,
             room_name=room_name,
             participant_identity=participant_identity,
-            dispatch_id=dispatch_id,
+            # LiveKit creates the dispatch atomically when the participant
+            # presents this token and creates its unique room.
+            dispatch_id=None,
             expires_in=BROWSER_TOKEN_TTL_SECONDS,
         )
 
@@ -134,6 +89,8 @@ class LiveKitBrowserSessionProvider:
         room_name: str,
         participant_identity: str,
         expires_in: int,
+        agent_name: str | None = None,
+        dispatch_metadata: str | None = None,
     ) -> str:
         """Mint another credential for an existing room without extending its deadline."""
         ttl_seconds = int(expires_in)
@@ -143,7 +100,7 @@ class LiveKitBrowserSessionProvider:
             or not 1 <= ttl_seconds <= BROWSER_TOKEN_TTL_SECONDS
         ):
             raise LiveKitBrowserSessionError("LiveKit browser token lifetime is invalid")
-        return (
+        token = (
             api.AccessToken(self.api_key, self.api_secret)
             .with_identity(participant_identity)
             .with_name("VAV browser tester")
@@ -163,8 +120,27 @@ class LiveKitBrowserSessionProvider:
                     room_record=False,
                 )
             )
-            .to_jwt()
         )
+        if agent_name is not None or dispatch_metadata is not None:
+            if not agent_name or not dispatch_metadata:
+                raise LiveKitBrowserSessionError(
+                    "LiveKit browser dispatch configuration is incomplete"
+                )
+            token = token.with_room_config(
+                api.RoomConfiguration(
+                    name=room_name,
+                    empty_timeout=BROWSER_TOKEN_TTL_SECONDS + 60,
+                    departure_timeout=30,
+                    max_participants=2,
+                    agents=[
+                        api.RoomAgentDispatch(
+                            agent_name=agent_name,
+                            metadata=dispatch_metadata,
+                        )
+                    ],
+                )
+            )
+        return token.to_jwt()
 
     @staticmethod
     async def _delete_room(livekit: api.LiveKitAPI, room_name: str) -> bool:

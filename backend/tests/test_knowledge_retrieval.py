@@ -237,6 +237,37 @@ def test_ranking_drops_filler_only_follow_up():
     )
 
 
+def test_ranking_does_not_reject_pronoun_business_follow_up():
+    matches = rank_knowledge(
+        "Do they have a building materials division?",
+        [
+            (
+                "Al Zaabi Trading - Al Zaabi Group",
+                "The trading division distributes construction and building materials across "
+                "Abu Dhabi and Sharjah.",
+            )
+        ],
+    )
+
+    assert matches
+    assert "building materials" in matches[0].text
+
+
+def test_ranking_treats_leadership_words_as_one_information_intent():
+    matches = rank_knowledge(
+        "Al Zaabi Group hierarchy management chairman leadership",
+        [
+            (
+                "Management - Al Zaabi Group",
+                "Saeed Yousif Ibrahim Al Zaabi is identified in the approved Chairman's Message.",
+            )
+        ],
+    )
+
+    assert matches
+    assert "Saeed Yousif" in matches[0].text
+
+
 @pytest.mark.asyncio
 async def test_retrieval_bounds_candidates_and_offloads_ranking(db, tenant, monkeypatch):
     agent = Agent(

@@ -187,30 +187,6 @@ def test_expired_browser_dispatch_is_rejected(monkeypatch):
 @pytest.mark.asyncio
 async def test_livekit_provider_mints_microphone_only_room_token(monkeypatch):
     _configure_platform(monkeypatch)
-    captured = {}
-
-    class RoomService:
-        async def create_room(self, request):
-            captured["room"] = request
-            return SimpleNamespace(name=request.name)
-
-        async def delete_room(self, _request):
-            captured["deleted"] = True
-
-    class DispatchService:
-        async def create_dispatch(self, request):
-            captured["dispatch"] = request
-            return SimpleNamespace(id="AD_browser_test")
-
-    class FakeLiveKit:
-        def __init__(self, **_kwargs):
-            self.room = RoomService()
-            self.agent_dispatch = DispatchService()
-
-        async def aclose(self):
-            raise RuntimeError("client close failed after successful token mint")
-
-    monkeypatch.setattr(browser_module.api, "LiveKitAPI", FakeLiveKit)
     call_id = uuid4()
     tenant_id = uuid4()
     agent_id = uuid4()
@@ -242,12 +218,17 @@ async def test_livekit_provider_mints_microphone_only_room_token(monkeypatch):
     assert grants["canPublishData"] is False
     assert grants["canUpdateOwnMetadata"] is False
     assert not grants.get("roomAdmin", False)
+    room_config = claims["roomConfig"]
+    assert room_config["name"] == result.room_name
+    assert room_config["maxParticipants"] == 2
+    assert room_config["departureTimeout"] == 30
+    assert result.dispatch_id is None
     envelope = verify_browser_dispatch_metadata(
-        captured["dispatch"].metadata,
+        room_config["agents"][0]["metadata"],
         expected_room_name=result.room_name,
     )
     assert envelope.tenant_id == tenant_id
-    assert captured["room"].max_participants == 2
+    assert room_config["agents"][0]["agentName"] == "vav-inworld"
 
 
 @pytest.mark.asyncio
@@ -277,94 +258,43 @@ async def test_room_delete_success_is_not_masked_by_livekit_client_close_failure
 
 
 @pytest.mark.asyncio
-async def test_livekit_provider_deletes_room_when_dispatch_fails(monkeypatch):
+async def test_livekit_provider_issues_token_without_control_plane_round_trip(monkeypatch):
     _configure_platform(monkeypatch)
-    deleted = []
-
-    class RoomService:
-        async def create_room(self, _request):
-            return SimpleNamespace()
-
-        async def delete_room(self, request):
-            deleted.append(request.room)
-
-    class DispatchService:
-        async def create_dispatch(self, _request):
-            raise RuntimeError("dispatch unavailable")
-
-    class FakeLiveKit:
-        def __init__(self, **_kwargs):
-            self.room = RoomService()
-            self.agent_dispatch = DispatchService()
-
-        async def aclose(self):
-            return None
-
-    monkeypatch.setattr(browser_module.api, "LiveKitAPI", FakeLiveKit)
+    monkeypatch.setattr(
+        browser_module.api,
+        "LiveKitAPI",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("unexpected API call")),
+    )
     call_id = uuid4()
-    with pytest.raises(LiveKitBrowserSessionError) as exc_info:
-        await LiveKitBrowserSessionProvider(
-            url=settings.livekit_url,
-            api_key=settings.livekit_api_key,
-            api_secret=settings.livekit_api_secret,
-        ).create_session(
-            tenant_id=uuid4(),
-            agent_id=uuid4(),
-            call_id=call_id,
-            agent_name="vav-inworld",
-            max_call_duration_seconds=90,
-        )
-    assert exc_info.value.ambiguous is False
-    assert deleted == [f"vav-browser-{call_id}"]
+    result = await LiveKitBrowserSessionProvider(
+        url=settings.livekit_url,
+        api_key=settings.livekit_api_key,
+        api_secret=settings.livekit_api_secret,
+    ).create_session(
+        tenant_id=uuid4(),
+        agent_id=uuid4(),
+        call_id=call_id,
+        agent_name="vav-inworld",
+        max_call_duration_seconds=90,
+    )
+    assert result.room_name == f"vav-browser-{call_id}"
 
 
 @pytest.mark.asyncio
-async def test_livekit_provider_cancellation_cleans_room_and_propagates(monkeypatch):
+async def test_livekit_provider_rejects_incomplete_token_dispatch(monkeypatch):
     _configure_platform(monkeypatch)
-    room_created = asyncio.Event()
-    dispatch_wait = asyncio.Event()
-    deleted = []
-
-    class RoomService:
-        async def create_room(self, _request):
-            room_created.set()
-            return SimpleNamespace()
-
-        async def delete_room(self, request):
-            deleted.append(request.room)
-
-    class DispatchService:
-        async def create_dispatch(self, _request):
-            await dispatch_wait.wait()
-
-    class FakeLiveKit:
-        def __init__(self, **_kwargs):
-            self.room = RoomService()
-            self.agent_dispatch = DispatchService()
-
-        async def aclose(self):
-            return None
-
-    monkeypatch.setattr(browser_module.api, "LiveKitAPI", FakeLiveKit)
-    call_id = uuid4()
-    task = asyncio.create_task(
-        LiveKitBrowserSessionProvider(
-            url=settings.livekit_url,
-            api_key=settings.livekit_api_key,
-            api_secret=settings.livekit_api_secret,
-        ).create_session(
-            tenant_id=uuid4(),
-            agent_id=uuid4(),
-            call_id=call_id,
-            agent_name="vav-inworld",
-            max_call_duration_seconds=90,
-        )
+    provider = LiveKitBrowserSessionProvider(
+        url=settings.livekit_url,
+        api_key=settings.livekit_api_key,
+        api_secret=settings.livekit_api_secret,
     )
-    await room_created.wait()
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    assert deleted == [f"vav-browser-{call_id}"]
+    with pytest.raises(LiveKitBrowserSessionError, match="dispatch configuration"):
+        provider.mint_access_token(
+            room_name="vav-browser-test",
+            participant_identity="browser-test",
+            expires_in=90,
+            agent_name="vav-inworld",
+        )
 
 
 @pytest.mark.asyncio
@@ -475,6 +405,7 @@ async def test_endpoint_issues_durable_preconnect_browser_call_without_sip(
     assert call.call_metadata["runtime"]["transport"] == "livekit_webrtc"
     assert call.call_metadata["reserved_max_duration_seconds"] == 30
     assert call.call_metadata["runtime"]["max_duration_seconds"] == 30
+    assert call.call_metadata["livekit_dispatch_mode"] == "token"
     assert call.call_metadata["livekit_dispatch_id"] == "AD_browser"
     assert "browser_session_request" not in call.call_metadata
     assert len(call.call_metadata["browser_session_request_fingerprint"]) == 64
