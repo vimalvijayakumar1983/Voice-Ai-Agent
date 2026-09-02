@@ -598,10 +598,10 @@ async def test_worker_failure_after_call_persistence_finalizes_once_and_resolves
     assert session_options["turn_handling"]["interruption"] == {
         "enabled": True,
         "mode": "vad",
-        "min_duration": 0.5,
-        "min_words": 0,
-        "resume_false_interruption": True,
-        "false_interruption_timeout": 2.0,
+        "min_duration": 0.3,
+        "min_words": 1,
+        "resume_false_interruption": False,
+        "false_interruption_timeout": None,
     }
     assert session_options["turn_handling"]["preemptive_generation"] == {
         "enabled": True,

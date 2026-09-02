@@ -1476,11 +1476,17 @@ async def vav_inworld_session(ctx: JobContext) -> None:
                 },
                 "interruption": {
                     "enabled": True,
+                    # Inworld STT currently does not expose the aligned
+                    # transcripts required by LiveKit's adaptive barge-in
+                    # detector, so use transcript-gated VAD. Requiring one
+                    # recognized word rejects noise while the shorter duration
+                    # keeps intentional barge-in responsive. Never resume the
+                    # stale response after the caller has taken the turn.
                     "mode": "vad",
-                    "min_duration": 0.5,
-                    "min_words": 0,
-                    "resume_false_interruption": True,
-                    "false_interruption_timeout": 2.0,
+                    "min_duration": 0.3,
+                    "min_words": 1,
+                    "resume_false_interruption": False,
+                    "false_interruption_timeout": None,
                 },
                 "preemptive_generation": {
                     "enabled": True,
