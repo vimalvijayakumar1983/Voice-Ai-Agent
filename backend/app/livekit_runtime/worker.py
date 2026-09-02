@@ -84,6 +84,24 @@ VOICE_KNOWLEDGE_CONTEXT_CHARS = 3600
 _BARE_HOLD_UTTERANCES = frozenset(
     {"hang on", "hold on", "just a moment", "one moment", "please wait", "wait"}
 )
+_SILENT_STOP_UTTERANCES = frozenset(
+    {
+        "be quiet",
+        "do not talk",
+        "dont talk",
+        "enough",
+        "it is top",
+        "please stop",
+        "please stop talking",
+        "stop",
+        "stop stop",
+        "stop stop stop",
+        "stop talking",
+        "top",
+        "you it is top",
+        "you need to stop talking",
+    }
+)
 _BACKCHANNEL_UTTERANCES = frozenset(
     {
         "fine",
@@ -128,6 +146,9 @@ _CONVERSATION_CONTROL_PATTERNS = (
 _ELLIPTICAL_FOLLOW_UPS = frozenset(
     {"give me that", "tell me more", "what about it", "what else"}
 )
+_AGENT_ROLE_WORDS = frozenset(
+    {"agent", "assistant", "concierge", "customer", "receptionist", "support", "voice"}
+)
 
 
 def _normalized_utterance(value: str) -> str:
@@ -138,9 +159,28 @@ def _is_bare_hold_utterance(value: str) -> bool:
     return _normalized_utterance(value) in _BARE_HOLD_UTTERANCES
 
 
+def _is_silent_stop_utterance(value: str) -> bool:
+    return _normalized_utterance(value) in _SILENT_STOP_UTTERANCES
+
+
 def _is_conversation_control_utterance(value: str) -> bool:
     normalized = _normalized_utterance(value)
     return any(pattern in normalized for pattern in _CONVERSATION_CONTROL_PATTERNS)
+
+
+def _agent_scope_name(value: str) -> str:
+    words = [word for word in value.split() if word.casefold() not in _AGENT_ROLE_WORDS]
+    return " ".join(words).strip()
+
+
+def _broad_knowledge_fallback_query(*, agent_name: str, query: str) -> str | None:
+    tokens = set(_normalized_utterance(query).split())
+    if not tokens.intersection({"division", "divisions", "group"}):
+        return None
+    scope_name = _agent_scope_name(agent_name)
+    if not scope_name:
+        return None
+    return f"{scope_name} overview divisions companies services"
 
 
 def _knowledge_query(turn_ctx: llm.ChatContext, new_message: llm.ChatMessage) -> str | None:
@@ -581,6 +621,7 @@ class VAVInworldAgent(Agent):
     def __init__(self, *, model: AgentModel, variables: ProviderVariables | None = None):
         self._tenant_id = model.tenant_id
         self._agent_id = model.id
+        self._agent_name = str(getattr(model, "name", "") or "")
         call_variables = variables or {}
         rendered_prompt = _render_call_template(model.system_prompt, call_variables)
         primary_language = str(getattr(model, "language", "en-US") or "en-US").strip() or "en-US"
@@ -625,6 +666,8 @@ Conversation repair policy:
   relying on business knowledge.
 - A bare request such as "wait" or "hold on" is handled silently by the runtime.
   Do not fill the pause or ask the caller to repeat before they continue.
+- A command to stop talking is also handled silently. Never answer a stop command
+  with an apology, acknowledgement, follow-up question, or additional speech.
 - If a transcript is nonsensical, mixed with fragments of your previous reply,
   or too uncertain to form a reliable query, apologize once and ask the caller
   to repeat the request. Do not search corrupted text and do not guess.
@@ -661,7 +704,7 @@ Knowledge policy:
         new_message: llm.ChatMessage,
     ) -> None:
         text = (new_message.text_content or "").strip()
-        if _is_bare_hold_utterance(text):
+        if _is_bare_hold_utterance(text) or _is_silent_stop_utterance(text):
             # A short hold command is commonly followed by the caller's actual
             # question. Stay silent instead of creating a premature assistant
             # turn that collides with the continuation.
@@ -679,6 +722,20 @@ Knowledge policy:
                 limit=VOICE_KNOWLEDGE_MATCH_LIMIT,
                 max_context_chars=VOICE_KNOWLEDGE_CONTEXT_CHARS,
             )
+            if context is None:
+                fallback_query = _broad_knowledge_fallback_query(
+                    agent_name=self._agent_name,
+                    query=query,
+                )
+                if fallback_query is not None:
+                    context = await retrieve_knowledge_context(
+                        db,
+                        tenant_id=self._tenant_id,
+                        agent_id=self._agent_id,
+                        query=fallback_query,
+                        limit=VOICE_KNOWLEDGE_MATCH_LIMIT,
+                        max_context_chars=VOICE_KNOWLEDGE_CONTEXT_CHARS,
+                    )
         evidence = context or "NO_VERIFIED_KNOWLEDGE_MATCH"
         turn_ctx.add_message(
             role="assistant",

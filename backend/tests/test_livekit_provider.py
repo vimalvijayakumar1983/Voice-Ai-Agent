@@ -686,10 +686,55 @@ async def test_livekit_agent_stays_silent_for_bare_hold_and_skips_control_search
     with pytest.raises(livekit_worker.llm.StopResponse):
         await agent.on_user_turn_completed(hold_ctx, hold)
 
+    stop_ctx = livekit_worker.llm.ChatContext.empty()
+    stop = stop_ctx.add_message(role="user", content="Stop! Stop! Stop!")
+    with pytest.raises(livekit_worker.llm.StopResponse):
+        await agent.on_user_turn_completed(stop_ctx, stop)
+
+    mistranscribed_stop_ctx = livekit_worker.llm.ChatContext.empty()
+    mistranscribed_stop = mistranscribed_stop_ctx.add_message(
+        role="user", content="You. It is top."
+    )
+    with pytest.raises(livekit_worker.llm.StopResponse):
+        await agent.on_user_turn_completed(mistranscribed_stop_ctx, mistranscribed_stop)
+
     control_ctx = livekit_worker.llm.ChatContext.empty()
     control = control_ctx.add_message(role="user", content="Can you? Or slowly.")
     await agent.on_user_turn_completed(control_ctx, control)
     retrieval.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_livekit_agent_recovers_group_knowledge_from_mistranscribed_entity(monkeypatch):
+    model = Agent(
+        tenant_id=uuid4(),
+        name="Al Zaabi Group Receptionist",
+        system_prompt="Answer from approved knowledge.",
+        voice_provider="inworld",
+        voice_id="inworld:Ashley",
+        language="en-GB",
+    )
+    retrieval = AsyncMock(
+        side_effect=[None, "Source: Divisions — Al Zaabi Group\nVerified group companies."]
+    )
+    monkeypatch.setattr(livekit_worker, "retrieve_knowledge_context", retrieval)
+    monkeypatch.setattr(livekit_worker, "async_session_factory", session_factory)
+    agent = livekit_worker.VAVInworldAgent(model=model)
+    turn_ctx = livekit_worker.llm.ChatContext.empty()
+    message = turn_ctx.add_message(
+        role="user", content="What companies are part of Alzebra Group?"
+    )
+
+    await agent.on_user_turn_completed(turn_ctx, message)
+
+    assert retrieval.await_count == 2
+    assert retrieval.await_args_list[0].kwargs["query"] == (
+        "What companies are part of Alzebra Group?"
+    )
+    assert retrieval.await_args_list[1].kwargs["query"] == (
+        "Al Zaabi Group overview divisions companies services"
+    )
+    assert "Verified group companies" in turn_ctx.messages()[-1].text_content
 
 
 @pytest.mark.asyncio
