@@ -298,9 +298,7 @@ def _terminology_phrases(values: Iterable[object]) -> dict[str, str]:
                 if any(token.isdigit() for token in normalized_tokens):
                     continue
                 distinctive = [
-                    token
-                    for token in normalized_tokens
-                    if len(token) >= 4 and token not in ignored
+                    token for token in normalized_tokens if len(token) >= 4 and token not in ignored
                 ]
                 if not distinctive:
                     continue

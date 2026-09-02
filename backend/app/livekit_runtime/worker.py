@@ -327,9 +327,7 @@ def _contextual_knowledge_queries(
         variants.append(f"{previous_topic.rstrip(' .!?')}. {raw_query}")
 
     expansions = {
-        expansion
-        for token in tokens
-        for expansion in _KNOWLEDGE_INTENT_EXPANSIONS.get(token, ())
+        expansion for token in tokens for expansion in _KNOWLEDGE_INTENT_EXPANSIONS.get(token, ())
     }
     if expansions:
         variants.append(f"{scoped_query} {' '.join(sorted(expansions))}")

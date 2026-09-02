@@ -818,8 +818,9 @@ async def test_livekit_agent_uses_cached_knowledge_terminology_and_conversation_
         "Chemical Peeling",
         "Platelet Rich Plasma",
     )
-    assert "Tell me about facial treatments. What about chemical feeling?" in (
-        retrieval.await_args.kwargs["query_variants"]
+    assert (
+        "Tell me about facial treatments. What about chemical feeling?"
+        in (retrieval.await_args.kwargs["query_variants"])
     )
 
 
