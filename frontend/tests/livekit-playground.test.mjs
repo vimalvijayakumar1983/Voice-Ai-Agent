@@ -6,9 +6,10 @@ const playgroundSource = readFileSync(new URL('../src/pages/playground.tsx', imp
 const apiSource = readFileSync(new URL('../src/lib/api.ts', import.meta.url), 'utf8');
 const packageJson = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
 
-test('LiveKit browser SDK is pinned and loaded only after a user starts a session', () => {
+test('LiveKit browser SDK is pinned, prefetched, and token issuance still waits for permission', () => {
   assert.equal(packageJson.dependencies['livekit-client'], '2.22.0');
-  assert.match(playgroundSource, /await import\('livekit-client'\)/);
+  assert.match(playgroundSource, /if \(!selectedUsesLiveKitBrowser\) return;[\s\S]*void import\('livekit-client'\)/);
+  assert.match(playgroundSource, /const liveKitSdkPromise = browserTransport === 'livekit'[\s\S]*import\('livekit-client'\)/);
   assert.doesNotMatch(playgroundSource, /^import (?!type\b).*from 'livekit-client';/m);
 
   const microphoneIndex = playgroundSource.indexOf('await requestMicrophoneReadiness()');
@@ -121,7 +122,7 @@ test('terminal LiveKit failures tear down the current room and microphone before
 
 test('ending while browser setup is pending prevents later token or room activation', () => {
   assert.match(playgroundSource, /await requestMicrophoneReadiness\(\);\s*if \(terminalStateRef\.current === 'ended' \|\| terminalStateRef\.current === 'error'\) return;/);
-  assert.match(playgroundSource, /await import\('livekit-client'\);\s*if \(terminalStateRef\.current === 'ended'\) return;/);
+  assert.match(playgroundSource, /await liveKitSdkPromise!;\s*if \(terminalStateRef\.current === 'ended'\) return;/);
   assert.match(playgroundSource, /await api\.createLiveKitBrowserSession\(selected\.id, variables\);\s*if \(terminalStateRef\.current === 'ended'\) return;/);
 });
 

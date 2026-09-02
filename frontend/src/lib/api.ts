@@ -176,6 +176,7 @@ export interface RuntimeProfile {
   llm_provider: 'openai' | 'inworld';
   llm_model: string;
   stt_language: string;
+  stt_model: 'auto' | 'assemblyai/u3-rt-pro' | 'soniox/stt-rt-v4' | 'inworld/inworld-stt-1';
   tts_delivery_mode: 'stable' | 'balanced' | 'creative';
   max_concurrent_calls: number;
   daily_call_limit: number;

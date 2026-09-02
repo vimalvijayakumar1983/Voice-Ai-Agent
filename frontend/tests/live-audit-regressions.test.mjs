@@ -57,6 +57,7 @@ test('Inworld runtime exposes native delivery modes with honest cost guidance', 
   assert.match(runtimeSource, /LiveKit native dynamic turn detection/);
   assert.match(runtimeSource, /Transport, SIP, and model usage remain billable/);
   assert.match(apiSource, /tts_delivery_mode: 'stable' \| 'balanced' \| 'creative'/);
+  assert.match(apiSource, /stt_model: 'auto' \| 'assemblyai\/u3-rt-pro' \| 'soniox\/stt-rt-v4'/);
 });
 
 test('knowledge health explains when every agent already has access', () => {

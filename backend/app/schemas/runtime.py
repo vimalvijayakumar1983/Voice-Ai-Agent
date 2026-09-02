@@ -12,6 +12,13 @@ PRODUCTION_LLM_MODELS = {
     "inworld": ("auto", "openai/gpt-4o-mini", "openai/gpt-4o"),
 }
 
+InworldSTTModel = Literal[
+    "auto",
+    "assemblyai/u3-rt-pro",
+    "soniox/stt-rt-v4",
+    "inworld/inworld-stt-1",
+]
+
 
 class RuntimeProfileUpdate(BaseModel):
     telephony_provider: Literal["twilio", "livekit_sip"] = "twilio"
@@ -20,6 +27,7 @@ class RuntimeProfileUpdate(BaseModel):
     llm_provider: Literal["openai", "inworld"] = "openai"
     llm_model: str = Field("gpt-4o-mini", min_length=2, max_length=100)
     stt_language: str = Field("auto", min_length=2, max_length=30)
+    stt_model: InworldSTTModel = "auto"
     tts_delivery_mode: Literal["stable", "balanced", "creative"] = "balanced"
     max_concurrent_calls: int = Field(1, ge=1, le=100)
     daily_call_limit: int = Field(100, ge=1, le=100_000)
@@ -66,6 +74,7 @@ class RuntimeProfileResponse(BaseModel):
     llm_provider: str
     llm_model: str
     stt_language: str
+    stt_model: InworldSTTModel
     tts_delivery_mode: Literal["stable", "balanced", "creative"]
     max_concurrent_calls: int
     daily_call_limit: int

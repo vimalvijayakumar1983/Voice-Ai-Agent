@@ -3773,7 +3773,14 @@ async def create_livekit_browser_session(
                 "speech_provider": "inworld",
                 "llm_provider": profile.llm_provider,
                 "llm_model": profile.llm_model,
-                "stt_model": "inworld/inworld-stt-1",
+                "stt_model": str(
+                    (
+                        profile.runtime_config.get("stt_model")
+                        if isinstance(profile.runtime_config, dict)
+                        else None
+                    )
+                    or "auto"
+                ),
                 "stt_language": (
                     agent.language if profile.stt_language == "auto" else profile.stt_language
                 ),

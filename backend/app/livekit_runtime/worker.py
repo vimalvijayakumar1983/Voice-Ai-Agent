@@ -81,6 +81,20 @@ ROOM_DELETE_TIMEOUT_SECONDS = 5.0
 LIVEKIT_TURN_DETECTOR_VERSION = "v1-mini"
 VOICE_KNOWLEDGE_MATCH_LIMIT = 4
 VOICE_KNOWLEDGE_CONTEXT_CHARS = 3600
+DEFAULT_ENDPOINTING = {"mode": "fixed", "min_delay": 0.65, "max_delay": 1.0}
+BARGE_IN_ENDPOINTING = {"mode": "fixed", "min_delay": 1.35, "max_delay": 2.0}
+BARGE_IN_ENDPOINTING_RESET_SECONDS = 4.0
+INWORLD_STT_FIRST_PARTY = "inworld/inworld-stt-1"
+INWORLD_STT_FAST_ACCURATE = "assemblyai/u3-rt-pro"
+INWORLD_STT_WIDE_MULTILINGUAL = "soniox/stt-rt-v4"
+INWORLD_STT_MODELS = frozenset(
+    {
+        INWORLD_STT_FIRST_PARTY,
+        INWORLD_STT_FAST_ACCURATE,
+        INWORLD_STT_WIDE_MULTILINGUAL,
+    }
+)
+_U3_SUPPORTED_LANGUAGES = frozenset({"en", "es", "fr", "de", "it", "pt"})
 _BARE_HOLD_UTTERANCES = frozenset(
     {"hang on", "hold on", "just a moment", "one moment", "please wait", "wait"}
 )
@@ -548,6 +562,31 @@ def _effective_stt_language(*, model: AgentModel, profile: AgentRuntimeProfile) 
     return str(model.language or "en-US").strip() or "en-US"
 
 
+def _inworld_stt_model(*, model: AgentModel, profile: AgentRuntimeProfile) -> str:
+    """Select a production recognizer while preserving an explicit operator choice."""
+    raw_runtime_config = getattr(profile, "runtime_config", None)
+    runtime_config = raw_runtime_config if isinstance(raw_runtime_config, dict) else {}
+    configured = str(runtime_config.get("stt_model") or "auto").strip().lower()
+    if configured in INWORLD_STT_MODELS:
+        return configured
+
+    languages = {
+        str(language or "").strip().lower().split("-", 1)[0]
+        for language in (
+            list(getattr(model, "supported_languages", None) or [])
+            + [getattr(model, "language", "")]
+            + [getattr(profile, "stt_language", "")]
+        )
+        if str(language or "").strip() and str(language or "").strip().lower() != "auto"
+    }
+    # U3 Pro is the fast/high-accuracy route for its six supported languages.
+    # Soniox provides the broader multilingual route needed for Arabic, Hindi,
+    # and agents that may switch beyond that set.
+    if languages and languages.issubset(_U3_SUPPORTED_LANGUAGES):
+        return INWORLD_STT_FAST_ACCURATE
+    return INWORLD_STT_WIDE_MULTILINGUAL
+
+
 def _revision_timestamp(value: object) -> str | None:
     if not isinstance(value, datetime):
         return None
@@ -605,6 +644,7 @@ def _served_browser_configuration(
         "language": model.language,
         "supported_languages": list(model.supported_languages or []),
         "speech_rate": model.speech_rate,
+        "stt_model": _inworld_stt_model(model=model, profile=profile),
         "tts_delivery_mode": _inworld_delivery_mode(profile),
         "llm_provider": profile.llm_provider,
         "llm_model": profile.llm_model,
@@ -1084,7 +1124,7 @@ async def _open_call(
                     "speech_provider": "inworld",
                     "llm_provider": profile.llm_provider,
                     "llm_model": profile.llm_model,
-                    "stt_model": "inworld/inworld-stt-1",
+                    "stt_model": _inworld_stt_model(model=model, profile=profile),
                     "stt_language": _effective_stt_language(model=model, profile=profile),
                     "stt_language_configured": profile.stt_language,
                     "tts_model": "inworld-tts-2",
@@ -1122,7 +1162,7 @@ async def _open_call(
                     "speech_provider": "inworld",
                     "llm_provider": profile.llm_provider,
                     "llm_model": profile.llm_model,
-                    "stt_model": "inworld/inworld-stt-1",
+                    "stt_model": _inworld_stt_model(model=model, profile=profile),
                     "stt_language": _effective_stt_language(model=model, profile=profile),
                     "stt_language_configured": profile.stt_language,
                     "tts_model": "inworld-tts-2",
@@ -1194,7 +1234,7 @@ async def _open_browser_call(
                 "speech_provider": "inworld",
                 "llm_provider": profile.llm_provider,
                 "llm_model": profile.llm_model,
-                "stt_model": "inworld/inworld-stt-1",
+                "stt_model": _inworld_stt_model(model=model, profile=profile),
                 "stt_language": _effective_stt_language(model=model, profile=profile),
                 "stt_language_configured": profile.stt_language,
                 "tts_model": "inworld-tts-2",
@@ -1617,6 +1657,8 @@ async def vav_inworld_session(ctx: JobContext) -> None:
     closing = False
     runtime_failure: BaseException | None = None
     max_duration_task: asyncio.Task[None] | None = None
+    barge_in_reset_task: asyncio.Task[None] | None = None
+    barge_in_endpointing_active = False
     session: AgentSession | None = None
 
     async def _finalize_once(*, failure: BaseException | None = None) -> None:
@@ -1635,6 +1677,8 @@ async def vav_inworld_session(ctx: JobContext) -> None:
     async def _shutdown() -> None:
         if max_duration_task is not None and max_duration_task is not asyncio.current_task():
             max_duration_task.cancel()
+        if barge_in_reset_task is not None and barge_in_reset_task is not asyncio.current_task():
+            barge_in_reset_task.cancel()
         await _run_bounded_cleanup(
             _finalize_once(),
             timeout_seconds=CALL_FINALIZE_TIMEOUT_SECONDS,
@@ -1650,10 +1694,14 @@ async def vav_inworld_session(ctx: JobContext) -> None:
         ctx.add_shutdown_callback(_shutdown)
         stt_options: dict[str, Any] = {
             "api_key": api_keys.speech,
-            "model": "inworld/inworld-stt-1",
+            "model": _inworld_stt_model(model=model, profile=profile),
             # VAV does not use inferred age/gender/emotion/accent attributes.
             "enable_voice_profile": False,
             "language": _effective_stt_language(model=model, profile=profile),
+            # Wait for a confident semantic boundary from the provider instead
+            # of finalizing on a tiny hesitation inside a name or sentence.
+            "min_end_of_turn_silence_when_confident": 300,
+            "end_of_turn_confidence_threshold": 0.5,
         }
         tts_options = _inworld_tts_options(
             model=model,
@@ -1675,13 +1723,7 @@ async def vav_inworld_session(ctx: JobContext) -> None:
                     version=LIVEKIT_TURN_DETECTOR_VERSION,
                 ),
                 "endpointing": {
-                    # Dynamic endpointing learned the caller's long pauses and
-                    # stretched ordinary turns to 3-4.5 seconds in production.
-                    # A fixed guard still accommodates Inworld's trailing final
-                    # transcript without allowing one call to poison later turns.
-                    "mode": "fixed",
-                    "min_delay": 0.8,
-                    "max_delay": 1.2,
+                    **DEFAULT_ENDPOINTING,
                 },
                 "interruption": {
                     "enabled": True,
@@ -1692,10 +1734,10 @@ async def vav_inworld_session(ctx: JobContext) -> None:
                     # keeps intentional barge-in responsive. Never resume the
                     # stale response after the caller has taken the turn.
                     "mode": "vad",
-                    "min_duration": 0.3,
+                    "min_duration": 0.2,
                     "min_words": 1,
-                    "resume_false_interruption": False,
-                    "false_interruption_timeout": None,
+                    "resume_false_interruption": True,
+                    "false_interruption_timeout": 1.0,
                 },
                 "preemptive_generation": {
                     # Knowledge is injected in on_user_turn_completed. Starting an
@@ -1708,6 +1750,42 @@ async def vav_inworld_session(ctx: JobContext) -> None:
                 },
             },
         )
+
+        def _restore_normal_endpointing() -> None:
+            nonlocal barge_in_endpointing_active, barge_in_reset_task
+            if not barge_in_endpointing_active:
+                return
+            barge_in_endpointing_active = False
+            current_task = asyncio.current_task()
+            if barge_in_reset_task is not None and barge_in_reset_task is not current_task:
+                barge_in_reset_task.cancel()
+            barge_in_reset_task = None
+            session.update_options(endpointing_opts=DEFAULT_ENDPOINTING)
+
+        async def _restore_normal_endpointing_later() -> None:
+            await asyncio.sleep(BARGE_IN_ENDPOINTING_RESET_SECONDS)
+            _restore_normal_endpointing()
+
+        @session.on("user_state_changed")
+        def _on_user_state_changed(event: Any) -> None:
+            nonlocal barge_in_endpointing_active, barge_in_reset_task
+            # Stop playout promptly, then give only the replacement barge-in
+            # sentence more time to settle. Normal turns retain the faster
+            # endpoint so improving interruption completeness does not make the
+            # entire conversation sluggish.
+            if getattr(event, "new_state", None) != "speaking":
+                return
+            if session.agent_state != "speaking":
+                return
+            barge_in_endpointing_active = True
+            session.update_options(endpointing_opts=BARGE_IN_ENDPOINTING)
+            if barge_in_reset_task is not None:
+                barge_in_reset_task.cancel()
+            barge_in_reset_task = asyncio.create_task(_restore_normal_endpointing_later())
+
+        @session.on("agent_false_interruption")
+        def _on_agent_false_interruption(_event: Any) -> None:
+            _restore_normal_endpointing()
 
         async def _close_session(reason: str, *, terminate_browser_room: bool = False) -> None:
             nonlocal closing
@@ -1884,6 +1962,8 @@ async def vav_inworld_session(ctx: JobContext) -> None:
         def _on_item(event: Any) -> None:
             role = str(getattr(event.item, "role", ""))
             content = str(getattr(event.item, "text_content", "") or "").strip()
+            if role == "user":
+                _restore_normal_endpointing()
             _capture_turn_latency(
                 role=role,
                 metrics=getattr(event.item, "metrics", {}) or {},
@@ -1917,6 +1997,8 @@ async def vav_inworld_session(ctx: JobContext) -> None:
     except BaseException as exc:
         if max_duration_task is not None:
             max_duration_task.cancel()
+        if barge_in_reset_task is not None:
+            barge_in_reset_task.cancel()
         if session is not None:
             await _run_bounded_cleanup(
                 session.aclose(),

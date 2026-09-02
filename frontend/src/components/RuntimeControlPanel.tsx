@@ -41,6 +41,7 @@ export default function RuntimeControlPanel({ agent, profile, onClose, onChange 
     llm_provider: form.llm_provider,
     llm_model: form.llm_model,
     stt_language: form.stt_language,
+    stt_model: form.stt_model,
     tts_delivery_mode: form.tts_delivery_mode,
     max_concurrent_calls: Number(form.max_concurrent_calls),
     daily_call_limit: Number(form.daily_call_limit),
@@ -54,6 +55,7 @@ export default function RuntimeControlPanel({ agent, profile, onClose, onChange 
     llm_provider: profile.llm_provider,
     llm_model: profile.llm_model,
     stt_language: profile.stt_language,
+    stt_model: profile.stt_model,
     tts_delivery_mode: profile.tts_delivery_mode,
     max_concurrent_calls: Number(profile.max_concurrent_calls),
     daily_call_limit: Number(profile.daily_call_limit),
@@ -174,6 +176,18 @@ export default function RuntimeControlPanel({ agent, profile, onClose, onChange 
           <label htmlFor="runtime-language">Realtime STT language</label>
           <input id="runtime-language" value={form.stt_language} onChange={(event) => setForm({ ...form, stt_language: event.target.value })} placeholder="auto, en-GB, ar-AE, or hi-IN" />
         </div>
+        {inworldRuntime ? (
+          <div className="form-group">
+            <label htmlFor="runtime-stt-model">Speech recognition model</label>
+            <select id="runtime-stt-model" value={form.stt_model} onChange={(event) => setForm({ ...form, stt_model: event.target.value as RuntimeProfile['stt_model'] })}>
+              <option value="auto">Automatic · best model for configured languages</option>
+              <option value="assemblyai/u3-rt-pro">AssemblyAI U3 Pro · fast, accurate English/European</option>
+              <option value="soniox/stt-rt-v4">Soniox RT v4 · multilingual including Arabic and Hindi</option>
+              <option value="inworld/inworld-stt-1">Inworld STT 1 · experimental first-party</option>
+            </select>
+            <p className="form-hint">Automatic uses U3 Pro for English and supported European languages, and Soniox for wider multilingual coverage. Both are routed through the existing Inworld credential.</p>
+          </div>
+        ) : null}
         {inworldRuntime ? (
           <div className="form-group">
             <label htmlFor="runtime-delivery-mode">Inworld TTS delivery</label>

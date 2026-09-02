@@ -537,6 +537,7 @@ def _response(
         "llm_provider": "openai",
         "llm_model": "gpt-4o-mini",
         "stt_language": "auto",
+        "stt_model": "auto",
         "tts_delivery_mode": "balanced",
         "max_concurrent_calls": 1,
         "daily_call_limit": 100,
@@ -544,8 +545,26 @@ def _response(
         "assigned_numbers": [],
     }
     if profile is not None:
-        values.update({key: getattr(profile, key) for key in values if key != "tts_delivery_mode"})
+        values.update(
+            {
+                key: getattr(profile, key)
+                for key in values
+                if key not in {"stt_model", "tts_delivery_mode"}
+            }
+        )
         runtime_config = profile.runtime_config if isinstance(profile.runtime_config, dict) else {}
+        stt_model = str(runtime_config.get("stt_model") or "auto")
+        values["stt_model"] = (
+            stt_model
+            if stt_model
+            in {
+                "auto",
+                "assemblyai/u3-rt-pro",
+                "soniox/stt-rt-v4",
+                "inworld/inworld-stt-1",
+            }
+            else "auto"
+        )
         delivery_mode = str(runtime_config.get("tts_delivery_mode") or "balanced").lower()
         values["tts_delivery_mode"] = (
             delivery_mode if delivery_mode in {"stable", "balanced", "creative"} else "balanced"
@@ -605,10 +624,15 @@ async def update_runtime_profile(
     agent = await _agent(db, current_user.tenant_id, agent_id)
     profile = await _profile(db, current_user.tenant_id, agent_id, create=True)
     assert profile is not None
-    payload = data.model_dump(exclude={"tts_delivery_mode"})
+    payload = data.model_dump(exclude={"stt_model", "tts_delivery_mode"})
     for key, value in payload.items():
         setattr(profile, key, value)
     runtime_config = profile.runtime_config if isinstance(profile.runtime_config, dict) else {}
+    if "stt_model" in data.model_fields_set:
+        runtime_config = {
+            **runtime_config,
+            "stt_model": data.stt_model,
+        }
     if "tts_delivery_mode" in data.model_fields_set:
         runtime_config = {
             **runtime_config,
@@ -634,6 +658,7 @@ async def update_runtime_profile(
             "telephony_provider": profile.telephony_provider,
             "primary_speech_provider": profile.primary_speech_provider,
             "assigned_number_count": len(profile.assigned_numbers),
+            "stt_model": data.stt_model,
             "tts_delivery_mode": delivery_mode,
         },
     )
