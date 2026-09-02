@@ -20,6 +20,33 @@ DIRECT_CALL_UNKNOWN_STATUS = "terminal_unknown"
 REALTIME_CALL_WATCHDOG_PROVIDERS = frozenset({"sarvam", "elevenlabs", "inworld"})
 
 
+def _has_substantive_caller_input(turns: object) -> bool:
+    """Return whether the persisted transcript contains actual caller speech."""
+    if not isinstance(turns, list):
+        return False
+    return any(
+        isinstance(turn, dict)
+        and str(turn.get("role") or "").strip().lower() == "user"
+        and isinstance(turn.get("content"), str)
+        and bool(turn["content"].strip())
+        for turn in turns
+    )
+
+
+def _insufficient_transcript_summary() -> dict:
+    """Build an evidence-safe outcome without asking an LLM to infer one."""
+    return {
+        "summary": (
+            "No substantive caller speech was captured, so no call outcome or follow-up "
+            "could be determined."
+        ),
+        "key_topics": [],
+        "action_items": [],
+        "sentiment": "neutral",
+        "disposition": "unknown",
+    }
+
+
 def _as_utc(value: datetime | None) -> datetime | None:
     if value is None:
         return None
@@ -609,6 +636,7 @@ async def _process_completed_call_async(call_id: str, tenant_id: str):
     tenant_uuid = uuid.UUID(tenant_id)
     transcript_text: str | None = None
     should_generate_summary = False
+    has_substantive_caller_input = False
     openai_api_key: str | None = None
 
     async with async_session_factory() as db:
@@ -639,8 +667,9 @@ async def _process_completed_call_async(call_id: str, tenant_id: str):
             )
         )
         transcript = transcript_result.scalar_one_or_none()
-        if transcript and transcript.full_text:
-            transcript_text = transcript.full_text
+        if transcript is not None:
+            transcript_text = str(transcript.full_text or "").strip()
+            has_substantive_caller_input = _has_substantive_caller_input(transcript.turns)
             summary_result = await db.execute(
                 select(CallSummary).where(
                     CallSummary.call_id == call_uuid,
@@ -694,25 +723,31 @@ async def _process_completed_call_async(call_id: str, tenant_id: str):
         await db.commit()
 
     summary_data = None
-    if should_generate_summary and transcript_text:
-        try:
-            from app.ai.conversation import ConversationEngine, conversation_engine
+    if should_generate_summary:
+        if not has_substantive_caller_input:
+            # Agent greetings and prompts are not evidence of caller intent.
+            # Bypass the model so it cannot turn a one-sided transcript into a
+            # fabricated disposition, contact detail, or follow-up action.
+            summary_data = _insufficient_transcript_summary()
+        elif transcript_text:
+            try:
+                from app.ai.conversation import ConversationEngine, conversation_engine
 
-            # Deliberately outside every database transaction/row lock.
-            engine = (
-                ConversationEngine(api_key=openai_api_key)
-                if openai_api_key
-                else conversation_engine
-            )
-            summary_data = await engine.generate_call_summary(transcript_text)
-        except Exception as exc:
-            # Billing and lifecycle delivery should still complete when an
-            # optional LLM summary provider is unavailable.
-            logger.error(
-                "summary_generation_failed",
-                call_id=call_id,
-                error_type=type(exc).__name__,
-            )
+                # Deliberately outside every database transaction/row lock.
+                engine = (
+                    ConversationEngine(api_key=openai_api_key)
+                    if openai_api_key
+                    else conversation_engine
+                )
+                summary_data = await engine.generate_call_summary(transcript_text)
+            except Exception as exc:
+                # Billing and lifecycle delivery should still complete when an
+                # optional LLM summary provider is unavailable.
+                logger.error(
+                    "summary_generation_failed",
+                    call_id=call_id,
+                    error_type=type(exc).__name__,
+                )
 
     if summary_data is not None:
         async with async_session_factory() as db:
