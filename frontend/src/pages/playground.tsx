@@ -69,6 +69,7 @@ const INITIAL_DIAGNOSTICS: Diagnostics = {
 
 const CONNECT_TIMEOUT_MS = 12_000;
 const AGENT_JOIN_TIMEOUT_MS = 20_000;
+const MICROPHONE_PERMISSION_TIMEOUT_MS = 25_000;
 
 function languageName(code: string) {
   try {
@@ -90,8 +91,49 @@ async function requestMicrophoneReadiness() {
   if (!navigator.mediaDevices?.getUserMedia) {
     throw new DOMException('No browser microphone interface is available.', 'NotFoundError');
   }
-  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-  stream.getTracks().forEach((track) => track.stop());
+  const permissionRequest = navigator.mediaDevices.getUserMedia({ audio: true });
+  let permissionTimedOut = false;
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  const permissionTimeout = new Promise<never>((_, reject) => {
+    timeoutId = setTimeout(() => {
+      permissionTimedOut = true;
+      const timeoutError = new Error(
+        'Microphone permission timed out. Click Allow in the browser prompt or site settings, then retry.',
+      );
+      timeoutError.name = 'MicrophonePermissionTimeoutError';
+      reject(timeoutError);
+    }, MICROPHONE_PERMISSION_TIMEOUT_MS);
+  });
+
+  try {
+    const stream = await Promise.race([permissionRequest, permissionTimeout]);
+    stream.getTracks().forEach((track) => track.stop());
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId);
+    if (permissionTimedOut) {
+      // A native permission prompt cannot be cancelled. If it resolves after
+      // VAV has failed the attempt, immediately release every captured track.
+      void permissionRequest.then((lateStream) => {
+        lateStream.getTracks().forEach((track) => track.stop());
+      }).catch(() => undefined);
+    }
+  }
+}
+
+function isLiveKitBrowserLlmProvider(provider: RuntimeProfile['llm_provider'] | undefined) {
+  return provider === 'openai' || provider === 'inworld';
+}
+
+function isMicrophoneReadinessError(error: unknown) {
+  const name = typeof error === 'object' && error && 'name' in error
+    ? String(error.name)
+    : '';
+  return [
+    'NotAllowedError',
+    'NotFoundError',
+    'NotReadableError',
+    'MicrophonePermissionTimeoutError',
+  ].includes(name);
 }
 
 function liveKitSessionState(agentState: string): SessionState | null {
@@ -201,7 +243,8 @@ export default function Playground() {
     && selectedRuntimeProfile?.id
     && selectedRuntimeProfile.status !== 'inactive'
     && selectedRuntimeProfile.telephony_provider === 'livekit_sip'
-    && selectedRuntimeProfile.primary_speech_provider === 'inworld',
+    && selectedRuntimeProfile.primary_speech_provider === 'inworld'
+    && isLiveKitBrowserLlmProvider(selectedRuntimeProfile.llm_provider),
   );
   const browserTransport: BrowserTransport = selectedUsesLiveKitBrowser
     ? 'livekit'
@@ -307,7 +350,10 @@ export default function Playground() {
     setError(null);
     dispatchTranscript({ type: 'clear' });
     setMuted(false);
-    setDiagnostics({ ...INITIAL_DIAGNOSTICS, lastEvent: 'Preparing microphone' });
+    setDiagnostics({
+      ...INITIAL_DIAGNOSTICS,
+      lastEvent: 'Waiting for microphone permission — click Allow in the browser prompt',
+    });
 
     try {
       // Permission and the lazy SDK download happen before token issuance so a
@@ -754,11 +800,7 @@ export default function Playground() {
       setState('error');
       setDiagnostics((current) => ({
         ...current,
-        permission: sessionError instanceof DOMException && (
-          sessionError.name === 'NotAllowedError'
-          || sessionError.name === 'NotFoundError'
-          || sessionError.name === 'NotReadableError'
-        ) ? 'blocked' : current.permission,
+        permission: isMicrophoneReadinessError(sessionError) ? 'blocked' : current.permission,
         token: current.token === 'requesting' || current.token === 'issued' ? 'failed' : current.token,
         agentState: 'failed',
         audioPlayback: 'not started',
@@ -902,7 +944,8 @@ export default function Playground() {
                   && runtime?.id
                   && runtime.status !== 'inactive'
                   && runtime.telephony_provider === 'livekit_sip'
-                  && runtime.primary_speech_provider === 'inworld',
+                  && runtime.primary_speech_provider === 'inworld'
+                  && isLiveKitBrowserLlmProvider(runtime.llm_provider),
                 );
                 const isVav = ['sarvam', 'elevenlabs', 'inworld'].includes(agent.voice_provider);
                 const status = liveKitBrowser && !ready

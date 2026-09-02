@@ -68,6 +68,12 @@ test('session errors provide permission and network recovery guidance', () => {
     sessionErrorGuidance(new Error('WebSocket connection failed')).message,
     /fresh single-use token/,
   );
+  const timeoutError = new Error('Microphone permission timed out.');
+  timeoutError.name = 'MicrophonePermissionTimeoutError';
+  const timeoutGuidance = sessionErrorGuidance(timeoutError);
+  assert.equal(timeoutGuidance.title, 'Microphone permission is still waiting');
+  assert.match(timeoutGuidance.message, /Click Allow/);
+  assert.match(timeoutGuidance.message, /site's browser settings/);
 });
 
 test('transcript language is shown only when the provider supplied it', () => {

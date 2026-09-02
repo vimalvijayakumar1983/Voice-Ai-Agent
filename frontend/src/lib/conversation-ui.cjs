@@ -58,6 +58,15 @@ function sessionErrorGuidance(error) {
       : '';
   const message = rawMessage.toLowerCase();
 
+  if (
+    name === 'MicrophonePermissionTimeoutError'
+    || message.includes('microphone permission timed out')
+  ) {
+    return {
+      title: 'Microphone permission is still waiting',
+      message: 'Click Allow in the browser permission prompt. If no prompt is visible, allow microphone access in this site\'s browser settings, then retry.',
+    };
+  }
   if (name === 'NotAllowedError' || message.includes('permission') || message.includes('notallowed')) {
     return {
       title: 'Microphone permission is blocked',

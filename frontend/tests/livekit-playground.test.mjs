@@ -16,6 +16,31 @@ test('LiveKit browser SDK is pinned and loaded only after a user starts a sessio
   assert.ok(microphoneIndex > -1 && tokenIndex > microphoneIndex, 'token must be requested after microphone permission');
 });
 
+test('microphone permission is bounded and a late stream is always released', () => {
+  const readinessStart = playgroundSource.indexOf('async function requestMicrophoneReadiness()');
+  const readinessEnd = playgroundSource.indexOf('function isLiveKitBrowserLlmProvider', readinessStart);
+  const readinessSource = playgroundSource.slice(readinessStart, readinessEnd);
+
+  assert.match(playgroundSource, /const MICROPHONE_PERMISSION_TIMEOUT_MS = 25_000/);
+  assert.match(readinessSource, /Promise\.race\(\[permissionRequest, permissionTimeout\]\)/);
+  assert.match(readinessSource, /permissionTimedOut = true/);
+  assert.match(readinessSource, /Click Allow in the browser prompt or site settings/);
+  assert.match(readinessSource, /permissionRequest\.then\(\(lateStream\) => \{/);
+  assert.match(readinessSource, /lateStream\.getTracks\(\)\.forEach\(\(track\) => track\.stop\(\)\)/);
+  assert.match(playgroundSource, /Waiting for microphone permission — click Allow in the browser prompt/);
+});
+
+test('LiveKit browser candidates require one of the supported LLM providers', () => {
+  assert.match(
+    playgroundSource,
+    /return provider === 'openai' \|\| provider === 'inworld'/,
+  );
+  assert.equal(
+    playgroundSource.match(/isLiveKitBrowserLlmProvider\([^)]*\.llm_provider\)/g)?.length,
+    2,
+  );
+});
+
 test('LiveKit browser token uses the authenticated agent endpoint and stays memory-only', () => {
   assert.match(apiSource, /`\/api\/v1\/agents\/\$\{agentId\}\/livekit\/session`/);
   assert.match(apiSource, /body: JSON\.stringify\(\{ variables \}\)/);
