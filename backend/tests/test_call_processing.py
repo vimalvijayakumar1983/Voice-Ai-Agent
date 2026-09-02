@@ -105,6 +105,82 @@ async def test_completed_call_processing_is_tenant_scoped_and_idempotent(
     assert wrong_tenant_payload is None
 
 
+@pytest.mark.parametrize(
+    ("turns", "full_text"),
+    [
+        (
+            [
+                {
+                    "role": "assistant",
+                    "content": "Hello, how may I help you today?",
+                },
+                {"role": "user", "content": "   "},
+            ],
+            "Assistant: Hello, how may I help you today?",
+        ),
+        ([], ""),
+    ],
+)
+@pytest.mark.asyncio
+async def test_assistant_only_transcript_gets_evidence_safe_unknown_outcome(
+    db,
+    tenant,
+    monkeypatch,
+    turns,
+    full_text,
+):
+    call = Call(
+        tenant_id=tenant.id,
+        agent_id=None,
+        direction="inbound",
+        status="completed",
+        from_number="browser",
+        to_number="voice-agent",
+        provider="livekit_webrtc",
+        duration_seconds=3,
+    )
+    db.add(call)
+    await db.flush()
+    db.add(
+        CallTranscript(
+            tenant_id=tenant.id,
+            call_id=call.id,
+            turns=turns,
+            full_text=full_text,
+        )
+    )
+    await db.commit()
+
+    summarize = AsyncMock(
+        return_value={
+            "summary": "The caller requested an email.",
+            "key_topics": ["email"],
+            "action_items": ["Send an email"],
+            "sentiment": "positive",
+            "disposition": "interested",
+        }
+    )
+    monkeypatch.setattr(conversation_engine, "generate_call_summary", summarize)
+    monkeypatch.setattr(database, "async_session_factory", session_factory)
+
+    payload = await _process_completed_call_async(str(call.id), str(tenant.id))
+
+    async with session_factory() as session:
+        summary = await session.scalar(select(CallSummary).where(CallSummary.call_id == call.id))
+        processed_call = await session.get(Call, call.id)
+
+    summarize.assert_not_awaited()
+    assert payload["disposition"] == "unknown"
+    assert processed_call.disposition == "unknown"
+    assert summary.summary == (
+        "No substantive caller speech was captured, so no call outcome or follow-up "
+        "could be determined."
+    )
+    assert summary.key_topics == []
+    assert summary.action_items == []
+    assert summary.sentiment == "neutral"
+
+
 @pytest.mark.asyncio
 async def test_provider_analytics_wins_while_local_summary_runs_without_db_lock(
     db,
