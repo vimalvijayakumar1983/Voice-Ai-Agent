@@ -15,6 +15,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 from dataclasses import dataclass
@@ -23,7 +24,7 @@ from typing import Any
 from uuid import UUID
 
 from livekit import agents
-from livekit.agents import Agent, AgentServer, AgentSession, JobContext, function_tool
+from livekit.agents import Agent, AgentServer, AgentSession, JobContext, function_tool, inference
 from livekit.plugins import inworld, openai
 from sqlalchemy import func, select
 
@@ -217,6 +218,70 @@ def _usage_snapshot(usage: object) -> dict[str, int | float]:
         elif usage_type == "stt_usage":
             result["stt_audio_seconds"] += _usage_value(item, "audio_duration")
     return result
+
+
+def _metric_milliseconds(metrics: object, name: str) -> int | None:
+    """Convert an optional LiveKit per-turn seconds metric into milliseconds."""
+    if isinstance(metrics, dict):
+        value = metrics.get(name)
+    else:
+        value = getattr(metrics, name, None)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        return None
+    return round(value * 1000)
+
+
+def _latency_percentile(values: list[int], percentile: float) -> int | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    index = max(0, math.ceil(len(ordered) * percentile) - 1)
+    return ordered[min(index, len(ordered) - 1)]
+
+
+def _capture_turn_latency(
+    *,
+    role: str,
+    metrics: object,
+    runtime_metrics: dict[str, int | float],
+    end_to_end_samples: list[int],
+) -> None:
+    """Record production-safe latency fields from LiveKit ChatMessage.metrics."""
+    if role != "assistant":
+        return
+
+    runtime_metrics["turn_count"] = int(runtime_metrics.get("turn_count", 0)) + 1
+    llm_ttft = _metric_milliseconds(metrics, "llm_node_ttft")
+    tts_ttfb = _metric_milliseconds(metrics, "tts_node_ttfb")
+    e2e_latency = _metric_milliseconds(metrics, "e2e_latency")
+
+    if llm_ttft is not None:
+        runtime_metrics["last_llm_first_token_ms"] = llm_ttft
+    if tts_ttfb is not None:
+        runtime_metrics["last_tts_first_byte_ms"] = tts_ttfb
+    if llm_ttft is not None and tts_ttfb is not None:
+        runtime_metrics["last_transcript_to_first_audio_ms"] = llm_ttft + tts_ttfb
+    if e2e_latency is not None:
+        runtime_metrics["last_speech_end_to_first_audio_ms"] = e2e_latency
+        end_to_end_samples.append(e2e_latency)
+        runtime_metrics["turn_latency_p50_ms"] = _latency_percentile(end_to_end_samples, 0.5)
+        runtime_metrics["turn_latency_p95_ms"] = _latency_percentile(end_to_end_samples, 0.95)
+
+
+def _inworld_tts_options(*, model: AgentModel, api_key: str) -> dict[str, Any]:
+    options: dict[str, Any] = {
+        "api_key": api_key,
+        "model": "inworld-tts-2",
+        "voice": model.voice_id.removeprefix("inworld:"),
+        "speaking_rate": model.speech_rate,
+        "delivery_mode": "BALANCED",
+        "text_normalization": "ON",
+    }
+    # A fixed primary language needs explicit TTS normalization and locale
+    # handling. Keep the provider's auto behavior for multilingual agents.
+    if not getattr(model, "language_switching_enabled", False):
+        options["language"] = model.language
+    return options
 
 
 def _revision_timestamp(value: object) -> str | None:
@@ -1004,7 +1069,9 @@ async def vav_inworld_session(ctx: JobContext) -> None:
         "llm_output_tokens": 0,
         "tts_characters": 0,
         "stt_audio_seconds": 0.0,
+        "turn_count": 0,
     }
+    end_to_end_latency_samples: list[int] = []
     finalization_lock = asyncio.Lock()
     close_lock = asyncio.Lock()
     finalized = False
@@ -1036,7 +1103,6 @@ async def vav_inworld_session(ctx: JobContext) -> None:
         # The explicit exception path below covers failures that occur before
         # LiveKit begins its normal job shutdown sequence.
         ctx.add_shutdown_callback(_shutdown)
-        voice = model.voice_id.removeprefix("inworld:")
         stt_options: dict[str, Any] = {
             "api_key": api_key,
             "model": "inworld/inworld-stt-1",
@@ -1044,6 +1110,7 @@ async def vav_inworld_session(ctx: JobContext) -> None:
         }
         if profile.stt_language != "auto":
             stt_options["language"] = profile.stt_language
+        tts_options = _inworld_tts_options(model=model, api_key=api_key)
         session = AgentSession(
             stt=inworld.STT(**stt_options),
             llm=openai.LLM(
@@ -1051,12 +1118,29 @@ async def vav_inworld_session(ctx: JobContext) -> None:
                 base_url=f"{settings.inworld_base_url.rstrip('/')}/v1",
                 model=profile.llm_model,
             ),
-            tts=inworld.TTS(
-                api_key=api_key,
-                model="inworld-tts-2",
-                voice=voice,
-                speaking_rate=model.speech_rate,
-            ),
+            tts=inworld.TTS(**tts_options),
+            turn_handling={
+                "turn_detection": inference.TurnDetector(),
+                "endpointing": {
+                    "mode": "fixed",
+                    "min_delay": 0.5,
+                    "max_delay": 3.0,
+                },
+                "interruption": {
+                    "enabled": True,
+                    "mode": "vad",
+                    "min_duration": 0.5,
+                    "min_words": 0,
+                    "resume_false_interruption": True,
+                    "false_interruption_timeout": 2.0,
+                },
+                "preemptive_generation": {
+                    "enabled": True,
+                    "preemptive_tts": False,
+                    "max_speech_duration": 10.0,
+                    "max_retries": 3,
+                },
+            },
         )
 
         async def _close_session(reason: str, *, terminate_browser_room: bool = False) -> None:
@@ -1148,6 +1232,12 @@ async def vav_inworld_session(ctx: JobContext) -> None:
         def _on_item(event: Any) -> None:
             role = str(getattr(event.item, "role", ""))
             content = str(getattr(event.item, "text_content", "") or "").strip()
+            _capture_turn_latency(
+                role=role,
+                metrics=getattr(event.item, "metrics", {}) or {},
+                runtime_metrics=usage_totals,
+                end_to_end_samples=end_to_end_latency_samples,
+            )
             if role in {"user", "assistant"} and content:
                 turns.append(
                     {
