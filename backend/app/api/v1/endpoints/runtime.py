@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from urllib.parse import urlsplit
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -46,6 +46,7 @@ from app.services.provider_credentials import (
     load_provider_config,
     store_provider_config,
 )
+from app.services.rate_limit import enforce_rate_limit
 from app.telephony.livekit_provider import LiveKitSIPError, LiveKitSIPProvider
 
 router = APIRouter(prefix="/runtime", tags=["Realtime Runtime"])
@@ -500,9 +501,7 @@ async def live_runtime_readiness(
     try:
         openai_config = await load_provider_config(db, agent.tenant_id, "openai")
     except ProviderCredentialError:
-        blockers.append(
-            "OpenAI workspace credential became unavailable during live readiness."
-        )
+        blockers.append("OpenAI workspace credential became unavailable during live readiness.")
         return blockers, checks
     openai_api_key = str(
         ((openai_config or {}).get("api_key") or "")
@@ -627,9 +626,20 @@ async def update_runtime_profile(
 @router.post("/agents/{agent_id}/test", response_model=RuntimeReadinessResponse)
 async def test_runtime_profile(
     agent_id: UUID,
+    request: Request,
     current_user: CurrentUser = Depends(require_role("owner", "admin", "member")),
     db: AsyncSession = Depends(get_db),
 ):
+    await enforce_rate_limit(
+        request,
+        scope="runtime-live-readiness",
+        limit=5,
+        window_seconds=60,
+        subject=f"{current_user.tenant_id}:{current_user.id}",
+        bind_to_client=False,
+        limit_detail="Too many live readiness tests. Wait one minute and try again.",
+        unavailable_detail="Live readiness testing is temporarily unavailable.",
+    )
     agent = await _agent(db, current_user.tenant_id, agent_id)
     profile = await _profile(db, current_user.tenant_id, agent_id, create=True)
     assert profile is not None
@@ -669,9 +679,20 @@ async def test_runtime_profile(
 @router.post("/agents/{agent_id}/activate", response_model=RuntimeProfileResponse)
 async def activate_runtime_profile(
     agent_id: UUID,
+    request: Request,
     current_user: CurrentUser = Depends(require_role("owner", "admin")),
     db: AsyncSession = Depends(get_db),
 ):
+    await enforce_rate_limit(
+        request,
+        scope="runtime-live-readiness",
+        limit=5,
+        window_seconds=60,
+        subject=f"{current_user.tenant_id}:{current_user.id}",
+        bind_to_client=False,
+        limit_detail="Too many live readiness tests. Wait one minute and try again.",
+        unavailable_detail="Live readiness testing is temporarily unavailable.",
+    )
     agent = await _agent(db, current_user.tenant_id, agent_id)
     profile = await _profile(db, current_user.tenant_id, agent_id, create=True)
     assert profile is not None

@@ -554,14 +554,15 @@ def _call_components(
         )
         llm_model = str(runtime.get("llm_model") or "gpt-4o-mini")
         priced_llm_model = llm_model.removeprefix("openai/")
-        auto_routed_model = llm_provider == "inworld" and priced_llm_model == "auto"
-        if auto_routed_model:
-            # Auto routing may select any supported model. Do not present a
-            # convenient proxy as complete customer-facing cost coverage.
-            missing.append("Inworld Router selected model/rate")
+        unpriced_router = llm_provider == "inworld"
+        if unpriced_router:
+            # Router pricing is not the direct upstream model's public token
+            # rate. Keep it unpriced until Inworld exposes authoritative usage
+            # and rate data for this route.
+            missing.append("Inworld Router usage/rate")
         input_tokens = runtime.get("llm_input_tokens")
         output_tokens = runtime.get("llm_output_tokens")
-        model_rates = None if auto_routed_model else OPENAI_RATES.get(priced_llm_model)
+        model_rates = None if unpriced_router else OPENAI_RATES.get(priced_llm_model)
         if (
             model_rates
             and isinstance(input_tokens, (int, float))

@@ -2,7 +2,7 @@
 
 An enterprise voice-agent workspace for building, governing, testing, and operating multilingual [Smallest.ai Atoms](https://docs.smallest.ai/voice-agents/developer-guide/get-started/build-with-a-coding-agent) agents.
 
-This repository combines a multi-tenant FastAPI control plane with a polished Next.js operator console. Its preferred production phone lane is customer-owned e& SIP through LiveKit with direct Inworld STT, Router LLM, and TTS; the existing Sarvam/Twilio path remains available for controlled rollback.
+This repository combines a multi-tenant FastAPI control plane with a polished Next.js operator console. Its preferred production phone lane is customer-owned e& SIP through LiveKit with direct Inworld STT/TTS and a tenant-selected direct OpenAI LLM; Inworld Router remains an explicitly tested option, and the existing Sarvam/Twilio path remains available for controlled rollback.
 
 ## What is included
 
@@ -35,7 +35,8 @@ flowchart TD
     Hook --> API
     UI -. "single-use web-call token" .-> Atoms
     UI -. "short-lived room token" .-> LiveKit["LiveKit WebRTC / SIP"]
-    LiveKit --> Inworld["Direct Inworld STT / Router / TTS"]
+    LiveKit --> Inworld["Direct Inworld STT / TTS"]
+    LiveKit --> OpenAI["Direct OpenAI LLM + tools"]
     LiveKit --> LKWorker["VAV LiveKit worker"]
     LKWorker --> DB
     LKWorker --> Knowledge

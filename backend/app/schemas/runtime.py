@@ -7,6 +7,11 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+PRODUCTION_LLM_MODELS = {
+    "openai": ("gpt-4o-mini", "gpt-4o"),
+    "inworld": ("auto", "openai/gpt-4o-mini", "openai/gpt-4o"),
+}
+
 
 class RuntimeProfileUpdate(BaseModel):
     telephony_provider: Literal["twilio", "livekit_sip"] = "twilio"
@@ -41,8 +46,12 @@ class RuntimeProfileUpdate(BaseModel):
     @model_validator(mode="after")
     def validate_llm_route(self):
         model = self.llm_model.strip()
-        if self.llm_provider == "openai" and (model == "auto" or "/" in model):
-            raise ValueError("OpenAI routes require a direct OpenAI model such as gpt-4o-mini")
+        allowed = PRODUCTION_LLM_MODELS[self.llm_provider]
+        if model not in allowed:
+            choices = ", ".join(allowed)
+            provider_name = "OpenAI" if self.llm_provider == "openai" else "Inworld"
+            raise ValueError(f"{provider_name} LLM routes support only: {choices}")
+        self.llm_model = model
         return self
 
 

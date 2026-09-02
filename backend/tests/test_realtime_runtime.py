@@ -1,7 +1,8 @@
 """VAV realtime runtime control-plane and protocol tests."""
 
 from datetime import UTC, datetime
-from unittest.mock import AsyncMock
+from unittest.mock import ANY, AsyncMock
+from uuid import uuid4
 
 import pytest
 from httpx import AsyncClient
@@ -43,12 +44,46 @@ def test_media_token_is_call_scoped_and_expires():
     assert not verify_media_token(token + "tampered", call_id, now=1001)
 
 
-def test_runtime_model_identifier_matches_database_column_limit():
-    assert RuntimeProfileUpdate(llm_model="m" * 100).llm_model == "m" * 100
-    with pytest.raises(ValidationError):
-        RuntimeProfileUpdate(llm_model="m" * 101)
-    with pytest.raises(ValidationError, match="direct OpenAI model"):
+def test_runtime_model_identifier_is_normalized_and_limited_to_production_routes():
+    assert RuntimeProfileUpdate(llm_model="  gpt-4o-mini  ").llm_model == "gpt-4o-mini"
+    assert (
+        RuntimeProfileUpdate(llm_provider="inworld", llm_model="  openai/gpt-4o-mini  ").llm_model
+        == "openai/gpt-4o-mini"
+    )
+    with pytest.raises(ValidationError, match="OpenAI LLM routes support only"):
         RuntimeProfileUpdate(llm_provider="openai", llm_model="openai/gpt-4o-mini")
+    with pytest.raises(ValidationError, match="Inworld LLM routes support only"):
+        RuntimeProfileUpdate(llm_provider="inworld", llm_model="customer-support-preview")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["test", "activate"])
+async def test_billable_live_readiness_is_rate_limited_per_tenant_user(
+    action,
+    client,
+    auth_headers,
+    tenant,
+    user,
+    monkeypatch,
+):
+    from app.api.v1.endpoints import runtime as runtime_endpoint
+
+    enforce = AsyncMock()
+    monkeypatch.setattr(runtime_endpoint, "enforce_rate_limit", enforce)
+
+    response = await client.post(f"/api/v1/runtime/agents/{uuid4()}/{action}", headers=auth_headers)
+
+    assert response.status_code == 404
+    enforce.assert_awaited_once_with(
+        ANY,
+        scope="runtime-live-readiness",
+        limit=5,
+        window_seconds=60,
+        subject=f"{tenant.id}:{user.id}",
+        bind_to_client=False,
+        limit_detail="Too many live readiness tests. Wait one minute and try again.",
+        unavailable_detail="Live readiness testing is temporarily unavailable.",
+    )
 
 
 def test_twilio_media_token_is_read_from_start_custom_parameters():
@@ -688,9 +723,7 @@ async def test_live_readiness_never_falls_back_when_workspace_inworld_key_is_unr
 
     assert checks["tts_provider_live"] is False
     assert checks["llm_provider_live"] is False
-    assert blockers == [
-        "Inworld workspace credential became unavailable during live readiness."
-    ]
+    assert blockers == ["Inworld workspace credential became unavailable during live readiness."]
     synthesize.assert_not_awaited()
 
 
