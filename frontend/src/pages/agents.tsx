@@ -118,12 +118,18 @@ export default function Agents() {
         ...agent.supported_languages,
         ...agent.supported_languages.map((code) => languageLabel(code, catalog)),
       ].filter(Boolean).join(' ').toLowerCase();
+      const runtime = runtimeProfiles[agent.id];
+      const vavManaged = isVAVRuntimeAgent(agent);
       const deploymentMatches = deploymentFilter === 'all'
-        || (deploymentFilter === 'local' && !agent.provider_agent_id)
-        || (deploymentFilter === 'synced' && agent.sync_status === 'synced')
-        || (deploymentFilter === 'changes' && agent.sync_status === 'dirty')
+        || (deploymentFilter === 'local' && (vavManaged ? !runtime?.enabled : !agent.provider_agent_id))
+        || (deploymentFilter === 'synced' && (vavManaged
+          ? runtime?.enabled === true && runtime.status === 'active'
+          : agent.sync_status === 'synced'))
+        || (deploymentFilter === 'changes' && !vavManaged && agent.sync_status === 'dirty')
         || (deploymentFilter === 'attention' && (
-          agent.sync_status === 'error' || providerOperationUnresolved(agent.sync_status)
+          vavManaged
+            ? runtime?.status === 'blocked'
+            : agent.sync_status === 'error' || providerOperationUnresolved(agent.sync_status)
         ));
       return (!normalizedQuery || searchable.includes(normalizedQuery))
         && deploymentMatches
@@ -135,7 +141,7 @@ export default function Agents() {
       if (sort === 'created') return Date.parse(right.created_at) - Date.parse(left.created_at);
       return Date.parse(right.updated_at) - Date.parse(left.updated_at);
     });
-  }, [agents, catalog, deploymentFilter, languageFilter, query, sort]);
+  }, [agents, catalog, deploymentFilter, languageFilter, query, runtimeProfiles, sort]);
   const usableVoiceCount = catalog?.voices.filter((voice) => (
     Boolean(voice.synthesizer_model) && !voice.unavailability_reason
   )).length;
@@ -523,10 +529,10 @@ export default function Agents() {
               <label htmlFor="agent-deployment-filter">Deployment state</label>
               <select id="agent-deployment-filter" value={deploymentFilter} onChange={(event) => setDeploymentFilter(event.target.value as DeploymentFilter)}>
                 <option value="all">All deployment states</option>
-                <option value="local">Local drafts</option>
-                <option value="synced">Provider synced</option>
-                <option value="changes">Unpublished local changes</option>
-                <option value="attention">Provider attention required</option>
+                <option value="local">Draft or inactive</option>
+                <option value="synced">Serving or provider synced</option>
+                <option value="changes">Unpublished Smallest.ai changes</option>
+                <option value="attention">Runtime or provider attention</option>
               </select>
             </div>
             <div className="form-group">
@@ -584,7 +590,9 @@ export default function Agents() {
                 <span className="meta-chip">{languageConfigurationLabel(agent)}</span>
                 <span className="meta-chip">Voice: {voiceLabel(agent.voice_id, catalog)}</span>
                 <span className="meta-chip">Provider: {voiceProviderName(agent.voice_provider)}</span>
-                <span className={`badge ${syncBadge(agent.sync_status)}`}>{syncStatusLabel(agent.sync_status)}</span>
+                <span className={`badge ${agentStateBadge(agent, runtimeProfiles[agent.id])}`}>
+                  {agentStateLabel(agent, runtimeProfiles[agent.id])}
+                </span>
                 {agent.provider_revision_id && <span className="meta-chip">Revision: {agent.provider_revision_id.slice(0, 12)}…</span>}
                 {agent.last_synced_at && <span className="meta-chip">Last sync: {new Date(agent.last_synced_at).toLocaleString()}</span>}
               </div>
@@ -685,6 +693,28 @@ function syncBadge(status: VoiceAgent['sync_status']) {
 
 function providerOperationUnresolved(status: VoiceAgent['sync_status']) {
   return ['provisioning', 'provision_unknown', 'publishing', 'provider_scanning', 'publish_unknown'].includes(status);
+}
+
+function isVAVRuntimeAgent(agent: VoiceAgent) {
+  return ['sarvam', 'elevenlabs', 'inworld'].includes(agent.voice_provider);
+}
+
+function agentStateLabel(agent: VoiceAgent, runtime?: RuntimeProfile) {
+  if (!isVAVRuntimeAgent(agent)) return syncStatusLabel(agent.sync_status);
+  if (!runtime) return 'Runtime not configured';
+  if (runtime.enabled && runtime.status === 'active') return 'Runtime active';
+  if (runtime.status === 'blocked') return 'Runtime blocked';
+  if (runtime.status === 'ready') return 'Runtime ready';
+  if (runtime.status === 'inactive') return 'Runtime inactive';
+  return 'Runtime draft';
+}
+
+function agentStateBadge(agent: VoiceAgent, runtime?: RuntimeProfile) {
+  if (!isVAVRuntimeAgent(agent)) return syncBadge(agent.sync_status);
+  if (runtime?.enabled && runtime.status === 'active') return 'badge-success';
+  if (runtime?.status === 'blocked') return 'badge-danger';
+  if (runtime?.status === 'ready') return 'badge-success';
+  return 'badge-neutral';
 }
 
 function syncStatusLabel(status: VoiceAgent['sync_status']) {
