@@ -8,6 +8,7 @@ const runtimeSource = readFileSync(new URL('../src/components/RuntimeControlPane
 const knowledgeSource = readFileSync(new URL('../src/pages/knowledge.tsx', import.meta.url), 'utf8');
 const settingsSource = readFileSync(new URL('../src/pages/settings.tsx', import.meta.url), 'utf8');
 const apiSource = readFileSync(new URL('../src/lib/api.ts', import.meta.url), 'utf8');
+const agentsSource = readFileSync(new URL('../src/pages/agents.tsx', import.meta.url), 'utf8');
 
 test('phone playground names the selected agent instead of a hard-coded agent', () => {
   assert.match(playgroundSource, /selected\?\.name \|\| 'this agent'/);
@@ -46,4 +47,11 @@ test('tenant SIP routes never collect platform LiveKit or carrier credentials', 
   assert.doesNotMatch(settingsSource, /id="sip-(?:user|password|number)"/);
   assert.doesNotMatch(apiSource, /livekit_api_(?:key|secret): string/);
   assert.doesNotMatch(apiSource, /\binbound_number: string/);
+});
+
+test('VAV-managed agents show runtime lifecycle instead of Smallest draft state', () => {
+  assert.match(agentsSource, /agentStateLabel\(agent, runtimeProfiles\[agent\.id\]\)/);
+  assert.match(agentsSource, /if \(runtime\.enabled && runtime\.status === 'active'\) return 'Runtime active'/);
+  assert.match(agentsSource, /if \(runtime\.status === 'inactive'\) return 'Runtime inactive'/);
+  assert.match(agentsSource, /Serving or provider synced/);
 });
