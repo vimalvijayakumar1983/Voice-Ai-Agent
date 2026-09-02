@@ -106,9 +106,7 @@ class OpenAIProviderClient:
                                 "OpenAI tool readiness returned an unexpectedly large response."
                             )
         except httpx.TimeoutException as exc:
-            raise OpenAIProviderError(
-                "OpenAI tool readiness timed out.", status_code=504
-            ) from exc
+            raise OpenAIProviderError("OpenAI tool readiness timed out.", status_code=504) from exc
         except httpx.RequestError as exc:
             raise OpenAIProviderError("OpenAI could not be reached.") from exc
 
