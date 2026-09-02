@@ -21,9 +21,11 @@ test('billing headline reports measurable line-item coverage', () => {
   assert.match(billingSource, /partial or unpriced/);
 });
 
-test('billing can filter the direct LiveKit SIP lane', () => {
+test('billing can filter direct LiveKit SIP and browser WebRTC lanes', () => {
   assert.match(billingSource, /<option value="livekit_sip">LiveKit SIP<\/option>/);
-  assert.match(apiSource, /provider\?: 'twilio' \| 'smallest' \| 'livekit_sip' \| ''/);
+  assert.match(billingSource, /<option value="livekit_webrtc">LiveKit WebRTC<\/option>/);
+  assert.match(billingSource, /value === 'livekit_webrtc'\) return 'LiveKit WebRTC'/);
+  assert.match(apiSource, /provider\?: 'twilio' \| 'smallest' \| 'livekit_sip' \| 'livekit_webrtc' \| ''/);
 });
 
 test('phone diagnostics identify the selected transport and response engine', () => {

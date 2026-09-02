@@ -6,6 +6,9 @@ export function proxy(request: NextRequest) {
   const contentSecurityPolicy = buildContentSecurityPolicy({
     nonce,
     production: process.env.NODE_ENV === 'production',
+    // Optional exact origin for self-hosted LiveKit. LiveKit Cloud regional
+    // endpoints are already constrained to *.livekit.cloud by the CSP helper.
+    livekitConnectOrigin: process.env.LIVEKIT_BROWSER_CONNECT_ORIGIN,
   });
   const requestHeaders = new Headers(request.headers);
   requestHeaders.set('x-nonce', nonce);

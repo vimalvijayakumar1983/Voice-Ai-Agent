@@ -6,14 +6,14 @@ export interface SessionErrorGuidance {
 }
 
 export type TranscriptRole = 'assistant' | 'user';
-export interface UiTranscriptTurn { id: number; role: TranscriptRole; text: string }
-export interface UiLiveTranscript { role: TranscriptRole; text: string }
+export interface UiTranscriptTurn { id: number; role: TranscriptRole; text: string; language?: string }
+export interface UiLiveTranscript { role: TranscriptRole; text: string; language?: string }
 export interface UiTranscriptState { turns: UiTranscriptTurn[]; live: UiLiveTranscript | null }
 export type UiTranscriptAction =
   | { type: 'clear' }
   | { type: 'clear_live' }
-  | { type: 'delta'; role: TranscriptRole; text: string }
-  | { type: 'settled'; id: number; role: TranscriptRole; text: string };
+  | { type: 'delta'; role: TranscriptRole; text: string; language?: string }
+  | { type: 'settled'; id: number; role: TranscriptRole; text: string; language?: string };
 
 export function parseTestVariables(text: string): ScalarVariables;
 export function reduceTranscriptState(state: UiTranscriptState, action: UiTranscriptAction): UiTranscriptState;

@@ -68,6 +68,8 @@ function percentage(value: number) {
 function providerName(value: string | null) {
   if (!value) return '—';
   if (value === 'smallest') return 'Smallest.ai';
+  if (value === 'livekit_sip') return 'LiveKit SIP';
+  if (value === 'livekit_webrtc') return 'LiveKit WebRTC';
   return value.charAt(0).toUpperCase() + value.slice(1);
 }
 
@@ -165,7 +167,7 @@ export default function Billing() {
       <section className="cost-filter-bar" aria-label="Report filters">
         <div className="cost-filter-heading"><Filter size={15} /><strong>Filters</strong>{activeFilterCount > 0 && <span className="badge badge-neutral">{activeFilterCount} active</span>}</div>
         <label><span>Period</span><select value={filters.days || 30} onChange={(event) => updateFilter('days', Number(event.target.value))}><option value={7}>Last 7 days</option><option value={30}>Last 30 days</option><option value={90}>Last 90 days</option><option value={365}>Last 12 months</option></select></label>
-        <label><span>Telephony</span><select value={filters.provider || ''} onChange={(event) => updateFilter('provider', event.target.value)}><option value="">All providers</option><option value="twilio">Twilio</option><option value="livekit_sip">LiveKit SIP</option><option value="smallest">Smallest.ai</option></select></label>
+        <label><span>Transport</span><select value={filters.provider || ''} onChange={(event) => updateFilter('provider', event.target.value)}><option value="">All providers</option><option value="twilio">Twilio</option><option value="livekit_sip">LiveKit SIP</option><option value="livekit_webrtc">LiveKit WebRTC</option><option value="smallest">Smallest.ai</option></select></label>
         <label><span>Speech</span><select value={filters.speech_provider || ''} onChange={(event) => updateFilter('speech_provider', event.target.value)}><option value="">All speech</option><option value="inworld">Inworld</option><option value="sarvam">Sarvam</option><option value="elevenlabs">ElevenLabs</option><option value="smallest">Smallest.ai</option></select></label>
         <label><span>Agent</span><select value={filters.agent_id || ''} onChange={(event) => updateFilter('agent_id', event.target.value)}><option value="">All agents</option>{agents.map((agent) => <option key={agent.id} value={agent.id}>{agent.name}</option>)}</select></label>
         <label><span>Direction</span><select value={filters.direction || ''} onChange={(event) => updateFilter('direction', event.target.value)}><option value="">Inbound & outbound</option><option value="inbound">Inbound</option><option value="outbound">Outbound</option></select></label>

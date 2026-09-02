@@ -30,6 +30,24 @@ test('cumulative transcript deltas update one live turn and settle once', () => 
   });
 });
 
+test('provider-reported transcript language survives live and settled updates', () => {
+  const live = reduceTranscriptState(
+    { turns: [], live: null },
+    { type: 'delta', role: 'assistant', text: 'مرحبا', language: 'ar-AE' },
+  );
+  assert.equal(live.live.language, 'ar-AE');
+
+  const settled = reduceTranscriptState(live, {
+    type: 'settled',
+    id: 7,
+    role: 'assistant',
+    text: 'مرحبا',
+    language: 'ar-AE',
+  });
+  assert.equal(settled.turns[0].language, 'ar-AE');
+  assert.equal(settled.live, null);
+});
+
 test('test variables accept scalar JSON objects and reject unsafe shapes', () => {
   assert.deepEqual(parseTestVariables('{"customer":"Vimal","priority":2,"vip":true}'), {
     customer: 'Vimal',

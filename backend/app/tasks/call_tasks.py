@@ -1,10 +1,14 @@
 """Post-call processing tasks."""
 
+import asyncio
 import uuid
 from datetime import UTC, datetime, timedelta
 
 import structlog
 
+from app.core.config import settings
+from app.livekit_runtime.browser_session import delete_browser_room
+from app.livekit_runtime.constants import BROWSER_TOKEN_TTL_SECONDS
 from app.tasks.async_runner import run_async as _run_async
 from app.tasks.worker import celery_app
 
@@ -26,6 +30,18 @@ def _as_utc(value: datetime | None) -> datetime | None:
 
 def _bounded_call_duration(value: int | None) -> int:
     return max(int(value or 600), 30)
+
+
+def _browser_watchdog_duration(metadata: dict, current_agent_duration: int | None) -> int:
+    """Honor the immutable per-call cap even if the agent is later expanded."""
+    reserved_duration = metadata.get("reserved_max_duration_seconds")
+    if (
+        isinstance(reserved_duration, bool)
+        or not isinstance(reserved_duration, int)
+        or not 30 <= reserved_duration <= 7200
+    ):
+        return 30
+    return min(reserved_duration, _bounded_call_duration(current_agent_duration))
 
 
 def arm_direct_call_terminal_watchdog(
@@ -112,6 +128,59 @@ def _mark_realtime_call_terminal_unknown(call, now: datetime) -> None:
     call.status = DIRECT_CALL_UNKNOWN_STATUS
     call.ended_at = call.ended_at or now
     call.call_metadata = metadata
+
+
+def _mark_browser_join_timeout(call, now: datetime) -> None:
+    """Release a known never-connected browser reservation without ambiguity."""
+    metadata = dict(call.call_metadata or {})
+    metadata.update(
+        {
+            "lifecycle_error": "livekit_browser_join_timeout",
+            "operator_review_required": False,
+            "automatic_redial_disabled": True,
+            "recovered_at": now.isoformat(),
+            "session_issuance": "expired",
+        }
+    )
+    call.status = "failed"
+    call.started_at = None
+    call.answered_at = None
+    call.ended_at = call.ended_at or now
+    call.duration_seconds = 0
+    call.call_metadata = metadata
+
+
+async def _cleanup_expired_browser_rooms(room_names: list[str]) -> None:
+    """Best-effort bounded cleanup after the database transaction is committed."""
+    if not room_names:
+        return
+    semaphore = asyncio.Semaphore(10)
+
+    async def cleanup(room_name: str) -> None:
+        async with semaphore:
+            try:
+                removed = await asyncio.wait_for(
+                    delete_browser_room(
+                        url=settings.livekit_url,
+                        api_key=settings.livekit_api_key,
+                        api_secret=settings.livekit_api_secret,
+                        room_name=room_name,
+                    ),
+                    timeout=5,
+                )
+                if not removed:
+                    logger.warning(
+                        "livekit_browser_join_timeout_cleanup_unconfirmed",
+                        room_name=room_name,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "livekit_browser_join_timeout_cleanup_failed",
+                    room_name=room_name,
+                    error_type=type(exc).__name__,
+                )
+
+    await asyncio.gather(*(cleanup(room_name) for room_name in set(room_names)))
 
 
 @celery_app.task(name="app.tasks.call_tasks.process_completed_call", bind=True, max_retries=3)
@@ -376,7 +445,7 @@ async def _sweep_stale_realtime_calls_async(
     *,
     now: datetime | None = None,
 ) -> int:
-    from sqlalchemy import select
+    from sqlalchemy import and_, func, or_, select
 
     from app.core.database import async_session_factory
     from app.models.agent import Agent
@@ -384,7 +453,33 @@ async def _sweep_stale_realtime_calls_async(
 
     bounded_limit = min(max(int(limit), 1), 1000)
     observed_at = _as_utc(now) or datetime.now(UTC)
+    expired_browser_rooms: list[str] = []
     async with async_session_factory() as db:
+        metadata = Call.call_metadata
+        runtime = metadata["runtime"]
+        runtime_route = metadata["runtime_route"]
+        route_filter = or_(
+            and_(
+                Call.provider == "twilio",
+                metadata["conversation_type"].as_string() == "telephonyInbound",
+                metadata["channel"].as_string() == "phone",
+            ),
+            and_(
+                Call.provider == "livekit_sip",
+                runtime["transport"].as_string() == "livekit_sip",
+            ),
+            and_(
+                Call.provider == "livekit_webrtc",
+                metadata["conversation_type"].as_string() == "webcall",
+                metadata["channel"].as_string() == "browser",
+                runtime["transport"].as_string() == "livekit_webrtc",
+            ),
+        )
+        speech_provider = func.coalesce(
+            runtime["speech_provider"].as_string(),
+            runtime_route["speech_provider"].as_string(),
+            metadata["speech_provider"].as_string(),
+        )
         rows = (
             await db.execute(
                 select(Call, Agent.max_call_duration_seconds)
@@ -394,11 +489,15 @@ async def _sweep_stale_realtime_calls_async(
                 )
                 .where(
                     Call.direction == "inbound",
-                    Call.provider.in_(("twilio", "livekit_sip")),
-                    Call.status == "in_progress",
-                    Call.answered_at.is_not(None),
+                    Call.provider.in_(("twilio", "livekit_sip", "livekit_webrtc")),
+                    Call.status.in_(("initiated", "in_progress")),
+                    route_filter,
+                    speech_provider.in_(tuple(REALTIME_CALL_WATCHDOG_PROVIDERS)),
                 )
-                .order_by(Call.answered_at, Call.created_at)
+                # Oldest reservation first prevents a large set of connected
+                # calls (whose answered_at is non-null) from starving expired
+                # browser rows on databases that sort NULL timestamps last.
+                .order_by(Call.created_at)
                 .limit(bounded_limit)
                 .with_for_update(skip_locked=True, of=Call)
             )
@@ -424,26 +523,76 @@ async def _sweep_stale_realtime_calls_async(
                 and isinstance(runtime, dict)
                 and runtime.get("transport") == "livekit_sip"
             )
+            is_livekit_browser = (
+                call.provider == "livekit_webrtc"
+                and metadata.get("conversation_type") == "webcall"
+                and metadata.get("channel") == "browser"
+                and isinstance(runtime, dict)
+                and runtime.get("transport") == "livekit_webrtc"
+            )
             if not (
-                (is_twilio_realtime or is_livekit_realtime)
+                (is_twilio_realtime or is_livekit_realtime or is_livekit_browser)
                 and speech_provider in REALTIME_CALL_WATCHDOG_PROVIDERS
             ):
+                continue
+            if is_livekit_browser and call.status == "initiated":
+                issued_at = _as_utc(call.created_at)
+                if issued_at is None:
+                    # TimestampMixin makes this unreachable for normal rows,
+                    # but an unreadable legacy row must still fail closed.
+                    issued_at = observed_at - timedelta(
+                        seconds=(BROWSER_TOKEN_TTL_SECONDS + DIRECT_TERMINAL_CALLBACK_GRACE_SECONDS)
+                    )
+                fallback_deadline = issued_at + timedelta(seconds=BROWSER_TOKEN_TTL_SECONDS)
+                join_expires_at = metadata.get("join_expires_at")
+                token_deadline = None
+                if isinstance(join_expires_at, str):
+                    try:
+                        token_deadline = _as_utc(
+                            datetime.fromisoformat(join_expires_at.replace("Z", "+00:00"))
+                        )
+                    except ValueError:
+                        token_deadline = None
+                # Metadata is durable server state, but corruption or a future
+                # migration must never be able to reserve capacity forever.
+                # Permit only small timestamp skew beyond the shared token TTL.
+                if token_deadline is None or token_deadline > (
+                    fallback_deadline + timedelta(seconds=30)
+                ):
+                    token_deadline = fallback_deadline
+                if (
+                    token_deadline + timedelta(seconds=DIRECT_TERMINAL_CALLBACK_GRACE_SECONDS)
+                    > observed_at
+                ):
+                    continue
+                _mark_browser_join_timeout(call, observed_at)
+                if call.provider_call_sid:
+                    expired_browser_rooms.append(str(call.provider_call_sid))
+                recovered += 1
+                continue
+            if call.status != "in_progress":
                 continue
             answered_at = _as_utc(call.answered_at) or _as_utc(call.started_at)
             if answered_at is None:
                 continue
+            watchdog_duration = (
+                _browser_watchdog_duration(metadata, max_duration)
+                if is_livekit_browser
+                else _bounded_call_duration(max_duration)
+            )
             deadline = answered_at + timedelta(
-                seconds=(
-                    _bounded_call_duration(max_duration) + DIRECT_TERMINAL_CALLBACK_GRACE_SECONDS
-                )
+                seconds=(watchdog_duration + DIRECT_TERMINAL_CALLBACK_GRACE_SECONDS)
             )
             if deadline > observed_at:
                 continue
             _mark_realtime_call_terminal_unknown(call, observed_at)
+            if is_livekit_browser and call.provider_call_sid:
+                expired_browser_rooms.append(str(call.provider_call_sid))
             recovered += 1
 
         await db.commit()
-        return recovered
+    await _cleanup_expired_browser_rooms(expired_browser_rooms)
+    return recovered
 
 
 async def _process_completed_call_async(call_id: str, tenant_id: str):

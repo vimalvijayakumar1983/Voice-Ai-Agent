@@ -23,6 +23,36 @@ VAV does not use LiveKit Inference in this lane. This prevents a second AI-servi
 
 Outbound is the same after connection. VAV creates a LiveKit SIP participant through the recorded outbound trunk; the AI costs are the same for the same duration and usage. Only the customer's e& carrier tariff normally differs by destination. That carrier invoice is a direct customer cost and is deliberately excluded from VAV margin.
 
+## Browser playground path
+
+The VAV playground can dispatch the same `vav-inworld` worker through LiveKit
+WebRTC without placing a PSTN call. The operator grants microphone permission
+first; VAV then creates a durable browser-call row and returns a short-lived,
+room-scoped LiveKit token that can publish microphone audio and subscribe to
+the agent. Tenant, agent and call selection come only from VAV's signed dispatch
+envelope. Browser participant metadata is never trusted for routing.
+Each Start attempt also carries a random `Idempotency-Key`. An authenticated
+retry can re-mint only the remaining lifetime of the same issued room token;
+it cannot create a duplicate call or extend the original join deadline, and
+VAV never persists the bearer token itself.
+
+The browser and phone paths intentionally share the agent prompt, approved
+knowledge, Inworld STT/Router/TTS configuration, tools, limits, transcript,
+usage and finalization code. They do not prove the same things:
+
+- **Test in browser** validates VAV, LiveKit WebRTC, the worker, Inworld and
+  knowledge retrieval without consuming an e& carrier minute.
+- **Call assigned number** validates the real DID, e& SIP trunk, LiveKit SIP
+  ingress, caller audio and carrier routing.
+- **Place outbound test call** validates the outbound trunk, caller ID and
+  destination routing and therefore must remain consent- and DNC-gated.
+
+Browser calls are recorded as `livekit_webrtc`, not `livekit_sip`. Cost reports
+include their metered Inworld usage and fixed-worker allocation gap, but never
+add the LiveKit third-party SIP line item or an e& carrier charge. An unused
+token or interrupted connection is terminalized by the same stale-session
+recovery controls and cannot reserve concurrency indefinitely.
+
 ## Reference cost for a 60-second connected call
 
 Assumptions: LiveKit third-party SIP overage, conservative public on-demand Inworld rates, 1,000 TTS characters, 1,000 LLM input tokens, 500 output tokens, an explicitly selected GPT-4o mini Router route, and no e& carrier charge.
@@ -70,6 +100,7 @@ The LiveKit process imports VAV's shared production settings and decrypts tenant
 | Shared startup gate | `SMALLEST_API_KEY`, `SMALLEST_WEBHOOK_SECRET`, `SMALLEST_WEBHOOK_ID` | Required by the current shared production validator even though this lane never calls Smallest |
 | Conditional bootstrap | `BOOTSTRAP_OWNER_EMAIL` | Required only while `REGISTRATION_MODE=bootstrap` |
 | LiveKit | `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`, `LIVEKIT_AGENT_NAME` | Same project on API and worker; agent name is exactly `vav-inworld` |
+| Frontend browser CSP | `LIVEKIT_BROWSER_CONNECT_ORIGIN` | Optional exact self-hosted LiveKit `wss://` or `https://` origin; omit for LiveKit Cloud and never place credentials in it |
 | API worker probe | `LIVEKIT_WORKER_HEALTH_URL` | Private HTTP origin and port of `livekit-agent`, with no path; on Railway use `http://${{livekit-agent.RAILWAY_PRIVATE_DOMAIN}}:${{livekit-agent.PORT}}`; set on API only and never expose publicly |
 | Inworld | `INWORLD_API_KEY` | Optional platform fallback; prefer the encrypted workspace credential in VAV Settings |
 | Operations | `LIVEKIT_LOG_LEVEL=info`, `LIVEKIT_NUM_IDLE_PROCESSES=1`, `VAV_RELEASE_SHA` | Keep registration evidence, cap Railway prewarming until load-tested, and record the exact deployed commit |
@@ -92,7 +123,7 @@ The LiveKit project URL, key, and secret are platform-owned server variables on 
    The first command must report `SUCCESS`. The logs must include `registered worker` with `agent_name=vav-inworld`, a worker ID and the expected LiveKit region. A successful container without this registration record is not ready.
 6. Confirm the Railway health check remains green after the registration log. A transient `200` during initial connection is not enough on its own; the health check, registration log and VAV route check are one release gate.
 7. Set `LIVEKIT_WORKER_HEALTH_URL` on API to the private worker origin, then in VAV save the workspace Inworld credential and LiveKit route and run **Test readiness**. It must verify the exact project credentials, inbound trunk, optional outbound trunk, dispatch rule, assigned DIDs, plus live `/` and `/worker` health with the expected agent name.
-8. Place one controlled inbound call and one controlled outbound call before assigning customer traffic. Confirm transcript, provider IDs, direction, duration and cost components in VAV.
+8. Run one browser WebRTC test, one controlled inbound call and one controlled outbound call before assigning customer traffic. Confirm transcript, provider IDs, channel, direction, duration and cost components in VAV.
 
 Do not use `railway up` from an uncommitted working tree for production. The three GitHub-backed application services and `livekit-agent` should all point to an auditable commit so rollback and release attribution remain deterministic.
 
@@ -104,11 +135,13 @@ Do not use `railway up` from an uncommitted working tree for production. The thr
 4. In VAV Settings, connect the direct Inworld key and record only the customer e& SIP URI plus returned LiveKit trunk/dispatch IDs. The shared LiveKit project credentials remain server-only environment variables.
 5. Create an Inworld-voice agent, attach and approve its knowledge base, choose the LiveKit/Inworld runtime, assign the E.164 DID and save.
 6. Run **Test readiness**. Activation remains disabled for missing searchable knowledge, credentials, exact project match, route IDs, assigned DID coverage, live worker health/name, number uniqueness or unavailable voice.
-7. Activate only after a real inbound and outbound test call passes the acceptance matrix below.
+7. Activate only after the browser test plus real inbound and outbound test calls pass the acceptance matrix below.
 
 ## Pilot acceptance matrix
 
 - At least 20 inbound and 20 outbound calls for each enabled language/accent (initially en-GB, ar-AE and hi-IN).
+- At least 20 browser WebRTC sessions per enabled language/accent, with the
+  same golden questions used for the phone pilot.
 - 100% correct tenant and agent routing; no cross-agent knowledge result.
 - At least 95% correct answers on a versioned golden-question set; zero invented prices, doctors, policies or medical claims.
 - Barge-in, silence, voicemail, DTMF, transfer, hang-up and carrier rejection cases end with the correct call status and SIP identifier.

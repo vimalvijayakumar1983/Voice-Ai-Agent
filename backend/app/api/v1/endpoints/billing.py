@@ -121,7 +121,10 @@ async def get_cost_report(
     current_user: CurrentUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
     days: int = Query(30, ge=1, le=365),
-    provider: str | None = Query(None, pattern="^(twilio|smallest|livekit_sip)$"),
+    provider: str | None = Query(
+        None,
+        pattern="^(twilio|smallest|livekit_sip|livekit_webrtc)$",
+    ),
     speech_provider: str | None = Query(None, pattern="^(inworld|sarvam|elevenlabs|smallest)$"),
     agent_id: UUID | None = None,
     direction: str | None = Query(None, pattern="^(inbound|outbound)$"),
@@ -145,7 +148,10 @@ async def export_cost_report(
     current_user: CurrentUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
     days: int = Query(30, ge=1, le=365),
-    provider: str | None = Query(None, pattern="^(twilio|smallest|livekit_sip)$"),
+    provider: str | None = Query(
+        None,
+        pattern="^(twilio|smallest|livekit_sip|livekit_webrtc)$",
+    ),
     speech_provider: str | None = Query(None, pattern="^(inworld|sarvam|elevenlabs|smallest)$"),
     agent_id: UUID | None = None,
     direction: str | None = Query(None, pattern="^(inbound|outbound)$"),

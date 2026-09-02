@@ -8,7 +8,8 @@ This repository combines a multi-tenant FastAPI control plane with a polished Ne
 
 - Local-first, editable agent authoring with Smallest.ai's public voice/language catalog, five governed templates, explicit provisioning, and versioned publishing. Private voice clones stay unavailable until tenant-owned provider entitlements are implemented.
 - Provider-neutral Knowledge Studio with reusable group/division/branch/department scopes, automatic robots-aware whole-site crawling, curated URL and sitemap ingestion, JavaScript recovery, bounded PDF uploads, page-level repair ledgers, provider-verified indexing, approval gates, agent bindings, and tenant-scoped audit history.
-- Secure browser voice playground using `@smallest-ai/agent-sdk`
+- Secure browser voice playground using `@smallest-ai/agent-sdk` for Smallest
+  agents and short-lived LiveKit WebRTC sessions for direct Inworld agents
 - Controlled outbound calls and bounded campaigns with tenant-scoped E.164 DNC enforcement, calling windows, pause checks, and Smallest/Twilio provider routing
 - Signed Smallest.ai and Twilio lifecycle ingestion plus signed, idempotent outbound integration webhooks with retry and destination safety checks
 - Conversation reporting with accessible transcript and AI-summary review
@@ -33,6 +34,11 @@ flowchart TD
     Atoms --> Hook["Signed lifecycle webhook"]
     Hook --> API
     UI -. "single-use web-call token" .-> Atoms
+    UI -. "short-lived room token" .-> LiveKit["LiveKit WebRTC / SIP"]
+    LiveKit --> Inworld["Direct Inworld STT / Router / TTS"]
+    LiveKit --> LKWorker["VAV LiveKit worker"]
+    LKWorker --> DB
+    LKWorker --> Knowledge
 ```
 
 Provider operations are deliberate: creating a local draft does not make an external API call. An owner or admin must provision the agent, then publish later edits through the provider branch workflow.
@@ -108,6 +114,7 @@ Set these service variables with Railway references where shown:
 | API + livekit-agent | `INWORLD_API_KEY` | Optional platform fallback; prefer an encrypted workspace key in Settings |
 | API + livekit-agent | `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET` | One shared LiveKit project; must match the project recorded in Settings |
 | API + livekit-agent | `LIVEKIT_AGENT_NAME` | `vav-inworld`; must match the SIP dispatch rule |
+| frontend | `LIVEKIT_BROWSER_CONNECT_ORIGIN` | Optional exact `wss://` or `https://` origin for self-hosted LiveKit; LiveKit Cloud is allowed automatically and no secret belongs here |
 | livekit-agent | `LIVEKIT_NUM_IDLE_PROCESSES` | `1` initially; raise only after memory/load testing (VAV validates 1-16) |
 | API | `LIVEKIT_WORKER_HEALTH_URL` | `http://${{livekit-agent.RAILWAY_PRIVATE_DOMAIN}}:${{livekit-agent.PORT}}`; required for activation and never browser-exposed |
 | livekit-agent | `LIVEKIT_LOG_LEVEL` | `info` for production registration and dispatch evidence |
@@ -226,6 +233,7 @@ Twilio inbound routing currently fails closed after signature verification. An a
 | Provision Atoms agent | `POST /api/v1/agents/{id}/smallest/provision` | Creates, configures, and publishes the remote agent |
 | Publish changes | `POST /api/v1/agents/{id}/smallest/sync` | Updates and publishes the default branch draft |
 | Mint browser session | `POST /api/v1/agents/{id}/smallest/session` | Returns a short-lived web-call token |
+| Mint LiveKit + Inworld browser session | `POST /api/v1/agents/{id}/livekit/session` | Reserves a metered VAV call and returns a short-lived, room-scoped microphone token; the worker uses the agent's approved VAV knowledge binding |
 | Start outbound call | `POST /api/v1/calls` | Starts a provider conversation |
 
 ## Knowledge Studio flow
