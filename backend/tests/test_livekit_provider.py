@@ -591,9 +591,9 @@ async def test_worker_failure_after_call_persistence_finalizes_once_and_resolves
         "version": livekit_worker.LIVEKIT_TURN_DETECTOR_VERSION,
     }
     assert session_options["turn_handling"]["endpointing"] == {
-        "mode": "dynamic",
-        "min_delay": 0.6,
-        "max_delay": 3.0,
+        "mode": "fixed",
+        "min_delay": 0.8,
+        "max_delay": 1.2,
     }
     assert session_options["turn_handling"]["interruption"] == {
         "enabled": True,
@@ -604,7 +604,7 @@ async def test_worker_failure_after_call_persistence_finalizes_once_and_resolves
         "false_interruption_timeout": None,
     }
     assert session_options["turn_handling"]["preemptive_generation"] == {
-        "enabled": True,
+        "enabled": False,
         "preemptive_tts": False,
         "max_speech_duration": 10.0,
         "max_retries": 3,
@@ -632,9 +632,90 @@ def test_livekit_agent_enforces_fixed_language_and_repairs_uncertain_transcripts
 
     assert "Speak only in the configured primary language, en-GB" in instructions
     assert "overrides any broader or conflicting language claim" in instructions
-    assert "do not call\n  search_approved_knowledge for them" in instructions
+    assert "without\n  relying on business knowledge" in instructions
+    assert "automatically added to the current turn" in instructions
     assert "Do not search corrupted text and do not guess" in instructions
     assert "Never quote it" in instructions
+
+
+@pytest.mark.asyncio
+async def test_livekit_agent_injects_bounded_knowledge_before_one_llm_response(monkeypatch):
+    model = Agent(
+        tenant_id=uuid4(),
+        name="Knowledge receptionist",
+        system_prompt="Answer from approved knowledge.",
+        voice_provider="inworld",
+        voice_id="inworld:Ashley",
+        language="en-GB",
+    )
+    retrieval = AsyncMock(return_value="Source: Group overview\nVerified group companies.")
+    monkeypatch.setattr(livekit_worker, "retrieve_knowledge_context", retrieval)
+    monkeypatch.setattr(livekit_worker, "async_session_factory", session_factory)
+    agent = livekit_worker.VAVInworldAgent(model=model)
+    turn_ctx = livekit_worker.llm.ChatContext.empty()
+    message = turn_ctx.add_message(role="user", content="Which companies are in the group?")
+
+    await agent.on_user_turn_completed(turn_ctx, message)
+
+    retrieval.assert_awaited_once()
+    assert retrieval.await_args.kwargs["query"] == "Which companies are in the group?"
+    assert retrieval.await_args.kwargs["limit"] == livekit_worker.VOICE_KNOWLEDGE_MATCH_LIMIT
+    assert (
+        retrieval.await_args.kwargs["max_context_chars"]
+        == livekit_worker.VOICE_KNOWLEDGE_CONTEXT_CHARS
+    )
+    assert "Verified group companies" in turn_ctx.messages()[-1].text_content
+
+
+@pytest.mark.asyncio
+async def test_livekit_agent_stays_silent_for_bare_hold_and_skips_control_search(monkeypatch):
+    model = Agent(
+        tenant_id=uuid4(),
+        name="Patient receptionist",
+        system_prompt="Answer from approved knowledge.",
+        voice_provider="inworld",
+        voice_id="inworld:Ashley",
+        language="en-GB",
+    )
+    retrieval = AsyncMock()
+    monkeypatch.setattr(livekit_worker, "retrieve_knowledge_context", retrieval)
+    agent = livekit_worker.VAVInworldAgent(model=model)
+
+    hold_ctx = livekit_worker.llm.ChatContext.empty()
+    hold = hold_ctx.add_message(role="user", content="Wait.")
+    with pytest.raises(livekit_worker.llm.StopResponse):
+        await agent.on_user_turn_completed(hold_ctx, hold)
+
+    control_ctx = livekit_worker.llm.ChatContext.empty()
+    control = control_ctx.add_message(role="user", content="Can you? Or slowly.")
+    await agent.on_user_turn_completed(control_ctx, control)
+    retrieval.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_livekit_agent_resolves_elliptical_follow_up_before_retrieval(monkeypatch):
+    model = Agent(
+        tenant_id=uuid4(),
+        name="Knowledge receptionist",
+        system_prompt="Answer from approved knowledge.",
+        voice_provider="inworld",
+        voice_id="inworld:Ashley",
+        language="en-GB",
+    )
+    retrieval = AsyncMock(return_value="Source: Group overview\nVerified group companies.")
+    monkeypatch.setattr(livekit_worker, "retrieve_knowledge_context", retrieval)
+    monkeypatch.setattr(livekit_worker, "async_session_factory", session_factory)
+    agent = livekit_worker.VAVInworldAgent(model=model)
+    turn_ctx = livekit_worker.llm.ChatContext.empty()
+    turn_ctx.add_message(role="user", content="Which companies are in Al Zaabi Group?")
+    turn_ctx.add_message(role="assistant", content="There are several companies.")
+    follow_up = turn_ctx.add_message(role="user", content="Tell me more.")
+
+    await agent.on_user_turn_completed(turn_ctx, follow_up)
+
+    assert retrieval.await_args.kwargs["query"] == (
+        "Which companies are in Al Zaabi Group? Tell me more."
+    )
 
 
 def test_livekit_usage_snapshot_reads_cumulative_model_usage_once():
