@@ -29,6 +29,9 @@ def test_contextual_plan_expands_meaning_without_company_specific_rules():
     assert "When was this company established?" in plan.variants
     assert "When was this company inception?" in plan.variants
 
+    begin_plan = build_contextual_query_plan("Which year did this company begin?")
+    assert "Which year did this company formed?" in begin_plan.variants
+
 
 def test_semantic_variant_retrieves_source_worded_as_inception():
     documents = [
@@ -93,6 +96,12 @@ def test_structured_retrieval_keeps_parent_and_subsidiary_dates_separate():
     assert matches[0].source == "Management and divisions"
     assert "SUBJECT: Al Zaabi Group" in matches[0].text
     assert "Tyre Factory" not in matches[0].text
+
+
+def test_structured_subject_matching_supports_lowercase_voice_queries():
+    assert knowledge_retrieval._requested_subject_tokens(
+        "when was al zaabi group formed"
+    ) == {"al", "zaabi", "group"}
 
 
 @pytest.mark.asyncio

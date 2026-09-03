@@ -261,6 +261,7 @@ _SEMANTIC_CONCEPT_GROUPS: tuple[tuple[str, ...], ...] = (
         "founded",
         "established",
         "inception",
+        "begin",
         "began",
         "begun",
         "started",
@@ -734,6 +735,46 @@ def _is_group_overview_source(source: str) -> bool:
     return title_tokens[:2] == ["the", "group"]
 
 
+def _requested_subject_tokens(query: str) -> set[str]:
+    """Return an explicit organization/person named in the caller's question."""
+
+    candidates = [match.group(0) for match in _ENTITY_SEQUENCE.finditer(query)]
+    if candidates:
+        return set(_base_tokens(max(candidates, key=lambda item: len(_base_tokens(item)))))
+
+    base_tokens = _base_tokens(query)
+    subject_markers = {
+        "center",
+        "centre",
+        "clinic",
+        "company",
+        "factory",
+        "group",
+        "hospital",
+        "organization",
+        "organisation",
+    }
+    for index, token in enumerate(base_tokens):
+        if token not in subject_markers:
+            continue
+        window = base_tokens[max(0, index - 4) : index + 1]
+        subject_tokens = {
+            value
+            for value in window
+            if value not in _QUERY_STOP_WORDS
+            and value not in _SEMANTIC_CONCEPTS
+            and value not in {"year", "president", "chairman", "management"}
+        }
+        if len(subject_tokens) >= 2:
+            return subject_tokens
+    return set()
+
+
+def _structured_subject_tokens(chunk: str) -> set[str]:
+    match = re.search(r"\bSUBJECT:\s*(.+?)(?:\s+-\s+|$)", chunk)
+    return set(_base_tokens(match.group(1))) if match else set()
+
+
 def _intent_content(value: str, *, phone_query: bool) -> str:
     """Prefer compiler-verified subject/fact bundles over ambiguous raw prose.
 
@@ -853,6 +894,7 @@ def rank_knowledge(
     ubiquitous_source_terms = _ubiquitous_source_terms(documents)
     broad_query = _is_broad_query(query, query_tokens)
     directory_query = bool(query_tokens & _DIRECTORY_QUERY_TOKENS)
+    requested_subject_tokens = _requested_subject_tokens(query)
     matches: list[KnowledgeMatch] = []
     for source, content in documents:
         source_terms = _source_terms(source)
@@ -863,6 +905,15 @@ def rank_knowledge(
             ranked_content,
             preserve_paragraphs=phone_query or structured_facts,
         ):
+            structured_subject_tokens = (
+                _structured_subject_tokens(chunk) if structured_facts else set()
+            )
+            if (
+                requested_subject_tokens
+                and structured_subject_tokens
+                and not requested_subject_tokens <= structured_subject_tokens
+            ):
+                continue
             chunk_base_tokens = _base_tokens(chunk)
             chunk_tokens = _token_forms(chunk_base_tokens)
             chunk_has_phone = _has_phone_evidence(chunk, chunk_tokens)
@@ -937,6 +988,8 @@ def rank_knowledge(
             if directory_query and source_terms & _DIRECTORY_SOURCE_TOKENS:
                 topic_bonus = max(topic_bonus, 0.18)
             authority_bonus = 0.14 if structured_facts else 0.0
+            if requested_subject_tokens and requested_subject_tokens <= structured_subject_tokens:
+                authority_bonus += 0.18
             score = (
                 coverage * 0.76
                 + content_coverage * 0.18
