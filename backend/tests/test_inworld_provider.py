@@ -6,6 +6,7 @@ import json
 import httpx
 import pytest
 
+from app.providers import inworld as inworld_module
 from app.providers.inworld import (
     INWORLD_TTS_SUPPORTED_LANGUAGES,
     MAX_PROBE_RESPONSE_BYTES,
@@ -17,6 +18,107 @@ from app.services.agent_catalog import (
     LanguageCompatibilityStatus,
     voice_language_compatibility,
 )
+
+
+class _RealtimeProbeWebSocket:
+    def __init__(self, events):
+        self.events = list(events)
+        self.sent = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return None
+
+    async def receive_json(self):
+        return self.events.pop(0)
+
+    async def send_json(self, payload):
+        self.sent.append(payload)
+
+
+class _RealtimeProbeClientSession:
+    def __init__(self, websocket, captured):
+        self.websocket = websocket
+        self.captured = captured
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return None
+
+    async def ws_connect(self, url, headers):
+        self.captured.update({"url": url, "headers": headers})
+        return self.websocket
+
+
+@pytest.mark.asyncio
+async def test_realtime_readiness_executes_required_tool_without_generating_audio(monkeypatch):
+    captured = {}
+    websocket = _RealtimeProbeWebSocket(
+        [
+            {"type": "session.created"},
+            {"type": "session.updated"},
+            {
+                "type": "response.function_call_arguments.done",
+                "name": "vav_readiness_check",
+                "arguments": "{}",
+            },
+        ]
+    )
+    monkeypatch.setattr(
+        inworld_module.aiohttp,
+        "ClientSession",
+        lambda: _RealtimeProbeClientSession(websocket, captured),
+    )
+    client = InworldClient(api_key="workspace-inworld-key-123456")
+
+    await client.realtime_readiness_probe(
+        model_id="openai/gpt-4o-mini",
+        voice_id="Ashley",
+        stt_model_id="assemblyai/u3-rt-pro",
+    )
+
+    update = websocket.sent[0]
+    assert update["session"]["output_modalities"] == ["text"]
+    assert update["session"]["tool_choice"] == "required"
+    assert update["session"]["tools"][0]["name"] == "vav_readiness_check"
+    assert websocket.sent[-1] == {"type": "response.create"}
+    assert captured["headers"]["Authorization"] == "Basic workspace-inworld-key-123456"
+
+
+@pytest.mark.asyncio
+async def test_realtime_readiness_surfaces_plan_restriction_before_a_call(monkeypatch):
+    websocket = _RealtimeProbeWebSocket(
+        [
+            {"type": "session.created"},
+            {"type": "session.updated"},
+            {
+                "type": "error",
+                "error": {
+                    "message": (
+                        "Tool calling is currently restricted on your plan. "
+                        "Add credits to unlock."
+                    )
+                },
+            },
+        ]
+    )
+    monkeypatch.setattr(
+        inworld_module.aiohttp,
+        "ClientSession",
+        lambda: _RealtimeProbeClientSession(websocket, {}),
+    )
+    client = InworldClient(api_key="workspace-inworld-key-123456")
+
+    with pytest.raises(InworldError, match="Tool calling is currently restricted"):
+        await client.realtime_readiness_probe(
+            model_id="openai/gpt-4o-mini",
+            voice_id="Ashley",
+            stt_model_id="assemblyai/u3-rt-pro",
+        )
 
 
 @pytest.mark.asyncio

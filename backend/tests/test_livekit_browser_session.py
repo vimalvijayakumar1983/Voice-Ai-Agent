@@ -34,6 +34,7 @@ from app.models.agent import (
 )
 from app.models.audit import AuditEvent
 from app.models.call import Call
+from app.providers.inworld import InworldClient, InworldError
 from app.telephony.livekit_provider import LiveKitSIPProvider
 from tests.conftest import test_session_factory as session_factory
 
@@ -465,6 +466,56 @@ async def test_endpoint_issues_durable_preconnect_browser_call_without_sip(
     served_call = await db.get(Call, UUID(payload["call_id"]))
     assert served_call.call_metadata["agent_configuration"]["language"] == "en-US"
     assert served_call.call_metadata["served_configuration"] == served_configuration
+
+
+@pytest.mark.asyncio
+async def test_native_browser_session_fails_before_reservation_when_tools_are_restricted(
+    client,
+    auth_headers,
+    db,
+    tenant,
+    monkeypatch,
+):
+    _configure_platform(monkeypatch)
+    agent = await _configured_browser_agent(db, tenant)
+    profile = await db.scalar(
+        select(AgentRuntimeProfile).where(AgentRuntimeProfile.agent_id == agent.id)
+    )
+    profile.runtime_config = {
+        "voice_runtime": "inworld_realtime",
+        "stt_model": "auto",
+    }
+    await db.commit()
+
+    async def reject_tool_call(_self, **_kwargs):
+        raise InworldError("Tool calling is currently restricted on your plan.")
+
+    worker_probe = AsyncMock()
+    session_create = AsyncMock()
+    monkeypatch.setattr(InworldClient, "realtime_readiness_probe", reject_tool_call)
+    monkeypatch.setattr(LiveKitSIPProvider, "verify_worker", worker_probe)
+    monkeypatch.setattr(LiveKitBrowserSessionProvider, "create_session", session_create)
+
+    response = await client.post(
+        f"/api/v1/agents/{agent.id}/livekit/session",
+        headers={
+            **auth_headers,
+            "Idempotency-Key": "native-inworld-plan-gate-0001",
+        },
+        json={"variables": {}},
+    )
+
+    assert response.status_code == 409
+    assert "Tool calling is currently restricted" in response.json()["detail"]
+    worker_probe.assert_not_awaited()
+    session_create.assert_not_awaited()
+    reserved_call = await db.scalar(
+        select(Call).where(
+            Call.agent_id == agent.id,
+            Call.provider == "livekit_webrtc",
+        )
+    )
+    assert reserved_call is None
 
 
 @pytest.mark.asyncio

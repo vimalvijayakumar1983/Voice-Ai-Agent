@@ -1003,6 +1003,47 @@ async def _livekit_browser_runtime(
     return agent, profile
 
 
+def _native_browser_stt_model(agent: Agent, profile: AgentRuntimeProfile) -> str:
+    runtime_config = profile.runtime_config if isinstance(profile.runtime_config, dict) else {}
+    configured = str(runtime_config.get("stt_model") or "auto").strip().lower()
+    if configured != "auto":
+        return configured
+    languages = {
+        str(language or "").strip().lower().split("-", 1)[0]
+        for language in (
+            list(agent.supported_languages or [])
+            + [agent.language, profile.stt_language]
+        )
+        if str(language or "").strip()
+        and str(language or "").strip().lower() != "auto"
+    }
+    return (
+        "assemblyai/u3-rt-pro"
+        if languages and languages.issubset({"en", "es", "fr", "de", "it", "pt"})
+        else "soniox/stt-rt-v4"
+    )
+
+
+async def _verify_native_browser_capability(
+    *,
+    inworld: InworldClient,
+    model_id: str,
+    voice_id: str,
+    stt_model_id: str,
+) -> None:
+    try:
+        await inworld.realtime_readiness_probe(
+            model_id=model_id,
+            voice_id=voice_id,
+            stt_model_id=stt_model_id,
+        )
+    except InworldError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Native Inworld browser readiness failed: {exc}",
+        ) from exc
+
+
 async def _mark_livekit_browser_issuance_failed(
     db: AsyncSession,
     *,
@@ -3603,13 +3644,36 @@ async def create_livekit_browser_session(
     # Perform the first readiness pass without locks, then end its transaction
     # before the external worker probe. The short locked pass below is the
     # authoritative capacity reservation.
-    await _livekit_browser_runtime(
+    preflight_agent, preflight_profile = await _livekit_browser_runtime(
         db,
         tenant_id=current_user.tenant_id,
         agent_id=agent_id,
         for_update=False,
     )
+    runtime_config = (
+        preflight_profile.runtime_config
+        if isinstance(preflight_profile.runtime_config, dict)
+        else {}
+    )
+    native_inworld = None
+    native_route = None
+    if str(runtime_config.get("voice_runtime") or "pipeline") == "inworld_realtime":
+        native_inworld, _source, _updated_at = await _tenant_inworld_client(
+            db, current_user.tenant_id
+        )
+        native_route = (
+            preflight_profile.llm_model,
+            preflight_agent.voice_id.removeprefix("inworld:"),
+            _native_browser_stt_model(preflight_agent, preflight_profile),
+        )
     await db.rollback()
+    if native_inworld is not None and native_route is not None:
+        await _verify_native_browser_capability(
+            inworld=native_inworld,
+            model_id=native_route[0],
+            voice_id=native_route[1],
+            stt_model_id=native_route[2],
+        )
     try:
         await LiveKitSIPProvider(
             url=settings.livekit_url,

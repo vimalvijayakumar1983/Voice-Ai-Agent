@@ -25,6 +25,7 @@ TTS_PROBE_TEXT = "OK."
 ROUTER_PROBE_PROMPT = "Reply OK."
 ROUTER_TOOL_NAME = "vav_readiness_check"
 ROUTER_PROBE_MAX_TOKENS = 64
+REALTIME_PROBE_MAX_EVENTS = 32
 # ``auto`` may select a reasoning model that spends a tiny completion budget
 # before producing visible text. Keep the larger bound isolated to that route.
 ROUTER_AUTO_PROBE_MAX_TOKENS = 128
@@ -374,7 +375,15 @@ class InworldClient:
         voice_id: str,
         stt_model_id: str,
     ) -> None:
-        """Open and configure the exact native Realtime route without generating audio."""
+        """Prove the exact native route can execute VAV's required knowledge tool.
+
+        A successful ``session.updated`` only proves that Inworld accepted the
+        model, voice, and STT configuration. Some Inworld plans accept that
+        configuration but reject tool execution when the first caller turn is
+        processed. VAV's native agent requires a knowledge-search tool, so the
+        readiness probe must exercise one tiny text-only tool call before an
+        operator can start a production session.
+        """
 
         if not self.is_configured:
             raise InworldError(
@@ -388,12 +397,28 @@ class InworldClient:
             self.base_url,
             session_id=f"vav-readiness-{uuid4().hex}",
         )
+        tool = {
+            "type": "function",
+            "name": ROUTER_TOOL_NAME,
+            "description": "Confirms tool-calling capability.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+        }
         update = {
             "type": "session.update",
             "session": {
                 "type": "realtime",
                 "model": selected_model,
-                "output_modalities": ["audio"],
+                # Keep the capability check silent and tightly bounded. The
+                # selected voice and TTS model are still validated when the
+                # session configuration is accepted.
+                "output_modalities": ["text"],
+                "max_output_tokens": 16,
+                "tools": [tool],
+                "tool_choice": "required",
                 "audio": {
                     "input": {
                         "transcription": {"model": selected_stt},
@@ -440,6 +465,49 @@ class InworldClient:
                         raise InworldError(
                             "Inworld Realtime readiness probe did not accept the selected route."
                         )
+                    await websocket.send_json(
+                        {
+                            "type": "conversation.item.create",
+                            "item": {
+                                "type": "message",
+                                "role": "user",
+                                "content": [
+                                    {
+                                        "type": "input_text",
+                                        "text": (
+                                            f"Call {ROUTER_TOOL_NAME} now. "
+                                            "Do not reply with text."
+                                        ),
+                                    }
+                                ],
+                            },
+                        }
+                    )
+                    await websocket.send_json({"type": "response.create"})
+                    for _ in range(REALTIME_PROBE_MAX_EVENTS):
+                        event = await asyncio.wait_for(websocket.receive_json(), timeout)
+                        event_type = event.get("type")
+                        if event_type == "error":
+                            raise InworldError(_payload_error_message(event), status_code=422)
+                        if event_type == "response.function_call_arguments.done":
+                            if event.get("name") != ROUTER_TOOL_NAME:
+                                raise InworldError(
+                                    "Inworld Realtime called an unexpected readiness tool."
+                                )
+                            return
+                        if event_type == "response.done":
+                            response = event.get("response")
+                            status = response.get("status") if isinstance(response, dict) else None
+                            if status in {"failed", "cancelled", "incomplete"}:
+                                raise InworldError(
+                                    _payload_error_message(response), status_code=422
+                                )
+                            raise InworldError(
+                                "Inworld Realtime completed without executing the required tool."
+                            )
+                    raise InworldError(
+                        "Inworld Realtime did not complete the required tool check."
+                    )
         except InworldError:
             raise
         except TimeoutError as exc:
