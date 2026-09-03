@@ -76,6 +76,12 @@ def public_call_metadata(value: Any) -> dict[str, Any] | None:
             "inbound_audio_bytes",
             "outbound_audio_bytes",
             "barge_in_count",
+            "stale_generation_cancel_count",
+            "suppressed_fragment_count",
+            "last_suppressed_fragment_words",
+            "fragment_continuation_window_ms",
+            "knowledge_terminology_load_ms",
+            "knowledge_terminology_count",
             "call_open_to_greeting_ms",
             "session_start_to_greeting_ms",
             "last_llm_latency_ms",
@@ -97,6 +103,45 @@ def public_call_metadata(value: Any) -> dict[str, Any] | None:
         for field in numeric_fields:
             if isinstance(runtime.get(field), (int, float)):
                 safe_runtime[field] = runtime[field]
+        turn_diagnostics = runtime.get("turn_diagnostics")
+        if isinstance(turn_diagnostics, list):
+            safe_turns: list[dict[str, Any]] = []
+            numeric_trace_fields = {
+                "turn",
+                "user_speech_ms",
+                "transcript_words",
+                "transcript_after_speech_ms",
+                "stabilization_ms",
+                "transcript_to_first_audio_ms",
+                "speech_end_to_first_audio_ms",
+                "llm_first_token_ms",
+                "tts_first_byte_ms",
+                "end_of_utterance_ms",
+                "transcription_delay_ms",
+                "knowledge_hook_ms",
+                "interruption_detection_ms",
+            }
+            for trace in turn_diagnostics[-50:]:
+                if not isinstance(trace, dict):
+                    continue
+                safe_trace: dict[str, Any] = {}
+                for field in numeric_trace_fields:
+                    if isinstance(trace.get(field), (int, float)) and not isinstance(
+                        trace.get(field), bool
+                    ):
+                        safe_trace[field] = trace[field]
+                if isinstance(trace.get("barge_in"), bool):
+                    safe_trace["barge_in"] = trace["barge_in"]
+                if trace.get("outcome") in {
+                    "answered",
+                    "fragment_suppressed",
+                    "superseded_by_caller",
+                }:
+                    safe_trace["outcome"] = trace["outcome"]
+                if safe_trace:
+                    safe_turns.append(safe_trace)
+            if safe_turns:
+                safe_runtime["turn_diagnostics"] = safe_turns
         if safe_runtime:
             result["runtime"] = safe_runtime
     return result or None

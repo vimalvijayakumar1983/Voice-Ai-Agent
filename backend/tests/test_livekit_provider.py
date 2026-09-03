@@ -642,6 +642,8 @@ def test_livekit_agent_enforces_fixed_language_and_repairs_uncertain_transcripts
     assert "without\n  relying on business knowledge" in instructions
     assert "automatically added to the current turn" in instructions
     assert "Do not search corrupted text and do not guess" in instructions
+    assert "normally stop after one or two short sentences" in instructions
+    assert 'Do not append routine closings such as "Is there anything else?"' in instructions
     assert "Never quote it" in instructions
 
 
@@ -1054,6 +1056,7 @@ def test_native_inworld_realtime_model_uses_one_grounded_speech_session():
         model=model,
         profile=profile,
         api_key="inworld-key",
+        terminology=("Al Zaabi Group", "Saeed Al Zaabi Tire Factory"),
     )
 
     assert _inworld_voice_runtime(profile) == "inworld_realtime"
@@ -1063,6 +1066,7 @@ def test_native_inworld_realtime_model_uses_one_grounded_speech_session():
     assert realtime._opts.speed == 0.95
     assert realtime._opts.input_audio_transcription.model == "assemblyai/u3-rt-pro"
     assert "Al Zaabi Group Support" in realtime._opts.input_audio_transcription.prompt
+    assert "Saeed Al Zaabi Tire Factory" in realtime._opts.input_audio_transcription.prompt
     assert realtime._opts.turn_detection.type == "semantic_vad"
     assert realtime._opts.turn_detection.interrupt_response is True
 
@@ -1192,6 +1196,23 @@ def test_livekit_native_events_capture_exact_turn_and_interruption_metrics(monke
 
     assert runtime_metrics == {
         "barge_in_count": 2,
+        "turn_diagnostics": [
+            {
+                "turn": 1,
+                "user_speech_ms": 300,
+                "barge_in": True,
+                "transcript_words": 0,
+                "transcript_after_speech_ms": 1000,
+                "transcript_to_first_audio_ms": 400,
+                "speech_end_to_first_audio_ms": 1400,
+                "outcome": "answered",
+                "llm_first_token_ms": 310,
+                "end_of_utterance_ms": 220,
+                "transcription_delay_ms": 140,
+                "knowledge_hook_ms": 80,
+                "interruption_detection_ms": 180,
+            }
+        ],
         "call_open_to_greeting_ms": 700,
         "session_start_to_greeting_ms": 200,
         "last_transcript_to_first_audio_ms": 400,
@@ -1204,6 +1225,68 @@ def test_livekit_native_events_capture_exact_turn_and_interruption_metrics(monke
         "last_transcription_delay_ms": 140,
         "last_knowledge_hook_ms": 80,
         "last_interruption_detection_ms": 180,
+    }
+
+
+@pytest.mark.parametrize(
+    ("transcript", "expected"),
+    [
+        ("See.", True),
+        ("Hop.", True),
+        ("Thank you.", True),
+        ("What is", True),
+        ("Tell me the", True),
+        ("Phone", False),
+        ("Repeat", False),
+        ("Why?", False),
+        ("What is the group's phone number?", False),
+        ("Stop. Just give me the mobile number.", False),
+    ],
+)
+def test_adaptive_barge_in_fragment_detection(transcript, expected):
+    assert livekit_worker._is_incomplete_barge_in_fragment(transcript) is expected
+
+
+def test_adaptive_barge_in_accepts_single_word_from_bound_knowledge():
+    assert (
+        livekit_worker._is_incomplete_barge_in_fragment(
+            "Healthcare",
+            terminology=("Healthcare", "Al Zaabi Group"),
+        )
+        is False
+    )
+
+
+def test_livekit_native_fragment_is_consumed_once_and_recorded(monkeypatch):
+    timestamps = iter([20.0])
+    monkeypatch.setattr(livekit_worker.time, "monotonic", lambda: next(timestamps))
+    runtime_metrics = {"barge_in_count": 0}
+    telemetry = _LiveKitRuntimeTelemetry(
+        runtime_metrics=runtime_metrics,
+        end_to_end_samples=[],
+        opened_at=19.0,
+    )
+
+    telemetry.on_user_state(
+        old_state="listening", new_state="speaking", agent_state="thinking"
+    )
+    assert telemetry.consume_barge_in_transcript() is True
+    assert telemetry.consume_barge_in_transcript() is False
+    telemetry.record_suppressed_fragment("See.")
+
+    assert runtime_metrics == {
+        "barge_in_count": 1,
+        "turn_diagnostics": [
+            {
+                "turn": 1,
+                "transcript_words": 1,
+                "stabilization_ms": 500,
+                "outcome": "fragment_suppressed",
+            }
+        ],
+        "suppressed_fragment_count": 1,
+        "last_suppressed_fragment_words": 1,
+        "fragment_continuation_window_ms": 500,
     }
 
 

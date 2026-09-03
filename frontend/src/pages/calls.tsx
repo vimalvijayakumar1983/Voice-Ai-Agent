@@ -465,6 +465,11 @@ export default function Calls() {
   const selectedRuntime = selectedMetadata.runtime && typeof selectedMetadata.runtime === 'object' && !Array.isArray(selectedMetadata.runtime)
     ? selectedMetadata.runtime as Record<string, unknown>
     : {};
+  const turnDiagnostics = Array.isArray(selectedRuntime.turn_diagnostics)
+    ? selectedRuntime.turn_diagnostics.filter(
+      (trace): trace is Record<string, unknown> => Boolean(trace) && typeof trace === 'object' && !Array.isArray(trace),
+    ).slice(-20)
+    : [];
   const metadataLanguages = configuredLanguages(selectedCall);
   const transcriptLanguages = transcript
     ? transcript.turns.map((turn) => transcriptLanguage(turn)).filter(Boolean)
@@ -642,9 +647,30 @@ export default function Calls() {
                   {typeof selectedRuntime.llm_output_audio_tokens === 'number' ? <div><dt>Output audio tokens</dt><dd>{selectedRuntime.llm_output_audio_tokens}</dd></div> : null}
                   {typeof selectedRuntime.realtime_session_seconds === 'number' ? <div><dt>Realtime session</dt><dd>{selectedRuntime.realtime_session_seconds.toFixed(1)} s</dd></div> : null}
                   {typeof selectedRuntime.barge_in_count === 'number' ? <div><dt>Barge-ins</dt><dd>{selectedRuntime.barge_in_count}</dd></div> : null}
+                  {typeof selectedRuntime.stale_generation_cancel_count === 'number' ? <div><dt>Stale responses cancelled</dt><dd>{selectedRuntime.stale_generation_cancel_count}</dd></div> : null}
+                  {typeof selectedRuntime.suppressed_fragment_count === 'number' ? <div><dt>Incomplete fragments suppressed</dt><dd>{selectedRuntime.suppressed_fragment_count}</dd></div> : null}
+                  {typeof selectedRuntime.fragment_continuation_window_ms === 'number' ? <div><dt>Fragment continuation window</dt><dd>{selectedRuntime.fragment_continuation_window_ms} ms</dd></div> : null}
+                  {typeof selectedRuntime.knowledge_terminology_count === 'number' ? <div><dt>Recognition terms loaded</dt><dd>{selectedRuntime.knowledge_terminology_count}</dd></div> : null}
+                  {typeof selectedRuntime.knowledge_terminology_load_ms === 'number' ? <div><dt>Recognition vocabulary load</dt><dd>{selectedRuntime.knowledge_terminology_load_ms} ms</dd></div> : null}
                   {selectedRuntime.cost_state === 'pending_provider_billing_sync' ? <div><dt>Runtime cost</dt><dd>Awaiting provider billing sync</dd></div> : null}
                 </dl>
               </section>
+
+              {turnDiagnostics.length ? (
+                <section className="detail-section" aria-labelledby="turn-diagnostics-heading">
+                  <div className="detail-section-title"><ListChecks size={16} /><h3 id="turn-diagnostics-heading">Turn diagnostics</h3></div>
+                  <dl className="call-detail-grid">
+                    {turnDiagnostics.map((trace, index) => {
+                      const turn = typeof trace.turn === 'number' ? trace.turn : index + 1;
+                      const outcome = typeof trace.outcome === 'string' ? trace.outcome.replace(/_/g, ' ') : 'captured';
+                      const latency = typeof trace.speech_end_to_first_audio_ms === 'number' ? `${trace.speech_end_to_first_audio_ms} ms response` : null;
+                      const words = typeof trace.transcript_words === 'number' ? `${trace.transcript_words} transcript words` : null;
+                      const interrupted = trace.barge_in === true ? 'barge-in' : null;
+                      return <div key={`turn-diagnostic-${turn}-${index}`}><dt>Turn {turn}</dt><dd>{[outcome, latency, words, interrupted].filter(Boolean).join(' · ')}</dd></div>;
+                    })}
+                  </dl>
+                </section>
+              ) : null}
 
               <section className="detail-section" aria-labelledby="call-recording-heading">
                 <div className="detail-section-title"><AudioLines size={16} /><h3 id="call-recording-heading">Recording</h3></div>

@@ -20,7 +20,7 @@ import math
 import os
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
@@ -95,6 +95,7 @@ DEFAULT_ENDPOINTING = {"mode": "fixed", "min_delay": 0.3, "max_delay": 0.8}
 ASSEMBLYAI_ENDPOINTING = {"mode": "fixed", "min_delay": 0.1, "max_delay": 0.35}
 BARGE_IN_ENDPOINTING = {"mode": "fixed", "min_delay": 1.35, "max_delay": 2.0}
 BARGE_IN_ENDPOINTING_RESET_SECONDS = 4.0
+ADAPTIVE_FRAGMENT_CONTINUATION_MS = 500
 INWORLD_STT_FIRST_PARTY = "inworld/inworld-stt-1"
 INWORLD_STT_FAST_ACCURATE = "assemblyai/u3-rt-pro"
 INWORLD_STT_WIDE_MULTILINGUAL = "soniox/stt-rt-v4"
@@ -188,6 +189,75 @@ _REFERENTIAL_FOLLOW_UP_WORDS = frozenset(
         "this",
     }
 )
+_COMPLETE_SINGLE_WORD_INTERRUPTS = frozenset(
+    {
+        "address",
+        "appointment",
+        "cancel",
+        "continue",
+        "cost",
+        "doctor",
+        "help",
+        "hours",
+        "location",
+        "louder",
+        "number",
+        "offers",
+        "phone",
+        "price",
+        "products",
+        "repeat",
+        "services",
+        "slower",
+        "where",
+        "who",
+        "why",
+    }
+)
+_INCOMPLETE_UTTERANCE_ENDINGS = frozenset(
+    {
+        "a",
+        "about",
+        "an",
+        "and",
+        "are",
+        "at",
+        "can",
+        "could",
+        "did",
+        "do",
+        "does",
+        "for",
+        "from",
+        "in",
+        "is",
+        "of",
+        "or",
+        "should",
+        "the",
+        "to",
+        "was",
+        "were",
+        "with",
+        "would",
+    }
+)
+_INCOMPLETE_UTTERANCE_PREFIXES = frozenset(
+    {
+        "can you",
+        "could you",
+        "do you",
+        "give me",
+        "how many",
+        "i need",
+        "i want",
+        "tell me",
+        "what are",
+        "what is",
+        "where is",
+        "who is",
+    }
+)
 _AGENT_ROLE_WORDS = frozenset(
     {"agent", "assistant", "concierge", "customer", "receptionist", "support", "voice"}
 )
@@ -217,6 +287,38 @@ def _is_silent_stop_utterance(value: str) -> bool:
 def _is_conversation_control_utterance(value: str) -> bool:
     normalized = _normalized_utterance(value)
     return any(pattern in normalized for pattern in _CONVERSATION_CONTROL_PATTERNS)
+
+
+def _is_incomplete_barge_in_fragment(
+    value: str,
+    *,
+    terminology: tuple[str, ...] = (),
+) -> bool:
+    """Identify a truncated interruption without hard-coding business vocabulary."""
+
+    normalized = _normalized_utterance(value)
+    if not normalized:
+        return True
+    if (
+        normalized in _BACKCHANNEL_UTTERANCES
+        or normalized in _BARE_HOLD_UTTERANCES
+        or normalized in _SILENT_STOP_UTTERANCES
+    ):
+        return True
+    words = normalized.split()
+    if len(words) == 1:
+        known_single_terms = {
+            candidate
+            for item in terminology
+            if len((candidate := _normalized_utterance(item)).split()) == 1
+        }
+        return words[0] not in _COMPLETE_SINGLE_WORD_INTERRUPTS | known_single_terms
+    if len(words) <= 4 and (
+        normalized in _INCOMPLETE_UTTERANCE_PREFIXES
+        or words[-1] in _INCOMPLETE_UTTERANCE_ENDINGS
+    ):
+        return True
+    return False
 
 
 def _agent_scope_name(value: str) -> str:
@@ -662,7 +764,7 @@ def _capture_turn_latency(
 class _LiveKitRuntimeTelemetry:
     """Turn-level telemetry derived from LiveKit's realtime session events."""
 
-    runtime_metrics: dict[str, int | float]
+    runtime_metrics: dict[str, Any]
     end_to_end_samples: list[int]
     opened_at: float
     session_started_at: float | None = None
@@ -670,6 +772,34 @@ class _LiveKitRuntimeTelemetry:
     last_final_transcript_at: float | None = None
     first_agent_audio_seen: bool = False
     barge_in_active: bool = False
+    pending_barge_in_transcript: bool = False
+    user_speech_started_at: float | None = None
+    current_turn_trace: dict[str, int | bool | str] | None = None
+    turn_diagnostics: list[dict[str, int | bool | str]] = field(default_factory=list)
+    turn_sequence: int = 0
+
+    def __post_init__(self) -> None:
+        self.runtime_metrics["turn_diagnostics"] = self.turn_diagnostics
+
+    def _trace(self) -> dict[str, int | bool | str]:
+        if self.current_turn_trace is None:
+            self.turn_sequence += 1
+            self.current_turn_trace = {"turn": self.turn_sequence}
+        return self.current_turn_trace
+
+    def _finish_trace(self, outcome: str) -> None:
+        if self.current_turn_trace is None:
+            return
+        self.current_turn_trace["outcome"] = outcome
+        self.turn_diagnostics.append(self.current_turn_trace)
+        if len(self.turn_diagnostics) > 50:
+            del self.turn_diagnostics[:-50]
+        self.current_turn_trace = None
+
+    def _latest_trace(self) -> dict[str, int | bool | str] | None:
+        if self.current_turn_trace is not None:
+            return self.current_turn_trace
+        return self.turn_diagnostics[-1] if self.turn_diagnostics else None
 
     def mark_session_started(self) -> None:
         self.session_started_at = time.monotonic()
@@ -677,18 +807,56 @@ class _LiveKitRuntimeTelemetry:
     def on_user_state(self, *, old_state: object, new_state: object, agent_state: object) -> None:
         now = time.monotonic()
         if new_state == "speaking":
-            if agent_state == "speaking" and not self.barge_in_active:
+            if self.current_turn_trace is not None:
+                self._finish_trace("superseded_by_caller")
+            self.user_speech_started_at = now
+            if agent_state in {"speaking", "thinking"} and not self.barge_in_active:
                 self.runtime_metrics["barge_in_count"] = int(
                     self.runtime_metrics.get("barge_in_count", 0)
                 ) + 1
                 self.barge_in_active = True
+                self.pending_barge_in_transcript = True
             return
         if old_state == "speaking":
             self.last_user_speech_end_at = now
+            trace = self._trace()
+            if self.user_speech_started_at is not None:
+                trace["user_speech_ms"] = round((now - self.user_speech_started_at) * 1000)
+            trace["barge_in"] = self.pending_barge_in_transcript
+            self.user_speech_started_at = None
             self.barge_in_active = False
 
-    def on_final_transcript(self) -> None:
-        self.last_final_transcript_at = time.monotonic()
+    def on_final_transcript(self, value: str = "") -> None:
+        now = time.monotonic()
+        self.last_final_transcript_at = now
+        trace = self._trace()
+        trace["transcript_words"] = len(_normalized_utterance(value).split())
+        if self.last_user_speech_end_at is not None:
+            trace["transcript_after_speech_ms"] = max(
+                0, round((now - self.last_user_speech_end_at) * 1000)
+            )
+
+    def consume_barge_in_transcript(self) -> bool:
+        pending = self.pending_barge_in_transcript
+        self.pending_barge_in_transcript = False
+        return pending
+
+    def record_suppressed_fragment(self, value: str) -> None:
+        self.runtime_metrics["suppressed_fragment_count"] = int(
+            self.runtime_metrics.get("suppressed_fragment_count", 0)
+        ) + 1
+        self.runtime_metrics["last_suppressed_fragment_words"] = len(
+            _normalized_utterance(value).split()
+        )
+        self.runtime_metrics["fragment_continuation_window_ms"] = (
+            ADAPTIVE_FRAGMENT_CONTINUATION_MS
+        )
+        trace = self._trace()
+        trace["transcript_words"] = len(_normalized_utterance(value).split())
+        trace["stabilization_ms"] = ADAPTIVE_FRAGMENT_CONTINUATION_MS
+        self._finish_trace("fragment_suppressed")
+        self.last_final_transcript_at = None
+        self.last_user_speech_end_at = None
 
     def on_agent_state(self, *, new_state: object) -> None:
         if new_state != "speaking":
@@ -705,13 +873,16 @@ class _LiveKitRuntimeTelemetry:
                 )
 
         if self.last_final_transcript_at is not None:
-            self.runtime_metrics["last_transcript_to_first_audio_ms"] = round(
+            transcript_latency = round(
                 (now - self.last_final_transcript_at) * 1000
             )
+            self.runtime_metrics["last_transcript_to_first_audio_ms"] = transcript_latency
+            self._trace()["transcript_to_first_audio_ms"] = transcript_latency
             self.last_final_transcript_at = None
         if self.last_user_speech_end_at is not None:
             latency = round((now - self.last_user_speech_end_at) * 1000)
             self.runtime_metrics["last_speech_end_to_first_audio_ms"] = latency
+            self._trace()["speech_end_to_first_audio_ms"] = latency
             self.end_to_end_samples.append(latency)
             self.runtime_metrics["turn_latency_p50_ms"] = _latency_percentile(
                 self.end_to_end_samples, 0.5
@@ -723,6 +894,7 @@ class _LiveKitRuntimeTelemetry:
                 self.end_to_end_samples, 0.95
             )
             self.last_user_speech_end_at = None
+        self._finish_trace("answered")
 
     def on_metrics(self, metrics: object) -> None:
         metric_type = str(getattr(metrics, "type", ""))
@@ -730,10 +902,14 @@ class _LiveKitRuntimeTelemetry:
             ttft = _metric_milliseconds(metrics, "ttft")
             if ttft is not None:
                 self.runtime_metrics["last_llm_first_token_ms"] = ttft
+                if (trace := self._latest_trace()) is not None:
+                    trace["llm_first_token_ms"] = ttft
         elif metric_type == "tts_metrics":
             ttfb = _metric_milliseconds(metrics, "ttfb")
             if ttfb is not None:
                 self.runtime_metrics["last_tts_first_byte_ms"] = ttfb
+                if (trace := self._latest_trace()) is not None:
+                    trace["tts_first_byte_ms"] = ttfb
         elif metric_type == "eou_metrics":
             for source, target in (
                 ("end_of_utterance_delay", "last_end_of_utterance_ms"),
@@ -743,6 +919,8 @@ class _LiveKitRuntimeTelemetry:
                 value = _metric_milliseconds(metrics, source)
                 if value is not None:
                     self.runtime_metrics[target] = value
+                    if (trace := self._latest_trace()) is not None:
+                        trace[target.removeprefix("last_")] = value
         elif metric_type == "interruption_metrics":
             interruptions = getattr(metrics, "num_interruptions", None)
             if isinstance(interruptions, int) and not isinstance(interruptions, bool):
@@ -752,6 +930,8 @@ class _LiveKitRuntimeTelemetry:
             delay = _metric_milliseconds(metrics, "detection_delay")
             if delay is not None:
                 self.runtime_metrics["last_interruption_detection_ms"] = delay
+                if (trace := self._latest_trace()) is not None:
+                    trace["interruption_detection_ms"] = delay
 
 
 def _inworld_delivery_mode(profile: AgentRuntimeProfile | None) -> str:
@@ -856,16 +1036,22 @@ def _build_inworld_realtime_model(
     model: AgentModel,
     profile: AgentRuntimeProfile,
     api_key: str,
+    terminology: tuple[str, ...] = (),
 ) -> InworldRealtimeModel:
     """Build the single-session Inworld speech-to-speech lane."""
 
     language = _effective_stt_language(model=model, profile=profile)
+    vocabulary = ", ".join(terminology[:80])[:1500].rstrip(" ,")
+    vocabulary_instruction = (
+        f" Approved knowledge terminology: {vocabulary}." if vocabulary else ""
+    )
     transcription = AudioTranscription(
         model=_inworld_stt_model(model=model, profile=profile),
         language=None if language == "auto" else language,
         prompt=(
             "Customer-service call. Preserve business, person, treatment, product, and "
             f"place names exactly. Agent scope: {str(model.name or '').strip()[:180]}."
+            f"{vocabulary_instruction}"
         ),
     )
     return InworldRealtimeModel(
@@ -963,11 +1149,12 @@ class VAVInworldAgent(Agent):
         model: AgentModel,
         variables: ProviderVariables | None = None,
         native_realtime: bool = False,
+        knowledge_terminology: tuple[str, ...] = (),
     ):
         self._tenant_id = model.tenant_id
         self._agent_id = model.id
         self._agent_name = str(getattr(model, "name", "") or "")
-        self._knowledge_terminology: tuple[str, ...] | None = None
+        self._knowledge_terminology: tuple[str, ...] | None = knowledge_terminology or None
         call_variables = variables or {}
         rendered_prompt = _render_call_template(model.system_prompt, call_variables)
         primary_language = str(getattr(model, "language", "en-US") or "en-US").strip() or "en-US"
@@ -1057,6 +1244,12 @@ Knowledge policy:
   divisions, and services. If you offer additional detail, retrieve and provide
   that detail on the next turn rather than losing the topic.
 - Keep spoken answers concise and natural. Confirm consequential actions.
+- Give the requested fact first and normally stop after one or two short sentences.
+  Do not append routine closings such as "Is there anything else?" after every
+  answer. If the caller asks for only one fact, provide only that fact.
+- When interrupted, never restart or complete the abandoned response. Answer
+  only the caller's replacement request. Use compact prose for lists unless the
+  caller explicitly asks for a detailed explanation.
 """
         super().__init__(instructions=instructions)
 
@@ -1140,8 +1333,19 @@ Knowledge policy:
 class VAVInworldRealtimeAgent(VAVInworldAgent):
     """Native realtime agent that keeps VAV knowledge behind a grounded tool."""
 
-    def __init__(self, *, model: AgentModel, variables: ProviderVariables | None = None):
-        super().__init__(model=model, variables=variables, native_realtime=True)
+    def __init__(
+        self,
+        *,
+        model: AgentModel,
+        variables: ProviderVariables | None = None,
+        knowledge_terminology: tuple[str, ...] = (),
+    ):
+        super().__init__(
+            model=model,
+            variables=variables,
+            native_realtime=True,
+            knowledge_terminology=knowledge_terminology,
+        )
 
     async def on_user_turn_completed(
         self,
@@ -1183,6 +1387,18 @@ class VAVInworldRealtimeAgent(VAVInworldAgent):
         return await self._retrieve_approved_knowledge(
             query=query,
             query_variants=query_variants,
+        )
+
+
+async def _load_runtime_knowledge_terminology(model: AgentModel) -> tuple[str, ...]:
+    """Load one reusable recognition vocabulary before opening a native session."""
+
+    async with async_session_factory() as db:
+        return await load_agent_knowledge_terminology(
+            db,
+            tenant_id=model.tenant_id,
+            agent_id=model.id,
+            hints=(model.name,),
         )
 
 
@@ -2072,6 +2288,7 @@ async def vav_inworld_session(ctx: JobContext) -> None:
     runtime_failure: BaseException | None = None
     max_duration_task: asyncio.Task[None] | None = None
     barge_in_reset_task: asyncio.Task[None] | None = None
+    fragment_guard_task: asyncio.Task[None] | None = None
     barge_in_endpointing_active = False
     session: AgentSession | None = None
 
@@ -2093,6 +2310,8 @@ async def vav_inworld_session(ctx: JobContext) -> None:
             max_duration_task.cancel()
         if barge_in_reset_task is not None and barge_in_reset_task is not asyncio.current_task():
             barge_in_reset_task.cancel()
+        if fragment_guard_task is not None and fragment_guard_task is not asyncio.current_task():
+            fragment_guard_task.cancel()
         await _run_bounded_cleanup(
             _finalize_once(),
             timeout_seconds=CALL_FINALIZE_TIMEOUT_SECONDS,
@@ -2108,6 +2327,20 @@ async def vav_inworld_session(ctx: JobContext) -> None:
         ctx.add_shutdown_callback(_shutdown)
         voice_runtime = _inworld_voice_runtime(profile)
         native_realtime = voice_runtime == "inworld_realtime"
+        knowledge_terminology: tuple[str, ...] = ()
+        if native_realtime:
+            terminology_started_at = time.monotonic()
+            try:
+                knowledge_terminology = await _load_runtime_knowledge_terminology(model)
+            except Exception:
+                logger.warning(
+                    "livekit_recognition_terminology_load_failed",
+                    extra={"call_id": str(call_id)},
+                )
+            usage_totals["knowledge_terminology_load_ms"] = round(
+                (time.monotonic() - terminology_started_at) * 1000
+            )
+            usage_totals["knowledge_terminology_count"] = len(knowledge_terminology)
         resolved_stt_model = _inworld_stt_model(model=model, profile=profile)
         normal_endpointing = (
             ASSEMBLYAI_ENDPOINTING
@@ -2134,6 +2367,7 @@ async def vav_inworld_session(ctx: JobContext) -> None:
                     model=model,
                     profile=profile,
                     api_key=api_keys.speech,
+                    terminology=knowledge_terminology,
                 ),
                 tts=inworld.TTS(**tts_options),
                 turn_handling={
@@ -2206,6 +2440,33 @@ async def vav_inworld_session(ctx: JobContext) -> None:
                 },
             )
 
+        def _cancel_stale_generation() -> None:
+            try:
+                future = session.interrupt(force=True)
+            except RuntimeError:
+                return
+
+            def _log_interruption_failure(done: asyncio.Future[None]) -> None:
+                if done.cancelled() or done.exception() is None:
+                    return
+                logger.warning(
+                    "livekit_stale_generation_cancel_failed",
+                    extra={
+                        "call_id": str(call_id),
+                        "error_type": type(done.exception()).__name__,
+                    },
+                )
+
+            future.add_done_callback(_log_interruption_failure)
+
+        async def _guard_suppressed_fragment_generation() -> None:
+            # Provider event ordering may deliver the final transcript just
+            # before response.created. Recheck within the bounded continuation
+            # window so that a late response to the fragment cannot leak audio.
+            for delay in (0.1, 0.25):
+                await asyncio.sleep(delay)
+                _cancel_stale_generation()
+
         def _restore_normal_endpointing() -> None:
             nonlocal barge_in_endpointing_active, barge_in_reset_task
             if native_realtime:
@@ -2225,12 +2486,25 @@ async def vav_inworld_session(ctx: JobContext) -> None:
 
         @session.on("user_state_changed")
         def _on_user_state_changed(event: Any) -> None:
-            nonlocal barge_in_endpointing_active, barge_in_reset_task
+            nonlocal barge_in_endpointing_active, barge_in_reset_task, fragment_guard_task
+            new_state = getattr(event, "new_state", None)
+            agent_state = getattr(session, "agent_state", None)
             telemetry.on_user_state(
                 old_state=getattr(event, "old_state", None),
-                new_state=getattr(event, "new_state", None),
-                agent_state=getattr(session, "agent_state", None),
+                new_state=new_state,
+                agent_state=agent_state,
             )
+            if new_state == "speaking" and fragment_guard_task is not None:
+                fragment_guard_task.cancel()
+                fragment_guard_task = None
+            if native_realtime and new_state == "speaking" and agent_state in {
+                "speaking",
+                "thinking",
+            }:
+                usage_totals["stale_generation_cancel_count"] = int(
+                    usage_totals.get("stale_generation_cancel_count", 0)
+                ) + 1
+                _cancel_stale_generation()
             # Stop playout promptly, then give only the replacement barge-in
             # sentence more time to settle. Normal turns retain the faster
             # endpoint so improving interruption completeness does not make the
@@ -2455,8 +2729,30 @@ async def vav_inworld_session(ctx: JobContext) -> None:
 
         @session.on("user_input_transcribed")
         def _on_user_input_transcribed(event: Any) -> None:
+            nonlocal fragment_guard_task
             if getattr(event, "is_final", False):
-                telemetry.on_final_transcript()
+                transcript = str(getattr(event, "transcript", "") or "").strip()
+                telemetry.on_final_transcript(transcript)
+                if (
+                    native_realtime
+                    and telemetry.consume_barge_in_transcript()
+                    and _is_incomplete_barge_in_fragment(
+                        transcript,
+                        terminology=knowledge_terminology,
+                    )
+                ):
+                    telemetry.record_suppressed_fragment(transcript)
+                    # In native realtime mode the provider may have already
+                    # started the replacement generation before VAV receives
+                    # its final transcript. Cancel it at this final boundary;
+                    # the fragment remains in context so the caller's next
+                    # utterance can complete the meaning without a bogus reply.
+                    _cancel_stale_generation()
+                    if fragment_guard_task is not None:
+                        fragment_guard_task.cancel()
+                    fragment_guard_task = asyncio.create_task(
+                        _guard_suppressed_fragment_generation()
+                    )
 
         @session.on("agent_state_changed")
         def _on_agent_state_changed(event: Any) -> None:
@@ -2466,7 +2762,11 @@ async def vav_inworld_session(ctx: JobContext) -> None:
         await session.start(
             room=ctx.room,
             agent=(
-                VAVInworldRealtimeAgent(model=model, variables=variables)
+                VAVInworldRealtimeAgent(
+                    model=model,
+                    variables=variables,
+                    knowledge_terminology=knowledge_terminology,
+                )
                 if native_realtime
                 else VAVInworldAgent(model=model, variables=variables)
             ),
@@ -2483,6 +2783,8 @@ async def vav_inworld_session(ctx: JobContext) -> None:
             max_duration_task.cancel()
         if barge_in_reset_task is not None:
             barge_in_reset_task.cancel()
+        if fragment_guard_task is not None:
+            fragment_guard_task.cancel()
         if session is not None:
             await _run_bounded_cleanup(
                 session.aclose(),

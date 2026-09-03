@@ -76,6 +76,22 @@ def test_public_call_metadata_exposes_realtime_quality_and_usage_metrics():
                 "llm_input_audio_tokens": 700,
                 "llm_output_audio_tokens": 120,
                 "realtime_session_seconds": 42.5,
+                "stale_generation_cancel_count": 3,
+                "suppressed_fragment_count": 2,
+                "last_suppressed_fragment_words": 1,
+                "fragment_continuation_window_ms": 500,
+                "knowledge_terminology_load_ms": 95,
+                "knowledge_terminology_count": 80,
+                "turn_diagnostics": [
+                    {
+                        "turn": 1,
+                        "barge_in": True,
+                        "transcript_words": 1,
+                        "stabilization_ms": 500,
+                        "outcome": "fragment_suppressed",
+                        "private_transcript": "do-not-expose",
+                    }
+                ],
                 "private_provider_request": "do-not-expose",
             },
         }
@@ -94,5 +110,20 @@ def test_public_call_metadata_exposes_realtime_quality_and_usage_metrics():
             "llm_input_audio_tokens": 700,
             "llm_output_audio_tokens": 120,
             "realtime_session_seconds": 42.5,
+            "stale_generation_cancel_count": 3,
+            "suppressed_fragment_count": 2,
+            "last_suppressed_fragment_words": 1,
+            "fragment_continuation_window_ms": 500,
+            "knowledge_terminology_load_ms": 95,
+            "knowledge_terminology_count": 80,
+            "turn_diagnostics": [
+                {
+                    "turn": 1,
+                    "barge_in": True,
+                    "transcript_words": 1,
+                    "stabilization_ms": 500,
+                    "outcome": "fragment_suppressed",
+                }
+            ],
         },
     }
