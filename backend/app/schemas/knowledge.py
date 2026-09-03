@@ -13,6 +13,7 @@ KnowledgeScope = Literal["workspace", "group", "division", "branch", "department
 KnowledgeStatus = Literal["local_only", "provisioning", "processing", "ready", "error"]
 SourceType = Literal["website", "sitemap", "url", "file", "text"]
 SourceStatus = Literal["pending", "processing", "indexed", "failed", "local_only"]
+KnowledgeProcessingMode = Literal["automatic", "fast", "ai_verified"]
 
 
 def _clean_list(values: list[str], *, maximum: int, item_maximum: int) -> list[str]:
@@ -244,6 +245,7 @@ class KnowledgeCrawlCreate(BaseModel):
     max_pages: int = Field(default=100, ge=1, le=500)
     max_depth: int = Field(default=3, ge=0, le=8)
     include_subdomains: bool = False
+    processing_mode: KnowledgeProcessingMode = "automatic"
 
     @field_validator("homepage_url")
     @classmethod

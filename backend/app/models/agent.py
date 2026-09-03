@@ -181,7 +181,15 @@ class KnowledgeSource(TenantScopedModel):
     source_type: Mapped[str] = mapped_column(String(30), nullable=False)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     location: Mapped[str | None] = mapped_column(Text)
+    # Website sources keep the immutable extraction separately from the
+    # retrieval document produced by the knowledge compiler.  This makes the
+    # generated representation auditable and lets a new compiler version
+    # rebuild knowledge without downloading the page again.
+    raw_content: Mapped[str | None] = mapped_column(Text)
     content: Mapped[str | None] = mapped_column(Text)
+    structured_content: Mapped[dict | None] = mapped_column(JSONB)
+    content_sha256: Mapped[str | None] = mapped_column(String(64), index=True)
+    compiled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     file_content: Mapped[bytes | None] = mapped_column(LargeBinary)
     mime_type: Mapped[str | None] = mapped_column(String(120))
     size_bytes: Mapped[int | None] = mapped_column(Integer)

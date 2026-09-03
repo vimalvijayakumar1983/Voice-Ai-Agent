@@ -274,6 +274,7 @@ export interface AgentProviderCatalog {
 
 export type KnowledgeScope = 'workspace' | 'group' | 'division' | 'branch' | 'department';
 export type KnowledgeSyncStatus = 'local_only' | 'provisioning' | 'processing' | 'ready' | 'error';
+export type KnowledgeProcessingMode = 'automatic' | 'fast' | 'ai_verified';
 
 export interface KnowledgeSource {
   id: string;
@@ -1713,6 +1714,7 @@ class ApiClient {
     max_pages: number;
     max_depth: number;
     include_subdomains: boolean;
+    processing_mode: KnowledgeProcessingMode;
   }) {
     return this.request<KnowledgeBase>(`/api/v1/knowledge/${id}/crawls`, {
       method: 'POST',

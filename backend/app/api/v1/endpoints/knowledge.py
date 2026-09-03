@@ -95,11 +95,12 @@ def _provider_error(exc: SmallestAIError) -> HTTPException:
 
 def _source_response(source: KnowledgeSource) -> KnowledgeSourceResponse:
     content = source.content if isinstance(source.content, str) else ""
+    extracted = source.raw_content if isinstance(source.raw_content, str) else content
     response = KnowledgeSourceResponse.model_validate(source)
     return response.model_copy(
         update={
             "retrieval_ready": bool(content.strip()),
-            "extracted_character_count": len(content.strip()),
+            "extracted_character_count": len(extracted.strip()),
         }
     )
 
@@ -803,7 +804,10 @@ async def start_website_crawl(
         max_pages=data.max_pages,
         max_depth=data.max_depth,
         include_subdomains=data.include_subdomains,
-        options={"respects_robots": True},
+        options={
+            "respects_robots": True,
+            "processing_mode": data.processing_mode,
+        },
     )
     kb.crawls.append(crawl)
     await db.flush()
@@ -819,6 +823,7 @@ async def start_website_crawl(
             "max_pages": data.max_pages,
             "max_depth": data.max_depth,
             "include_subdomains": data.include_subdomains,
+            "processing_mode": data.processing_mode,
             "approval_invalidated": approval_invalidated,
         },
     )

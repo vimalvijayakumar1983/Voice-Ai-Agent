@@ -11,6 +11,7 @@ import structlog
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
+from app.core.config import settings
 from app.core.database import async_session_factory
 from app.models.agent import (
     AgentKnowledgeBinding,
@@ -21,6 +22,12 @@ from app.models.agent import (
 )
 from app.providers.smallest import SmallestAIClient, SmallestAIError, get_smallest_client
 from app.services.audit import record_audit_event
+from app.services.knowledge_compiler import (
+    COMPILER_VERSION,
+    CompiledKnowledge,
+    KnowledgeCompilerError,
+    compile_website_knowledge,
+)
 from app.services.knowledge_sources import (
     VAV_NATIVE_KNOWLEDGE_PROVIDERS,
     canonical_source_url,
@@ -31,7 +38,7 @@ from app.services.knowledge_sources import (
     mark_remote_creation_outcome_unknown,
     remote_creation_outcome_unknown,
 )
-from app.services.provider_credentials import load_provider_config
+from app.services.provider_credentials import ProviderCredentialError, load_provider_config
 from app.services.website_crawler import discover_website
 from app.services.website_recovery import (
     RecoveredPage,
@@ -393,6 +400,7 @@ async def _crawl_website(tenant_id: UUID, kb_id: UUID, crawl_id: UUID) -> None:
         max_pages = crawl.max_pages
         max_depth = crawl.max_depth
         include_subdomains = crawl.include_subdomains
+        processing_mode = str((crawl.options or {}).get("processing_mode") or "automatic")
     finally:
         await session.close()
 
@@ -454,6 +462,7 @@ async def _crawl_website(tenant_id: UUID, kb_id: UUID, crawl_id: UUID) -> None:
                             "crawl_root": discovery.root_url,
                             "discovered_via": discovered.discovered_via,
                             "crawl_depth": discovered.depth,
+                            "processing_mode": processing_mode,
                         },
                         stage="queued",
                         status="queued",
@@ -470,6 +479,7 @@ async def _crawl_website(tenant_id: UUID, kb_id: UUID, crawl_id: UUID) -> None:
                         "crawl_root": discovery.root_url,
                         "discovered_via": discovered.discovered_via,
                         "crawl_depth": discovered.depth,
+                        "processing_mode": processing_mode,
                     }
                 )
                 source.status = "processing"
@@ -503,6 +513,7 @@ async def _crawl_website(tenant_id: UUID, kb_id: UUID, crawl_id: UUID) -> None:
             "warnings": list(discovery.warnings),
             "respects_robots": True,
             "discovery_methods": ["robots", "sitemap", "same_site_links", "javascript_links"],
+            "processing_mode": processing_mode,
         }
         crawl.indexed_count = len(discovery.pages) - len(queued_sources)
         crawl.queued_count = len(queued_sources)
@@ -636,6 +647,18 @@ async def _repair(tenant_id: UUID, kb_id: UUID, source_id: UUID) -> None:
     )
     session, knowledge_base, source = await _context(tenant_id, kb_id, source_id)
     location = str(source.location or "")
+    source_metadata = dict(source.source_metadata or {})
+    requested_mode = str(source_metadata.get("processing_mode") or "automatic")
+    if requested_mode not in {"automatic", "fast", "ai_verified"}:
+        requested_mode = "automatic"
+    existing_content_sha256 = source.content_sha256
+    existing_compiled_content = source.content
+    existing_structured_content = source.structured_content
+    try:
+        openai_config = await load_provider_config(session, tenant_id, "openai")
+    except ProviderCredentialError:
+        openai_config = None
+    openai_api_key = str((openai_config or {}).get("api_key") or settings.openai_api_key).strip()
     await session.close()
     if not location:
         raise WebsiteRecoveryError("The source has no website URL.", code="invalid_source")
@@ -686,11 +709,47 @@ async def _repair(tenant_id: UUID, kb_id: UUID, source_id: UUID) -> None:
         "extracting",
         f"Extracted {len(page.text):,} readable characters using {page.method}.",
     )
+    raw_content_sha256 = hashlib.sha256(page.text.encode("utf-8")).hexdigest()
+    reused_compilation = bool(
+        existing_content_sha256 == raw_content_sha256
+        and existing_compiled_content
+        and existing_structured_content
+        and (existing_structured_content.get("compiler") or {}).get("version") == COMPILER_VERSION
+        and (existing_structured_content.get("compiler") or {}).get("requested_mode")
+        == requested_mode
+    )
+    if reused_compilation:
+        compiler = existing_structured_content.get("compiler") or {}
+        compiled = CompiledKnowledge(
+            content=existing_compiled_content,
+            structured=existing_structured_content,
+            effective_mode=str(compiler.get("effective_mode") or "fast"),
+            model=str(compiler.get("model")) if compiler.get("model") else None,
+            input_tokens=0,
+            output_tokens=0,
+            estimated_cost_usd=0.0,
+            warning=None,
+        )
+    else:
+        await _set_stage(
+            tenant_id,
+            kb_id,
+            source_id,
+            "compiling",
+            "Structuring extracted knowledge and verifying every AI fact against its source.",
+        )
+        compiled = await compile_website_knowledge(
+            title=page.title,
+            url=page.url,
+            text=page.text,
+            requested_mode=requested_mode,
+            api_key=openai_api_key or None,
+        )
     provider_document = await asyncio.to_thread(
         searchable_pdf,
         title=page.title,
         url=page.url,
-        text=page.text,
+        text=compiled.content,
     )
 
     await _set_stage(
@@ -705,7 +764,7 @@ async def _repair(tenant_id: UUID, kb_id: UUID, source_id: UUID) -> None:
         provider = await _tenant_client(session, tenant_id)
         remote_id = await _ensure_remote_locked(session, knowledge_base, provider)
 
-        content_sha256 = hashlib.sha256(page.text.encode("utf-8")).hexdigest()
+        content_sha256 = hashlib.sha256(compiled.content.encode("utf-8")).hexdigest()
         artifact_prefix = f"vav-web-recovery-{source.id}-"
         legacy_artifact_name = f"vav-web-recovery-{source.id}.pdf"
         artifact_name = f"{artifact_prefix}{content_sha256[:16]}.pdf"
@@ -753,7 +812,10 @@ async def _repair(tenant_id: UUID, kb_id: UUID, source_id: UUID) -> None:
 
         source.name = page.title[:255]
         source.location = page.url
-        source.content = page.text
+        source.raw_content = page.text
+        source.content = compiled.content
+        source.structured_content = compiled.structured
+        source.content_sha256 = raw_content_sha256
         source.mime_type = "text/html"
         source.size_bytes = page.downloaded_bytes
         source.status = "indexed"
@@ -766,6 +828,10 @@ async def _repair(tenant_id: UUID, kb_id: UUID, source_id: UUID) -> None:
                 "content_sha256": content_sha256,
                 "provider_artifact_name": artifact_name,
                 "retrieval_content_source": "vav_website_recovery",
+                "compiler": {
+                    **(compiled.structured.get("compiler") or {}),
+                    "reused": reused_compilation,
+                },
             }
         )
         source.source_metadata = recovery_metadata(
@@ -777,6 +843,7 @@ async def _repair(tenant_id: UUID, kb_id: UUID, source_id: UUID) -> None:
             extracted_characters=len(page.text),
         )
         now = datetime.now(UTC)
+        source.compiled_at = source.compiled_at if reused_compilation else now
         source.last_synced_at = now
         knowledge_base.last_synced_at = now
 
@@ -815,6 +882,13 @@ async def _repair(tenant_id: UUID, kb_id: UUID, source_id: UUID) -> None:
             details={
                 "method": page.method,
                 "characters": len(page.text),
+                "processing_mode": requested_mode,
+                "compiler_mode": compiled.effective_mode,
+                "compiler_model": compiled.model,
+                "compiler_input_tokens": compiled.input_tokens,
+                "compiler_output_tokens": compiled.output_tokens,
+                "compiler_estimated_cost_usd": round(compiled.estimated_cost_usd, 8),
+                "compilation_reused": reused_compilation,
                 "agents_requiring_sync": affected_agent_ids,
             },
         )
@@ -937,6 +1011,16 @@ def repair_website_source(self, tenant_id: str, knowledge_base_id: str, source_i
     source_uuid = UUID(source_id)
     try:
         _run_async(_repair(tenant_uuid, knowledge_uuid, source_uuid))
+    except KnowledgeCompilerError as exc:
+        _run_async(
+            _mark_failed(
+                tenant_uuid,
+                knowledge_uuid,
+                source_uuid,
+                message=str(exc),
+                code="knowledge_compilation_failed",
+            )
+        )
     except WebsiteRecoveryError as exc:
         if exc.retryable and self.request.retries < self.max_retries:
             _run_async(

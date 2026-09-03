@@ -34,6 +34,7 @@ import {
   KnowledgeAIDraftResponse,
   KnowledgeBase,
   KnowledgeCrawl,
+  KnowledgeProcessingMode,
   KnowledgeScope,
   KnowledgeSource,
   VoiceAgent,
@@ -441,6 +442,7 @@ export default function KnowledgeStudio() {
         max_pages: Number(form.get('max_pages') || 100),
         max_depth: Number(form.get('max_depth') || 3),
         include_subdomains: form.get('include_subdomains') === 'on',
+        processing_mode: String(form.get('processing_mode') || 'automatic') as KnowledgeProcessingMode,
       }),
       'Whole-site discovery started. Progress and every failed page will remain visible here.',
     );
@@ -752,6 +754,7 @@ function CrawlForm({ busy, onSubmit }: { busy: boolean; onSubmit: (event: FormEv
   return <form onSubmit={onSubmit} className={styles.crawlForm}>
     <div className={styles.crawlIntro}><label htmlFor="homepage-url">Website homepage</label><p>VAV follows sitemaps and same-site links, respects robots.txt, renders JavaScript when needed, and keeps a repair ledger for every page.</p></div>
     <input id="homepage-url" name="homepage_url" type="url" required placeholder="https://www.example.com/" />
+    <label><span>Knowledge processing</span><select name="processing_mode" defaultValue="automatic"><option value="automatic">Automatic · recommended</option><option value="fast">Fast · deterministic</option><option value="ai_verified">AI-verified · highest quality</option></select></label>
     <label><span>Page limit</span><input name="max_pages" type="number" min="1" max="500" defaultValue="100" /></label>
     <label><span>Link depth</span><input name="max_depth" type="number" min="0" max="8" defaultValue="3" /></label>
     <label className={styles.crawlCheckbox}><input name="include_subdomains" type="checkbox" /> Include subdomains</label>
@@ -768,9 +771,10 @@ function CrawlRuns({ crawls, busy, canRepair, onRetry }: { crawls: KnowledgeCraw
       const percent = crawl.discovered_count ? Math.round((terminal / crawl.discovered_count) * 100) : 0;
       const active = ['queued', 'discovering', 'indexing', 'retrying'].includes(crawl.status);
       const warnings = Array.isArray(crawl.options?.warnings) ? crawl.options.warnings.filter((item): item is string => typeof item === 'string') : [];
+      const processingMode = typeof crawl.options?.processing_mode === 'string' ? crawl.options.processing_mode : 'automatic';
       const failures = crawl.pages.filter((page) => page.status === 'failed');
       return <article className={styles.crawlRun} key={crawl.id}>
-        <div className={styles.crawlRunHeader}><div><strong>{crawl.allowed_host}</strong><span>{crawl.root_url}</span></div><span className={`badge ${crawl.failed_count || crawl.status === 'failed' ? 'badge-danger' : crawl.status === 'completed' ? 'badge-success' : 'badge-warning'}`}>{crawlStatusLabel(crawl.status)}</span></div>
+        <div className={styles.crawlRunHeader}><div><strong>{crawl.allowed_host}</strong><span>{crawl.root_url} · {processingModeLabel(processingMode)}</span></div><span className={`badge ${crawl.failed_count || crawl.status === 'failed' ? 'badge-danger' : crawl.status === 'completed' ? 'badge-success' : 'badge-warning'}`}>{crawlStatusLabel(crawl.status)}</span></div>
         <div className={styles.crawlStats}><span><strong>{crawl.discovered_count}</strong> discovered</span><span><strong>{crawl.indexed_count}</strong> ready</span><span><strong>{crawl.queued_count}</strong> processing</span><span><strong>{crawl.failed_count}</strong> failed</span><span><strong>{crawl.skipped_count}</strong> skipped</span></div>
         <div className={styles.crawlProgress} aria-label={`${percent}% of discovered pages processed`}><div style={{ width: `${percent}%` }} /></div>
         {active && <p className={styles.crawlMessage}><Loader2 className="spin" size={12} /> {crawl.status === 'discovering' ? 'Discovering sitemaps and same-site links…' : 'Extracting, indexing and verifying discovered pages…'}</p>}
@@ -792,6 +796,7 @@ function SourcesSection({ sources, canRepair, canRemove, busy, onRepair, onRemov
   const readyCount = sources.filter((source) => source.retrieval_ready && source.status === 'indexed').length;
   return <section className={styles.section} aria-labelledby="sources-heading"><div className={styles.sectionHeading}><div><span className={styles.sectionIcon}><Layers3 size={15} /></span><div><h3 id="sources-heading">Source inventory</h3><p>One canonical row per document. “Ready for agents” always requires searchable VAV text.</p></div></div><span className="badge badge-neutral">{sources.length} documents · {readyCount} ready</span></div>{sources.length === 0 ? <div className={styles.sourceEmpty}><FileText size={20} /><div><strong>No sources yet</strong><p>Add curated web pages, searchable text, or an approved PDF to begin.</p></div></div> : <div className={styles.sourceList}>{sources.map((source) => {
     const method = typeof source.source_metadata?.extraction_method === 'string' ? source.source_metadata.extraction_method : null;
+    const compiler = sourceCompiler(source);
     const isReady = source.retrieval_ready && source.status === 'indexed';
     const recovery = sourceRecovery(source);
     const isWebsite = source.source_type === 'url' || source.source_type === 'website' || source.source_type === 'sitemap';
@@ -805,7 +810,7 @@ function SourcesSection({ sources, canRepair, canRemove, busy, onRepair, onRemov
         : null;
     const recoveryActive = recovery?.status === 'queued' || recovery?.status === 'processing';
     const refreshLabel = isReady ? 'Refresh page' : 'Repair page';
-    return <article className={styles.sourceRow} key={source.id}><span className={styles.sourceTypeIcon}>{source.source_type === 'file' ? <FileText size={16} /> : source.source_type === 'text' ? <Layers3 size={16} /> : <Globe2 size={16} />}</span><div className={styles.sourceIdentity}><strong>{source.name}</strong><span>{source.location || (source.size_bytes ? formatBytes(source.size_bytes) : source.source_type)} · {source.retrieval_ready ? `${source.extracted_character_count.toLocaleString()} searchable characters${method ? ` · ${method === 'native' ? 'text extracted' : method === 'static_html' ? 'HTML extracted' : method === 'javascript_render' ? 'JavaScript rendered' : method}` : ''}` : 'no voice-searchable text'}</span>{detail && <p className={recoveryActive ? styles.recoveryProgress : undefined}>{detail}</p>}{source.error_message && source.error_message !== detail && <p>{source.error_message}</p>}</div><span className={`badge ${isReady ? 'badge-success' : sourceBadge(source.status)}`}>{isReady ? 'Ready for agents' : recoveryActive ? recoveryStageLabel(recovery.stage) : source.status.replace('_', ' ')}</span><time>{formatDate(source.last_synced_at || source.updated_at)}</time><span className={styles.sourceActions}>{canRepair && repairable && <button type="button" className="btn btn-secondary btn-sm" disabled={busy || recoveryActive} onClick={() => onRepair(source)} aria-label={`${refreshLabel} ${source.name} and re-index its searchable content`} title="Download, render, extract, index and verify the latest page content"><RefreshCw size={12} className={recoveryActive ? 'spin' : undefined} /> {refreshLabel}</button>}{canRemove && <button type="button" className="icon-button" disabled={busy} onClick={() => onRemove(source)} aria-label={`Remove ${source.name} from VAV and Smallest.ai`} title="Remove from VAV and Smallest.ai"><Trash2 size={14} /></button>}</span></article>;
+    return <article className={styles.sourceRow} key={source.id}><span className={styles.sourceTypeIcon}>{source.source_type === 'file' ? <FileText size={16} /> : source.source_type === 'text' ? <Layers3 size={16} /> : <Globe2 size={16} />}</span><div className={styles.sourceIdentity}><strong>{source.name}</strong><span>{source.location || (source.size_bytes ? formatBytes(source.size_bytes) : source.source_type)} · {source.retrieval_ready ? `${source.extracted_character_count.toLocaleString()} searchable characters${method ? ` · ${method === 'native' ? 'text extracted' : method === 'static_html' ? 'HTML extracted' : method === 'javascript_render' ? 'JavaScript rendered' : method}` : ''}${compiler ? ` · ${compilerLabel(compiler)}` : ''}` : 'no voice-searchable text'}</span>{compiler?.warning && <p>{compiler.warning}</p>}{detail && <p className={recoveryActive ? styles.recoveryProgress : undefined}>{detail}</p>}{source.error_message && source.error_message !== detail && <p>{source.error_message}</p>}</div><span className={`badge ${isReady ? 'badge-success' : sourceBadge(source.status)}`}>{isReady ? 'Ready for agents' : recoveryActive ? recoveryStageLabel(recovery.stage) : source.status.replace('_', ' ')}</span><time>{formatDate(source.last_synced_at || source.updated_at)}</time><span className={styles.sourceActions}>{canRepair && repairable && <button type="button" className="btn btn-secondary btn-sm" disabled={busy || recoveryActive} onClick={() => onRepair(source)} aria-label={`${refreshLabel} ${source.name} and re-index its searchable content`} title="Download, render, extract, index and verify the latest page content"><RefreshCw size={12} className={recoveryActive ? 'spin' : undefined} /> {refreshLabel}</button>}{canRemove && <button type="button" className="icon-button" disabled={busy} onClick={() => onRemove(source)} aria-label={`Remove ${source.name} from VAV and Smallest.ai`} title="Remove from VAV and Smallest.ai"><Trash2 size={14} /></button>}</span></article>;
   })}</div>}</section>;
 }
 
@@ -825,8 +830,12 @@ function StatusDot({ status }: { status: KnowledgeBase['sync_status'] }) { retur
 function scopeLabel(kb: KnowledgeBase) { return kb.scope_label || scopeOptions.find((scope) => scope.value === kb.scope_type)?.label || kb.scope_type; }
 function sourceBadge(status: KnowledgeSource['status']) { if (status === 'indexed') return 'badge-success'; if (status === 'failed') return 'badge-danger'; if (status === 'processing' || status === 'pending') return 'badge-warning'; return 'badge-neutral'; }
 type SourceRecovery = { status?: string; stage?: string; message?: string };
+type SourceCompiler = { effective_mode?: string; model?: string; input_tokens?: number; output_tokens?: number; estimated_cost_usd?: number; estimated_cost_aed?: number; reused?: boolean; warning?: string | null };
 function sourceRecovery(source: KnowledgeSource): SourceRecovery | null { const value = source.source_metadata?.recovery; return value && typeof value === 'object' ? value as SourceRecovery : null; }
-function recoveryStageLabel(stage?: string) { const labels: Record<string, string> = { queued: 'Queued', fetching: 'Downloading', rendering: 'Rendering JavaScript', extracting: 'Extracting text', provider_indexing: 'Indexing', verifying: 'Verifying index', verified: 'Verified', failed: 'Needs attention' }; return labels[stage || ''] || 'Repairing'; }
+function sourceCompiler(source: KnowledgeSource): SourceCompiler | null { const value = source.source_metadata?.compiler; return value && typeof value === 'object' ? value as SourceCompiler : null; }
+function compilerLabel(value: SourceCompiler) { if (value.reused) return 'unchanged · previous compilation reused'; if (value.effective_mode !== 'ai_verified') return 'deterministic knowledge'; const tokens = Number(value.input_tokens || 0) + Number(value.output_tokens || 0); const usd = Number(value.estimated_cost_usd || 0); const aed = Number(value.estimated_cost_aed || usd * 3.6725); return `AI-verified${value.model ? ` by ${value.model}` : ''} · ${tokens.toLocaleString()} tokens · $${usd.toFixed(4)} / AED ${aed.toFixed(4)}`; }
+function processingModeLabel(value: string) { const labels: Record<string, string> = { automatic: 'Automatic knowledge processing', fast: 'Fast deterministic processing', ai_verified: 'AI-verified processing' }; return labels[value] || labels.automatic; }
+function recoveryStageLabel(stage?: string) { const labels: Record<string, string> = { queued: 'Queued', fetching: 'Downloading', rendering: 'Rendering JavaScript', extracting: 'Extracting text', compiling: 'Structuring knowledge', provider_indexing: 'Indexing', verifying: 'Verifying index', verified: 'Verified', failed: 'Needs attention' }; return labels[stage || ''] || 'Repairing'; }
 function crawlStatusLabel(status: KnowledgeCrawl['status']) { const labels: Record<KnowledgeCrawl['status'], string> = { queued: 'Queued', discovering: 'Discovering', indexing: 'Indexing', retrying: 'Repairing', completed: 'Complete', completed_with_errors: 'Needs repair', failed: 'Discovery failed', cancelled: 'Cancelled' }; return labels[status]; }
 function formatBytes(bytes: number) { return bytes < 1024 * 1024 ? `${Math.ceil(bytes / 1024)} KB` : `${(bytes / 1024 / 1024).toFixed(1)} MB`; }
 function formatDate(value: string) { return new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value)); }

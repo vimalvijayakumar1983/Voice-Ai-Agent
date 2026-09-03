@@ -693,6 +693,7 @@ async def test_homepage_crawl_is_persisted_and_queued(
             "max_pages": 120,
             "max_depth": 4,
             "include_subdomains": False,
+            "processing_mode": "ai_verified",
         },
     )
 
@@ -701,6 +702,7 @@ async def test_homepage_crawl_is_persisted_and_queued(
     assert crawl_data["status"] == "queued"
     assert crawl_data["max_pages"] == 120
     assert crawl_data["max_depth"] == 4
+    assert crawl_data["options"]["processing_mode"] == "ai_verified"
     crawl = await db.get(KnowledgeCrawl, UUID(crawl_data["id"]))
     assert crawl is not None
     assert queued == [([str(tenant.id), str(knowledge.id), str(crawl.id)], "knowledge")]
