@@ -474,6 +474,22 @@ def _recover_terminology(query: str, terminology: Iterable[object]) -> tuple[str
                 continue
             for start in range(len(query_tokens) - width + 1):
                 window = query_tokens[start : start + width]
+                mismatched_indexes = [
+                    index
+                    for index, (query_token, canonical_token) in enumerate(
+                        zip(window, canonical_tokens, strict=True)
+                    )
+                    if query_token != canonical_token
+                ] if len(window) == len(canonical_tokens) else []
+                if any(
+                    window[index] in _QUERY_STOP_WORDS
+                    or window[index] in _QUERY_INTENT_TOKENS
+                    for index in mismatched_indexes
+                ):
+                    # Never reinterpret ordinary grammar or an explicit intent
+                    # as part of a proper name (for example, rewriting
+                    # ``for Al Zaabi Group`` to ``ITR Al Zaabi Group``).
+                    continue
                 score = _phrase_similarity(window, canonical_tokens)
                 if score <= 0:
                     continue

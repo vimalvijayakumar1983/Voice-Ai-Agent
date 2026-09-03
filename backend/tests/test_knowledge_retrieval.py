@@ -41,6 +41,18 @@ def test_contextual_plan_recovers_one_uncertain_word_inside_known_entity():
     assert plan.recovered_terms == ("Al Zaabi Group",)
 
 
+def test_contextual_plan_never_rewrites_preposition_as_part_of_source_name():
+    plan = build_contextual_query_plan(
+        "What is the contact address and phone number for Al Zaabi Group?",
+        terminology=("ITR Al Zaabi Group", "Al Zaabi Group"),
+    )
+
+    assert plan.variants == (
+        "What is the contact address and phone number for Al Zaabi Group?",
+    )
+    assert plan.recovered_terms == ()
+
+
 def test_contextual_plan_recovers_joined_spoken_brand_from_proper_name():
     plan = build_contextual_query_plan(
         "Do you have information about Sengobin?",
