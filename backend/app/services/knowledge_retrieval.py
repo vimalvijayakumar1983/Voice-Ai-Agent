@@ -770,9 +770,7 @@ def _structured_retrieval_content(value: object) -> str | None:
     facts = value.get("facts")
     if not isinstance(facts, list) or not facts:
         return None
-    lines = ["VERIFIED STRUCTURED FACTS"]
-    current_subject: str | None = None
-    accepted = 0
+    blocks: list[str] = []
     for fact in facts[:200]:
         if not isinstance(fact, dict):
             continue
@@ -782,9 +780,7 @@ def _structured_retrieval_content(value: object) -> str | None:
         evidence = " ".join(str(fact.get("evidence") or "").split()).strip()
         if not subject or not predicate or not fact_value or not evidence:
             continue
-        if subject != current_subject:
-            lines.extend(["", f"SUBJECT: {subject}"])
-            current_subject = subject
+        lines = ["VERIFIED STRUCTURED FACTS", f"SUBJECT: {subject}"]
         lines.append(f"- {predicate}: {fact_value}")
         phrases = [
             " ".join(str(phrase).split()).strip(" |,.;:")
@@ -793,9 +789,17 @@ def _structured_retrieval_content(value: object) -> str | None:
         ][:8]
         if phrases:
             lines.append(f"  Search phrases: {' | '.join(phrases)}")
+        if len(evidence) > 520:
+            value_index = evidence.casefold().find(fact_value.casefold())
+            if value_index > 220:
+                value_start = max(value_index - 160, 0)
+                evidence_tail = evidence[value_start : value_start + 290].strip()
+                evidence = f"{evidence[:220].rstrip()} … {evidence_tail}"
+            else:
+                evidence = evidence[:520].rstrip()
         lines.append(f"  Evidence: {evidence}")
-        accepted += 1
-    return "\n".join(lines).strip() if accepted else None
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks).strip() if blocks else None
 
 
 def _chunks(
@@ -932,12 +936,14 @@ def rank_knowledge(
                     topic_bonus = 0.12
             if directory_query and source_terms & _DIRECTORY_SOURCE_TOKENS:
                 topic_bonus = max(topic_bonus, 0.18)
+            authority_bonus = 0.14 if structured_facts else 0.0
             score = (
                 coverage * 0.76
                 + content_coverage * 0.18
                 + min(density, 0.25) * 0.24
                 + source_bonus
                 + topic_bonus
+                + authority_bonus
             )
             matches.append(KnowledgeMatch(source, chunk, score))
 

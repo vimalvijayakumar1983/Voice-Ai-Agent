@@ -78,11 +78,19 @@ def test_structured_retrieval_keeps_parent_and_subsidiary_dates_separate():
 
     matches = knowledge_retrieval._rank_contextual_knowledge(
         plan.variants,
-        [("Management and divisions", content)],
+        [
+            (
+                "Al Zaabi Transport – Al Zaabi Group",
+                "Al Zaabi Group is present in the UAE. The transport group has established "
+                "its foothold over the years.",
+            ),
+            ("Management and divisions", content),
+        ],
         limit=4,
     )
 
     assert matches
+    assert matches[0].source == "Management and divisions"
     assert "SUBJECT: Al Zaabi Group" in matches[0].text
     assert "Tyre Factory" not in matches[0].text
 
