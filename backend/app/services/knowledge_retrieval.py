@@ -63,12 +63,14 @@ _QUERY_STOP_WORDS = {
     "hello",
     "hey",
     "hi",
+    "how",
     "is",
     "it",
     "just",
     "kind",
     "know",
     "like",
+    "long",
     "maybe",
     "me",
     "my",
@@ -208,6 +210,7 @@ _QUERY_INTENT_TOKENS = (
         "pricing",
         "service",
         "treatment",
+        "year",
     }
 )
 _NAVIGATION_NOISE_TOKENS = {
@@ -253,7 +256,17 @@ _PHONE_NUMBER = re.compile(r"(?<!\w)\+?\d[\d\s().-]{6,}\d(?!\w)")
 # never rewritten here. The live LLM can supply additional semantic terms, and
 # compiler-v4 facts carry source-specific search phrases generated at ingestion.
 _SEMANTIC_CONCEPT_GROUPS: tuple[tuple[str, ...], ...] = (
-    ("formed", "founded", "established", "inception"),
+    (
+        "formed",
+        "founded",
+        "established",
+        "inception",
+        "began",
+        "begun",
+        "started",
+        "created",
+        "existed",
+    ),
     ("position", "role", "designation", "title"),
     ("cost", "price", "pricing", "fee"),
     ("hour", "timing", "schedule", "opening"),
@@ -722,10 +735,14 @@ def _is_group_overview_source(source: str) -> bool:
 
 
 def _intent_content(value: str, *, phone_query: bool) -> str:
-    """Prefer verified subject associations for multi-entity phone lookups."""
+    """Prefer compiler-verified subject/fact bundles over ambiguous raw prose.
 
-    if not phone_query:
-        return value
+    Once a source has structured facts, the raw extraction remains auditable but
+    is no longer allowed to outrank an explicitly associated subject. This
+    prevents a subsidiary's date, contact or executive from being attributed to
+    the parent organization merely because both names occur on one page.
+    """
+
     marker = "VERIFIED STRUCTURED FACTS"
     source_marker = "\n\nSOURCE CONTENT"
     start = value.find(marker)
@@ -733,6 +750,8 @@ def _intent_content(value: str, *, phone_query: bool) -> str:
         return value
     end = value.find(source_marker, start)
     structured = value[start : end if end >= 0 else len(value)].strip()
+    if not phone_query:
+        return structured or value
     structured_tokens = _token_forms(_base_tokens(structured))
     return structured if _has_phone_evidence(structured, structured_tokens) else value
 

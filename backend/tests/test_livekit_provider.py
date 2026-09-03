@@ -693,7 +693,7 @@ async def test_native_realtime_agent_uses_tool_without_duplicate_context_injecti
 
     retrieval.assert_not_awaited()
     assert len(turn_ctx.messages()) == 1
-    assert "meaning-preserving semantic" in agent.instructions
+    assert "alternative semantic query" in agent.instructions
 
 
 @pytest.mark.asyncio
@@ -712,14 +712,14 @@ async def test_native_realtime_tool_passes_semantic_terms_to_shared_retrieval(mo
 
     result = await agent.search_approved_knowledge(
         "When was Al Zaabi Group formed?",
-        "founded established inception year",
+        "What is the Al Zaabi Group inception year?",
     )
 
     assert result.endswith("2003")
     retrieval.assert_awaited_once_with(
         query="When was Al Zaabi Group formed?",
         query_variants=(
-            "When was Al Zaabi Group formed? founded established inception year",
+            "What is the Al Zaabi Group inception year?",
         ),
     )
 
