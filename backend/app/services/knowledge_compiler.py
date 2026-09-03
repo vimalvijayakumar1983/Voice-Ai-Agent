@@ -62,8 +62,11 @@ class _PageKnowledge(BaseModel):
         "article",
         "other",
     ]
-    entities: list[_Entity] = Field(default_factory=list, max_length=50)
-    facts: list[_Fact] = Field(default_factory=list, max_length=100)
+    # OpenAI strict structured outputs require every object property to appear
+    # in ``required``. Empty arrays remain valid, but they cannot have schema
+    # defaults or the API rejects the request before inference with HTTP 400.
+    entities: list[_Entity] = Field(max_length=50)
+    facts: list[_Fact] = Field(max_length=100)
 
     model_config = {"extra": "forbid"}
 

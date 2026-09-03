@@ -805,6 +805,8 @@ function SourcesSection({ sources, canRepair, canRemove, busy, onRepair, onRemov
     const repairable = isWebsite;
     const detail = recovery?.status === 'queued' || recovery?.status === 'processing'
       ? recovery.message || `VAV is ${recoveryStageLabel(recovery.stage)}…`
+      : recovery?.status === 'failed' && isReady
+        ? recovery.message || 'Latest refresh failed; the previous approved content remains active.'
       : !source.retrieval_ready
         ? isWebsite ? 'VAV could not read this page yet. Use Repair page to recover it automatically.' : 'VAV cannot use this document yet. Re-upload it to run extraction and OCR repair.'
         : null;

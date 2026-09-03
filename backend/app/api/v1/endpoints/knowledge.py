@@ -1073,11 +1073,19 @@ async def repair_website_source(
     if isinstance(recovery, dict) and recovery.get("status") in {"queued", "processing"}:
         raise HTTPException(status_code=409, detail="This website page is already being repaired")
 
-    approval_invalidated = invalidate_knowledge_approval(kb)
     metadata = dict(source.source_metadata or {})
+    staged_refresh = bool(
+        kb.approval_status == "approved"
+        and source.status == "indexed"
+        and has_searchable_content(source)
+        and source.content_sha256
+    )
+    approval_invalidated = False if staged_refresh else invalidate_knowledge_approval(kb)
     attempts = int(metadata.get("recovery_attempts") or 0) + 1
     metadata["recovery_attempts"] = attempts
-    source.status = "processing"
+    metadata["staged_refresh"] = staged_refresh
+    if not staged_refresh:
+        source.status = "processing"
     source.error_message = None
     source.source_metadata = recovery_metadata(
         metadata,
@@ -1085,7 +1093,8 @@ async def repair_website_source(
         status="queued",
         message="VAV queued safe download, extraction, provider indexing and verification.",
     )
-    kb.sync_status = "processing"
+    if not staged_refresh:
+        kb.sync_status = "processing"
     kb.sync_error = None
     await record_audit_event(
         db,
@@ -1094,7 +1103,11 @@ async def repair_website_source(
         action="knowledge_source.website_repair_queued",
         resource_type="knowledge_source",
         resource_id=str(source.id),
-        details={"attempt": attempts, "approval_invalidated": approval_invalidated},
+        details={
+            "attempt": attempts,
+            "approval_invalidated": approval_invalidated,
+            "staged_refresh": staged_refresh,
+        },
     )
     # The worker must never race the request transaction that records the job.
     await db.commit()

@@ -96,6 +96,20 @@ async def test_ai_compilation_rejects_every_fact_without_verbatim_evidence():
     assert result.estimated_cost_usd == pytest.approx(0.004)
     assert result.structured["compiler"]["estimated_cost_aed"] == pytest.approx(0.01469)
 
+    schema = client.completions.requests[0]["response_format"]["json_schema"]["schema"]
+    assert set(schema["required"]) == {"page_type", "entities", "facts"}
+    assert set(schema["$defs"]["_Entity"]["required"]) == {
+        "name",
+        "entity_type",
+        "evidence",
+    }
+    assert set(schema["$defs"]["_Fact"]["required"]) == {
+        "subject",
+        "predicate",
+        "value",
+        "evidence",
+    }
+
 
 @pytest.mark.asyncio
 async def test_ai_verified_mode_requires_an_openai_key():

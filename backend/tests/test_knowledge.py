@@ -660,6 +660,91 @@ async def test_failed_website_source_can_be_queued_for_vav_repair(
 
 
 @pytest.mark.asyncio
+async def test_approved_ready_source_refresh_keeps_previous_version_live(
+    client,
+    auth_headers,
+    tenant,
+    db,
+    monkeypatch,
+):
+    queued: list[tuple[list[str], str]] = []
+
+    from app.tasks import knowledge_tasks
+
+    monkeypatch.setattr(
+        knowledge_tasks.repair_website_source,
+        "apply_async",
+        lambda *, args, queue: queued.append((args, queue)),
+    )
+    monkeypatch.setattr(knowledge_tasks, "async_session_factory", lambda: db)
+    knowledge = KnowledgeBase(
+        tenant_id=tenant.id,
+        name="Approved website knowledge",
+        provider="smallest",
+        sync_status="ready",
+        approval_status="approved",
+        published_at=datetime.now(UTC),
+        source_count=1,
+        indexed_source_count=1,
+    )
+    source = KnowledgeSource(
+        tenant_id=tenant.id,
+        source_type="website",
+        name="Contact",
+        location="https://company.example/contact",
+        content="Previously approved contact information.",
+        raw_content="Previously approved contact information.",
+        content_sha256="a" * 64,
+        status="indexed",
+        provider_item_id="provider-contact",
+    )
+    knowledge.sources.append(source)
+    db.add(knowledge)
+    await db.commit()
+
+    response = await client.post(
+        f"/api/v1/knowledge/{knowledge.id}/sources/{source.id}/repair",
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["approval_status"] == "approved"
+    assert body["sync_status"] == "ready"
+    assert body["sources"][0]["status"] == "indexed"
+    assert body["sources"][0]["source_metadata"]["staged_refresh"] is True
+    assert queued == [([str(tenant.id), str(knowledge.id), str(source.id)], "knowledge")]
+
+    await knowledge_tasks._set_stage(
+        tenant.id,
+        knowledge.id,
+        source.id,
+        "fetching",
+        "Downloading the candidate page.",
+    )
+    await knowledge_tasks._mark_failed(
+        tenant.id,
+        knowledge.id,
+        source.id,
+        message="The candidate page timed out.",
+        code="download_timeout",
+    )
+    db.expire_all()
+    refreshed = await db.get(KnowledgeBase, knowledge.id)
+    refreshed_source = await db.get(KnowledgeSource, source.id)
+
+    assert refreshed.approval_status == "approved"
+    assert refreshed.sync_status == "ready"
+    assert refreshed_source.status == "indexed"
+    assert refreshed_source.content == "Previously approved contact information."
+    assert refreshed_source.source_metadata["recovery"]["status"] == "failed"
+    assert (
+        "previous approved content remains active"
+        in refreshed_source.source_metadata["recovery"]["message"]
+    )
+
+
+@pytest.mark.asyncio
 async def test_homepage_crawl_is_persisted_and_queued(
     client,
     auth_headers,

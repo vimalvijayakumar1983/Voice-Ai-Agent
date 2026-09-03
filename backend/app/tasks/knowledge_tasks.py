@@ -200,20 +200,32 @@ async def _set_stage(
 ) -> None:
     session, knowledge_base, source = await _context(tenant_id, kb_id, source_id)
     try:
-        source.status = "processing"
+        metadata = dict(source.source_metadata or {})
+        staged_refresh = bool(
+            metadata.get("staged_refresh")
+            and source.status == "indexed"
+            and has_searchable_content(source)
+        )
+        if not staged_refresh:
+            source.status = "processing"
         source.error_message = None
         source.source_metadata = recovery_metadata(
-            source.source_metadata,
+            metadata,
             stage=stage,
             message=message,
         )
-        knowledge_base.sync_status = "processing"
+        if not staged_refresh:
+            knowledge_base.sync_status = "processing"
         knowledge_base.sync_error = None
-        invalidate_knowledge_approval(knowledge_base)
+        if not staged_refresh:
+            invalidate_knowledge_approval(knowledge_base)
         await session.commit()
     finally:
         await session.close()
-    await _mark_crawl_pages_for_source(source_id, status="processing")
+    await _mark_crawl_pages_for_source(
+        source_id,
+        status="indexed" if staged_refresh else "processing",
+    )
 
 
 async def _refresh_crawl(crawl_id: UUID) -> None:
@@ -654,6 +666,7 @@ async def _repair(tenant_id: UUID, kb_id: UUID, source_id: UUID) -> None:
     existing_content_sha256 = source.content_sha256
     existing_compiled_content = source.content
     existing_structured_content = source.structured_content
+    staged_refresh = bool(source_metadata.get("staged_refresh"))
     try:
         openai_config = await load_provider_config(session, tenant_id, "openai")
     except ProviderCredentialError:
@@ -710,6 +723,22 @@ async def _repair(tenant_id: UUID, kb_id: UUID, source_id: UUID) -> None:
         f"Extracted {len(page.text):,} readable characters using {page.method}.",
     )
     raw_content_sha256 = hashlib.sha256(page.text.encode("utf-8")).hexdigest()
+    if staged_refresh and existing_content_sha256 != raw_content_sha256:
+        # Keep the last approved version live while downloading. Only move the
+        # knowledge base back through review after an actual content change is
+        # proven, never merely because an operator clicked Refresh.
+        session, knowledge_base, source = await _context(tenant_id, kb_id, source_id)
+        try:
+            metadata = dict(source.source_metadata or {})
+            metadata["staged_refresh"] = False
+            source.source_metadata = metadata
+            source.status = "processing"
+            knowledge_base.sync_status = "processing"
+            invalidate_knowledge_approval(knowledge_base)
+            await session.commit()
+        finally:
+            await session.close()
+        staged_refresh = False
     reused_compilation = bool(
         existing_content_sha256 == raw_content_sha256
         and existing_compiled_content
@@ -717,6 +746,7 @@ async def _repair(tenant_id: UUID, kb_id: UUID, source_id: UUID) -> None:
         and (existing_structured_content.get("compiler") or {}).get("version") == COMPILER_VERSION
         and (existing_structured_content.get("compiler") or {}).get("requested_mode")
         == requested_mode
+        and not (existing_structured_content.get("compiler") or {}).get("warning")
     )
     if reused_compilation:
         compiler = existing_structured_content.get("compiler") or {}
@@ -822,6 +852,7 @@ async def _repair(tenant_id: UUID, kb_id: UUID, source_id: UUID) -> None:
         source.provider_item_id = provider_item_id
         source.error_message = None
         metadata = dict(source.source_metadata or {})
+        metadata.pop("staged_refresh", None)
         metadata.update(
             {
                 "extraction_method": page.method,
@@ -942,15 +973,24 @@ async def _mark_failed(
     except WebsiteRecoveryError:
         return
     try:
-        source.status = "failed"
-        source.error_message = message[:1000]
         metadata = dict(source.source_metadata or {})
+        preserve_previous = bool(
+            metadata.pop("staged_refresh", False)
+            and source.status == "indexed"
+            and has_searchable_content(source)
+        )
+        source.status = "indexed" if preserve_previous else "failed"
+        source.error_message = None if preserve_previous else message[:1000]
         metadata["recovery_error_code"] = code
         source.source_metadata = recovery_metadata(
             metadata,
             stage="failed",
             status="failed",
-            message=message,
+            message=(
+                f"Latest refresh failed; the previous approved content remains active. {message}"
+                if preserve_previous
+                else message
+            ),
         )
         source.last_synced_at = datetime.now(UTC)
         _recount(knowledge_base)
@@ -959,7 +999,7 @@ async def _mark_failed(
         await session.close()
     await _mark_crawl_pages_for_source(
         source_id,
-        status="failed",
+        status="indexed" if preserve_previous else "failed",
         error_code=code,
         error_message=message,
     )
