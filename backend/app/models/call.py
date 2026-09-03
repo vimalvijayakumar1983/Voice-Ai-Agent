@@ -86,6 +86,7 @@ class CallSummary(TenantScopedModel):
     key_topics: Mapped[dict | None] = mapped_column(JSONB)  # ["topic1", "topic2"]
     action_items: Mapped[dict | None] = mapped_column(JSONB)  # ["item1", "item2"]
     sentiment: Mapped[str | None] = mapped_column(String(20))  # positive, neutral, negative
+    disposition_details: Mapped[dict | None] = mapped_column(JSONB)
 
     # Relationships
     call = relationship("Call", back_populates="summary")

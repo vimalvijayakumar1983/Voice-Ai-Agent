@@ -34,6 +34,7 @@ class Agent(TenantScopedModel):
     model_name: Mapped[str] = mapped_column(String(100), default="electron")
     temperature: Mapped[float] = mapped_column(Float, default=0.7)
     max_tokens: Mapped[int] = mapped_column(Integer, default=500)
+    disposition_profile: Mapped[str] = mapped_column(String(30), default="general")
 
     # Voice Configuration
     voice_provider: Mapped[str] = mapped_column(String(50), default="smallest")

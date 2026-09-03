@@ -9,6 +9,11 @@ import structlog
 from app.core.config import settings
 from app.livekit_runtime.browser_session import delete_browser_room
 from app.livekit_runtime.constants import BROWSER_TOKEN_TTL_SECONDS
+from app.services.call_disposition import (
+    disposition_catalog,
+    infer_disposition_profile,
+    normalize_call_analysis,
+)
 from app.tasks.async_runner import run_async as _run_async
 from app.tasks.worker import celery_app
 
@@ -33,7 +38,7 @@ def _has_substantive_caller_input(turns: object) -> bool:
     )
 
 
-def _insufficient_transcript_summary() -> dict:
+def _insufficient_transcript_summary(existing_disposition: str | None = None) -> dict:
     """Build an evidence-safe outcome without asking an LLM to infer one."""
     return {
         "summary": (
@@ -43,7 +48,28 @@ def _insufficient_transcript_summary() -> dict:
         "key_topics": [],
         "action_items": [],
         "sentiment": "neutral",
-        "disposition": "unknown",
+        "disposition": existing_disposition or "unknown",
+        "resolution": "unknown",
+        "confidence": 0.0,
+        "evidence": [],
+        "needs_review": True,
+        "follow_up": {"required": False},
+    }
+
+
+def _analysis_unavailable_summary(existing_disposition: str | None = None) -> dict:
+    """Persist a visible review state when optional post-call AI is unavailable."""
+    return {
+        "summary": "Automated call analysis was unavailable. Review the transcript before action.",
+        "key_topics": [],
+        "action_items": ["Review the call transcript"],
+        "sentiment": "neutral",
+        "disposition": existing_disposition or "unknown",
+        "resolution": "unknown",
+        "confidence": 0.0,
+        "evidence": [],
+        "needs_review": True,
+        "follow_up": {"required": True, "action": "Review the call transcript", "owner": None},
     }
 
 
@@ -255,6 +281,31 @@ def process_completed_call(
             countdown=countdown,
         ) from None
     return "processed" if webhook_payload is not None else "missing"
+
+
+@celery_app.task(
+    name="app.tasks.call_tasks.reprocess_call_disposition",
+    bind=True,
+    max_retries=2,
+)
+def reprocess_call_disposition(self, call_id: str, tenant_id: str):
+    """Rebuild a stored call outcome without replaying lifecycle webhooks or billing."""
+    try:
+        result = _run_async(
+            _process_completed_call_async(call_id, tenant_id, force_analysis=True)
+        )
+    except (TypeError, ValueError):
+        return "invalid_identity"
+    except Exception as exc:
+        if self.request.retries >= self.max_retries:
+            logger.error(
+                "call_disposition_reprocessing_exhausted",
+                call_id=call_id,
+                error_type=type(exc).__name__,
+            )
+            raise RuntimeError("call_disposition_reprocessing_failed") from None
+        raise self.retry(exc=RuntimeError("call_disposition_reprocessing_failed"), countdown=30)
+    return "processed" if result is not None else "missing"
 
 
 @celery_app.task(
@@ -622,13 +673,19 @@ async def _sweep_stale_realtime_calls_async(
     return recovered
 
 
-async def _process_completed_call_async(call_id: str, tenant_id: str):
+async def _process_completed_call_async(
+    call_id: str,
+    tenant_id: str,
+    *,
+    force_analysis: bool = False,
+):
     from datetime import datetime
 
     from sqlalchemy import select
     from sqlalchemy.exc import IntegrityError
 
     from app.core.database import async_session_factory
+    from app.models.agent import Agent
     from app.models.billing import UsageRecord
     from app.models.call import Call, CallSummary, CallTranscript
 
@@ -638,6 +695,9 @@ async def _process_completed_call_async(call_id: str, tenant_id: str):
     should_generate_summary = False
     has_substantive_caller_input = False
     openai_api_key: str | None = None
+    disposition_profile = "general"
+    agent_goal: str | None = None
+    existing_disposition: str | None = None
 
     async with async_session_factory() as db:
         from app.services.provider_credentials import load_provider_config
@@ -659,6 +719,21 @@ async def _process_completed_call_async(call_id: str, tenant_id: str):
         call = result.scalar_one_or_none()
         if not call:
             return None
+        existing_disposition = call.disposition
+
+        agent = (
+            await db.scalar(
+                select(Agent).where(
+                    Agent.id == call.agent_id,
+                    Agent.tenant_id == tenant_uuid,
+                )
+            )
+            if call.agent_id
+            else None
+        )
+        disposition_profile = infer_disposition_profile(agent)
+        if agent is not None:
+            agent_goal = str(agent.description or agent.system_prompt or "")[:1200]
 
         transcript_result = await db.execute(
             select(CallTranscript).where(
@@ -669,6 +744,13 @@ async def _process_completed_call_async(call_id: str, tenant_id: str):
         transcript = transcript_result.scalar_one_or_none()
         if transcript is not None:
             transcript_text = str(transcript.full_text or "").strip()
+            if not transcript_text and isinstance(transcript.turns, list):
+                transcript_text = "\n".join(
+                    f"{str(turn.get('role') or 'unknown').title()}: "
+                    f"{str(turn.get('content') or '').strip()}"
+                    for turn in transcript.turns
+                    if isinstance(turn, dict) and str(turn.get("content") or "").strip()
+                )
             has_substantive_caller_input = _has_substantive_caller_input(transcript.turns)
             summary_result = await db.execute(
                 select(CallSummary).where(
@@ -681,7 +763,9 @@ async def _process_completed_call_async(call_id: str, tenant_id: str):
                 isinstance(call.call_metadata, dict)
                 and call.call_metadata.get("smallest_analytics") is not None
             )
-            should_generate_summary = summary is None and not has_provider_analytics
+            should_generate_summary = force_analysis or summary is None or not bool(
+                summary.disposition_details
+            )
 
         # Record usage
         if call.duration_seconds and call.duration_seconds > 0:
@@ -728,7 +812,7 @@ async def _process_completed_call_async(call_id: str, tenant_id: str):
             # Agent greetings and prompts are not evidence of caller intent.
             # Bypass the model so it cannot turn a one-sided transcript into a
             # fabricated disposition, contact detail, or follow-up action.
-            summary_data = _insufficient_transcript_summary()
+            summary_data = _insufficient_transcript_summary(existing_disposition)
         elif transcript_text:
             try:
                 from app.ai.conversation import ConversationEngine, conversation_engine
@@ -739,7 +823,12 @@ async def _process_completed_call_async(call_id: str, tenant_id: str):
                     if openai_api_key
                     else conversation_engine
                 )
-                summary_data = await engine.generate_call_summary(transcript_text)
+                summary_data = await engine.generate_call_summary(
+                    transcript_text,
+                    disposition_profile=disposition_profile,
+                    allowed_dispositions=disposition_catalog(disposition_profile),
+                    agent_goal=agent_goal,
+                )
             except Exception as exc:
                 # Billing and lifecycle delivery should still complete when an
                 # optional LLM summary provider is unavailable.
@@ -748,8 +837,10 @@ async def _process_completed_call_async(call_id: str, tenant_id: str):
                     call_id=call_id,
                     error_type=type(exc).__name__,
                 )
+                summary_data = _analysis_unavailable_summary(existing_disposition)
 
     if summary_data is not None:
+        summary_data = normalize_call_analysis(summary_data, profile=disposition_profile)
         async with async_session_factory() as db:
             call = (
                 await db.execute(
@@ -773,7 +864,7 @@ async def _process_completed_call_async(call_id: str, tenant_id: str):
                     isinstance(call.call_metadata, dict)
                     and call.call_metadata.get("smallest_analytics") is not None
                 )
-                if summary is None and not has_provider_analytics:
+                if summary is None:
                     try:
                         async with db.begin_nested():
                             db.add(
@@ -784,16 +875,34 @@ async def _process_completed_call_async(call_id: str, tenant_id: str):
                                     key_topics=summary_data.get("key_topics", []),
                                     action_items=summary_data.get("action_items", []),
                                     sentiment=summary_data.get("sentiment"),
+                                    disposition_details=summary_data.get("disposition_details"),
                                 )
                             )
                             await db.flush()
                     except IntegrityError:
                         # A provider analytics callback won the conditional
                         # insert; its authoritative summary is preserved.
-                        pass
-                    else:
-                        if summary_data.get("disposition") and not call.disposition:
+                        summary = await db.scalar(
+                            select(CallSummary).where(
+                                CallSummary.call_id == call_uuid,
+                                CallSummary.tenant_id == tenant_uuid,
+                            )
+                        )
+                        if summary is not None and not summary.disposition_details:
+                            summary.disposition_details = summary_data["disposition_details"]
                             call.disposition = summary_data["disposition"]
+                    else:
+                        call.disposition = summary_data["disposition"]
+                elif force_analysis or not summary.disposition_details:
+                    # Provider summaries remain authoritative, while VAV adds a
+                    # provider-neutral outcome contract for consistent reporting.
+                    if not has_provider_analytics:
+                        summary.summary = summary_data["summary"]
+                        summary.key_topics = summary_data["key_topics"]
+                        summary.action_items = summary_data["action_items"]
+                        summary.sentiment = summary_data["sentiment"]
+                    summary.disposition_details = summary_data["disposition_details"]
+                    call.disposition = summary_data["disposition"]
                 await db.commit()
 
     async with async_session_factory() as db:
@@ -809,5 +918,8 @@ async def _process_completed_call_async(call_id: str, tenant_id: str):
         "status": call.status,
         "duration_seconds": call.duration_seconds,
         "disposition": call.disposition,
+        "disposition_details": (
+            call.summary.disposition_details if call.summary is not None else None
+        ),
         "direction": call.direction,
     }

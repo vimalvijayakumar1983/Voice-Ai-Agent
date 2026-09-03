@@ -65,6 +65,7 @@ export interface VoiceAgent {
   system_prompt: string;
   model_provider: string;
   model_name: string;
+  disposition_profile: 'general' | 'receptionist' | 'customer_support' | 'appointment' | 'sales' | 'collections';
   voice_provider: string;
   voice_id: string;
   language: string;
@@ -113,6 +114,7 @@ export interface AgentAIDraftResponse {
     greeting_message: string | null;
     model_provider: string;
     model_name: string;
+    disposition_profile: 'general' | 'receptionist' | 'customer_support' | 'appointment' | 'sales' | 'collections';
     voice_provider: 'smallest' | 'sarvam' | 'elevenlabs' | 'inworld';
     voice_id: string;
     temperature: number;
@@ -262,6 +264,7 @@ export interface AgentTemplate {
   speech_rate: number;
   temperature: number;
   timezone: string;
+  disposition_profile: 'general' | 'receptionist' | 'customer_support' | 'appointment' | 'sales' | 'collections';
 }
 
 export interface AgentProviderCatalog {
@@ -540,6 +543,23 @@ export interface CallSummary {
   key_topics: string[] | null;
   action_items: string[] | null;
   sentiment: string | null;
+  disposition_details: {
+    version: string;
+    profile: string;
+    primary: string;
+    secondary: string | null;
+    resolution: string;
+    customer_intent: string | null;
+    follow_up: {
+      required: boolean;
+      action: string | null;
+      owner: string | null;
+      due_at: string | null;
+    };
+    confidence: number;
+    evidence: string[];
+    needs_review: boolean;
+  } | null;
 }
 
 export interface ProviderHistorySyncResult {
@@ -1817,6 +1837,12 @@ class ApiClient {
 
   async getCallSummary(callId: string) {
     return this.request<CallSummary>(`/api/v1/calls/${callId}/summary`);
+  }
+
+  async reanalyzeCall(callId: string) {
+    return this.request<{ status: string; call_id: string }>(`/api/v1/calls/${callId}/reanalyze`, {
+      method: 'POST',
+    });
   }
 
   // Campaigns

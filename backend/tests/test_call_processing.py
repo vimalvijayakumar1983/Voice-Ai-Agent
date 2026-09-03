@@ -100,6 +100,7 @@ async def test_completed_call_processing_is_tenant_scoped_and_idempotent(
     assert usage.quantity == 2.0
     assert processed_call is not None
     assert processed_call.disposition == "callback"
+    assert processed_call.summary.disposition_details["primary"] == "callback"
 
     wrong_tenant_payload = await _process_completed_call_async(str(call.id), str(uuid4()))
     assert wrong_tenant_payload is None
@@ -179,6 +180,7 @@ async def test_assistant_only_transcript_gets_evidence_safe_unknown_outcome(
     assert summary.key_topics == []
     assert summary.action_items == []
     assert summary.sentiment == "neutral"
+    assert summary.disposition_details["needs_review"] is True
 
 
 @pytest.mark.asyncio
@@ -212,7 +214,7 @@ async def test_provider_analytics_wins_while_local_summary_runs_without_db_lock(
     call_id = call.id
     tenant_id = tenant.id
 
-    async def provider_analytics_arrives(_transcript):
+    async def provider_analytics_arrives(_transcript, **_kwargs):
         # This separate transaction must be able to commit while the external
         # summary await is in flight.
         async with session_factory() as callback_db:
@@ -248,7 +250,8 @@ async def test_provider_analytics_wins_while_local_summary_runs_without_db_lock(
         stored_call = await session.get(Call, call_id)
     assert summarize.await_count == 1
     assert summary.summary == "Authoritative provider summary"
-    assert stored_call.disposition is None
+    assert stored_call.disposition == "unknown"
+    assert summary.disposition_details["needs_review"] is True
 
 
 @pytest.mark.asyncio

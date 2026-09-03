@@ -12,7 +12,7 @@ logger = structlog.get_logger()
 # Keep this in lockstep with the Alembic script head. A test compares the two so
 # adding a migration without updating API readiness fails CI instead of making a
 # newly deployed service advertise an older schema as ready.
-EXPECTED_DATABASE_REVISIONS = frozenset({"20260903_019"})
+EXPECTED_DATABASE_REVISIONS = frozenset({"20260903_020"})
 READINESS_TIMEOUT_SECONDS = 3.0
 
 

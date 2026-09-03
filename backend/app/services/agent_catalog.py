@@ -772,6 +772,7 @@ def normalize_voices(
 AGENT_TEMPLATES: list[dict[str, Any]] = [
     {
         "id": "receptionist",
+        "disposition_profile": "receptionist",
         "name": "AI Receptionist",
         "category": "Inbound",
         "description": (
@@ -810,6 +811,7 @@ Summarize the agreed next step, ask whether anything else is needed, and close p
     },
     {
         "id": "customer_support",
+        "disposition_profile": "customer_support",
         "name": "Customer Support",
         "category": "Service",
         "description": (
@@ -849,6 +851,7 @@ RULES
     },
     {
         "id": "lead_qualification",
+        "disposition_profile": "sales",
         "name": "Lead Qualification",
         "category": "Sales",
         "description": (
@@ -887,6 +890,7 @@ CRM updates.""",
     },
     {
         "id": "appointment_booking",
+        "disposition_profile": "appointment",
         "name": "Appointment Booking",
         "category": "Scheduling",
         "description": (
@@ -921,6 +925,7 @@ GUARDRAILS
     },
     {
         "id": "payment_reminder",
+        "disposition_profile": "collections",
         "name": "Payment Reminder",
         "category": "Collections",
         "description": (

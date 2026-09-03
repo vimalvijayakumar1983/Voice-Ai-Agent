@@ -172,6 +172,8 @@ export default function Calls() {
   const [detailLoading, setDetailLoading] = useState(false);
   const [transcriptError, setTranscriptError] = useState('');
   const [summaryError, setSummaryError] = useState('');
+  const [analysisReprocessing, setAnalysisReprocessing] = useState(false);
+  const [analysisNotice, setAnalysisNotice] = useState('');
   const [recordingUrl, setRecordingUrl] = useState('');
   const [recordingLoading, setRecordingLoading] = useState(false);
   const [recordingError, setRecordingError] = useState('');
@@ -289,6 +291,20 @@ export default function Calls() {
     }
   };
 
+  const reanalyzeSelectedCall = async () => {
+    if (!selectedCall) return;
+    setAnalysisReprocessing(true);
+    setAnalysisNotice('');
+    try {
+      await api.reanalyzeCall(selectedCall.id);
+      setAnalysisNotice('Outcome analysis queued. Refresh this call in a few seconds.');
+    } catch (error) {
+      setAnalysisNotice(error instanceof Error ? error.message : 'Outcome analysis could not be queued.');
+    } finally {
+      setAnalysisReprocessing(false);
+    }
+  };
+
   const releaseRecording = useCallback(() => {
     if (recordingAudioRef.current) {
       recordingAudioRef.current.pause();
@@ -311,6 +327,7 @@ export default function Calls() {
 
   const openDetails = (call: CallRecord) => {
     resetRecording();
+    setAnalysisNotice('');
     setSelectedCall(call);
     void loadDetails(call.id);
   };
@@ -580,7 +597,7 @@ export default function Calls() {
                     <td><span className={`badge ${call.direction === 'inbound' ? 'badge-info' : 'badge-warning'}`}>{call.direction}</span></td>
                     <td><span className={`badge ${statusBadge(call.status)}`}>{call.status.replace(/_/g, ' ')}</span></td>
                     <td>{formatDuration(call.duration_seconds)}</td>
-                    <td>{call.disposition || '—'}</td>
+                    <td>{call.disposition?.replace(/_/g, ' ') || '—'}</td>
                     <td>{languages.length ? languages.map(languageName).join(', ') : 'Not captured'}</td>
                     <td className="table-muted">{formatDate(call.created_at)}</td>
                     <td><button type="button" className="btn btn-secondary btn-sm" onClick={() => openDetails(call)}>Details</button></td>
@@ -624,7 +641,7 @@ export default function Calls() {
                   <div><dt>Started</dt><dd>{formatDate(selectedCall.started_at)}</dd></div>
                   <div><dt>Answered</dt><dd>{formatDate(selectedCall.answered_at)}</dd></div>
                   <div><dt>Ended</dt><dd>{formatDate(selectedCall.ended_at)}</dd></div>
-                  <div><dt>Disposition</dt><dd>{selectedCall.disposition || 'Not reported'}</dd></div>
+                  <div><dt>Disposition</dt><dd>{selectedCall.disposition?.replace(/_/g, ' ') || 'Not reported'}</dd></div>
                   {selectedCall.cost_cents !== null ? <div><dt>Provider cost</dt><dd>{selectedCall.cost_cents} cents</dd></div> : null}
                   {selectedCall.sentiment_score !== null ? <div><dt>Sentiment score</dt><dd>{selectedCall.sentiment_score.toFixed(2)}</dd></div> : null}
                   {typeof selectedMetadata.provider_latency_ms === 'number' ? <div><dt>Provider latency</dt><dd>{selectedMetadata.provider_latency_ms} ms</dd></div> : null}
@@ -695,14 +712,34 @@ export default function Calls() {
               </section>
 
               <section className="detail-section" aria-labelledby="call-summary-heading">
-                <div className="detail-section-title"><ListChecks size={16} /><h3 id="call-summary-heading">AI summary</h3>{summary?.sentiment ? <span className="badge badge-info">{summary.sentiment}</span> : null}</div>
+                <div className="detail-section-title">
+                  <ListChecks size={16} />
+                  <h3 id="call-summary-heading">AI summary and outcome</h3>
+                  {summary?.sentiment ? <span className="badge badge-info">{summary.sentiment}</span> : null}
+                  {summary?.disposition_details?.needs_review ? <span className="badge badge-warning">Needs review</span> : null}
+                  <button type="button" className="btn btn-secondary btn-sm" disabled={analysisReprocessing || !transcript} onClick={() => void reanalyzeSelectedCall()}>
+                    <RefreshCw size={12} /> {analysisReprocessing ? 'Queuing…' : 'Re-analyze'}
+                  </button>
+                </div>
+                {analysisNotice ? <p className={styles.recordingNote} role="status">{analysisNotice}</p> : null}
                 {detailLoading ? (
                   <p className="detail-loading" role="status">Loading summary…</p>
                 ) : summary ? (
                   <div className="summary-content" dir="auto">
                     <p>{summary.summary}</p>
+                    {summary.disposition_details ? (
+                      <dl className="call-detail-grid">
+                        <div><dt>Business outcome</dt><dd>{summary.disposition_details.primary.replace(/_/g, ' ')}</dd></div>
+                        <div><dt>Resolution</dt><dd>{summary.disposition_details.resolution.replace(/_/g, ' ')}</dd></div>
+                        <div><dt>Workflow</dt><dd>{summary.disposition_details.profile.replace(/_/g, ' ')}</dd></div>
+                        <div><dt>Confidence</dt><dd>{Math.round(summary.disposition_details.confidence * 100)}%</dd></div>
+                        {summary.disposition_details.customer_intent ? <div><dt>Customer intent</dt><dd>{summary.disposition_details.customer_intent}</dd></div> : null}
+                        <div><dt>Follow-up</dt><dd>{summary.disposition_details.follow_up.required ? summary.disposition_details.follow_up.action || 'Required' : 'Not required'}</dd></div>
+                      </dl>
+                    ) : null}
                     {summary.key_topics?.length ? <div><h4>Key topics</h4><div className="topic-list">{summary.key_topics.map((topic) => <span className="meta-chip" key={topic}>{topic}</span>)}</div></div> : null}
                     {summary.action_items?.length ? <div><h4>Action items</h4><ol>{summary.action_items.map((item, index) => <li key={`${index}-${item}`}>{item}</li>)}</ol></div> : null}
+                    {summary.disposition_details?.evidence.length ? <div><h4>Evidence</h4><ul>{summary.disposition_details.evidence.map((item, index) => <li key={`${index}-${item}`}>{item}</li>)}</ul></div> : null}
                   </div>
                 ) : (
                   <div className="detail-empty" role={summaryError.includes('not available') ? undefined : 'alert'}><p>{summaryError || 'No summary data was returned.'}</p>{summaryError && !summaryError.includes('not available') ? <button type="button" className={`btn btn-secondary btn-sm ${styles.detailRetry}`} onClick={() => void loadDetails(selectedCall.id)}><RefreshCw size={12} /> Retry details</button> : null}</div>

@@ -54,6 +54,9 @@ class AgentCreate(BaseModel):
     model_name: Literal["electron"] = "electron"
     temperature: float = Field(0.7, ge=0, le=2)
     max_tokens: int = Field(500, ge=32, le=8192)
+    disposition_profile: Literal[
+        "general", "receptionist", "customer_support", "appointment", "sales", "collections"
+    ] = "general"
     voice_provider: Literal["smallest", "sarvam", "elevenlabs", "inworld"] = "smallest"
     voice_id: str = Field("", max_length=100)
     language: str = Field("en", min_length=2, max_length=63)
@@ -112,6 +115,9 @@ class AgentUpdate(BaseModel):
     model_name: Literal["electron"] | None = None
     temperature: float | None = Field(None, ge=0, le=2)
     max_tokens: int | None = Field(None, ge=32, le=8192)
+    disposition_profile: Literal[
+        "general", "receptionist", "customer_support", "appointment", "sales", "collections"
+    ] | None = None
     voice_provider: Literal["smallest", "sarvam", "elevenlabs", "inworld"] | None = None
     voice_id: str | None = Field(None, max_length=100)
     language: str | None = Field(None, min_length=2, max_length=63)
@@ -150,6 +156,7 @@ class AgentUpdate(BaseModel):
             "model_name",
             "temperature",
             "max_tokens",
+            "disposition_profile",
             "voice_provider",
             "voice_id",
             "language",
@@ -180,6 +187,7 @@ class AgentResponse(BaseModel):
     model_name: str
     temperature: float
     max_tokens: int
+    disposition_profile: str
     voice_provider: str
     voice_id: str
     language: str
@@ -384,6 +392,9 @@ class AgentTemplate(BaseModel):
     speech_rate: float = 1.0
     temperature: float = 0.5
     timezone: str = "Asia/Dubai"
+    disposition_profile: Literal[
+        "general", "receptionist", "customer_support", "appointment", "sales", "collections"
+    ] = "general"
 
 
 class ProviderFieldCapability(BaseModel):

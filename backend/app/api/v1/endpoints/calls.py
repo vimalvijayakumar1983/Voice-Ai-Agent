@@ -1123,3 +1123,43 @@ async def get_call_summary(
     if not summary:
         raise HTTPException(status_code=404, detail="Summary not found")
     return CallSummaryResponse.model_validate(summary)
+
+
+@router.post("/{call_id}/reanalyze", status_code=202)
+async def reanalyze_call(
+    call_id: UUID,
+    current_user: CurrentUser = Depends(require_role("owner", "admin", "member")),
+    db: AsyncSession = Depends(get_db),
+):
+    """Queue safe post-call outcome analysis for one tenant-owned call."""
+    call = await db.scalar(
+        select(Call).where(
+            Call.id == call_id,
+            Call.tenant_id == current_user.tenant_id,
+        )
+    )
+    if call is None:
+        raise HTTPException(status_code=404, detail="Call not found")
+    transcript = await db.scalar(
+        select(CallTranscript.id).where(
+            CallTranscript.call_id == call_id,
+            CallTranscript.tenant_id == current_user.tenant_id,
+        )
+    )
+    if transcript is None:
+        raise HTTPException(status_code=409, detail="A transcript is required before reanalysis")
+
+    from app.tasks.call_tasks import reprocess_call_disposition
+
+    reprocess_call_disposition.delay(str(call.id), str(current_user.tenant_id))
+    await record_audit_event(
+        db,
+        tenant_id=current_user.tenant_id,
+        actor_user_id=current_user.id,
+        action="call.disposition_reanalysis_requested",
+        resource_type="call",
+        resource_id=str(call.id),
+        details={"previous_disposition": call.disposition},
+    )
+    await db.commit()
+    return {"status": "queued", "call_id": str(call.id)}

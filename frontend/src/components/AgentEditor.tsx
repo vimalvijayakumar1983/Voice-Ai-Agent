@@ -27,6 +27,7 @@ export interface AgentEditorValues {
   greeting_message: string;
   model_provider: string;
   model_name: string;
+  disposition_profile: 'general' | 'receptionist' | 'customer_support' | 'appointment' | 'sales' | 'collections';
   voice_provider: string;
   voice_id: string;
   temperature: number;
@@ -45,6 +46,7 @@ export const defaultAgentValues: AgentEditorValues = {
   greeting_message: '',
   model_provider: 'smallest',
   model_name: 'electron',
+  disposition_profile: 'general',
   voice_provider: 'smallest',
   voice_id: '',
   temperature: 0.7,
@@ -103,6 +105,7 @@ export default function AgentEditor({
   const greetingId = useId();
   const primaryLanguageId = useId();
   const modelId = useId();
+  const dispositionProfileId = useId();
   const timezoneId = useId();
   const speechRateId = useId();
   const allVoices = useMemo(() => catalog?.voices ?? [], [catalog?.voices]);
@@ -230,6 +233,7 @@ export default function AgentEditor({
       speech_rate: template.speech_rate,
       temperature: template.temperature,
       timezone: template.timezone,
+      disposition_profile: template.disposition_profile,
       ...switching,
     }, form.supported_languages.length);
   };
@@ -431,6 +435,18 @@ export default function AgentEditor({
           <div><span className="section-icon"><Sparkles size={14} /></span><h3>Conversation tuning</h3></div>
         </div>
         <div className="form-grid">
+          <div className="form-group">
+            <label htmlFor={dispositionProfileId}>Call outcome workflow</label>
+            <select id={dispositionProfileId} value={form.disposition_profile} onChange={(event) => setForm({ ...form, disposition_profile: event.target.value as AgentEditorValues['disposition_profile'] })}>
+              <option value="general">General</option>
+              <option value="receptionist">Receptionist</option>
+              <option value="customer_support">Customer support</option>
+              <option value="appointment">Appointment booking</option>
+              <option value="sales">Sales and qualification</option>
+              <option value="collections">Collections</option>
+            </select>
+            <p className="form-hint">Controls the validated post-call dispositions, resolution and follow-up fields.</p>
+          </div>
           {form.voice_provider !== 'smallest' ? (
             <div className="form-group">
               <label htmlFor={modelId}>Live phone runtime</label>

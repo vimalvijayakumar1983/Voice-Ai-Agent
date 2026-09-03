@@ -121,6 +121,7 @@ class CallSummaryResponse(BaseModel):
     key_topics: list[str] | None
     action_items: list[str] | None
     sentiment: str | None
+    disposition_details: dict | None
 
     model_config = {"from_attributes": True}
 
