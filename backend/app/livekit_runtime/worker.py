@@ -19,6 +19,7 @@ import logging
 import math
 import os
 import re
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -570,7 +571,13 @@ def _usage_snapshot(usage: object) -> dict[str, int | float]:
     result: dict[str, int | float] = {
         "llm_input_tokens": 0,
         "llm_output_tokens": 0,
+        "llm_input_audio_tokens": 0,
+        "llm_output_audio_tokens": 0,
+        "llm_input_text_tokens": 0,
+        "llm_output_text_tokens": 0,
+        "realtime_session_seconds": 0.0,
         "tts_characters": 0,
+        "tts_audio_seconds": 0.0,
         "stt_audio_seconds": 0.0,
     }
     for item in getattr(usage, "model_usage", []) or []:
@@ -578,10 +585,27 @@ def _usage_snapshot(usage: object) -> dict[str, int | float]:
         if usage_type == "llm_usage":
             result["llm_input_tokens"] += int(_usage_value(item, "input_tokens"))
             result["llm_output_tokens"] += int(_usage_value(item, "output_tokens"))
+            result["llm_input_audio_tokens"] += int(
+                _usage_value(item, "input_audio_tokens")
+            )
+            result["llm_output_audio_tokens"] += int(
+                _usage_value(item, "output_audio_tokens")
+            )
+            result["llm_input_text_tokens"] += int(
+                _usage_value(item, "input_text_tokens")
+            )
+            result["llm_output_text_tokens"] += int(
+                _usage_value(item, "output_text_tokens")
+            )
+            result["realtime_session_seconds"] += _usage_value(item, "session_duration")
         elif usage_type == "tts_usage":
             result["tts_characters"] += int(_usage_value(item, "characters_count"))
+            result["tts_audio_seconds"] += _usage_value(item, "audio_duration")
         elif usage_type == "stt_usage":
             result["stt_audio_seconds"] += _usage_value(item, "audio_duration")
+    result["llm_tokens"] = int(result["llm_input_tokens"]) + int(
+        result["llm_output_tokens"]
+    )
     return result
 
 
@@ -632,6 +656,102 @@ def _capture_turn_latency(
         runtime_metrics["turn_latency_p50_ms"] = _latency_percentile(end_to_end_samples, 0.5)
         runtime_metrics["turn_latency_p90_ms"] = _latency_percentile(end_to_end_samples, 0.9)
         runtime_metrics["turn_latency_p95_ms"] = _latency_percentile(end_to_end_samples, 0.95)
+
+
+@dataclass
+class _LiveKitRuntimeTelemetry:
+    """Turn-level telemetry derived from LiveKit's realtime session events."""
+
+    runtime_metrics: dict[str, int | float]
+    end_to_end_samples: list[int]
+    opened_at: float
+    session_started_at: float | None = None
+    last_user_speech_end_at: float | None = None
+    last_final_transcript_at: float | None = None
+    first_agent_audio_seen: bool = False
+    barge_in_active: bool = False
+
+    def mark_session_started(self) -> None:
+        self.session_started_at = time.monotonic()
+
+    def on_user_state(self, *, old_state: object, new_state: object, agent_state: object) -> None:
+        now = time.monotonic()
+        if new_state == "speaking":
+            if agent_state == "speaking" and not self.barge_in_active:
+                self.runtime_metrics["barge_in_count"] = int(
+                    self.runtime_metrics.get("barge_in_count", 0)
+                ) + 1
+                self.barge_in_active = True
+            return
+        if old_state == "speaking":
+            self.last_user_speech_end_at = now
+            self.barge_in_active = False
+
+    def on_final_transcript(self) -> None:
+        self.last_final_transcript_at = time.monotonic()
+
+    def on_agent_state(self, *, new_state: object) -> None:
+        if new_state != "speaking":
+            return
+        now = time.monotonic()
+        if not self.first_agent_audio_seen:
+            self.first_agent_audio_seen = True
+            self.runtime_metrics["call_open_to_greeting_ms"] = round(
+                (now - self.opened_at) * 1000
+            )
+            if self.session_started_at is not None:
+                self.runtime_metrics["session_start_to_greeting_ms"] = round(
+                    (now - self.session_started_at) * 1000
+                )
+
+        if self.last_final_transcript_at is not None:
+            self.runtime_metrics["last_transcript_to_first_audio_ms"] = round(
+                (now - self.last_final_transcript_at) * 1000
+            )
+            self.last_final_transcript_at = None
+        if self.last_user_speech_end_at is not None:
+            latency = round((now - self.last_user_speech_end_at) * 1000)
+            self.runtime_metrics["last_speech_end_to_first_audio_ms"] = latency
+            self.end_to_end_samples.append(latency)
+            self.runtime_metrics["turn_latency_p50_ms"] = _latency_percentile(
+                self.end_to_end_samples, 0.5
+            )
+            self.runtime_metrics["turn_latency_p90_ms"] = _latency_percentile(
+                self.end_to_end_samples, 0.9
+            )
+            self.runtime_metrics["turn_latency_p95_ms"] = _latency_percentile(
+                self.end_to_end_samples, 0.95
+            )
+            self.last_user_speech_end_at = None
+
+    def on_metrics(self, metrics: object) -> None:
+        metric_type = str(getattr(metrics, "type", ""))
+        if metric_type in {"realtime_model_metrics", "llm_metrics"}:
+            ttft = _metric_milliseconds(metrics, "ttft")
+            if ttft is not None:
+                self.runtime_metrics["last_llm_first_token_ms"] = ttft
+        elif metric_type == "tts_metrics":
+            ttfb = _metric_milliseconds(metrics, "ttfb")
+            if ttfb is not None:
+                self.runtime_metrics["last_tts_first_byte_ms"] = ttfb
+        elif metric_type == "eou_metrics":
+            for source, target in (
+                ("end_of_utterance_delay", "last_end_of_utterance_ms"),
+                ("transcription_delay", "last_transcription_delay_ms"),
+                ("on_user_turn_completed_delay", "last_knowledge_hook_ms"),
+            ):
+                value = _metric_milliseconds(metrics, source)
+                if value is not None:
+                    self.runtime_metrics[target] = value
+        elif metric_type == "interruption_metrics":
+            interruptions = getattr(metrics, "num_interruptions", None)
+            if isinstance(interruptions, int) and not isinstance(interruptions, bool):
+                self.runtime_metrics["barge_in_count"] = max(
+                    int(self.runtime_metrics.get("barge_in_count", 0)), interruptions
+                )
+            delay = _metric_milliseconds(metrics, "detection_delay")
+            if delay is not None:
+                self.runtime_metrics["last_interruption_detection_ms"] = delay
 
 
 def _inworld_delivery_mode(profile: AgentRuntimeProfile | None) -> str:
@@ -1928,11 +2048,23 @@ async def vav_inworld_session(ctx: JobContext) -> None:
     usage_totals: dict[str, int | float] = {
         "llm_input_tokens": 0,
         "llm_output_tokens": 0,
+        "llm_input_audio_tokens": 0,
+        "llm_output_audio_tokens": 0,
+        "llm_input_text_tokens": 0,
+        "llm_output_text_tokens": 0,
+        "realtime_session_seconds": 0.0,
         "tts_characters": 0,
+        "tts_audio_seconds": 0.0,
         "stt_audio_seconds": 0.0,
         "turn_count": 0,
+        "barge_in_count": 0,
     }
     end_to_end_latency_samples: list[int] = []
+    telemetry = _LiveKitRuntimeTelemetry(
+        runtime_metrics=usage_totals,
+        end_to_end_samples=end_to_end_latency_samples,
+        opened_at=time.monotonic(),
+    )
     finalization_lock = asyncio.Lock()
     close_lock = asyncio.Lock()
     finalized = False
@@ -1988,12 +2120,22 @@ async def vav_inworld_session(ctx: JobContext) -> None:
             else inference.TurnDetector(version=LIVEKIT_TURN_DETECTOR_VERSION)
         )
         if native_realtime:
+            # Keep realtime reasoning and ordinary responses on Inworld's
+            # speech-to-speech connection, while giving deterministic authored
+            # messages (especially the greeting) a direct streaming TTS path.
+            # This removes a full LLM turn before the caller hears the first word.
+            tts_options = _inworld_tts_options(
+                model=model,
+                api_key=api_keys.speech,
+                profile=profile,
+            )
             session = AgentSession(
                 llm=_build_inworld_realtime_model(
                     model=model,
                     profile=profile,
                     api_key=api_keys.speech,
                 ),
+                tts=inworld.TTS(**tts_options),
                 turn_handling={
                     "turn_detection": "realtime_llm",
                     "interruption": {
@@ -2084,6 +2226,11 @@ async def vav_inworld_session(ctx: JobContext) -> None:
         @session.on("user_state_changed")
         def _on_user_state_changed(event: Any) -> None:
             nonlocal barge_in_endpointing_active, barge_in_reset_task
+            telemetry.on_user_state(
+                old_state=getattr(event, "old_state", None),
+                new_state=getattr(event, "new_state", None),
+                agent_state=getattr(session, "agent_state", None),
+            )
             # Stop playout promptly, then give only the replacement barge-in
             # sentence more time to settle. Normal turns retain the faster
             # endpoint so improving interruption completeness does not make the
@@ -2279,12 +2426,16 @@ async def vav_inworld_session(ctx: JobContext) -> None:
             content = str(getattr(event.item, "text_content", "") or "").strip()
             if role == "user":
                 _restore_normal_endpointing()
-            _capture_turn_latency(
-                role=role,
-                metrics=getattr(event.item, "metrics", {}) or {},
-                runtime_metrics=usage_totals,
-                end_to_end_samples=end_to_end_latency_samples,
-            )
+            if native_realtime:
+                if role == "assistant":
+                    usage_totals["turn_count"] = int(usage_totals.get("turn_count", 0)) + 1
+            else:
+                _capture_turn_latency(
+                    role=role,
+                    metrics=getattr(event.item, "metrics", {}) or {},
+                    runtime_metrics=usage_totals,
+                    end_to_end_samples=end_to_end_latency_samples,
+                )
             if role in {"user", "assistant"} and content:
                 turns.append(
                     {
@@ -2298,6 +2449,20 @@ async def vav_inworld_session(ctx: JobContext) -> None:
         def _on_usage(event: Any) -> None:
             usage_totals.update(_usage_snapshot(event.usage))
 
+        @session.on("metrics_collected")
+        def _on_metrics(event: Any) -> None:
+            telemetry.on_metrics(getattr(event, "metrics", None))
+
+        @session.on("user_input_transcribed")
+        def _on_user_input_transcribed(event: Any) -> None:
+            if getattr(event, "is_final", False):
+                telemetry.on_final_transcript()
+
+        @session.on("agent_state_changed")
+        def _on_agent_state_changed(event: Any) -> None:
+            telemetry.on_agent_state(new_state=getattr(event, "new_state", None))
+
+        telemetry.mark_session_started()
         await session.start(
             room=ctx.room,
             agent=(
@@ -2308,17 +2473,7 @@ async def vav_inworld_session(ctx: JobContext) -> None:
             room_options=production_room_options(),
         )
         greeting = _render_greeting(model.greeting_message, variables)
-        greeting_handle = (
-            session.generate_reply(
-                instructions=(
-                    "Open this call now by saying exactly the following greeting and nothing "
-                    f"else: {json.dumps(greeting)}"
-                ),
-                tool_choice="none",
-            )
-            if native_realtime
-            else session.say(greeting, add_to_chat_ctx=True)
-        )
+        greeting_handle = session.say(greeting, add_to_chat_ctx=True)
         await greeting_handle
         greeting_failure = greeting_handle.exception()
         if greeting_failure is not None:

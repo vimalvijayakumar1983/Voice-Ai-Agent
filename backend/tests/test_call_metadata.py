@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 from uuid import uuid4
 
 from app.schemas.call import CallResponse
+from app.services.call_metadata import public_call_metadata
 
 
 def test_call_response_projects_only_safe_agent_configuration_metadata():
@@ -58,3 +59,40 @@ def test_call_response_projects_only_safe_agent_configuration_metadata():
     assert response.recording_available is True
     assert "provider_recording_url" not in response.model_dump()
     assert "private-recording" not in str(response.model_dump())
+
+
+def test_public_call_metadata_exposes_realtime_quality_and_usage_metrics():
+    projected = public_call_metadata(
+        {
+            "agent_configuration": {"language": "en-GB"},
+            "runtime": {
+                "call_open_to_greeting_ms": 820,
+                "session_start_to_greeting_ms": 420,
+                "last_end_of_utterance_ms": 210,
+                "last_transcription_delay_ms": 125,
+                "last_knowledge_hook_ms": 75,
+                "last_interruption_detection_ms": 160,
+                "llm_tokens": 1500,
+                "llm_input_audio_tokens": 700,
+                "llm_output_audio_tokens": 120,
+                "realtime_session_seconds": 42.5,
+                "private_provider_request": "do-not-expose",
+            },
+        }
+    )
+
+    assert projected == {
+        "language": "en-GB",
+        "runtime": {
+            "call_open_to_greeting_ms": 820,
+            "session_start_to_greeting_ms": 420,
+            "last_end_of_utterance_ms": 210,
+            "last_transcription_delay_ms": 125,
+            "last_knowledge_hook_ms": 75,
+            "last_interruption_detection_ms": 160,
+            "llm_tokens": 1500,
+            "llm_input_audio_tokens": 700,
+            "llm_output_audio_tokens": 120,
+            "realtime_session_seconds": 42.5,
+        },
+    }

@@ -623,6 +623,8 @@ export default function Calls() {
                   {selectedCall.cost_cents !== null ? <div><dt>Provider cost</dt><dd>{selectedCall.cost_cents} cents</dd></div> : null}
                   {selectedCall.sentiment_score !== null ? <div><dt>Sentiment score</dt><dd>{selectedCall.sentiment_score.toFixed(2)}</dd></div> : null}
                   {typeof selectedMetadata.provider_latency_ms === 'number' ? <div><dt>Provider latency</dt><dd>{selectedMetadata.provider_latency_ms} ms</dd></div> : null}
+                  {typeof selectedRuntime.call_open_to_greeting_ms === 'number' ? <div><dt>Call open → greeting</dt><dd>{selectedRuntime.call_open_to_greeting_ms} ms</dd></div> : null}
+                  {typeof selectedRuntime.session_start_to_greeting_ms === 'number' ? <div><dt>Session start → greeting</dt><dd>{selectedRuntime.session_start_to_greeting_ms} ms</dd></div> : null}
                   {typeof selectedRuntime.last_speech_end_to_first_audio_ms === 'number' ? <div><dt>Speech end → first audio</dt><dd>{selectedRuntime.last_speech_end_to_first_audio_ms} ms</dd></div> : null}
                   {typeof selectedRuntime.turn_latency_p50_ms === 'number' ? <div><dt>Turn latency p50</dt><dd>{selectedRuntime.turn_latency_p50_ms} ms</dd></div> : null}
                   {typeof selectedRuntime.turn_latency_p90_ms === 'number' ? <div><dt>Turn latency p90</dt><dd>{selectedRuntime.turn_latency_p90_ms} ms</dd></div> : null}
@@ -631,7 +633,14 @@ export default function Calls() {
                   {typeof selectedRuntime.last_llm_first_token_ms === 'number' ? <div><dt>LLM first token</dt><dd>{selectedRuntime.last_llm_first_token_ms} ms</dd></div> : null}
                   {typeof selectedRuntime.last_llm_latency_ms === 'number' ? <div><dt>Last LLM latency</dt><dd>{selectedRuntime.last_llm_latency_ms} ms</dd></div> : null}
                   {typeof selectedRuntime.last_tts_first_byte_ms === 'number' ? <div><dt>Last TTS first byte</dt><dd>{selectedRuntime.last_tts_first_byte_ms} ms</dd></div> : null}
+                  {typeof selectedRuntime.last_end_of_utterance_ms === 'number' ? <div><dt>End-of-turn detection</dt><dd>{selectedRuntime.last_end_of_utterance_ms} ms</dd></div> : null}
+                  {typeof selectedRuntime.last_transcription_delay_ms === 'number' ? <div><dt>Transcription delay</dt><dd>{selectedRuntime.last_transcription_delay_ms} ms</dd></div> : null}
+                  {typeof selectedRuntime.last_knowledge_hook_ms === 'number' ? <div><dt>Knowledge hook</dt><dd>{selectedRuntime.last_knowledge_hook_ms} ms</dd></div> : null}
+                  {typeof selectedRuntime.last_interruption_detection_ms === 'number' ? <div><dt>Interruption detection</dt><dd>{selectedRuntime.last_interruption_detection_ms} ms</dd></div> : null}
                   {typeof selectedRuntime.llm_tokens === 'number' ? <div><dt>LLM tokens</dt><dd>{selectedRuntime.llm_tokens}</dd></div> : null}
+                  {typeof selectedRuntime.llm_input_audio_tokens === 'number' ? <div><dt>Input audio tokens</dt><dd>{selectedRuntime.llm_input_audio_tokens}</dd></div> : null}
+                  {typeof selectedRuntime.llm_output_audio_tokens === 'number' ? <div><dt>Output audio tokens</dt><dd>{selectedRuntime.llm_output_audio_tokens}</dd></div> : null}
+                  {typeof selectedRuntime.realtime_session_seconds === 'number' ? <div><dt>Realtime session</dt><dd>{selectedRuntime.realtime_session_seconds.toFixed(1)} s</dd></div> : null}
                   {typeof selectedRuntime.barge_in_count === 'number' ? <div><dt>Barge-ins</dt><dd>{selectedRuntime.barge_in_count}</dd></div> : null}
                   {selectedRuntime.cost_state === 'pending_provider_billing_sync' ? <div><dt>Runtime cost</dt><dd>Awaiting provider billing sync</dd></div> : null}
                 </dl>

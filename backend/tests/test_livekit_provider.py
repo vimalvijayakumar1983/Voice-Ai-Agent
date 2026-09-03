@@ -19,6 +19,7 @@ from app.livekit_runtime.worker import (
     _inworld_stt_model,
     _inworld_tts_options,
     _inworld_voice_runtime,
+    _LiveKitRuntimeTelemetry,
     _usage_snapshot,
     _worker_http_port,
     _worker_idle_processes,
@@ -907,8 +908,17 @@ async def test_livekit_agent_resolves_elliptical_follow_up_before_retrieval(monk
 def test_livekit_usage_snapshot_reads_cumulative_model_usage_once():
     usage = SimpleNamespace(
         model_usage=[
-            SimpleNamespace(type="llm_usage", input_tokens=1200, output_tokens=300),
-            SimpleNamespace(type="tts_usage", characters_count=640),
+            SimpleNamespace(
+                type="llm_usage",
+                input_tokens=1200,
+                output_tokens=300,
+                input_audio_tokens=700,
+                output_audio_tokens=120,
+                input_text_tokens=500,
+                output_text_tokens=180,
+                session_duration=42.5,
+            ),
+            SimpleNamespace(type="tts_usage", characters_count=640, audio_duration=9.25),
             SimpleNamespace(type="stt_usage", audio_duration=42.5),
         ]
     )
@@ -916,8 +926,15 @@ def test_livekit_usage_snapshot_reads_cumulative_model_usage_once():
     assert _usage_snapshot(usage) == {
         "llm_input_tokens": 1200,
         "llm_output_tokens": 300,
+        "llm_input_audio_tokens": 700,
+        "llm_output_audio_tokens": 120,
+        "llm_input_text_tokens": 500,
+        "llm_output_text_tokens": 180,
+        "realtime_session_seconds": 42.5,
         "tts_characters": 640,
+        "tts_audio_seconds": 9.25,
         "stt_audio_seconds": 42.5,
+        "llm_tokens": 1500,
     }
 
 
@@ -1127,6 +1144,66 @@ def test_livekit_turn_latency_is_recorded_as_public_runtime_metrics():
         "turn_latency_p50_ms": 910,
         "turn_latency_p90_ms": 1200,
         "turn_latency_p95_ms": 1200,
+    }
+
+
+def test_livekit_native_events_capture_exact_turn_and_interruption_metrics(monkeypatch):
+    timestamps = iter([10.0, 10.2, 10.7, 11.0, 12.0, 12.4])
+    monkeypatch.setattr(livekit_worker.time, "monotonic", lambda: next(timestamps))
+    runtime_metrics = {"barge_in_count": 0}
+    samples: list[int] = []
+    telemetry = _LiveKitRuntimeTelemetry(
+        runtime_metrics=runtime_metrics,
+        end_to_end_samples=samples,
+        opened_at=9.5,
+    )
+
+    telemetry.mark_session_started()
+    telemetry.on_agent_state(new_state="speaking")
+    telemetry.on_user_state(
+        old_state="listening", new_state="speaking", agent_state="speaking"
+    )
+    telemetry.on_user_state(
+        old_state="speaking", new_state="listening", agent_state="listening"
+    )
+    telemetry.on_final_transcript()
+    telemetry.on_agent_state(new_state="speaking")
+    telemetry.on_metrics(
+        SimpleNamespace(
+            type="realtime_model_metrics",
+            ttft=0.31,
+        )
+    )
+    telemetry.on_metrics(
+        SimpleNamespace(
+            type="eou_metrics",
+            end_of_utterance_delay=0.22,
+            transcription_delay=0.14,
+            on_user_turn_completed_delay=0.08,
+        )
+    )
+    telemetry.on_metrics(
+        SimpleNamespace(
+            type="interruption_metrics",
+            num_interruptions=2,
+            detection_delay=0.18,
+        )
+    )
+
+    assert runtime_metrics == {
+        "barge_in_count": 2,
+        "call_open_to_greeting_ms": 700,
+        "session_start_to_greeting_ms": 200,
+        "last_transcript_to_first_audio_ms": 400,
+        "last_speech_end_to_first_audio_ms": 1400,
+        "turn_latency_p50_ms": 1400,
+        "turn_latency_p90_ms": 1400,
+        "turn_latency_p95_ms": 1400,
+        "last_llm_first_token_ms": 310,
+        "last_end_of_utterance_ms": 220,
+        "last_transcription_delay_ms": 140,
+        "last_knowledge_hook_ms": 80,
+        "last_interruption_detection_ms": 180,
     }
 
 
