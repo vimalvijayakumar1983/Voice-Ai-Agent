@@ -16,7 +16,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 ProcessingMode = Literal["automatic", "fast", "ai_verified"]
 
-COMPILER_VERSION = "vav-knowledge-compiler-2"
+COMPILER_VERSION = "vav-knowledge-compiler-3"
 AUTOMATIC_MODEL = "gpt-5.6-luna"
 VERIFIED_MODEL = "gpt-5.6-terra"
 _MODEL_PRICES_PER_MILLION = {
@@ -28,6 +28,8 @@ _AED_PER_USD = 3.6725
 _PHONE_RE = re.compile(r"(?<!\w)(?:\+?\d[\d\s().-]{6,}\d)(?!\w)")
 _EMAIL_RE = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.I)
 _SPACE_RE = re.compile(r"\s+")
+_GROUNDING_SEPARATOR_RE = re.compile(r"[^\w]+", re.UNICODE)
+_PARAGRAPH_RE = re.compile(r"\n\s*\n+")
 
 
 class KnowledgeCompilerError(RuntimeError):
@@ -87,6 +89,12 @@ def _normalized(value: str) -> str:
     return _SPACE_RE.sub(" ", value).strip().casefold()
 
 
+def _grounding_normalized(value: str) -> str:
+    """Normalize presentation-only punctuation without changing words or digits."""
+
+    return _SPACE_RE.sub(" ", _GROUNDING_SEPARATOR_RE.sub(" ", value)).strip().casefold()
+
+
 def _evidence_is_grounded(source: str, evidence: str) -> bool:
     return bool(evidence.strip()) and _normalized(evidence) in _normalized(source)
 
@@ -96,11 +104,44 @@ def _value_is_grounded(value: str, evidence: str) -> bool:
     normalized_evidence = _normalized(evidence)
     if normalized_value in normalized_evidence:
         return True
+    # Website extractors and language models can differ only in presentational
+    # punctuation (for example, ``Office 403 & 404, Al Reem`` versus
+    # ``Office 403 & 404 Al Reem``). Accept the same contiguous words/digits,
+    # while never allowing paraphrases or fuzzy semantic matches.
+    grounding_value = _grounding_normalized(value)
+    grounding_evidence = _grounding_normalized(evidence)
+    if len(grounding_value) >= 4 and grounding_value in grounding_evidence:
+        return True
     # Telephone formatting is often normalized by a model.  Compare digits
     # only, but never accept short identifiers that could match accidentally.
     value_digits = "".join(re.findall(r"\d", value))
     evidence_digits = "".join(re.findall(r"\d", evidence))
     return len(value_digits) >= 7 and value_digits in evidence_digits
+
+
+def _subject_is_grounded_in_context(source: str, subject: str, evidence: str) -> bool:
+    """Require a fact's subject in its evidence or its immediate heading block."""
+
+    if _value_is_grounded(subject, evidence):
+        return True
+    normalized_subject = _grounding_normalized(subject)
+    normalized_evidence = _grounding_normalized(evidence)
+    if not normalized_subject or not normalized_evidence:
+        return False
+    paragraphs = [
+        paragraph.strip()
+        for paragraph in _PARAGRAPH_RE.split(source)
+        if paragraph.strip()
+    ]
+    for index, paragraph in enumerate(paragraphs):
+        if normalized_evidence not in _grounding_normalized(paragraph) or index == 0:
+            continue
+        previous = _grounding_normalized(paragraphs[index - 1])
+        # The preceding block must be the subject heading, not an arbitrary
+        # earlier mention elsewhere on a multi-company contact page.
+        if previous == normalized_subject:
+            return True
+    return False
 
 
 def _requires_ai(text: str) -> bool:
@@ -144,7 +185,11 @@ def _build_document(*, title: str, url: str, text: str, structured: dict) -> str
             lines.extend(["", f"SUBJECT: {subject}"])
             for fact in subject_facts:
                 lines.append(f"- {fact['predicate']}: {fact['value']}")
-                lines.append(f"  Evidence: {fact['evidence']}")
+                # Evidence can span HTML blocks. Keep it on one retrieval line
+                # so paragraph chunking isolates the subject as a complete
+                # contact bundle instead of splitting its address from phone.
+                evidence = " ".join(str(fact["evidence"]).split())
+                lines.append(f"  Evidence: {evidence}")
     if not facts and (contacts.get("phones") or contacts.get("emails")):
         # An unassociated page-wide phone list is useful in deterministic mode,
         # but unsafe once verified subject/fact associations are available.
@@ -171,7 +216,10 @@ facts useful to a voice agent. Keep different organizations separate. Every enti
 fact MUST carry a short verbatim evidence span copied from SOURCE_TEXT. Never infer,
 summarize, complete, normalize, or invent a fact. For telephone numbers, state which
 organization/location it belongs to only when the evidence explicitly establishes that
-relationship. Omit anything ambiguous. Do not produce medical advice."""
+relationship. On contact pages, emit separate physical-address, primary-telephone, fax,
+mobile and email facts when present. Copy each value verbatim. For each contact fact,
+make the evidence one contiguous span beginning with the organization/location heading
+and ending after the fact value. Omit anything ambiguous. Do not produce medical advice."""
     payload = {"source_title": title, "source_url": url, "source_text": text[:120_000]}
     openai_client = client or AsyncOpenAI(api_key=api_key, timeout=45.0, max_retries=1)
     try:
@@ -207,7 +255,7 @@ relationship. Omit anything ambiguous. Do not produce medical advice."""
         fact.model_dump()
         for fact in result.facts
         if _evidence_is_grounded(text, fact.evidence)
-        and _value_is_grounded(fact.subject, fact.evidence)
+        and _subject_is_grounded_in_context(text, fact.subject, fact.evidence)
         and _value_is_grounded(fact.value, fact.evidence)
     ]
     usage = getattr(response, "usage", None)

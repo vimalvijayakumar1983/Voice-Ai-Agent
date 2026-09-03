@@ -168,6 +168,109 @@ async def test_ai_compilation_separates_multi_organization_contact_facts():
 
 
 @pytest.mark.asyncio
+async def test_contact_heading_context_keeps_address_and_phone_in_one_subject_chunk():
+    text = (
+        "Al Zaabi Group\n\n"
+        "Office No 403 & 404 Al Reem Plaza, Electra Street, Abu Dhabi UAE "
+        "Tel: +971 2 665 9998\n\n"
+        "Adam & Eve Specialized Medical Center\n\n"
+        "Pink Building, Abu Dhabi UAE Tel: +971 2 6767 366"
+    )
+    client = _FakeClient(
+        {
+            "page_type": "contact",
+            "entities": [],
+            "facts": [
+                {
+                    "subject": "Al Zaabi Group",
+                    "predicate": "physical address",
+                    "value": (
+                        "Office No 403 & 404, Al Reem Plaza, Electra Street, Abu Dhabi UAE"
+                    ),
+                    "evidence": (
+                        "Office No 403 & 404 Al Reem Plaza, Electra Street, Abu Dhabi UAE"
+                    ),
+                },
+                {
+                    "subject": "Al Zaabi Group",
+                    "predicate": "primary telephone",
+                    "value": "+971 2 665 9998",
+                    "evidence": (
+                        "Office No 403 & 404 Al Reem Plaza, Electra Street, Abu Dhabi UAE "
+                        "Tel: +971 2 665 9998"
+                    ),
+                },
+                {
+                    "subject": "Adam & Eve Specialized Medical Center",
+                    "predicate": "primary telephone",
+                    "value": "+971 2 6767 366",
+                    "evidence": "Pink Building, Abu Dhabi UAE Tel: +971 2 6767 366",
+                },
+            ],
+        }
+    )
+
+    result = await compile_website_knowledge(
+        title="Contact – Al Zaabi Group",
+        url="https://www.alzaabigroup.com/contact/",
+        text=text,
+        requested_mode="ai_verified",
+        api_key="test-key",
+        client=client,
+    )
+    matches = rank_knowledge(
+        "What is the contact address and phone number for Al Zaabi Group?",
+        [("Contact – Al Zaabi Group", result.content)],
+    )
+
+    assert len(result.structured["facts"]) == 3
+    assert matches
+    assert "Office No 403 & 404, Al Reem Plaza" in matches[0].text
+    assert "+971 2 665 9998" in matches[0].text
+    assert "+971 2 6767 366" not in matches[0].text
+    al_zaabi_section = result.content.split(
+        "SUBJECT: Adam & Eve Specialized Medical Center", 1
+    )[0]
+    assert "\n\nOffice No 403" not in al_zaabi_section
+
+
+@pytest.mark.asyncio
+async def test_contact_fact_rejects_unassociated_value_from_later_page_block():
+    text = (
+        "Al Zaabi Group\n\n"
+        "Office 403, Abu Dhabi.\n\n"
+        "Other Company\n\n"
+        "Tel: +971 2 111 2222"
+    )
+    client = _FakeClient(
+        {
+            "page_type": "contact",
+            "entities": [],
+            "facts": [
+                {
+                    "subject": "Al Zaabi Group",
+                    "predicate": "primary telephone",
+                    "value": "+971 2 111 2222",
+                    "evidence": "Tel: +971 2 111 2222",
+                }
+            ],
+        }
+    )
+
+    result = await compile_website_knowledge(
+        title="Contact – Al Zaabi Group",
+        url="https://www.alzaabigroup.com/contact/",
+        text=text,
+        requested_mode="ai_verified",
+        api_key="test-key",
+        client=client,
+    )
+
+    assert result.structured["facts"] == []
+    assert result.structured["validation"]["facts_rejected"] == 1
+
+
+@pytest.mark.asyncio
 async def test_ai_verified_mode_requires_an_openai_key():
     with pytest.raises(KnowledgeCompilerError, match="OpenAI API key"):
         await compile_website_knowledge(
