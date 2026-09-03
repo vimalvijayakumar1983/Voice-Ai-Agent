@@ -238,6 +238,21 @@ _CONTACT_SOURCE_MARKERS = (
 _PHONE_TERMS = {"mobile", "phone", "tel", "telephone"}
 _PHONE_NUMBER = re.compile(r"(?<!\w)\+?\d[\d\s().-]{6,}\d(?!\w)")
 
+# Provider-neutral semantic relations. These are deliberately limited to
+# meaning-preserving business vocabulary; company names and factual values are
+# never rewritten here. The live LLM can supply additional semantic terms, and
+# compiler-v4 facts carry source-specific search phrases generated at ingestion.
+_SEMANTIC_CONCEPT_GROUPS: tuple[tuple[str, ...], ...] = (
+    ("formed", "founded", "established", "inception"),
+    ("position", "role", "designation", "title"),
+    ("cost", "price", "pricing", "fee"),
+    ("hour", "timing", "schedule", "opening"),
+    ("address", "location", "where", "based"),
+)
+_SEMANTIC_CONCEPTS = {
+    term: group for group in _SEMANTIC_CONCEPT_GROUPS for term in group
+}
+
 
 @dataclass(frozen=True)
 class KnowledgeMatch:
@@ -313,6 +328,32 @@ def _deduplicated_queries(values: Iterable[str]) -> tuple[str, ...]:
         if len(selected) >= MAX_CONTEXTUAL_QUERY_VARIANTS:
             break
     return tuple(selected)
+
+
+def _semantic_query_variants(query: str) -> tuple[str, ...]:
+    """Expand meaning-preserving concepts without changing the transcript.
+
+    This is a cheap safety net for every knowledge base. Richer, source-specific
+    paraphrases are generated once by the knowledge compiler, while native
+    realtime agents can also provide semantic terms in their existing tool call.
+    """
+
+    matches = list(_TOKEN.finditer(query))
+    variants: list[str] = []
+    for match in matches:
+        token = _singular(match.group(0).casefold())
+        concepts = _SEMANTIC_CONCEPTS.get(token)
+        if concepts is None:
+            continue
+        for concept in concepts:
+            if concept == token:
+                continue
+            variants.append(
+                " ".join(
+                    f"{query[:match.start()]}{concept}{query[match.end():]}".split()
+                )
+            )
+    return _deduplicated_queries(variants)
 
 
 def _terminology_text(value: object) -> str:
@@ -524,7 +565,14 @@ def build_contextual_query_plan(
         recovered_query, recovered_term = recovered
         recovered_variants.append(recovered_query)
         recovered_terms.append(recovered_term)
-    variants = _deduplicated_queries((*base_variants, *recovered_variants))
+    semantic_variants = [
+        semantic_variant
+        for variant in base_variants
+        for semantic_variant in _semantic_query_variants(variant)
+    ]
+    variants = _deduplicated_queries(
+        (*base_variants, *recovered_variants, *semantic_variants)
+    )
     return ContextualQueryPlan(
         primary_query=base_variants[0],
         variants=variants,

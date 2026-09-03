@@ -67,12 +67,14 @@ async def test_ai_compilation_rejects_every_fact_without_verbatim_evidence():
                     "predicate": "telephone",
                     "value": "+971 2 665 9998",
                     "evidence": "Royal Clinic phone number is +971 2 665 9998.",
+                    "search_phrases": ["Royal Clinic phone contact telephone number"],
                 },
                 {
                     "subject": "Royal Clinic",
                     "predicate": "chairman",
                     "value": "Invented Person",
                     "evidence": "Invented Person is the chairman.",
+                    "search_phrases": ["Royal Clinic chairman leadership"],
                 },
             ],
         }
@@ -111,7 +113,56 @@ async def test_ai_compilation_rejects_every_fact_without_verbatim_evidence():
         "predicate",
         "value",
         "evidence",
+        "search_phrases",
     }
+
+
+@pytest.mark.asyncio
+async def test_ai_compilation_keeps_natural_questions_with_verified_fact():
+    text = "Al Zaabi Group has grown steadily since our inception in 2003."
+    client = _FakeClient(
+        {
+            "page_type": "overview",
+            "entities": [
+                {
+                    "name": "Al Zaabi Group",
+                    "entity_type": "organization",
+                    "evidence": "Al Zaabi Group",
+                }
+            ],
+            "facts": [
+                {
+                    "subject": "Al Zaabi Group",
+                    "predicate": "inception year",
+                    "value": "2003",
+                    "evidence": (
+                        "Al Zaabi Group has grown steadily since our inception in 2003."
+                    ),
+                    "search_phrases": [
+                        "when was Al Zaabi Group formed",
+                        "company founding year established inception",
+                    ],
+                }
+            ],
+        }
+    )
+
+    result = await compile_website_knowledge(
+        title="Management – Al Zaabi Group",
+        url="https://alzaabigroup.example/management",
+        text=text,
+        requested_mode="ai_verified",
+        api_key="test-key",
+        client=client,
+    )
+    matches = rank_knowledge(
+        "When was Al Zaabi Group formed?",
+        [("Management – Al Zaabi Group", result.content)],
+    )
+
+    assert matches
+    assert "inception year: 2003" in matches[0].text
+    assert "when was Al Zaabi Group formed" in matches[0].text
 
 
 @pytest.mark.asyncio
@@ -135,6 +186,7 @@ async def test_ai_compilation_separates_multi_organization_contact_facts():
                         "Al Zaabi Group. Office 403, Al Reem Plaza, Abu Dhabi. "
                         "Tel: +971 2 665 9998."
                     ),
+                    "search_phrases": ["Al Zaabi Group address phone contact"],
                 },
                 {
                     "subject": "Adam and Eve Medical Center",
@@ -144,6 +196,7 @@ async def test_ai_compilation_separates_multi_organization_contact_facts():
                         "Adam and Eve Medical Center. Pink Building, Abu Dhabi. "
                         "Tel: +971 2 6767 366."
                     ),
+                    "search_phrases": ["Adam and Eve Medical Center address phone"],
                 },
             ],
         }
@@ -190,6 +243,7 @@ async def test_contact_heading_context_keeps_address_and_phone_in_one_subject_ch
                     "evidence": (
                         "Office No 403 & 404 Al Reem Plaza, Electra Street, Abu Dhabi UAE"
                     ),
+                    "search_phrases": ["Al Zaabi Group address location where based"],
                 },
                 {
                     "subject": "Al Zaabi Group",
@@ -199,12 +253,14 @@ async def test_contact_heading_context_keeps_address_and_phone_in_one_subject_ch
                         "Office No 403 & 404 Al Reem Plaza, Electra Street, Abu Dhabi UAE "
                         "Tel: +971 2 665 9998"
                     ),
+                    "search_phrases": ["Al Zaabi Group phone contact telephone number"],
                 },
                 {
                     "subject": "Adam & Eve Specialized Medical Center",
                     "predicate": "primary telephone",
                     "value": "+971 2 6767 366",
                     "evidence": "Pink Building, Abu Dhabi UAE Tel: +971 2 6767 366",
+                    "search_phrases": ["Adam and Eve Medical Center phone contact"],
                 },
             ],
         }
@@ -252,6 +308,7 @@ async def test_contact_fact_rejects_unassociated_value_from_later_page_block():
                     "predicate": "primary telephone",
                     "value": "+971 2 111 2222",
                     "evidence": "Tel: +971 2 111 2222",
+                    "search_phrases": ["Al Zaabi Group phone contact"],
                 }
             ],
         }

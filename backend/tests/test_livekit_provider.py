@@ -674,6 +674,57 @@ async def test_livekit_agent_injects_bounded_knowledge_before_one_llm_response(m
 
 
 @pytest.mark.asyncio
+async def test_native_realtime_agent_uses_tool_without_duplicate_context_injection(monkeypatch):
+    model = Agent(
+        tenant_id=uuid4(),
+        name="Al Zaabi Group Receptionist",
+        system_prompt="Answer from approved knowledge.",
+        voice_provider="inworld",
+        voice_id="inworld:Ashley",
+        language="en-GB",
+    )
+    retrieval = AsyncMock(return_value="Source: Management\nInception year: 2003")
+    monkeypatch.setattr(livekit_worker, "retrieve_knowledge_context", retrieval)
+    agent = livekit_worker.VAVInworldRealtimeAgent(model=model)
+    turn_ctx = livekit_worker.llm.ChatContext.empty()
+    message = turn_ctx.add_message(role="user", content="When was this company formed?")
+
+    await agent.on_user_turn_completed(turn_ctx, message)
+
+    retrieval.assert_not_awaited()
+    assert len(turn_ctx.messages()) == 1
+    assert "meaning-preserving semantic" in agent.instructions
+
+
+@pytest.mark.asyncio
+async def test_native_realtime_tool_passes_semantic_terms_to_shared_retrieval(monkeypatch):
+    model = Agent(
+        tenant_id=uuid4(),
+        name="Al Zaabi Group Receptionist",
+        system_prompt="Answer from approved knowledge.",
+        voice_provider="inworld",
+        voice_id="inworld:Ashley",
+        language="en-GB",
+    )
+    agent = livekit_worker.VAVInworldRealtimeAgent(model=model)
+    retrieval = AsyncMock(return_value="Source: Management\nInception year: 2003")
+    monkeypatch.setattr(agent, "_retrieve_approved_knowledge", retrieval)
+
+    result = await agent.search_approved_knowledge(
+        "When was Al Zaabi Group formed?",
+        "founded established inception year",
+    )
+
+    assert result.endswith("2003")
+    retrieval.assert_awaited_once_with(
+        query="When was Al Zaabi Group formed?",
+        query_variants=(
+            "When was Al Zaabi Group formed? founded established inception year",
+        ),
+    )
+
+
+@pytest.mark.asyncio
 async def test_livekit_agent_stays_silent_for_bare_hold_and_skips_control_search(monkeypatch):
     model = Agent(
         tenant_id=uuid4(),

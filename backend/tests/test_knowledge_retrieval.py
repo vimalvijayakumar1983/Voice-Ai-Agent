@@ -21,6 +21,15 @@ def test_contextual_plan_recovers_domain_phrase_without_changing_raw_query():
     assert plan.recovered_terms == ("Chemical Peeling",)
 
 
+def test_contextual_plan_expands_meaning_without_company_specific_rules():
+    plan = build_contextual_query_plan("When was this company formed?")
+
+    assert plan.primary_query == "When was this company formed?"
+    assert "When was this company founded?" in plan.variants
+    assert "When was this company established?" in plan.variants
+    assert "When was this company inception?" in plan.variants
+
+
 def test_contextual_plan_does_not_turn_medical_term_into_operational_term():
     plan = build_contextual_query_plan(
         "Do you provide cancer treatment?",
@@ -47,9 +56,10 @@ def test_contextual_plan_never_rewrites_preposition_as_part_of_source_name():
         terminology=("ITR Al Zaabi Group", "Al Zaabi Group"),
     )
 
-    assert plan.variants == (
-        "What is the contact address and phone number for Al Zaabi Group?",
+    assert plan.variants[0] == (
+        "What is the contact address and phone number for Al Zaabi Group?"
     )
+    assert all("ITR Al Zaabi Group" not in variant for variant in plan.variants)
     assert plan.recovered_terms == ()
 
 
