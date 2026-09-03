@@ -10,10 +10,12 @@ from app.core.config import settings
 from app.livekit_runtime.browser_session import delete_browser_room
 from app.livekit_runtime.constants import BROWSER_TOKEN_TTL_SECONDS
 from app.services.call_disposition import (
+    apply_grounding_quality_guard,
     disposition_catalog,
     infer_disposition_profile,
     normalize_call_analysis,
     normalize_provider_call_analysis,
+    summarize_runtime_grounding,
 )
 from app.tasks.async_runner import run_async as _run_async
 from app.tasks.worker import celery_app
@@ -701,6 +703,7 @@ async def _process_completed_call_async(
     agent_goal: str | None = None
     existing_disposition: str | None = None
     provider_analysis_data: dict | None = None
+    grounding_summary: dict[str, int] = {}
 
     async with async_session_factory() as db:
         from app.services.provider_credentials import load_provider_config
@@ -723,6 +726,7 @@ async def _process_completed_call_async(
         if not call:
             return None
         existing_disposition = call.disposition
+        grounding_summary = summarize_runtime_grounding(call.call_metadata)
 
         agent = (
             await db.scalar(
@@ -865,6 +869,10 @@ async def _process_completed_call_async(
     if summary_data is not None:
         if not isinstance(summary_data.get("disposition_details"), dict):
             summary_data = normalize_call_analysis(summary_data, profile=disposition_profile)
+        summary_data = apply_grounding_quality_guard(
+            summary_data,
+            grounding=grounding_summary,
+        )
         async with async_session_factory() as db:
             call = (
                 await db.execute(

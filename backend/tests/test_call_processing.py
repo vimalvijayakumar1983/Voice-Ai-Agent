@@ -354,7 +354,10 @@ async def test_vav_ai_mode_analyzes_even_when_provider_analytics_exist(
             "smallest_analytics": {
                 "summary": "Provider summary",
                 "dispositionMetrics": [{"value": "answered"}],
-            }
+            },
+            "runtime": {
+                "turn_diagnostics": [{"grounding_outcome": "no_match_unverified_response"}]
+            },
         },
     )
     db.add(call)
@@ -400,6 +403,9 @@ async def test_vav_ai_mode_analyzes_even_when_provider_analytics_exist(
     assert stored_call.disposition == "callback"
     assert summary.summary == "Provider summary"
     assert summary.disposition_details["analysis_source"] == "vav_ai"
+    assert summary.disposition_details["resolution"] == "unresolved"
+    assert summary.disposition_details["needs_review"] is True
+    assert summary.disposition_details["grounding"]["no_match_unverified_response"] == 1
 
 
 @pytest.mark.asyncio

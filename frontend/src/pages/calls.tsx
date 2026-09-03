@@ -647,6 +647,7 @@ export default function Calls() {
                   {typeof selectedMetadata.provider_latency_ms === 'number' ? <div><dt>Provider latency</dt><dd>{selectedMetadata.provider_latency_ms} ms</dd></div> : null}
                   {typeof selectedRuntime.call_open_to_greeting_ms === 'number' ? <div><dt>Call open → greeting</dt><dd>{selectedRuntime.call_open_to_greeting_ms} ms</dd></div> : null}
                   {typeof selectedRuntime.session_start_to_greeting_ms === 'number' ? <div><dt>Session start → greeting</dt><dd>{selectedRuntime.session_start_to_greeting_ms} ms</dd></div> : null}
+                  {typeof selectedRuntime.session_connection_ms === 'number' ? <div><dt>Realtime session connection</dt><dd>{selectedRuntime.session_connection_ms} ms</dd></div> : null}
                   {typeof selectedRuntime.last_speech_end_to_first_audio_ms === 'number' ? <div><dt>Speech end → first audio</dt><dd>{selectedRuntime.last_speech_end_to_first_audio_ms} ms</dd></div> : null}
                   {typeof selectedRuntime.turn_latency_p50_ms === 'number' ? <div><dt>Turn latency p50</dt><dd>{selectedRuntime.turn_latency_p50_ms} ms</dd></div> : null}
                   {typeof selectedRuntime.turn_latency_p90_ms === 'number' ? <div><dt>Turn latency p90</dt><dd>{selectedRuntime.turn_latency_p90_ms} ms</dd></div> : null}
@@ -658,6 +659,7 @@ export default function Calls() {
                   {typeof selectedRuntime.last_end_of_utterance_ms === 'number' ? <div><dt>End-of-turn detection</dt><dd>{selectedRuntime.last_end_of_utterance_ms} ms</dd></div> : null}
                   {typeof selectedRuntime.last_transcription_delay_ms === 'number' ? <div><dt>Transcription delay</dt><dd>{selectedRuntime.last_transcription_delay_ms} ms</dd></div> : null}
                   {typeof selectedRuntime.last_knowledge_hook_ms === 'number' ? <div><dt>Knowledge hook</dt><dd>{selectedRuntime.last_knowledge_hook_ms} ms</dd></div> : null}
+                  {typeof selectedRuntime.last_knowledge_tool_ms === 'number' ? <div><dt>Last knowledge search</dt><dd>{selectedRuntime.last_knowledge_tool_ms} ms</dd></div> : null}
                   {typeof selectedRuntime.last_interruption_detection_ms === 'number' ? <div><dt>Interruption detection</dt><dd>{selectedRuntime.last_interruption_detection_ms} ms</dd></div> : null}
                   {typeof selectedRuntime.llm_tokens === 'number' ? <div><dt>LLM tokens</dt><dd>{selectedRuntime.llm_tokens}</dd></div> : null}
                   {typeof selectedRuntime.llm_input_audio_tokens === 'number' ? <div><dt>Input audio tokens</dt><dd>{selectedRuntime.llm_input_audio_tokens}</dd></div> : null}
@@ -668,7 +670,14 @@ export default function Calls() {
                   {typeof selectedRuntime.suppressed_fragment_count === 'number' ? <div><dt>Incomplete fragments suppressed</dt><dd>{selectedRuntime.suppressed_fragment_count}</dd></div> : null}
                   {typeof selectedRuntime.fragment_continuation_window_ms === 'number' ? <div><dt>Fragment continuation window</dt><dd>{selectedRuntime.fragment_continuation_window_ms} ms</dd></div> : null}
                   {typeof selectedRuntime.knowledge_terminology_count === 'number' ? <div><dt>Recognition terms loaded</dt><dd>{selectedRuntime.knowledge_terminology_count}</dd></div> : null}
+                  {typeof selectedRuntime.knowledge_terminology_total_count === 'number' ? <div><dt>Recognition terms available</dt><dd>{selectedRuntime.knowledge_terminology_total_count}</dd></div> : null}
                   {typeof selectedRuntime.knowledge_terminology_load_ms === 'number' ? <div><dt>Recognition vocabulary load</dt><dd>{selectedRuntime.knowledge_terminology_load_ms} ms</dd></div> : null}
+                  {typeof selectedRuntime.knowledge_lookup_count === 'number' ? <div><dt>Knowledge searches</dt><dd>{selectedRuntime.knowledge_lookup_count}</dd></div> : null}
+                  {typeof selectedRuntime.knowledge_match_count === 'number' ? <div><dt>Verified knowledge matches</dt><dd>{selectedRuntime.knowledge_match_count}</dd></div> : null}
+                  {typeof selectedRuntime.knowledge_no_match_count === 'number' ? <div><dt>Knowledge no-matches</dt><dd>{selectedRuntime.knowledge_no_match_count}</dd></div> : null}
+                  {typeof selectedRuntime.unsupported_knowledge_response_count === 'number' ? <div><dt>Unsupported factual responses</dt><dd>{selectedRuntime.unsupported_knowledge_response_count}</dd></div> : null}
+                  {typeof selectedRuntime.stt_model === 'string' ? <div><dt>Recognition model</dt><dd>{selectedRuntime.stt_model}</dd></div> : null}
+                  {typeof selectedRuntime.stt_language === 'string' ? <div><dt>Recognition language</dt><dd>{selectedRuntime.stt_language}</dd></div> : null}
                   {selectedRuntime.cost_state === 'pending_provider_billing_sync' ? <div><dt>Runtime cost</dt><dd>Awaiting provider billing sync</dd></div> : null}
                 </dl>
               </section>
@@ -683,7 +692,10 @@ export default function Calls() {
                       const latency = typeof trace.speech_end_to_first_audio_ms === 'number' ? `${trace.speech_end_to_first_audio_ms} ms response` : null;
                       const words = typeof trace.transcript_words === 'number' ? `${trace.transcript_words} transcript words` : null;
                       const interrupted = trace.barge_in === true ? 'barge-in' : null;
-                      return <div key={`turn-diagnostic-${turn}-${index}`}><dt>Turn {turn}</dt><dd>{[outcome, latency, words, interrupted].filter(Boolean).join(' · ')}</dd></div>;
+                      const knowledge = typeof trace.knowledge_result === 'string' ? `knowledge ${trace.knowledge_result.replace(/_/g, ' ')}` : null;
+                      const knowledgeLatency = typeof trace.knowledge_tool_ms === 'number' ? `${trace.knowledge_tool_ms} ms retrieval` : null;
+                      const grounding = typeof trace.grounding_outcome === 'string' ? trace.grounding_outcome.replace(/_/g, ' ') : null;
+                      return <div key={`turn-diagnostic-${turn}-${index}`}><dt>Turn {turn}</dt><dd>{[outcome, latency, words, knowledge, knowledgeLatency, grounding, interrupted].filter(Boolean).join(' · ')}</dd></div>;
                     })}
                   </dl>
                 </section>
