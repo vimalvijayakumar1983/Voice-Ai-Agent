@@ -756,6 +756,48 @@ def _intent_content(value: str, *, phone_query: bool) -> str:
     return structured if _has_phone_evidence(structured, structured_tokens) else value
 
 
+def _structured_retrieval_content(value: object) -> str | None:
+    """Render verified JSON facts for ranking without loading raw source prose.
+
+    PostgreSQL headline extraction is useful for legacy documents, but it can
+    clip away compiler section boundaries. Structured sources already contain
+    smaller, source-grounded fact bundles, so rank those directly and preserve
+    each subject association.
+    """
+
+    if not isinstance(value, dict):
+        return None
+    facts = value.get("facts")
+    if not isinstance(facts, list) or not facts:
+        return None
+    lines = ["VERIFIED STRUCTURED FACTS"]
+    current_subject: str | None = None
+    accepted = 0
+    for fact in facts[:200]:
+        if not isinstance(fact, dict):
+            continue
+        subject = " ".join(str(fact.get("subject") or "").split()).strip()
+        predicate = " ".join(str(fact.get("predicate") or "").split()).strip()
+        fact_value = " ".join(str(fact.get("value") or "").split()).strip()
+        evidence = " ".join(str(fact.get("evidence") or "").split()).strip()
+        if not subject or not predicate or not fact_value or not evidence:
+            continue
+        if subject != current_subject:
+            lines.extend(["", f"SUBJECT: {subject}"])
+            current_subject = subject
+        lines.append(f"- {predicate}: {fact_value}")
+        phrases = [
+            " ".join(str(phrase).split()).strip(" |,.;:")
+            for phrase in (fact.get("search_phrases") or [])
+            if " ".join(str(phrase).split()).strip(" |,.;:")
+        ][:8]
+        if phrases:
+            lines.append(f"  Search phrases: {' | '.join(phrases)}")
+        lines.append(f"  Evidence: {evidence}")
+        accepted += 1
+    return "\n".join(lines).strip() if accepted else None
+
+
 def _chunks(
     value: str,
     *,
@@ -812,7 +854,11 @@ def rank_knowledge(
         source_terms = _source_terms(source)
         source_compounds = _source_compounds(source)
         ranked_content = _intent_content(content, phone_query=phone_query)
-        for chunk in _chunks(ranked_content, preserve_paragraphs=phone_query):
+        structured_facts = "VERIFIED STRUCTURED FACTS" in ranked_content
+        for chunk in _chunks(
+            ranked_content,
+            preserve_paragraphs=phone_query or structured_facts,
+        ):
             chunk_base_tokens = _base_tokens(chunk)
             chunk_tokens = _token_forms(chunk_base_tokens)
             chunk_has_phone = _has_phone_evidence(chunk, chunk_tokens)
@@ -1573,6 +1619,7 @@ async def retrieve_knowledge_context(
                     KnowledgeSource.id,
                     KnowledgeSource.name,
                     content_expression.label("content"),
+                    KnowledgeSource.structured_content,
                 ).where(
                     *_eligible_source_filters(
                         tenant_id=tenant_id,
@@ -1582,14 +1629,13 @@ async def retrieve_knowledge_context(
                 )
             )
         ).all()
-    sources_by_id = {
-        source_id: (
-            source_name,
-            source_content.replace("<b>", "").replace("</b>", ""),
-        )
-        for source_id, source_name, source_content in source_rows
-        if isinstance(source_content, str) and source_content.strip()
-    }
+    sources_by_id = {}
+    for source_id, source_name, source_content, structured_content in source_rows:
+        retrieval_content = _structured_retrieval_content(structured_content)
+        if retrieval_content is None and isinstance(source_content, str):
+            retrieval_content = source_content.replace("<b>", "").replace("</b>", "")
+        if retrieval_content and retrieval_content.strip():
+            sources_by_id[source_id] = (source_name, retrieval_content)
     documents = [
         sources_by_id[source_id] for source_id in candidate_ids if source_id in sources_by_id
     ]

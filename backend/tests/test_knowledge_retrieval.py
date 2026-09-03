@@ -52,6 +52,41 @@ def test_semantic_variant_retrieves_source_worded_as_inception():
     assert "inception in 2003" in matches[0].text
 
 
+def test_structured_retrieval_keeps_parent_and_subsidiary_dates_separate():
+    content = knowledge_retrieval._structured_retrieval_content(
+        {
+            "facts": [
+                {
+                    "subject": "Al Zaabi Group",
+                    "predicate": "inception year",
+                    "value": "2003",
+                    "evidence": "Al Zaabi Group has operated since our inception in 2003.",
+                    "search_phrases": ["When was Al Zaabi Group formed?"],
+                },
+                {
+                    "subject": "Saeed Al Zaabi Tyre Factory",
+                    "predicate": "established in",
+                    "value": "2003",
+                    "evidence": "Saeed Al Zaabi Tyre Factory was established in 2003.",
+                    "search_phrases": ["When was the tyre factory founded?"],
+                },
+            ]
+        }
+    )
+    assert content is not None
+    plan = build_contextual_query_plan("When was Al Zaabi Group formed?")
+
+    matches = knowledge_retrieval._rank_contextual_knowledge(
+        plan.variants,
+        [("Management and divisions", content)],
+        limit=4,
+    )
+
+    assert matches
+    assert "SUBJECT: Al Zaabi Group" in matches[0].text
+    assert "Tyre Factory" not in matches[0].text
+
+
 def test_contextual_plan_does_not_turn_medical_term_into_operational_term():
     plan = build_contextual_query_plan(
         "Do you provide cancer treatment?",
