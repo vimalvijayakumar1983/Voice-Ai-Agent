@@ -1,7 +1,7 @@
 """LiveKit SIP transport tests."""
 
 import json
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import uuid4
@@ -16,10 +16,13 @@ from app.livekit_runtime import worker as livekit_worker
 from app.livekit_runtime.worker import (
     _build_inworld_realtime_model,
     _capture_turn_latency,
+    _inworld_recognition_terms,
     _inworld_stt_model,
     _inworld_tts_options,
     _inworld_voice_runtime,
     _LiveKitRuntimeTelemetry,
+    _no_match_response_outcome,
+    _runtime_date_context,
     _usage_snapshot,
     _worker_http_port,
     _worker_idle_processes,
@@ -645,6 +648,42 @@ def test_livekit_agent_enforces_fixed_language_and_repairs_uncertain_transcripts
     assert "normally stop after one or two short sentences" in instructions
     assert 'Do not append routine closings such as "Is there anything else?"' in instructions
     assert "Never quote it" in instructions
+    assert "current local date is" in instructions
+    assert "caller is a search clue only" in instructions
+    assert "verified founding year" in instructions
+
+
+def test_runtime_date_context_uses_agent_timezone_and_falls_back_safely():
+    observed = datetime(2026, 9, 3, 21, 30, tzinfo=UTC)
+
+    assert _runtime_date_context("Asia/Dubai", now_utc=observed) == (
+        "2026-09-04",
+        "Asia/Dubai",
+    )
+    assert _runtime_date_context("not/a-timezone", now_utc=observed) == (
+        "2026-09-03",
+        "UTC",
+    )
+
+
+def test_inworld_recognition_terms_never_truncate_a_business_name():
+    long_term = "A" * 1495
+    selected = _inworld_recognition_terms(("Al Zaabi Group", long_term, "Saeed Al Zaabi"))
+
+    assert selected == ("Al Zaabi Group",)
+    assert len(", ".join(selected)) <= 1500
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        ("I cannot verify that from the approved information.", "no_match_correctly_refused"),
+        ("Which location do you mean?", "no_match_clarification"),
+        ("The chairman is the person you named.", "no_match_unverified_response"),
+    ],
+)
+def test_no_match_response_outcomes_distinguish_safe_handling(content, expected):
+    assert _no_match_response_outcome(content) == expected
 
 
 @pytest.mark.asyncio
@@ -1280,6 +1319,37 @@ def test_livekit_native_fragment_is_consumed_once_and_recorded(monkeypatch):
         "last_suppressed_fragment_words": 1,
         "fragment_continuation_window_ms": 500,
     }
+
+
+def test_livekit_grounding_telemetry_links_tool_result_to_spoken_answer():
+    runtime_metrics = {"barge_in_count": 0}
+    telemetry = _LiveKitRuntimeTelemetry(
+        runtime_metrics=runtime_metrics,
+        end_to_end_samples=[],
+        opened_at=1.0,
+    )
+    telemetry.on_final_transcript("Who is the chairman?")
+    telemetry.record_knowledge_lookup(
+        elapsed_ms=43,
+        result="no_match",
+        query_variant_count=2,
+        fallback_used=True,
+    )
+    telemetry.on_agent_state(new_state="speaking")
+    telemetry.on_final_transcript("A newer caller turn")
+    telemetry.on_assistant_content("The chairman is the person you named.")
+
+    assert runtime_metrics["knowledge_lookup_count"] == 1
+    assert runtime_metrics["knowledge_no_match_count"] == 1
+    assert runtime_metrics["unsupported_knowledge_response_count"] == 1
+    trace = runtime_metrics["turn_diagnostics"][0]
+    assert trace["tool_call"] is True
+    assert trace["knowledge_tool_ms"] == 43
+    assert trace["knowledge_result"] == "no_match"
+    assert trace["knowledge_query_variant_count"] == 2
+    assert trace["knowledge_fallback_used"] is True
+    assert trace["grounding_outcome"] == "no_match_unverified_response"
+    assert "grounding_outcome" not in telemetry.current_turn_trace
 
 
 def test_livekit_worker_health_server_uses_valid_railway_port():

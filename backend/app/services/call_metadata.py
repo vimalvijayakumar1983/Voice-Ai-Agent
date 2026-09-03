@@ -60,6 +60,8 @@ def public_call_metadata(value: Any) -> dict[str, Any] | None:
             "speech_provider",
             "llm_provider",
             "llm_model",
+            "voice_runtime",
+            "stt_model",
             "stt_language",
             "cost_state",
         }
@@ -86,6 +88,14 @@ def public_call_metadata(value: Any) -> dict[str, Any] | None:
             "fragment_continuation_window_ms",
             "knowledge_terminology_load_ms",
             "knowledge_terminology_count",
+            "knowledge_terminology_total_count",
+            "knowledge_lookup_count",
+            "knowledge_match_count",
+            "knowledge_no_match_count",
+            "knowledge_error_count",
+            "unsupported_knowledge_response_count",
+            "last_knowledge_tool_ms",
+            "session_connection_ms",
             "call_open_to_greeting_ms",
             "session_start_to_greeting_ms",
             "last_llm_latency_ms",
@@ -123,6 +133,9 @@ def public_call_metadata(value: Any) -> dict[str, Any] | None:
                 "end_of_utterance_ms",
                 "transcription_delay_ms",
                 "knowledge_hook_ms",
+                "knowledge_tool_ms",
+                "knowledge_evidence_chars",
+                "knowledge_query_variant_count",
                 "interruption_detection_ms",
             }
             for trace in turn_diagnostics[-50:]:
@@ -136,6 +149,19 @@ def public_call_metadata(value: Any) -> dict[str, Any] | None:
                         safe_trace[field] = trace[field]
                 if isinstance(trace.get("barge_in"), bool):
                     safe_trace["barge_in"] = trace["barge_in"]
+                for field in ("tool_call", "knowledge_fallback_used"):
+                    if isinstance(trace.get(field), bool):
+                        safe_trace[field] = trace[field]
+                if trace.get("knowledge_result") in {"verified", "no_match", "error"}:
+                    safe_trace["knowledge_result"] = trace["knowledge_result"]
+                if trace.get("grounding_outcome") in {
+                    "verified_answer",
+                    "no_match_correctly_refused",
+                    "no_match_clarification",
+                    "no_match_unverified_response",
+                    "knowledge_error_response",
+                }:
+                    safe_trace["grounding_outcome"] = trace["grounding_outcome"]
                 if trace.get("outcome") in {
                     "answered",
                     "fragment_suppressed",

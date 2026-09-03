@@ -1,10 +1,12 @@
 from types import SimpleNamespace
 
 from app.services.call_disposition import (
+    apply_grounding_quality_guard,
     disposition_catalog,
     infer_disposition_profile,
     normalize_call_analysis,
     normalize_provider_call_analysis,
+    summarize_runtime_grounding,
 )
 
 
@@ -118,3 +120,54 @@ def test_incomplete_or_out_of_profile_provider_analytics_require_ai_fallback():
         )
         is None
     )
+
+
+def test_grounding_guard_downgrades_only_unsupported_no_match_answer():
+    analysis = normalize_call_analysis(
+        {
+            "summary": "The caller received company information.",
+            "disposition": "information_provided",
+            "resolution": "resolved",
+            "confidence": 0.9,
+        },
+        profile="receptionist",
+    )
+    grounding = summarize_runtime_grounding(
+        {
+            "runtime": {
+                "turn_diagnostics": [
+                    {"grounding_outcome": "verified_answer"},
+                    {"grounding_outcome": "no_match_correctly_refused"},
+                    {"grounding_outcome": "no_match_unverified_response"},
+                ]
+            }
+        }
+    )
+
+    guarded = apply_grounding_quality_guard(analysis, grounding=grounding)
+
+    assert guarded["disposition_details"]["resolution"] == "partially_resolved"
+    assert guarded["disposition_details"]["needs_review"] is True
+    assert guarded["disposition_details"]["confidence"] == 0.5
+    assert guarded["disposition_details"]["grounding"]["verified_answer"] == 1
+    assert guarded["disposition_details"]["grounding"]["no_match_correctly_refused"] == 1
+
+
+def test_grounding_guard_keeps_correct_refusal_out_of_manual_review():
+    analysis = normalize_call_analysis(
+        {
+            "summary": "The agent correctly declined an unsupported request.",
+            "disposition": "information_provided",
+            "resolution": "resolved",
+            "confidence": 0.9,
+        },
+        profile="receptionist",
+    )
+
+    guarded = apply_grounding_quality_guard(
+        analysis,
+        grounding={"no_match_correctly_refused": 1},
+    )
+
+    assert guarded["disposition_details"]["resolution"] == "resolved"
+    assert guarded["disposition_details"]["needs_review"] is False

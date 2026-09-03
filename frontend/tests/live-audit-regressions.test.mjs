@@ -9,6 +9,7 @@ const knowledgeSource = readFileSync(new URL('../src/pages/knowledge.tsx', impor
 const settingsSource = readFileSync(new URL('../src/pages/settings.tsx', import.meta.url), 'utf8');
 const apiSource = readFileSync(new URL('../src/lib/api.ts', import.meta.url), 'utf8');
 const agentsSource = readFileSync(new URL('../src/pages/agents.tsx', import.meta.url), 'utf8');
+const callsSource = readFileSync(new URL('../src/pages/calls.tsx', import.meta.url), 'utf8');
 
 test('phone playground names the selected agent instead of a hard-coded agent', () => {
   assert.match(playgroundSource, /selected\?\.name \|\| 'this agent'/);
@@ -78,4 +79,12 @@ test('VAV-managed agents show runtime lifecycle instead of Smallest draft state'
   assert.match(agentsSource, /if \(runtime\.enabled && runtime\.status === 'active'\) return 'Runtime active'/);
   assert.match(agentsSource, /if \(runtime\.status === 'inactive'\) return 'Runtime inactive'/);
   assert.match(agentsSource, /Serving or provider synced/);
+});
+
+test('call diagnostics separate recognition, retrieval, grounding, and session latency', () => {
+  assert.match(callsSource, /Realtime session connection/);
+  assert.match(callsSource, /Last knowledge search/);
+  assert.match(callsSource, /Recognition model/);
+  assert.match(callsSource, /Unsupported factual responses/);
+  assert.match(callsSource, /trace\.grounding_outcome/);
 });

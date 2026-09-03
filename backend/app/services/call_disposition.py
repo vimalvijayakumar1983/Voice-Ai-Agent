@@ -4,9 +4,19 @@ from __future__ import annotations
 
 from typing import Any
 
-CLASSIFIER_VERSION = "vav-call-outcome-v2"
+CLASSIFIER_VERSION = "vav-call-outcome-v3"
 
 ANALYSIS_SOURCES = frozenset({"provider_analytics", "vav_ai", "rules", "unavailable"})
+
+GROUNDING_OUTCOMES = frozenset(
+    {
+        "verified_answer",
+        "no_match_correctly_refused",
+        "no_match_clarification",
+        "no_match_unverified_response",
+        "knowledge_error_response",
+    }
+)
 
 PROFILES = frozenset(
     {"general", "receptionist", "customer_support", "appointment", "sales", "collections"}
@@ -309,3 +319,55 @@ def normalize_call_analysis(payload: object, *, profile: str) -> dict[str, Any]:
             "needs_review": needs_review,
         },
     }
+
+
+def summarize_runtime_grounding(call_metadata: object) -> dict[str, int]:
+    """Count content-free grounding outcomes captured by the realtime runtime."""
+    counts = {outcome: 0 for outcome in sorted(GROUNDING_OUTCOMES)}
+    if not isinstance(call_metadata, dict):
+        return counts
+    runtime = call_metadata.get("runtime")
+    if not isinstance(runtime, dict):
+        return counts
+    traces = runtime.get("turn_diagnostics")
+    if not isinstance(traces, list):
+        return counts
+    for trace in traces[-50:]:
+        if not isinstance(trace, dict):
+            continue
+        outcome = trace.get("grounding_outcome")
+        if outcome in counts:
+            counts[outcome] += 1
+    return counts
+
+
+def apply_grounding_quality_guard(
+    analysis: dict[str, Any],
+    *,
+    grounding: dict[str, int],
+) -> dict[str, Any]:
+    """Downgrade only unsupported answers, never a correct no-match refusal."""
+    details = analysis.get("disposition_details")
+    if not isinstance(details, dict):
+        return analysis
+    safe_counts = {
+        outcome: max(0, int(grounding.get(outcome, 0))) for outcome in sorted(GROUNDING_OUTCOMES)
+    }
+    details["grounding"] = safe_counts
+    unsupported_count = safe_counts["no_match_unverified_response"]
+    if unsupported_count <= 0:
+        return analysis
+
+    if details.get("resolution") == "resolved":
+        details["resolution"] = "partially_resolved"
+    details["needs_review"] = True
+    try:
+        details["confidence"] = min(float(details.get("confidence", 0.0)), 0.5)
+    except (TypeError, ValueError):
+        details["confidence"] = 0.0
+    evidence = details.get("evidence")
+    if not isinstance(evidence, list):
+        evidence = []
+    warning = f"{unsupported_count} response(s) followed a no-match knowledge result."
+    details["evidence"] = [*evidence[:2], warning]
+    return analysis
