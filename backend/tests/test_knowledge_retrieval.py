@@ -203,6 +203,13 @@ def test_contextual_plan_never_rewrites_semantic_intent_as_entity_suffix():
     assert plan.recovered_terms == ()
     assert all("Group Corporate" not in variant for variant in plan.variants)
 
+    segments_plan = build_contextual_query_plan(
+        "What business segments does Al Zaabi Group operate in?",
+        terminology=("Al Zaabi Group Corporate Knowledge Base",),
+    )
+    assert segments_plan.recovered_terms == ()
+    assert all("Group Corporate" not in variant for variant in segments_plan.variants)
+
 
 def test_contextual_plan_recovers_joined_spoken_brand_from_proper_name():
     plan = build_contextual_query_plan(

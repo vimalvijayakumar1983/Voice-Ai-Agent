@@ -525,11 +525,20 @@ def _recover_terminology(query: str, terminology: Iterable[object]) -> tuple[str
     if not matches:
         return None
     query_tokens = [match.group(0).casefold() for match in matches]
+    query_token_text = " ".join(query_tokens)
     best: tuple[float, int, int, str] | None = None
     for normalized, display in _terminology_phrases(terminology).items():
         canonical_tokens = normalized.split()
         canonical_width = len(canonical_tokens)
-        if normalized in " ".join(query_tokens):
+        if normalized in query_token_text:
+            continue
+        if len(canonical_tokens) >= 3 and (
+            " ".join(canonical_tokens[:-1]) in query_token_text
+            or " ".join(canonical_tokens[1:]) in query_token_text
+        ):
+            # A valid shorter entity is not a transcription mistake. Do not
+            # consume its neighbouring intent word to expand it into a longer
+            # metadata label (for example, Group -> Group Corporate).
             continue
         query_widths = {canonical_width}
         if canonical_width > 1:
