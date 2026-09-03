@@ -28,6 +28,7 @@ export interface AgentEditorValues {
   model_provider: string;
   model_name: string;
   disposition_profile: 'general' | 'receptionist' | 'customer_support' | 'appointment' | 'sales' | 'collections';
+  post_call_analysis_mode: 'provider_first' | 'vav_ai' | 'disabled';
   voice_provider: string;
   voice_id: string;
   temperature: number;
@@ -47,6 +48,7 @@ export const defaultAgentValues: AgentEditorValues = {
   model_provider: 'smallest',
   model_name: 'electron',
   disposition_profile: 'general',
+  post_call_analysis_mode: 'provider_first',
   voice_provider: 'smallest',
   voice_id: '',
   temperature: 0.7,
@@ -106,6 +108,7 @@ export default function AgentEditor({
   const primaryLanguageId = useId();
   const modelId = useId();
   const dispositionProfileId = useId();
+  const postCallAnalysisModeId = useId();
   const timezoneId = useId();
   const speechRateId = useId();
   const allVoices = useMemo(() => catalog?.voices ?? [], [catalog?.voices]);
@@ -234,6 +237,7 @@ export default function AgentEditor({
       temperature: template.temperature,
       timezone: template.timezone,
       disposition_profile: template.disposition_profile,
+      post_call_analysis_mode: template.post_call_analysis_mode,
       ...switching,
     }, form.supported_languages.length);
   };
@@ -438,14 +442,30 @@ export default function AgentEditor({
           <div className="form-group">
             <label htmlFor={dispositionProfileId}>Call outcome workflow</label>
             <select id={dispositionProfileId} value={form.disposition_profile} onChange={(event) => setForm({ ...form, disposition_profile: event.target.value as AgentEditorValues['disposition_profile'] })}>
-              <option value="general">General</option>
+              <option value="general">Auto-detect (recommended)</option>
               <option value="receptionist">Receptionist</option>
               <option value="customer_support">Customer support</option>
               <option value="appointment">Appointment booking</option>
               <option value="sales">Sales and qualification</option>
               <option value="collections">Collections</option>
             </select>
-            <p className="form-hint">Controls the validated post-call dispositions, resolution and follow-up fields.</p>
+            <p className="form-hint">Auto-detect selects the workflow from the agent purpose; an explicit workflow always wins.</p>
+          </div>
+          <div className="form-group">
+            <label htmlFor={postCallAnalysisModeId}>Post-call analysis</label>
+            <select
+              id={postCallAnalysisModeId}
+              value={form.post_call_analysis_mode}
+              onChange={(event) => setForm({
+                ...form,
+                post_call_analysis_mode: event.target.value as AgentEditorValues['post_call_analysis_mode'],
+              })}
+            >
+              <option value="provider_first">Provider first, VAV AI fallback</option>
+              <option value="vav_ai">Always use VAV AI</option>
+              <option value="disabled">Disable automatic analysis</option>
+            </select>
+            <p className="form-hint">Provider first avoids duplicate AI cost when trusted provider analytics already contain a valid outcome.</p>
           </div>
           {form.voice_provider !== 'smallest' ? (
             <div className="form-group">

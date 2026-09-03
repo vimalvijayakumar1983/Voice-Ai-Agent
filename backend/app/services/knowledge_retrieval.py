@@ -273,9 +273,7 @@ _SEMANTIC_CONCEPT_GROUPS: tuple[tuple[str, ...], ...] = (
     ("hour", "timing", "schedule", "opening"),
     ("address", "location", "where", "based"),
 )
-_SEMANTIC_CONCEPTS = {
-    term: group for group in _SEMANTIC_CONCEPT_GROUPS for term in group
-}
+_SEMANTIC_CONCEPTS = {term: group for group in _SEMANTIC_CONCEPT_GROUPS for term in group}
 
 
 @dataclass(frozen=True)
@@ -373,9 +371,7 @@ def _semantic_query_variants(query: str) -> tuple[str, ...]:
             if concept == token:
                 continue
             variants.append(
-                " ".join(
-                    f"{query[:match.start()]}{concept}{query[match.end():]}".split()
-                )
+                " ".join(f"{query[: match.start()]}{concept}{query[match.end() :]}".split())
             )
     return _deduplicated_queries(variants)
 
@@ -548,13 +544,17 @@ def _recover_terminology(query: str, terminology: Iterable[object]) -> tuple[str
                 continue
             for start in range(len(query_tokens) - width + 1):
                 window = query_tokens[start : start + width]
-                mismatched_indexes = [
-                    index
-                    for index, (query_token, canonical_token) in enumerate(
-                        zip(window, canonical_tokens, strict=True)
-                    )
-                    if query_token != canonical_token
-                ] if len(window) == len(canonical_tokens) else []
+                mismatched_indexes = (
+                    [
+                        index
+                        for index, (query_token, canonical_token) in enumerate(
+                            zip(window, canonical_tokens, strict=True)
+                        )
+                        if query_token != canonical_token
+                    ]
+                    if len(window) == len(canonical_tokens)
+                    else []
+                )
                 if any(
                     window[index] in _QUERY_STOP_WORDS
                     or window[index] in _QUERY_INTENT_TOKENS
@@ -604,9 +604,7 @@ def build_contextual_query_plan(
         for variant in base_variants
         for semantic_variant in _semantic_query_variants(variant)
     ]
-    variants = _deduplicated_queries(
-        (*base_variants, *recovered_variants, *semantic_variants)
-    )
+    variants = _deduplicated_queries((*base_variants, *recovered_variants, *semantic_variants))
     return ContextualQueryPlan(
         primary_query=base_variants[0],
         variants=variants,
@@ -1124,9 +1122,7 @@ def _bounded_ranking_documents(
     if phone_query:
         query_tokens.discard("number")
     phone_subject_tokens = (
-        query_tokens - _CONTACT_QUERY_TOKENS - {"detail", "information"}
-        if phone_query
-        else set()
+        query_tokens - _CONTACT_QUERY_TOKENS - {"detail", "information"} if phone_query else set()
     )
     eligible: list[tuple[str, str]] = []
     for source, content in documents:

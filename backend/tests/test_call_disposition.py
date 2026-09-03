@@ -4,6 +4,7 @@ from app.services.call_disposition import (
     disposition_catalog,
     infer_disposition_profile,
     normalize_call_analysis,
+    normalize_provider_call_analysis,
 )
 
 
@@ -78,3 +79,42 @@ def test_low_confidence_outcome_is_routed_for_review():
         "owner": "sales",
         "due_at": None,
     }
+
+
+def test_trusted_provider_analytics_are_normalized_without_inventing_evidence():
+    result = normalize_provider_call_analysis(
+        {
+            "summary": "The caller received the requested office information.",
+            "keyTopics": ["office details"],
+            "actionItems": [],
+            "sentiment": "positive",
+            "dispositionMetrics": [{"value": "answered", "confidence": 0.92}],
+        },
+        profile="receptionist",
+    )
+
+    assert result is not None
+    assert result["disposition"] == "information_provided"
+    assert result["disposition_details"]["resolution"] == "resolved"
+    assert result["disposition_details"]["analysis_source"] == "provider_analytics"
+    assert result["disposition_details"]["evidence"] == []
+
+
+def test_incomplete_or_out_of_profile_provider_analytics_require_ai_fallback():
+    assert (
+        normalize_provider_call_analysis(
+            {"summary": "No disposition was supplied."},
+            profile="receptionist",
+        )
+        is None
+    )
+    assert (
+        normalize_provider_call_analysis(
+            {
+                "summary": "The caller asked for an address.",
+                "dispositionMetrics": [{"value": "qualified_lead"}],
+            },
+            profile="receptionist",
+        )
+        is None
+    )

@@ -133,9 +133,7 @@ def _subject_is_grounded_in_context(source: str, subject: str, evidence: str) ->
     if not normalized_subject or not normalized_evidence:
         return False
     paragraphs = [
-        paragraph.strip()
-        for paragraph in _PARAGRAPH_RE.split(source)
-        if paragraph.strip()
+        paragraph.strip() for paragraph in _PARAGRAPH_RE.split(source) if paragraph.strip()
     ]
     for index, paragraph in enumerate(paragraphs):
         normalized_paragraph = _grounding_normalized(paragraph)
@@ -331,9 +329,7 @@ fact. Do not produce medical advice."""
         and _value_is_grounded(entity.name, entity.evidence)
     ]
     accepted_facts = [
-        validated
-        for fact in result.facts
-        if (validated := _validated_fact(text, fact)) is not None
+        validated for fact in result.facts if (validated := _validated_fact(text, fact)) is not None
     ]
     usage = getattr(response, "usage", None)
     input_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)

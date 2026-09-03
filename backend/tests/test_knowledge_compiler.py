@@ -135,9 +135,7 @@ async def test_ai_compilation_keeps_natural_questions_with_verified_fact():
                     "subject": "Al Zaabi Group",
                     "predicate": "inception year",
                     "value": "2003",
-                    "evidence": (
-                        "Al Zaabi Group has grown steadily since our inception in 2003."
-                    ),
+                    "evidence": ("Al Zaabi Group has grown steadily since our inception in 2003."),
                     "search_phrases": [
                         "when was Al Zaabi Group formed",
                         "company founding year established inception",
@@ -285,9 +283,7 @@ async def test_contact_heading_context_keeps_address_and_phone_in_one_subject_ch
                 {
                     "subject": "Al Zaabi Group",
                     "predicate": "physical address",
-                    "value": (
-                        "Office No 403 & 404, Al Reem Plaza, Electra Street, Abu Dhabi UAE"
-                    ),
+                    "value": ("Office No 403 & 404, Al Reem Plaza, Electra Street, Abu Dhabi UAE"),
                     "evidence": (
                         "Office No 403 & 404 Al Reem Plaza, Electra Street, Abu Dhabi UAE"
                     ),
@@ -332,20 +328,13 @@ async def test_contact_heading_context_keeps_address_and_phone_in_one_subject_ch
     assert "Office No 403 & 404, Al Reem Plaza" in matches[0].text
     assert "+971 2 665 9998" in matches[0].text
     assert "+971 2 6767 366" not in matches[0].text
-    al_zaabi_section = result.content.split(
-        "SUBJECT: Adam & Eve Specialized Medical Center", 1
-    )[0]
+    al_zaabi_section = result.content.split("SUBJECT: Adam & Eve Specialized Medical Center", 1)[0]
     assert "\n\nOffice No 403" not in al_zaabi_section
 
 
 @pytest.mark.asyncio
 async def test_contact_fact_rejects_unassociated_value_from_later_page_block():
-    text = (
-        "Al Zaabi Group\n\n"
-        "Office 403, Abu Dhabi.\n\n"
-        "Other Company\n\n"
-        "Tel: +971 2 111 2222"
-    )
+    text = "Al Zaabi Group\n\nOffice 403, Abu Dhabi.\n\nOther Company\n\nTel: +971 2 111 2222"
     client = _FakeClient(
         {
             "page_type": "contact",

@@ -314,8 +314,7 @@ def _is_incomplete_barge_in_fragment(
         }
         return words[0] not in _COMPLETE_SINGLE_WORD_INTERRUPTS | known_single_terms
     if len(words) <= 4 and (
-        normalized in _INCOMPLETE_UTTERANCE_PREFIXES
-        or words[-1] in _INCOMPLETE_UTTERANCE_ENDINGS
+        normalized in _INCOMPLETE_UTTERANCE_PREFIXES or words[-1] in _INCOMPLETE_UTTERANCE_ENDINGS
     ):
         return True
     return False
@@ -687,27 +686,17 @@ def _usage_snapshot(usage: object) -> dict[str, int | float]:
         if usage_type == "llm_usage":
             result["llm_input_tokens"] += int(_usage_value(item, "input_tokens"))
             result["llm_output_tokens"] += int(_usage_value(item, "output_tokens"))
-            result["llm_input_audio_tokens"] += int(
-                _usage_value(item, "input_audio_tokens")
-            )
-            result["llm_output_audio_tokens"] += int(
-                _usage_value(item, "output_audio_tokens")
-            )
-            result["llm_input_text_tokens"] += int(
-                _usage_value(item, "input_text_tokens")
-            )
-            result["llm_output_text_tokens"] += int(
-                _usage_value(item, "output_text_tokens")
-            )
+            result["llm_input_audio_tokens"] += int(_usage_value(item, "input_audio_tokens"))
+            result["llm_output_audio_tokens"] += int(_usage_value(item, "output_audio_tokens"))
+            result["llm_input_text_tokens"] += int(_usage_value(item, "input_text_tokens"))
+            result["llm_output_text_tokens"] += int(_usage_value(item, "output_text_tokens"))
             result["realtime_session_seconds"] += _usage_value(item, "session_duration")
         elif usage_type == "tts_usage":
             result["tts_characters"] += int(_usage_value(item, "characters_count"))
             result["tts_audio_seconds"] += _usage_value(item, "audio_duration")
         elif usage_type == "stt_usage":
             result["stt_audio_seconds"] += _usage_value(item, "audio_duration")
-    result["llm_tokens"] = int(result["llm_input_tokens"]) + int(
-        result["llm_output_tokens"]
-    )
+    result["llm_tokens"] = int(result["llm_input_tokens"]) + int(result["llm_output_tokens"])
     return result
 
 
@@ -811,9 +800,9 @@ class _LiveKitRuntimeTelemetry:
                 self._finish_trace("superseded_by_caller")
             self.user_speech_started_at = now
             if agent_state in {"speaking", "thinking"} and not self.barge_in_active:
-                self.runtime_metrics["barge_in_count"] = int(
-                    self.runtime_metrics.get("barge_in_count", 0)
-                ) + 1
+                self.runtime_metrics["barge_in_count"] = (
+                    int(self.runtime_metrics.get("barge_in_count", 0)) + 1
+                )
                 self.barge_in_active = True
                 self.pending_barge_in_transcript = True
             return
@@ -842,15 +831,13 @@ class _LiveKitRuntimeTelemetry:
         return pending
 
     def record_suppressed_fragment(self, value: str) -> None:
-        self.runtime_metrics["suppressed_fragment_count"] = int(
-            self.runtime_metrics.get("suppressed_fragment_count", 0)
-        ) + 1
+        self.runtime_metrics["suppressed_fragment_count"] = (
+            int(self.runtime_metrics.get("suppressed_fragment_count", 0)) + 1
+        )
         self.runtime_metrics["last_suppressed_fragment_words"] = len(
             _normalized_utterance(value).split()
         )
-        self.runtime_metrics["fragment_continuation_window_ms"] = (
-            ADAPTIVE_FRAGMENT_CONTINUATION_MS
-        )
+        self.runtime_metrics["fragment_continuation_window_ms"] = ADAPTIVE_FRAGMENT_CONTINUATION_MS
         trace = self._trace()
         trace["transcript_words"] = len(_normalized_utterance(value).split())
         trace["stabilization_ms"] = ADAPTIVE_FRAGMENT_CONTINUATION_MS
@@ -864,18 +851,14 @@ class _LiveKitRuntimeTelemetry:
         now = time.monotonic()
         if not self.first_agent_audio_seen:
             self.first_agent_audio_seen = True
-            self.runtime_metrics["call_open_to_greeting_ms"] = round(
-                (now - self.opened_at) * 1000
-            )
+            self.runtime_metrics["call_open_to_greeting_ms"] = round((now - self.opened_at) * 1000)
             if self.session_started_at is not None:
                 self.runtime_metrics["session_start_to_greeting_ms"] = round(
                     (now - self.session_started_at) * 1000
                 )
 
         if self.last_final_transcript_at is not None:
-            transcript_latency = round(
-                (now - self.last_final_transcript_at) * 1000
-            )
+            transcript_latency = round((now - self.last_final_transcript_at) * 1000)
             self.runtime_metrics["last_transcript_to_first_audio_ms"] = transcript_latency
             self._trace()["transcript_to_first_audio_ms"] = transcript_latency
             self.last_final_transcript_at = None
@@ -1042,9 +1025,7 @@ def _build_inworld_realtime_model(
 
     language = _effective_stt_language(model=model, profile=profile)
     vocabulary = ", ".join(terminology[:80])[:1500].rstrip(" ,")
-    vocabulary_instruction = (
-        f" Approved knowledge terminology: {vocabulary}." if vocabulary else ""
-    )
+    vocabulary_instruction = f" Approved knowledge terminology: {vocabulary}." if vocabulary else ""
     transcription = AudioTranscription(
         model=_inworld_stt_model(model=model, profile=profile),
         language=None if language == "auto" else language,
@@ -2497,13 +2478,18 @@ async def vav_inworld_session(ctx: JobContext) -> None:
             if new_state == "speaking" and fragment_guard_task is not None:
                 fragment_guard_task.cancel()
                 fragment_guard_task = None
-            if native_realtime and new_state == "speaking" and agent_state in {
-                "speaking",
-                "thinking",
-            }:
-                usage_totals["stale_generation_cancel_count"] = int(
-                    usage_totals.get("stale_generation_cancel_count", 0)
-                ) + 1
+            if (
+                native_realtime
+                and new_state == "speaking"
+                and agent_state
+                in {
+                    "speaking",
+                    "thinking",
+                }
+            ):
+                usage_totals["stale_generation_cancel_count"] = (
+                    int(usage_totals.get("stale_generation_cancel_count", 0)) + 1
+                )
                 _cancel_stale_generation()
             # Stop playout promptly, then give only the replacement barge-in
             # sentence more time to settle. Normal turns retain the faster

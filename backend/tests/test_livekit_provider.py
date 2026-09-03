@@ -721,9 +721,7 @@ async def test_native_realtime_tool_passes_semantic_terms_to_shared_retrieval(mo
     assert result.endswith("2003")
     retrieval.assert_awaited_once_with(
         query="When was Al Zaabi Group formed?",
-        query_variants=(
-            "What is the Al Zaabi Group inception year?",
-        ),
+        query_variants=("What is the Al Zaabi Group inception year?",),
     )
 
 
@@ -1164,12 +1162,8 @@ def test_livekit_native_events_capture_exact_turn_and_interruption_metrics(monke
 
     telemetry.mark_session_started()
     telemetry.on_agent_state(new_state="speaking")
-    telemetry.on_user_state(
-        old_state="listening", new_state="speaking", agent_state="speaking"
-    )
-    telemetry.on_user_state(
-        old_state="speaking", new_state="listening", agent_state="listening"
-    )
+    telemetry.on_user_state(old_state="listening", new_state="speaking", agent_state="speaking")
+    telemetry.on_user_state(old_state="speaking", new_state="listening", agent_state="listening")
     telemetry.on_final_transcript()
     telemetry.on_agent_state(new_state="speaking")
     telemetry.on_metrics(
@@ -1267,9 +1261,7 @@ def test_livekit_native_fragment_is_consumed_once_and_recorded(monkeypatch):
         opened_at=19.0,
     )
 
-    telemetry.on_user_state(
-        old_state="listening", new_state="speaking", agent_state="thinking"
-    )
+    telemetry.on_user_state(old_state="listening", new_state="speaking", agent_state="thinking")
     assert telemetry.consume_barge_in_transcript() is True
     assert telemetry.consume_barge_in_transcript() is False
     telemetry.record_suppressed_fragment("See.")

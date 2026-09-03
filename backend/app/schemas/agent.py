@@ -57,6 +57,7 @@ class AgentCreate(BaseModel):
     disposition_profile: Literal[
         "general", "receptionist", "customer_support", "appointment", "sales", "collections"
     ] = "general"
+    post_call_analysis_mode: Literal["provider_first", "vav_ai", "disabled"] = "provider_first"
     voice_provider: Literal["smallest", "sarvam", "elevenlabs", "inworld"] = "smallest"
     voice_id: str = Field("", max_length=100)
     language: str = Field("en", min_length=2, max_length=63)
@@ -115,9 +116,13 @@ class AgentUpdate(BaseModel):
     model_name: Literal["electron"] | None = None
     temperature: float | None = Field(None, ge=0, le=2)
     max_tokens: int | None = Field(None, ge=32, le=8192)
-    disposition_profile: Literal[
-        "general", "receptionist", "customer_support", "appointment", "sales", "collections"
-    ] | None = None
+    disposition_profile: (
+        Literal[
+            "general", "receptionist", "customer_support", "appointment", "sales", "collections"
+        ]
+        | None
+    ) = None
+    post_call_analysis_mode: Literal["provider_first", "vav_ai", "disabled"] | None = None
     voice_provider: Literal["smallest", "sarvam", "elevenlabs", "inworld"] | None = None
     voice_id: str | None = Field(None, max_length=100)
     language: str | None = Field(None, min_length=2, max_length=63)
@@ -157,6 +162,7 @@ class AgentUpdate(BaseModel):
             "temperature",
             "max_tokens",
             "disposition_profile",
+            "post_call_analysis_mode",
             "voice_provider",
             "voice_id",
             "language",
@@ -188,6 +194,7 @@ class AgentResponse(BaseModel):
     temperature: float
     max_tokens: int
     disposition_profile: str
+    post_call_analysis_mode: Literal["provider_first", "vav_ai", "disabled"]
     voice_provider: str
     voice_id: str
     language: str
@@ -395,6 +402,7 @@ class AgentTemplate(BaseModel):
     disposition_profile: Literal[
         "general", "receptionist", "customer_support", "appointment", "sales", "collections"
     ] = "general"
+    post_call_analysis_mode: Literal["provider_first", "vav_ai", "disabled"] = "provider_first"
 
 
 class ProviderFieldCapability(BaseModel):

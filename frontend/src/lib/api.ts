@@ -66,6 +66,7 @@ export interface VoiceAgent {
   model_provider: string;
   model_name: string;
   disposition_profile: 'general' | 'receptionist' | 'customer_support' | 'appointment' | 'sales' | 'collections';
+  post_call_analysis_mode: 'provider_first' | 'vav_ai' | 'disabled';
   voice_provider: string;
   voice_id: string;
   language: string;
@@ -115,6 +116,7 @@ export interface AgentAIDraftResponse {
     model_provider: string;
     model_name: string;
     disposition_profile: 'general' | 'receptionist' | 'customer_support' | 'appointment' | 'sales' | 'collections';
+    post_call_analysis_mode: 'provider_first' | 'vav_ai' | 'disabled';
     voice_provider: 'smallest' | 'sarvam' | 'elevenlabs' | 'inworld';
     voice_id: string;
     temperature: number;
@@ -265,6 +267,7 @@ export interface AgentTemplate {
   temperature: number;
   timezone: string;
   disposition_profile: 'general' | 'receptionist' | 'customer_support' | 'appointment' | 'sales' | 'collections';
+  post_call_analysis_mode: 'provider_first' | 'vav_ai' | 'disabled';
 }
 
 export interface AgentProviderCatalog {

@@ -244,6 +244,14 @@ PROVIDER_FIELD_CAPABILITIES = {
         "status": "local_only",
         "reason": "The current Smallest draft contract has no output-token limit field.",
     },
+    "disposition_profile": {
+        "status": "local_only",
+        "reason": "VAV validates post-call outcomes independently of the voice provider.",
+    },
+    "post_call_analysis_mode": {
+        "status": "local_only",
+        "reason": "VAV controls provider reuse and optional post-call AI analysis.",
+    },
     "fallback_message": {
         "status": "local_only",
         "reason": "Fallback behavior requires a provider workflow/tool runtime.",
