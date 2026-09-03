@@ -1380,6 +1380,8 @@ async def _postgres_candidate_source_ids(
         func.coalesce(cast(KnowledgeSource.name, Text), empty_text)
         + literal_column("' '", type_=Text())
         + func.coalesce(KnowledgeSource.content, empty_text)
+        + literal_column("' '", type_=Text())
+        + func.coalesce(cast(KnowledgeSource.structured_content, Text), empty_text)
     )
     search_vector = func.to_tsvector(
         literal_column("'simple'::regconfig"),
@@ -1453,6 +1455,7 @@ async def _fallback_candidate_source_ids(
 ) -> list[UUID]:
     lower_name = func.lower(KnowledgeSource.name)
     lower_content = func.lower(KnowledgeSource.content)
+    lower_structured_content = func.lower(cast(KnowledgeSource.structured_content, Text))
     exact_terms = sorted(_tokens(query) - _QUERY_STOP_WORDS)[:16]
     exact_ids: list[UUID] = []
     if exact_terms:
@@ -1472,6 +1475,7 @@ async def _fallback_candidate_source_ids(
                                 for predicate in (
                                     lower_name.contains(token),
                                     lower_content.contains(token),
+                                    lower_structured_content.contains(token),
                                 )
                             )
                         ),

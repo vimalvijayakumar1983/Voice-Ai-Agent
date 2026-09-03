@@ -87,6 +87,63 @@ def test_structured_retrieval_keeps_parent_and_subsidiary_dates_separate():
     assert "Tyre Factory" not in matches[0].text
 
 
+@pytest.mark.asyncio
+async def test_retrieval_candidate_search_includes_structured_facts(db, tenant):
+    agent = Agent(
+        tenant_id=tenant.id,
+        name="Structured knowledge agent",
+        system_prompt="Use only approved knowledge.",
+    )
+    knowledge_base = KnowledgeBase(
+        tenant_id=tenant.id,
+        name="Company knowledge",
+        approval_status="approved",
+        is_active=True,
+    )
+    db.add_all([agent, knowledge_base])
+    await db.flush()
+    db.add(
+        AgentKnowledgeBinding(
+            tenant_id=tenant.id,
+            agent_id=agent.id,
+            knowledge_base_id=knowledge_base.id,
+        )
+    )
+    db.add(
+        KnowledgeSource(
+            tenant_id=tenant.id,
+            knowledge_base_id=knowledge_base.id,
+            source_type="website",
+            name="Management",
+            status="indexed",
+            content="Legacy extraction without the requested date terminology.",
+            structured_content={
+                "facts": [
+                    {
+                        "subject": "Al Zaabi Group",
+                        "predicate": "inception year",
+                        "value": "2003",
+                        "evidence": "Al Zaabi Group has operated since its inception in 2003.",
+                        "search_phrases": ["When was Al Zaabi Group formed?"],
+                    }
+                ]
+            },
+        )
+    )
+    await db.commit()
+
+    context = await knowledge_retrieval.retrieve_knowledge_context(
+        db,
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        query="When was Al Zaabi Group formed?",
+    )
+
+    assert context is not None
+    assert "SUBJECT: Al Zaabi Group" in context
+    assert "inception year: 2003" in context
+
+
 def test_contextual_plan_does_not_turn_medical_term_into_operational_term():
     plan = build_contextual_query_plan(
         "Do you provide cancer treatment?",
