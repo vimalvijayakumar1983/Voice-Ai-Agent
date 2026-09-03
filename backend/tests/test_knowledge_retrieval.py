@@ -30,6 +30,28 @@ def test_contextual_plan_expands_meaning_without_company_specific_rules():
     assert "When was this company inception?" in plan.variants
 
 
+def test_semantic_variant_retrieves_source_worded_as_inception():
+    documents = [
+        (
+            "Management – Al Zaabi Group",
+            "Al Zaabi Group has contributed through fair business activities since our "
+            "inception in 2003.",
+        )
+    ]
+    plan = build_contextual_query_plan(
+        "Al Zaabi Group. When was this company formed?"
+    )
+
+    matches = knowledge_retrieval._rank_contextual_knowledge(
+        plan.variants,
+        documents,
+        limit=4,
+    )
+
+    assert matches
+    assert "inception in 2003" in matches[0].text
+
+
 def test_contextual_plan_does_not_turn_medical_term_into_operational_term():
     plan = build_contextual_query_plan(
         "Do you provide cancer treatment?",
