@@ -16,7 +16,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 ProcessingMode = Literal["automatic", "fast", "ai_verified"]
 
-COMPILER_VERSION = "vav-knowledge-compiler-1"
+COMPILER_VERSION = "vav-knowledge-compiler-2"
 AUTOMATIC_MODEL = "gpt-5.6-luna"
 VERIFIED_MODEL = "gpt-5.6-terra"
 _MODEL_PRICES_PER_MILLION = {
@@ -134,10 +134,20 @@ def _build_document(*, title: str, url: str, text: str, structured: dict) -> str
             lines.append(f"- {entity['entity_type']}: {entity['name']}")
     if facts:
         lines.extend(["", "VERIFIED STRUCTURED FACTS"])
+        facts_by_subject: dict[str, list[dict]] = {}
         for fact in facts:
-            lines.append(f"- {fact['subject']} | {fact['predicate']}: {fact['value']}")
-            lines.append(f"  Evidence: {fact['evidence']}")
-    if contacts.get("phones") or contacts.get("emails"):
+            facts_by_subject.setdefault(fact["subject"], []).append(fact)
+        for subject, subject_facts in facts_by_subject.items():
+            # Blank subject boundaries become retrieval chunk boundaries. This
+            # prevents a multi-company directory/contact page from leaking one
+            # organization's telephone values into another organization's answer.
+            lines.extend(["", f"SUBJECT: {subject}"])
+            for fact in subject_facts:
+                lines.append(f"- {fact['predicate']}: {fact['value']}")
+                lines.append(f"  Evidence: {fact['evidence']}")
+    if not facts and (contacts.get("phones") or contacts.get("emails")):
+        # An unassociated page-wide phone list is useful in deterministic mode,
+        # but unsafe once verified subject/fact associations are available.
         lines.extend(["", "CONTACT VALUES FOUND ON THIS PAGE"])
         lines.extend(f"- Phone: {value}" for value in contacts.get("phones", []))
         lines.extend(f"- Email: {value}" for value in contacts.get("emails", []))

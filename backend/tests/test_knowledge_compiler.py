@@ -7,6 +7,7 @@ from app.services.knowledge_compiler import (
     KnowledgeCompilerError,
     compile_website_knowledge,
 )
+from app.services.knowledge_retrieval import rank_knowledge
 
 
 class _FakeCompletions:
@@ -95,6 +96,8 @@ async def test_ai_compilation_rejects_every_fact_without_verbatim_evidence():
     assert result.output_tokens == 200
     assert result.estimated_cost_usd == pytest.approx(0.004)
     assert result.structured["compiler"]["estimated_cost_aed"] == pytest.approx(0.01469)
+    assert "SUBJECT: Royal Clinic" in result.content
+    assert "CONTACT VALUES FOUND ON THIS PAGE" not in result.content
 
     schema = client.completions.requests[0]["response_format"]["json_schema"]["schema"]
     assert set(schema["required"]) == {"page_type", "entities", "facts"}
@@ -109,6 +112,59 @@ async def test_ai_compilation_rejects_every_fact_without_verbatim_evidence():
         "value",
         "evidence",
     }
+
+
+@pytest.mark.asyncio
+async def test_ai_compilation_separates_multi_organization_contact_facts():
+    text = (
+        "Al Zaabi Group. Office 403, Al Reem Plaza, Abu Dhabi. "
+        "Tel: +971 2 665 9998.\n\n"
+        "Adam and Eve Medical Center. Pink Building, Abu Dhabi. "
+        "Tel: +971 2 6767 366."
+    )
+    client = _FakeClient(
+        {
+            "page_type": "contact",
+            "entities": [],
+            "facts": [
+                {
+                    "subject": "Al Zaabi Group",
+                    "predicate": "address and telephone",
+                    "value": "Office 403, Al Reem Plaza, Abu Dhabi; +971 2 665 9998",
+                    "evidence": (
+                        "Al Zaabi Group. Office 403, Al Reem Plaza, Abu Dhabi. "
+                        "Tel: +971 2 665 9998."
+                    ),
+                },
+                {
+                    "subject": "Adam and Eve Medical Center",
+                    "predicate": "address and telephone",
+                    "value": "Pink Building, Abu Dhabi; +971 2 6767 366",
+                    "evidence": (
+                        "Adam and Eve Medical Center. Pink Building, Abu Dhabi. "
+                        "Tel: +971 2 6767 366."
+                    ),
+                },
+            ],
+        }
+    )
+
+    result = await compile_website_knowledge(
+        title="Contact – Al Zaabi Group",
+        url="https://www.alzaabigroup.com/contact/",
+        text=text,
+        requested_mode="ai_verified",
+        api_key="test-key",
+        client=client,
+    )
+    matches = rank_knowledge(
+        "What is the phone number for Al Zaabi Group?",
+        [("Contact – Al Zaabi Group", result.content)],
+    )
+
+    assert matches
+    assert "+971 2 665 9998" in matches[0].text
+    assert all("+971 2 6767 366" not in match.text for match in matches)
 
 
 @pytest.mark.asyncio

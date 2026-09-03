@@ -18,6 +18,7 @@ from app.models.agent import AgentKnowledgeBinding, KnowledgeBase, KnowledgeSour
 
 _TOKEN = re.compile(r"[^\W_]+", re.UNICODE)
 _SPLIT = re.compile(r"(?:\r?\n){2,}|(?<=[.!?।])\s+")
+_PARAGRAPH_SPLIT = re.compile(r"(?:\r?\n){2,}")
 MAX_CONTEXT_CHARS = 6000
 MAX_SOURCE_CANDIDATES = 48
 MAX_RANKING_CORPUS_CHARS = 96_000
@@ -646,13 +647,38 @@ def _is_group_overview_source(source: str) -> bool:
     return title_tokens[:2] == ["the", "group"]
 
 
-def _chunks(value: str, *, max_chars: int = 900) -> list[str]:
+def _intent_content(value: str, *, phone_query: bool) -> str:
+    """Prefer verified subject associations for multi-entity phone lookups."""
+
+    if not phone_query:
+        return value
+    marker = "VERIFIED STRUCTURED FACTS"
+    source_marker = "\n\nSOURCE CONTENT"
+    start = value.find(marker)
+    if start < 0:
+        return value
+    end = value.find(source_marker, start)
+    structured = value[start : end if end >= 0 else len(value)].strip()
+    structured_tokens = _token_forms(_base_tokens(structured))
+    return structured if _has_phone_evidence(structured, structured_tokens) else value
+
+
+def _chunks(
+    value: str,
+    *,
+    max_chars: int = 900,
+    preserve_paragraphs: bool = False,
+) -> list[str]:
     chunks: list[str] = []
     current = ""
-    for part in _SPLIT.split(value):
+    splitter = _PARAGRAPH_SPLIT if preserve_paragraphs else _SPLIT
+    for part in splitter.split(value):
         part = " ".join(part.split()).strip()
         if not part:
             continue
+        if preserve_paragraphs and current:
+            chunks.append(current)
+            current = ""
         if current and len(current) + len(part) + 1 > max_chars:
             chunks.append(current)
             current = ""
@@ -679,6 +705,9 @@ def rank_knowledge(
         # concept.  Do not require the source to contain the literal word
         # ``number`` when it supplies the value as ``Tel: +971 ...``.
         query_tokens.discard("number")
+    phone_subject_tokens = (
+        query_tokens - _CONTACT_QUERY_TOKENS - {"detail", "information"} if phone_query else set()
+    )
     if not query_tokens or limit <= 0:
         return []
     ordered_query_tokens = sorted(query_tokens)
@@ -689,7 +718,8 @@ def rank_knowledge(
     for source, content in documents:
         source_terms = _source_terms(source)
         source_compounds = _source_compounds(source)
-        for chunk in _chunks(content):
+        ranked_content = _intent_content(content, phone_query=phone_query)
+        for chunk in _chunks(ranked_content, preserve_paragraphs=phone_query):
             chunk_base_tokens = _base_tokens(chunk)
             chunk_tokens = _token_forms(chunk_base_tokens)
             chunk_has_phone = _has_phone_evidence(chunk, chunk_tokens)
@@ -702,6 +732,12 @@ def rank_knowledge(
                 # Treat provider and website vocabulary as equivalent without
                 # rewriting the stored source or weakening unrelated intents.
                 chunk_tokens.update(_PHONE_TERMS)
+            if phone_subject_tokens and not phone_subject_tokens <= chunk_tokens:
+                # Contact pages commonly list several companies.  A source-title
+                # match is not enough: the returned phone evidence must name the
+                # organization requested by the caller.  Contextual spelling
+                # recovery supplies a corrected query variant when necessary.
+                continue
             quality = _chunk_quality(chunk, words=chunk_base_tokens)
             content_scores: list[float] = []
             source_scores: list[float] = []

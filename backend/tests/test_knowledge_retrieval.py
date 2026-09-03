@@ -149,6 +149,25 @@ def test_phone_number_query_matches_tel_labeled_contact_evidence():
     assert "+971 2 665 9998" in matches[0].text
 
 
+def test_phone_query_excludes_other_organizations_on_same_contact_page():
+    matches = rank_knowledge(
+        "What is the contact address and phone number for Al Zaabi Group?",
+        [
+            (
+                "Contact – Al Zaabi Group",
+                "Al Zaabi Group. Office No 403 and 404, Al Reem Plaza, Electra Street, "
+                "Abu Dhabi UAE. Tel: +971 2 665 9998.\n\n"
+                "Adam and Eve Medical Center. Pink Building, Abu Dhabi. "
+                "Tel: +971 2 6767 366. Mobile: +971 52 1555 366.",
+            )
+        ],
+    )
+
+    assert matches
+    assert all("+971 2 6767 366" not in match.text for match in matches)
+    assert all("+971 52 1555 366" not in match.text for match in matches)
+
+
 def test_phone_query_requires_phone_evidence_not_only_contact_title():
     matches = rank_knowledge(
         "What is the phone number for Al Zaabi Group?",
