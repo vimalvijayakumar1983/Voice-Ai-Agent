@@ -132,6 +132,46 @@ def test_ranking_requires_each_substantive_topic_not_explained_by_title():
     assert matches == []
 
 
+def test_phone_number_query_matches_tel_labeled_contact_evidence():
+    matches = rank_knowledge(
+        "What is the contact address and phone number for Al Zaabi Group?",
+        [
+            (
+                "Contact – Al Zaabi Group",
+                "Al Zaabi Group. Office No 403 and 404, Al Reem Plaza, Electra Street, "
+                "Abu Dhabi UAE. Tel: +971 2 665 9998. Fax: +971 2 665 9994. "
+                "Email: info@alzaabigroup.com.",
+            )
+        ],
+    )
+
+    assert matches
+    assert "+971 2 665 9998" in matches[0].text
+
+
+def test_phone_query_requires_phone_evidence_not_only_contact_title():
+    matches = rank_knowledge(
+        "What is the phone number for Al Zaabi Group?",
+        [
+            (
+                "Contact – Al Zaabi Group",
+                "Use the website form to send Al Zaabi Group a general enquiry.",
+            )
+        ],
+    )
+
+    assert matches == []
+
+
+def test_non_phone_number_remains_a_required_substantive_term():
+    matches = rank_knowledge(
+        "What is the customer account number?",
+        [("Customer accounts", "Contact the accounts team for general assistance.")],
+    )
+
+    assert matches == []
+
+
 def test_ranking_handles_compound_stt_brand_variant_and_follow_up_fillers():
     matches = rank_knowledge(
         "Okay, can you tell me more about Alzab group please?",

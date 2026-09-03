@@ -234,6 +234,8 @@ _CONTACT_SOURCE_MARKERS = (
     "mailto:",
     "@",
 )
+_PHONE_TERMS = {"mobile", "phone", "tel", "telephone"}
+_PHONE_NUMBER = re.compile(r"(?<!\w)\+?\d[\d\s().-]{6,}\d(?!\w)")
 
 
 @dataclass(frozen=True)
@@ -278,6 +280,23 @@ def _token_forms(base_tokens: list[str]) -> set[str]:
 
 def _query_tokens(value: str) -> set[str]:
     return {_singular(token) for token in _base_tokens(value)} - _QUERY_STOP_WORDS
+
+
+def _is_phone_query(value: str, query_tokens: set[str]) -> bool:
+    """Return whether the caller is asking for a telephone contact.
+
+    ``number`` remains substantive for account, invoice, order, and other
+    identifiers.  It becomes a harmless qualifier only when the query also
+    contains an explicit phone/contact-number signal.
+    """
+
+    return bool(query_tokens & _PHONE_TERMS) or bool(
+        re.search(r"\bcontact\s+(?:phone\s+)?number\b", value.casefold())
+    )
+
+
+def _has_phone_evidence(value: str, tokens: set[str]) -> bool:
+    return bool(tokens & _PHONE_TERMS) or bool(_PHONE_NUMBER.search(value))
 
 
 def _deduplicated_queries(values: Iterable[str]) -> tuple[str, ...]:
@@ -654,6 +673,12 @@ def rank_knowledge(
     limit: int = 6,
 ) -> list[KnowledgeMatch]:
     query_tokens = _query_tokens(query)
+    phone_query = _is_phone_query(query, query_tokens)
+    if phone_query:
+        # ``phone number`` and ``telephone number`` describe one contact
+        # concept.  Do not require the source to contain the literal word
+        # ``number`` when it supplies the value as ``Tel: +971 ...``.
+        query_tokens.discard("number")
     if not query_tokens or limit <= 0:
         return []
     ordered_query_tokens = sorted(query_tokens)
@@ -667,6 +692,16 @@ def rank_knowledge(
         for chunk in _chunks(content):
             chunk_base_tokens = _base_tokens(chunk)
             chunk_tokens = _token_forms(chunk_base_tokens)
+            chunk_has_phone = _has_phone_evidence(chunk, chunk_tokens)
+            if phone_query and not chunk_has_phone:
+                # A contact-page title alone must not satisfy a request for a
+                # phone number.  Require an explicit telephone label or a
+                # number-shaped value in the returned evidence.
+                continue
+            if chunk_has_phone:
+                # Treat provider and website vocabulary as equivalent without
+                # rewriting the stored source or weakening unrelated intents.
+                chunk_tokens.update(_PHONE_TERMS)
             quality = _chunk_quality(chunk, words=chunk_base_tokens)
             content_scores: list[float] = []
             source_scores: list[float] = []
