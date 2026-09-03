@@ -16,7 +16,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 ProcessingMode = Literal["automatic", "fast", "ai_verified"]
 
-COMPILER_VERSION = "vav-knowledge-compiler-4"
+COMPILER_VERSION = "vav-knowledge-compiler-5"
 AUTOMATIC_MODEL = "gpt-5.6-luna"
 VERIFIED_MODEL = "gpt-5.6-terra"
 _MODEL_PRICES_PER_MILLION = {
@@ -138,7 +138,22 @@ def _subject_is_grounded_in_context(source: str, subject: str, evidence: str) ->
         if paragraph.strip()
     ]
     for index, paragraph in enumerate(paragraphs):
-        if normalized_evidence not in _grounding_normalized(paragraph) or index == 0:
+        normalized_paragraph = _grounding_normalized(paragraph)
+        evidence_index = normalized_paragraph.find(normalized_evidence)
+        if evidence_index < 0:
+            continue
+        # Narrative pages often name the organization at the start of a
+        # paragraph and use "we" later in that same paragraph. Accept that
+        # bounded, explicit context without allowing a fact to borrow a subject
+        # from another paragraph or section.
+        subject_index = normalized_paragraph.rfind(
+            normalized_subject,
+            0,
+            evidence_index + len(normalized_subject),
+        )
+        if subject_index >= 0 and evidence_index - subject_index <= 1_200:
+            return True
+        if index == 0:
             continue
         previous = _grounding_normalized(paragraphs[index - 1])
         # The preceding block must be the subject heading, not an arbitrary

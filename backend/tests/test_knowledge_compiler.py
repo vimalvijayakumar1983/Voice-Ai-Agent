@@ -166,6 +166,52 @@ async def test_ai_compilation_keeps_natural_questions_with_verified_fact():
 
 
 @pytest.mark.asyncio
+async def test_ai_compilation_accepts_pronoun_fact_from_same_subject_paragraph():
+    text = (
+        "Al Zaabi Group has grown throughout the UAE. The market changes constantly. "
+        "We have conducted fair business activities since our inception in 2003."
+    )
+    client = _FakeClient(
+        {
+            "page_type": "overview",
+            "entities": [
+                {
+                    "name": "Al Zaabi Group",
+                    "entity_type": "organization",
+                    "evidence": "Al Zaabi Group",
+                }
+            ],
+            "facts": [
+                {
+                    "subject": "Al Zaabi Group",
+                    "predicate": "inception year",
+                    "value": "2003",
+                    "evidence": (
+                        "We have conducted fair business activities since our inception in 2003."
+                    ),
+                    "search_phrases": [
+                        "when was Al Zaabi Group formed",
+                        "Al Zaabi Group founding year inception",
+                    ],
+                }
+            ],
+        }
+    )
+
+    result = await compile_website_knowledge(
+        title="Management – Al Zaabi Group",
+        url="https://alzaabigroup.example/management",
+        text=text,
+        requested_mode="ai_verified",
+        api_key="test-key",
+        client=client,
+    )
+
+    assert result.structured["validation"]["facts_accepted"] == 1
+    assert result.structured["facts"][0]["value"] == "2003"
+
+
+@pytest.mark.asyncio
 async def test_ai_compilation_separates_multi_organization_contact_facts():
     text = (
         "Al Zaabi Group. Office 403, Al Reem Plaza, Abu Dhabi. "
