@@ -41,9 +41,7 @@ def test_semantic_variant_retrieves_source_worded_as_inception():
             "inception in 2003.",
         )
     ]
-    plan = build_contextual_query_plan(
-        "Al Zaabi Group. When was this company formed?"
-    )
+    plan = build_contextual_query_plan("Al Zaabi Group. When was this company formed?")
 
     matches = knowledge_retrieval._rank_contextual_knowledge(
         plan.variants,
@@ -99,9 +97,11 @@ def test_structured_retrieval_keeps_parent_and_subsidiary_dates_separate():
 
 
 def test_structured_subject_matching_supports_lowercase_voice_queries():
-    assert knowledge_retrieval._requested_subject_tokens(
-        "when was al zaabi group formed"
-    ) == {"al", "zaabi", "group"}
+    assert knowledge_retrieval._requested_subject_tokens("when was al zaabi group formed") == {
+        "al",
+        "zaabi",
+        "group",
+    }
 
 
 @pytest.mark.asyncio
@@ -187,9 +187,7 @@ def test_contextual_plan_never_rewrites_preposition_as_part_of_source_name():
         terminology=("ITR Al Zaabi Group", "Al Zaabi Group"),
     )
 
-    assert plan.variants[0] == (
-        "What is the contact address and phone number for Al Zaabi Group?"
-    )
+    assert plan.variants[0] == ("What is the contact address and phone number for Al Zaabi Group?")
     assert all("ITR Al Zaabi Group" not in variant for variant in plan.variants)
     assert plan.recovered_terms == ()
 
@@ -350,8 +348,7 @@ def test_bounded_corpus_keeps_requested_contact_subject_before_excerpting():
         + "\n\n".join(
             f"SUBJECT: Other Company {index}\n"
             f"- physical-address: Other address {index}, Abu Dhabi UAE\n"
-            f"- primary-telephone: +971 2 700 {index:04d}\n"
-            + ("Other approved details. " * 35)
+            f"- primary-telephone: +971 2 700 {index:04d}\n" + ("Other approved details. " * 35)
             for index in range(20)
         )
         + "\n\nSOURCE CONTENT\nLong raw contact page."

@@ -773,6 +773,7 @@ AGENT_TEMPLATES: list[dict[str, Any]] = [
     {
         "id": "receptionist",
         "disposition_profile": "receptionist",
+        "post_call_analysis_mode": "provider_first",
         "name": "AI Receptionist",
         "category": "Inbound",
         "description": (
@@ -812,6 +813,7 @@ Summarize the agreed next step, ask whether anything else is needed, and close p
     {
         "id": "customer_support",
         "disposition_profile": "customer_support",
+        "post_call_analysis_mode": "provider_first",
         "name": "Customer Support",
         "category": "Service",
         "description": (
@@ -852,6 +854,7 @@ RULES
     {
         "id": "lead_qualification",
         "disposition_profile": "sales",
+        "post_call_analysis_mode": "provider_first",
         "name": "Lead Qualification",
         "category": "Sales",
         "description": (
@@ -891,6 +894,7 @@ CRM updates.""",
     {
         "id": "appointment_booking",
         "disposition_profile": "appointment",
+        "post_call_analysis_mode": "provider_first",
         "name": "Appointment Booking",
         "category": "Scheduling",
         "description": (
@@ -926,6 +930,7 @@ GUARDRAILS
     {
         "id": "payment_reminder",
         "disposition_profile": "collections",
+        "post_call_analysis_mode": "provider_first",
         "name": "Payment Reminder",
         "category": "Collections",
         "description": (

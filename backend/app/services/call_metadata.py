@@ -11,6 +11,7 @@ def agent_configuration_snapshot(agent: Any) -> dict[str, Any]:
         "supported_languages": list(getattr(agent, "supported_languages", None) or []),
         "language_switching_enabled": bool(getattr(agent, "language_switching_enabled", False)),
         "language_switching_mode": getattr(agent, "language_switching_mode", "disabled"),
+        "post_call_analysis_mode": getattr(agent, "post_call_analysis_mode", "provider_first"),
     }
 
 
@@ -46,6 +47,9 @@ def public_call_metadata(value: Any) -> dict[str, Any] | None:
     switching_mode = snapshot.get("language_switching_mode")
     if switching_mode in {"disabled", "automatic"}:
         result["language_switching_mode"] = switching_mode
+    analysis_mode = snapshot.get("post_call_analysis_mode")
+    if analysis_mode in {"provider_first", "vav_ai", "disabled"}:
+        result["post_call_analysis_mode"] = analysis_mode
     speech_provider = value.get("speech_provider")
     if speech_provider in {"smallest", "sarvam", "elevenlabs", "inworld"}:
         result["speech_provider"] = speech_provider

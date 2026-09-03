@@ -21,7 +21,9 @@ def upgrade() -> None:
         "agents",
         sa.Column("disposition_profile", sa.String(length=30), nullable=True),
     )
-    op.execute("UPDATE agents SET disposition_profile = 'general' WHERE disposition_profile IS NULL")
+    op.execute(
+        "UPDATE agents SET disposition_profile = 'general' WHERE disposition_profile IS NULL"
+    )
     op.alter_column("agents", "disposition_profile", nullable=False)
     op.add_column(
         "call_summaries",

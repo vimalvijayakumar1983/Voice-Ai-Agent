@@ -255,6 +255,154 @@ async def test_provider_analytics_wins_while_local_summary_runs_without_db_lock(
 
 
 @pytest.mark.asyncio
+async def test_provider_first_normalizes_sufficient_analytics_without_openai(
+    db,
+    tenant,
+    monkeypatch,
+):
+    agent = Agent(
+        tenant_id=tenant.id,
+        name="Provider-first receptionist",
+        system_prompt="Welcome callers and answer approved questions.",
+        voice_provider="smallest",
+        disposition_profile="receptionist",
+        post_call_analysis_mode="provider_first",
+    )
+    db.add(agent)
+    await db.flush()
+    analytics = {
+        "summary": "The caller received the office number.",
+        "keyTopics": ["contact details"],
+        "actionItems": [],
+        "sentiment": "positive",
+        "dispositionMetrics": [{"value": "answered", "confidence": 0.94}],
+    }
+    call = Call(
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        direction="inbound",
+        status="completed",
+        from_number="browser",
+        to_number="voice-agent",
+        provider="smallest",
+        duration_seconds=30,
+        call_metadata={"smallest_analytics": analytics},
+    )
+    db.add(call)
+    await db.flush()
+    db.add_all(
+        [
+            CallTranscript(
+                tenant_id=tenant.id,
+                call_id=call.id,
+                turns=[{"role": "user", "content": "What is the office number?"}],
+                full_text="User: What is the office number?",
+            ),
+            CallSummary(
+                tenant_id=tenant.id,
+                call_id=call.id,
+                summary=analytics["summary"],
+                key_topics=analytics["keyTopics"],
+                action_items=[],
+                sentiment="positive",
+            ),
+        ]
+    )
+    await db.commit()
+
+    summarize = AsyncMock()
+    monkeypatch.setattr(conversation_engine, "generate_call_summary", summarize)
+    monkeypatch.setattr(database, "async_session_factory", session_factory)
+
+    await _process_completed_call_async(str(call.id), str(tenant.id))
+
+    async with session_factory() as session:
+        stored_call = await session.get(Call, call.id)
+        summary = await session.scalar(select(CallSummary).where(CallSummary.call_id == call.id))
+    summarize.assert_not_awaited()
+    assert stored_call.disposition == "information_provided"
+    assert summary.summary == analytics["summary"]
+    assert summary.disposition_details["analysis_source"] == "provider_analytics"
+
+
+@pytest.mark.asyncio
+async def test_vav_ai_mode_analyzes_even_when_provider_analytics_exist(
+    db,
+    tenant,
+    monkeypatch,
+):
+    agent = Agent(
+        tenant_id=tenant.id,
+        name="VAV AI receptionist",
+        system_prompt="Welcome callers and answer approved questions.",
+        voice_provider="smallest",
+        disposition_profile="receptionist",
+        post_call_analysis_mode="vav_ai",
+    )
+    db.add(agent)
+    await db.flush()
+    call = Call(
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        direction="inbound",
+        status="completed",
+        from_number="browser",
+        to_number="voice-agent",
+        provider="smallest",
+        duration_seconds=30,
+        call_metadata={
+            "smallest_analytics": {
+                "summary": "Provider summary",
+                "dispositionMetrics": [{"value": "answered"}],
+            }
+        },
+    )
+    db.add(call)
+    await db.flush()
+    db.add_all(
+        [
+            CallTranscript(
+                tenant_id=tenant.id,
+                call_id=call.id,
+                turns=[{"role": "user", "content": "Please call me back."}],
+                full_text="User: Please call me back.",
+            ),
+            CallSummary(
+                tenant_id=tenant.id,
+                call_id=call.id,
+                summary="Provider summary",
+                key_topics=[],
+                action_items=[],
+                sentiment="neutral",
+            ),
+        ]
+    )
+    await db.commit()
+
+    summarize = AsyncMock(
+        return_value={
+            "summary": "The caller requested a callback.",
+            "disposition": "callback",
+            "resolution": "unresolved",
+            "confidence": 0.9,
+            "follow_up": {"required": True, "action": "Return the call"},
+        }
+    )
+    monkeypatch.setattr(conversation_engine, "generate_call_summary", summarize)
+    monkeypatch.setattr(database, "async_session_factory", session_factory)
+
+    await _process_completed_call_async(str(call.id), str(tenant.id))
+
+    async with session_factory() as session:
+        stored_call = await session.get(Call, call.id)
+        summary = await session.scalar(select(CallSummary).where(CallSummary.call_id == call.id))
+    summarize.assert_awaited_once()
+    assert stored_call.disposition == "callback"
+    assert summary.summary == "Provider summary"
+    assert summary.disposition_details["analysis_source"] == "vav_ai"
+
+
+@pytest.mark.asyncio
 async def test_stale_dispatch_claim_becomes_visible_unknown_state(
     db,
     tenant,

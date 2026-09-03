@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from typing import Any
 
-CLASSIFIER_VERSION = "vav-call-outcome-v1"
+CLASSIFIER_VERSION = "vav-call-outcome-v2"
+
+ANALYSIS_SOURCES = frozenset({"provider_analytics", "vav_ai", "rules", "unavailable"})
 
 PROFILES = frozenset(
     {"general", "receptionist", "customer_support", "appointment", "sales", "collections"}
@@ -116,11 +118,15 @@ def infer_disposition_profile(agent: Any | None) -> str:
     if agent is None:
         return "general"
     metadata = getattr(agent, "agent_metadata", None)
-    explicit = str(
-        getattr(agent, "disposition_profile", None)
-        or (metadata or {}).get("disposition_profile")
-        or ""
-    ).strip().lower()
+    explicit = (
+        str(
+            getattr(agent, "disposition_profile", None)
+            or (metadata or {}).get("disposition_profile")
+            or ""
+        )
+        .strip()
+        .lower()
+    )
     if explicit in PROFILES and explicit != "general":
         return explicit
 
@@ -145,6 +151,77 @@ def infer_disposition_profile(agent: Any | None) -> str:
 def disposition_catalog(profile: str) -> list[str]:
     allowed = PROFILE_DISPOSITIONS.get(profile, DISPOSITIONS)
     return sorted(allowed)
+
+
+def _provider_disposition(analytics: dict[str, Any]) -> tuple[str | None, float | None]:
+    metrics = analytics.get("dispositionMetrics") or analytics.get("disposition_metrics")
+    if not isinstance(metrics, list):
+        return None, None
+    metric = next((item for item in metrics if isinstance(item, dict)), None)
+    if metric is None:
+        return None, None
+    value = metric.get("value") or metric.get("result") or metric.get("name")
+    if not isinstance(value, str) or not value.strip():
+        return None, None
+    confidence = metric.get("confidence", metric.get("score"))
+    if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
+        return value, None
+    normalized_confidence = float(confidence)
+    if normalized_confidence > 1 and normalized_confidence <= 100:
+        normalized_confidence /= 100
+    return value, normalized_confidence
+
+
+def normalize_provider_call_analysis(
+    analytics: object,
+    *,
+    profile: str,
+) -> dict[str, Any] | None:
+    """Normalize sufficient trusted provider analytics without another LLM request."""
+    if not isinstance(analytics, dict):
+        return None
+    summary = _text(analytics.get("summary"), limit=2000)
+    disposition, confidence = _provider_disposition(analytics)
+    if summary is None or disposition is None:
+        return None
+
+    normalized_disposition = ALIASES.get(disposition.strip().lower(), disposition.strip().lower())
+    allowed = PROFILE_DISPOSITIONS.get(profile, DISPOSITIONS)
+    if normalized_disposition not in DISPOSITIONS or normalized_disposition not in allowed:
+        return None
+
+    resolution = analytics.get("resolution")
+    if not isinstance(resolution, str) or resolution.strip().lower() not in RESOLUTIONS:
+        resolution = {
+            "appointment_booked": "resolved",
+            "information_provided": "resolved",
+            "issue_resolved": "resolved",
+            "issue_unresolved": "unresolved",
+        }.get(normalized_disposition, "unknown")
+
+    follow_up = analytics.get("followUp") or analytics.get("follow_up")
+    if not isinstance(follow_up, dict):
+        follow_up = {"required": normalized_disposition == "callback"}
+
+    result = normalize_call_analysis(
+        {
+            "summary": summary,
+            "key_topics": analytics.get("keyTopics") or analytics.get("key_topics") or [],
+            "action_items": analytics.get("actionItems") or analytics.get("action_items") or [],
+            "sentiment": analytics.get("sentiment"),
+            "disposition": normalized_disposition,
+            "secondary_disposition": analytics.get("secondaryDisposition"),
+            "resolution": resolution,
+            "customer_intent": analytics.get("customerIntent"),
+            "follow_up": follow_up,
+            "confidence": confidence if confidence is not None else 0.8,
+            "evidence": analytics.get("evidence") or [],
+            "needs_review": analytics.get("needsReview") is True,
+            "analysis_source": "provider_analytics",
+        },
+        profile=profile,
+    )
+    return result
 
 
 def _text(value: object, *, limit: int) -> str | None:
@@ -203,6 +280,9 @@ def normalize_call_analysis(payload: object, *, profile: str) -> dict[str, Any]:
     needs_review = bool(raw.get("needs_review")) or confidence < 0.65 or primary == "unknown"
     if invalid_for_profile:
         needs_review = True
+    analysis_source = str(raw.get("analysis_source") or "vav_ai").strip().lower()
+    if analysis_source not in ANALYSIS_SOURCES:
+        analysis_source = "vav_ai"
 
     return {
         "summary": _text(raw.get("summary"), limit=2000) or "Call analysis unavailable.",
@@ -217,6 +297,7 @@ def normalize_call_analysis(payload: object, *, profile: str) -> dict[str, Any]:
         "disposition": primary,
         "disposition_details": {
             "version": CLASSIFIER_VERSION,
+            "analysis_source": analysis_source,
             "profile": profile,
             "primary": primary,
             "secondary": _text(raw.get("secondary_disposition"), limit=100),
