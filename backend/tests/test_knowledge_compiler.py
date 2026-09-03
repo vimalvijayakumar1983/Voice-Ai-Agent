@@ -168,7 +168,8 @@ async def test_ai_compilation_keeps_natural_questions_with_verified_fact():
 @pytest.mark.asyncio
 async def test_ai_compilation_accepts_pronoun_fact_from_same_subject_paragraph():
     text = (
-        "Al Zaabi Group has grown throughout the UAE. The market changes constantly. "
+        "Al Zaabi Group has grown throughout the UAE.\n\nPresident's Message\n\n"
+        "Strive for Excellence\n\nThe market changes constantly. "
         "We have conducted fair business activities since our inception in 2003."
     )
     client = _FakeClient(
@@ -209,6 +210,7 @@ async def test_ai_compilation_accepts_pronoun_fact_from_same_subject_paragraph()
 
     assert result.structured["validation"]["facts_accepted"] == 1
     assert result.structured["facts"][0]["value"] == "2003"
+    assert result.structured["facts"][0]["evidence"].startswith("Al Zaabi Group")
 
 
 @pytest.mark.asyncio

@@ -16,7 +16,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 ProcessingMode = Literal["automatic", "fast", "ai_verified"]
 
-COMPILER_VERSION = "vav-knowledge-compiler-6"
+COMPILER_VERSION = "vav-knowledge-compiler-7"
 AUTOMATIC_MODEL = "gpt-5.6-luna"
 VERIFIED_MODEL = "gpt-5.6-terra"
 _MODEL_PRICES_PER_MILLION = {
@@ -163,6 +163,43 @@ def _subject_is_grounded_in_context(source: str, subject: str, evidence: str) ->
     return False
 
 
+def _validated_fact(source: str, fact: _Fact) -> dict | None:
+    """Return one grounded fact, expanding bounded pronoun evidence when safe.
+
+    Models sometimes quote only the sentence containing ``our`` even when the
+    named subject appears immediately above it. For non-contact facts, extend
+    that verbatim span back to the nearest exact subject mention. Contact values
+    never use this repair because crossing another directory block could attach
+    a phone number or email address to the wrong organization.
+    """
+
+    evidence = fact.evidence
+    if not _value_is_grounded(fact.subject, evidence) and not (
+        _PHONE_RE.search(fact.value)
+        or _PHONE_RE.search(evidence)
+        or _EMAIL_RE.search(fact.value)
+        or _EMAIL_RE.search(evidence)
+    ):
+        evidence_start = source.find(evidence)
+        if evidence_start >= 0:
+            subject_start = source.rfind(
+                fact.subject,
+                max(0, evidence_start - 1_500),
+                evidence_start,
+            )
+            if subject_start >= 0:
+                candidate = source[subject_start : evidence_start + len(evidence)]
+                if len(candidate) <= 1_500:
+                    evidence = candidate
+    if not (
+        _evidence_is_grounded(source, evidence)
+        and _subject_is_grounded_in_context(source, fact.subject, evidence)
+        and _value_is_grounded(fact.value, evidence)
+    ):
+        return None
+    return {**fact.model_dump(), "evidence": evidence}
+
+
 def _requires_ai(text: str) -> bool:
     contacts = len(_PHONE_RE.findall(text)) + len(_EMAIL_RE.findall(text))
     non_ascii = sum(ord(character) > 127 for character in text[:20_000])
@@ -294,11 +331,9 @@ fact. Do not produce medical advice."""
         and _value_is_grounded(entity.name, entity.evidence)
     ]
     accepted_facts = [
-        fact.model_dump()
+        validated
         for fact in result.facts
-        if _evidence_is_grounded(text, fact.evidence)
-        and _subject_is_grounded_in_context(text, fact.subject, fact.evidence)
-        and _value_is_grounded(fact.value, fact.evidence)
+        if (validated := _validated_fact(text, fact)) is not None
     ]
     usage = getattr(response, "usage", None)
     input_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
