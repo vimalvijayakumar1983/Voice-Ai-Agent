@@ -16,7 +16,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 ProcessingMode = Literal["automatic", "fast", "ai_verified"]
 
-COMPILER_VERSION = "vav-knowledge-compiler-5"
+COMPILER_VERSION = "vav-knowledge-compiler-6"
 AUTOMATIC_MODEL = "gpt-5.6-luna"
 VERIFIED_MODEL = "gpt-5.6-terra"
 _MODEL_PRICES_PER_MILLION = {
@@ -251,8 +251,13 @@ organization/location it belongs to only when the evidence explicitly establishe
 relationship. On contact pages, emit separate physical-address, primary-telephone, fax,
 mobile and email facts when present. Copy each value verbatim. For each contact fact,
 make the evidence one contiguous span beginning with the organization/location heading
-and ending after the fact value. Omit anything ambiguous. For every fact, provide up to
-eight short search_phrases expressing natural ways a caller could request that SAME fact.
+and ending after the fact value. Apply the same subject rule to EVERY fact: its evidence
+must be one contiguous source span containing both the explicit named subject and the
+fact value. If the value appears later under headings or pronouns such as we, our, it or
+they, begin the evidence at the nearest explicit subject sentence or heading and include
+the intervening source text through the value. Omit anything ambiguous. For every fact,
+provide up to eight short search_phrases expressing natural ways a caller could request
+that SAME fact.
 Include both everyday wording and the source's terminology (for example, formed, founded,
 established and inception for an explicit inception year). Search phrases are retrieval
 hints only: never add an answer, entity, date, number or claim that is not already in the
