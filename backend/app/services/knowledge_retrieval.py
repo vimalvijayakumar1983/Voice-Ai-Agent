@@ -911,7 +911,37 @@ def _bounded_ranking_documents(
     query: str,
     documents: list[tuple[str, str]],
 ) -> list[tuple[str, str]]:
-    eligible = [(source, content) for source, content in documents if content.strip()]
+    query_tokens = _query_tokens(query)
+    phone_query = _is_phone_query(query, query_tokens)
+    if phone_query:
+        query_tokens.discard("number")
+    phone_subject_tokens = (
+        query_tokens - _CONTACT_QUERY_TOKENS - {"detail", "information"}
+        if phone_query
+        else set()
+    )
+    eligible: list[tuple[str, str]] = []
+    for source, content in documents:
+        if not content.strip():
+            continue
+        prepared_content = content
+        if phone_query:
+            intent_content = _intent_content(content, phone_query=True)
+            if phone_subject_tokens:
+                subject_blocks = [
+                    block
+                    for block in _chunks(
+                        intent_content,
+                        max_chars=MAX_RANKING_SOURCE_CHARS,
+                        preserve_paragraphs=True,
+                    )
+                    if phone_subject_tokens <= _token_forms(_base_tokens(block))
+                    and _has_phone_evidence(block, _token_forms(_base_tokens(block)))
+                ]
+                prepared_content = "\n\n".join(subject_blocks) or intent_content
+            else:
+                prepared_content = intent_content
+        eligible.append((source, prepared_content))
     if not eligible:
         return []
 
@@ -933,7 +963,6 @@ def _bounded_ranking_documents(
             if remaining == 0:
                 break
 
-    query_tokens = _query_tokens(query)
     return [
         (source, _query_aware_excerpt(content, query_tokens, limit=allocation))
         for (source, content), allocation in zip(eligible, allocations, strict=True)

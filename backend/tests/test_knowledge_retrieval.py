@@ -168,6 +168,40 @@ def test_phone_query_excludes_other_organizations_on_same_contact_page():
     assert all("+971 52 1555 366" not in match.text for match in matches)
 
 
+def test_bounded_corpus_keeps_requested_contact_subject_before_excerpting():
+    contact_content = (
+        "SOURCE TITLE: Contact – Al Zaabi Group\n"
+        "SOURCE URL: https://www.alzaabigroup.com/contact/\n\n"
+        "VERIFIED STRUCTURED FACTS\n\n"
+        "SUBJECT: Al Zaabi Group\n"
+        "- physical-address: Office No 403 & 404 Al Reem Plaza, Electra Street, "
+        "Abu Dhabi UAE\n"
+        "- primary-telephone: +971 2 665 9998\n\n"
+        + "\n\n".join(
+            f"SUBJECT: Other Company {index}\n"
+            f"- physical-address: Other address {index}, Abu Dhabi UAE\n"
+            f"- primary-telephone: +971 2 700 {index:04d}\n"
+            + ("Other approved details. " * 35)
+            for index in range(20)
+        )
+        + "\n\nSOURCE CONTENT\nLong raw contact page."
+    )
+    documents = [("Contact – Al Zaabi Group", contact_content)] + [
+        (f"Approved source {index}", "General approved business information. " * 120)
+        for index in range(51)
+    ]
+
+    matches = knowledge_retrieval._rank_bounded_knowledge(
+        "What is the contact address and phone number for Al Zaabi Group?",
+        documents,
+    )
+
+    assert matches
+    assert "Office No 403 & 404 Al Reem Plaza" in matches[0].text
+    assert "+971 2 665 9998" in matches[0].text
+    assert "Other Company" not in matches[0].text
+
+
 def test_phone_query_requires_phone_evidence_not_only_contact_title():
     matches = rank_knowledge(
         "What is the phone number for Al Zaabi Group?",
