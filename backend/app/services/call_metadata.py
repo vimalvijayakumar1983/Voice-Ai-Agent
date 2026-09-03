@@ -72,6 +72,7 @@ def public_call_metadata(value: Any) -> dict[str, Any] | None:
             "last_transcript_to_first_audio_ms",
             "last_speech_end_to_first_audio_ms",
             "turn_latency_p50_ms",
+            "turn_latency_p90_ms",
             "turn_latency_p95_ms",
         }
         for field in string_fields:

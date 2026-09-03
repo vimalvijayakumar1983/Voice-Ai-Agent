@@ -41,6 +41,16 @@ def test_contextual_plan_recovers_one_uncertain_word_inside_known_entity():
     assert plan.recovered_terms == ("Al Zaabi Group",)
 
 
+def test_contextual_plan_recovers_joined_spoken_brand_from_proper_name():
+    plan = build_contextual_query_plan(
+        "Do you have information about Sengobin?",
+        terminology=("Saint Gobain Weber", "Appointment Cancellation Policy"),
+    )
+
+    assert "Do you have information about Saint Gobain?" in plan.variants
+    assert plan.recovered_terms == ("Saint Gobain",)
+
+
 def test_ranking_matches_compound_brand_name_from_short_stt_variant():
     matches = rank_knowledge(
         "Alzab",
@@ -534,6 +544,170 @@ async def test_agent_terminology_is_derived_from_bound_approved_source_metadata(
     assert "clinic.example treatments platelet-rich-plasma" in terminology
     assert "Dr Asha Dermatology Directory" in terminology
     assert not any("Arbitrary prose" in value for value in terminology)
+
+
+@pytest.mark.asyncio
+async def test_agent_terminology_includes_bounded_proper_names_from_approved_content(db, tenant):
+    agent = Agent(
+        tenant_id=tenant.id,
+        name="Trading concierge",
+        system_prompt="Use only approved knowledge.",
+    )
+    knowledge_base = KnowledgeBase(
+        tenant_id=tenant.id,
+        name="Trading knowledge",
+        approval_status="approved",
+        is_active=True,
+    )
+    db.add_all([agent, knowledge_base])
+    await db.flush()
+    db.add(
+        AgentKnowledgeBinding(
+            tenant_id=tenant.id,
+            agent_id=agent.id,
+            knowledge_base_id=knowledge_base.id,
+        )
+    )
+    db.add(
+        KnowledgeSource(
+            tenant_id=tenant.id,
+            knowledge_base_id=knowledge_base.id,
+            source_type="website",
+            name="Trading partners",
+            status="indexed",
+            content=(
+                "The approved distribution portfolio includes Saint Gobain Weber, HENKEL, "
+                "and Makita products. Ordinary prose must never become a speech alias."
+            ),
+        )
+    )
+    await db.commit()
+
+    terminology = await knowledge_retrieval.load_agent_knowledge_terminology(
+        db,
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+    )
+
+    assert "Saint Gobain Weber" in terminology
+    assert "HENKEL" in terminology
+    assert not any("Ordinary prose" in value for value in terminology)
+
+
+@pytest.mark.asyncio
+async def test_contact_query_routes_to_verified_contact_source_despite_misheard_name(db, tenant):
+    agent = Agent(
+        tenant_id=tenant.id,
+        name="Corporate concierge",
+        system_prompt="Use only approved knowledge.",
+    )
+    knowledge_base = KnowledgeBase(
+        tenant_id=tenant.id,
+        name="Al Zaabi Group knowledge",
+        approval_status="approved",
+        is_active=True,
+    )
+    db.add_all([agent, knowledge_base])
+    await db.flush()
+    db.add(
+        AgentKnowledgeBinding(
+            tenant_id=tenant.id,
+            agent_id=agent.id,
+            knowledge_base_id=knowledge_base.id,
+        )
+    )
+    db.add_all(
+        [
+            KnowledgeSource(
+                tenant_id=tenant.id,
+                knowledge_base_id=knowledge_base.id,
+                source_type="website",
+                name="Contact - Al Zaabi Group",
+                location="https://www.alzaabigroup.com/contact/",
+                status="indexed",
+                content=(
+                    "Contact Al Zaabi Group. Telephone: +971 2 665 9998. "
+                    "Email: info@alzaabigroup.com. Abu Dhabi, United Arab Emirates."
+                ),
+            ),
+            KnowledgeSource(
+                tenant_id=tenant.id,
+                knowledge_base_id=knowledge_base.id,
+                source_type="website",
+                name="Company overview",
+                status="indexed",
+                content="Al Zaabi Group operates several divisions across the UAE.",
+            ),
+        ]
+    )
+    await db.commit()
+
+    context = await knowledge_retrieval.retrieve_knowledge_context(
+        db,
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        query="Can you share the contact details for Alzavi Group?",
+        terminology=("Al Zaabi Group",),
+    )
+
+    assert context is not None
+    assert "+971 2 665 9998" in context
+    assert "info@alzaabigroup.com" in context
+
+
+@pytest.mark.asyncio
+async def test_spoken_brand_variant_retrieves_only_evidenced_approved_source(db, tenant):
+    agent = Agent(
+        tenant_id=tenant.id,
+        name="Trading concierge",
+        system_prompt="Use only approved knowledge.",
+    )
+    knowledge_base = KnowledgeBase(
+        tenant_id=tenant.id,
+        name="Trading knowledge",
+        approval_status="approved",
+        is_active=True,
+    )
+    db.add_all([agent, knowledge_base])
+    await db.flush()
+    db.add(
+        AgentKnowledgeBinding(
+            tenant_id=tenant.id,
+            agent_id=agent.id,
+            knowledge_base_id=knowledge_base.id,
+        )
+    )
+    db.add(
+        KnowledgeSource(
+            tenant_id=tenant.id,
+            knowledge_base_id=knowledge_base.id,
+            source_type="website",
+            name="Building materials partners",
+            status="indexed",
+            content=(
+                "Saint Gobain Weber supplies approved construction and building materials "
+                "through the trading division."
+            ),
+        )
+    )
+    await db.commit()
+
+    terminology = await knowledge_retrieval.load_agent_knowledge_terminology(
+        db,
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+    )
+    context = await knowledge_retrieval.retrieve_knowledge_context(
+        db,
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        query="Do you have information about Sengobin?",
+        terminology=terminology,
+    )
+
+    assert context is not None
+    assert "Contextual terminology considered: Saint Gobain" in context
+    assert "construction and building materials" in context
 
 
 def test_query_excerpt_uses_token_boundaries_and_prefers_substantive_tail():

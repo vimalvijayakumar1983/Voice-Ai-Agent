@@ -25,8 +25,11 @@ MAX_RANKING_SOURCE_CHARS = 8_000
 MAX_CONTEXTUAL_QUERY_VARIANTS = 5
 MAX_TERMINOLOGY_SOURCES = 256
 MAX_TERMINOLOGY_VALUES = 1_024
+MAX_TERMINOLOGY_CONTENT_CHARS = 16_000
+MAX_CONTENT_TERMS_PER_SOURCE = 24
 _FTS_CANDIDATE_LIMIT = 32
 _TITLE_CANDIDATE_LIMIT = 8
+_CONTACT_CANDIDATE_LIMIT = 12
 _POSTGRES_HEADLINE_OPTIONS = (
     "MaxWords=120, MinWords=20, ShortWord=2, MaxFragments=8, HighlightAll=FALSE"
 )
@@ -103,6 +106,7 @@ _QUERY_STOP_WORDS = {
     "his",
     "its",
     "she",
+    "share",
 }
 _SOURCE_NOISE_TOKENS = {
     "base",
@@ -155,9 +159,21 @@ _DIRECTORY_QUERY_TOKENS = {
     "surgeon",
 }
 _DIRECTORY_SOURCE_TOKENS = _DIRECTORY_QUERY_TOKENS | {"directory", "medical", "team"}
+_CONTACT_QUERY_TOKENS = {
+    "address",
+    "call",
+    "contact",
+    "email",
+    "fax",
+    "location",
+    "mobile",
+    "phone",
+    "telephone",
+}
 _QUERY_INTENT_TOKENS = (
     _BROAD_QUERY_TOKENS
     | _DIRECTORY_QUERY_TOKENS
+    | _CONTACT_QUERY_TOKENS
     | {
         "appointment",
         "availability",
@@ -202,6 +218,22 @@ _NAVIGATION_NOISE_TOKENS = {
     "twitter",
     "youtube",
 }
+_ENTITY_SEQUENCE = re.compile(
+    r"\b(?:[A-Z][\w&'’-]{2,})(?:\s+(?:(?:and|of|the)\s+)?[A-Z][\w&'’-]{2,}){1,3}\b",
+    re.UNICODE,
+)
+_UPPERCASE_ENTITY = re.compile(r"\b[A-Z][A-Z0-9&'’-]{3,}\b", re.UNICODE)
+_CONTACT_SOURCE_MARKERS = (
+    "contact",
+    "phone",
+    "telephone",
+    "mobile",
+    "email",
+    "address",
+    "tel:",
+    "mailto:",
+    "@",
+)
 
 
 @dataclass(frozen=True)
@@ -311,8 +343,66 @@ def _terminology_phrases(values: Iterable[object]) -> dict[str, str]:
     return phrases
 
 
+def _content_entity_terminology(value: str) -> tuple[str, ...]:
+    """Extract only high-confidence proper names from approved source prose.
+
+    Capitalized multi-word names and all-uppercase brands are sufficiently narrow
+    to help speech-recognition recovery. Ordinary prose remains excluded so a
+    similar medical or operational word cannot silently become an alias.
+    """
+    bounded = str(value or "")[:MAX_TERMINOLOGY_CONTENT_CHARS]
+    selected: list[str] = []
+    seen: set[str] = set()
+    matches = list(_ENTITY_SEQUENCE.finditer(bounded)) + list(_UPPERCASE_ENTITY.finditer(bounded))
+    for match in sorted(matches, key=lambda item: item.start()):
+        candidate = " ".join(match.group(0).split()).strip(" -|,.;:")
+        normalized_tokens = _base_tokens(candidate)
+        distinctive = [
+            token
+            for token in normalized_tokens
+            if len(token) >= 4
+            and token not in _QUERY_STOP_WORDS
+            and token not in _QUERY_INTENT_TOKENS
+            and token not in _SOURCE_NOISE_TOKENS
+        ]
+        folded = candidate.casefold()
+        if not distinctive or folded in seen:
+            continue
+        selected.append(candidate)
+        seen.add(folded)
+        if len(selected) >= MAX_CONTENT_TERMS_PER_SOURCE:
+            break
+    return tuple(selected)
+
+
+def _spoken_compound_similarity(query_token: str, canonical_tokens: Sequence[str]) -> float:
+    """Score one uncertain STT token against a multi-word proper name.
+
+    Streaming transcription often joins a spoken brand (``Saint Gobain`` ->
+    ``Sengobin``). This intentionally applies only to long single tokens and
+    metadata-derived proper names; it is never used for arbitrary content words.
+    """
+    if len(query_token) < 6 or not 2 <= len(canonical_tokens) <= 3:
+        return 0.0
+    compact = "".join(canonical_tokens)
+    if query_token[:1] != compact[:1] or abs(len(query_token) - len(compact)) > 5:
+        return 0.0
+    raw_score = SequenceMatcher(None, query_token, compact).ratio()
+    query_spoken = query_token.replace("saint", "sen").replace("ai", "i")
+    canonical_spoken = compact.replace("saint", "sen").replace("ai", "i")
+    spoken_score = SequenceMatcher(None, query_spoken, canonical_spoken).ratio()
+    best_score = max(raw_score, spoken_score)
+    if best_score < 0.7:
+        return 0.0
+    return best_score * 0.88
+
+
 def _phrase_similarity(query_tokens: Sequence[str], canonical_tokens: Sequence[str]) -> float:
-    if len(query_tokens) != len(canonical_tokens) or not query_tokens:
+    if not query_tokens or not canonical_tokens:
+        return 0.0
+    if len(query_tokens) == 1 and len(canonical_tokens) > 1:
+        return _spoken_compound_similarity(query_tokens[0], canonical_tokens)
+    if len(query_tokens) != len(canonical_tokens):
         return 0.0
     token_scores = [
         SequenceMatcher(None, query_token, canonical_token).ratio()
@@ -353,17 +443,23 @@ def _recover_terminology(query: str, terminology: Iterable[object]) -> tuple[str
     best: tuple[float, int, int, str] | None = None
     for normalized, display in _terminology_phrases(terminology).items():
         canonical_tokens = normalized.split()
-        width = len(canonical_tokens)
-        if width > len(query_tokens) or normalized in " ".join(query_tokens):
+        canonical_width = len(canonical_tokens)
+        if normalized in " ".join(query_tokens):
             continue
-        for start in range(len(query_tokens) - width + 1):
-            window = query_tokens[start : start + width]
-            score = _phrase_similarity(window, canonical_tokens)
-            if score <= 0:
+        query_widths = {canonical_width}
+        if canonical_width > 1:
+            query_widths.add(1)
+        for width in sorted(query_widths):
+            if width > len(query_tokens):
                 continue
-            candidate = (score, start, width, display)
-            if best is None or candidate[0] > best[0]:
-                best = candidate
+            for start in range(len(query_tokens) - width + 1):
+                window = query_tokens[start : start + width]
+                score = _phrase_similarity(window, canonical_tokens)
+                if score <= 0:
+                    continue
+                candidate = (score, start, width, display)
+                if best is None or candidate[0] > best[0]:
+                    best = candidate
     if best is None:
         return None
     _score, start, width, display = best
@@ -830,7 +926,12 @@ async def load_agent_knowledge_terminology(
     agent_id: UUID,
     hints: Iterable[object] = (),
 ) -> tuple[str, ...]:
-    """Load a bounded, metadata-only vocabulary for one bound agent."""
+    """Load a bounded proper-name vocabulary for one bound agent.
+
+    Source metadata remains the primary vocabulary. A bounded source-content
+    window contributes only high-confidence proper names so spoken brand names
+    can be recovered without treating ordinary prose as aliases.
+    """
     row = (
         await db.execute(
             select(
@@ -865,6 +966,11 @@ async def load_agent_knowledge_terminology(
                 KnowledgeSource.name,
                 KnowledgeSource.location,
                 KnowledgeSource.source_metadata,
+                func.substr(
+                    KnowledgeSource.content,
+                    1,
+                    MAX_TERMINOLOGY_CONTENT_CHARS,
+                ),
             )
             .where(
                 *_eligible_source_filters(
@@ -876,7 +982,7 @@ async def load_agent_knowledge_terminology(
             .limit(MAX_TERMINOLOGY_SOURCES)
         )
     ).all()
-    for source_name, location, source_metadata in source_rows:
+    for source_name, location, source_metadata, source_content in source_rows:
         values.extend((source_name, location))
         if isinstance(source_metadata, dict):
             values.extend(
@@ -884,6 +990,8 @@ async def load_agent_knowledge_terminology(
                 for key in ("title", "page_title", "display_name")
                 if source_metadata.get(key)
             )
+        if isinstance(source_content, str):
+            values.extend(_content_entity_terminology(source_content))
     selected: list[str] = []
     seen: set[str] = set()
     for value in values:
@@ -977,6 +1085,47 @@ async def _broad_title_candidate_ids(
     )
 
 
+def _is_contact_query(query: str) -> bool:
+    return bool(_query_tokens(query) & _CONTACT_QUERY_TOKENS)
+
+
+async def _contact_candidate_source_ids(
+    db: AsyncSession,
+    *,
+    tenant_id: UUID,
+    knowledge_base_id: UUID,
+) -> list[UUID]:
+    """Find bounded contact-bearing sources independently of transcript spelling."""
+    lower_name = func.lower(KnowledgeSource.name)
+    lower_location = func.lower(func.coalesce(KnowledgeSource.location, ""))
+    lower_content = func.lower(KnowledgeSource.content)
+    contact_predicate = or_(
+        *(lower_name.contains(marker) for marker in _CONTACT_QUERY_TOKENS),
+        *(lower_location.contains(marker) for marker in ("contact", "location")),
+        *(lower_content.contains(marker) for marker in _CONTACT_SOURCE_MARKERS),
+    )
+    title_priority = case(
+        (lower_name.contains("contact"), 0),
+        (lower_location.contains("contact"), 1),
+        (lower_name.contains("location"), 2),
+        else_=3,
+    )
+    return list(
+        (
+            await db.scalars(
+                select(KnowledgeSource.id)
+                .where(
+                    *_eligible_source_filters(
+                        tenant_id=tenant_id,
+                        knowledge_base_id=knowledge_base_id,
+                    ),
+                    contact_predicate,
+                )
+                .order_by(title_priority, KnowledgeSource.updated_at.desc(), KnowledgeSource.id)
+                .limit(_CONTACT_CANDIDATE_LIMIT)
+            )
+        ).all()
+    )
 async def _postgres_candidate_source_ids(
     db: AsyncSession,
     *,
@@ -1203,6 +1352,14 @@ async def retrieve_knowledge_context(
         knowledge_base_id=knowledge_base.id,
         query=combined_query,
     )
+    contact_query = any(_is_contact_query(value) for value in query_plan.variants)
+    if contact_query:
+        contact_ids = await _contact_candidate_source_ids(
+            db,
+            tenant_id=tenant_id,
+            knowledge_base_id=knowledge_base.id,
+        )
+        candidate_ids = _bounded_unique_ids(contact_ids, candidate_ids)
     if any(_is_broad_query(value, _query_tokens(value)) for value in query_plan.variants):
         broad_ids = await _broad_title_candidate_ids(
             db,
@@ -1213,7 +1370,7 @@ async def retrieve_knowledge_context(
     source_rows = []
     if candidate_ids:
         content_expression = KnowledgeSource.content
-        if db.get_bind().dialect.name == "postgresql":
+        if db.get_bind().dialect.name == "postgresql" and not contact_query:
             content_expression = _postgres_source_excerpt(combined_query)
         source_rows = (
             await db.execute(

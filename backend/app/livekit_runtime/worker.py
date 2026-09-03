@@ -615,6 +615,7 @@ def _capture_turn_latency(
         runtime_metrics["last_speech_end_to_first_audio_ms"] = e2e_latency
         end_to_end_samples.append(e2e_latency)
         runtime_metrics["turn_latency_p50_ms"] = _latency_percentile(end_to_end_samples, 0.5)
+        runtime_metrics["turn_latency_p90_ms"] = _latency_percentile(end_to_end_samples, 0.9)
         runtime_metrics["turn_latency_p95_ms"] = _latency_percentile(end_to_end_samples, 0.95)
 
 

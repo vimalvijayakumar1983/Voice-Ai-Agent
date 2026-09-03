@@ -625,6 +625,7 @@ export default function Calls() {
                   {typeof selectedMetadata.provider_latency_ms === 'number' ? <div><dt>Provider latency</dt><dd>{selectedMetadata.provider_latency_ms} ms</dd></div> : null}
                   {typeof selectedRuntime.last_speech_end_to_first_audio_ms === 'number' ? <div><dt>Speech end → first audio</dt><dd>{selectedRuntime.last_speech_end_to_first_audio_ms} ms</dd></div> : null}
                   {typeof selectedRuntime.turn_latency_p50_ms === 'number' ? <div><dt>Turn latency p50</dt><dd>{selectedRuntime.turn_latency_p50_ms} ms</dd></div> : null}
+                  {typeof selectedRuntime.turn_latency_p90_ms === 'number' ? <div><dt>Turn latency p90</dt><dd>{selectedRuntime.turn_latency_p90_ms} ms</dd></div> : null}
                   {typeof selectedRuntime.turn_latency_p95_ms === 'number' ? <div><dt>Turn latency p95</dt><dd>{selectedRuntime.turn_latency_p95_ms} ms</dd></div> : null}
                   {typeof selectedRuntime.last_transcript_to_first_audio_ms === 'number' ? <div><dt>Transcript → first audio</dt><dd>{selectedRuntime.last_transcript_to_first_audio_ms} ms</dd></div> : null}
                   {typeof selectedRuntime.last_llm_first_token_ms === 'number' ? <div><dt>LLM first token</dt><dd>{selectedRuntime.last_llm_first_token_ms} ms</dd></div> : null}

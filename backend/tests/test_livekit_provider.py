@@ -1075,6 +1075,7 @@ def test_livekit_turn_latency_is_recorded_as_public_runtime_metrics():
         "last_transcript_to_first_audio_ms": 500,
         "last_speech_end_to_first_audio_ms": 1200,
         "turn_latency_p50_ms": 910,
+        "turn_latency_p90_ms": 1200,
         "turn_latency_p95_ms": 1200,
     }
 
