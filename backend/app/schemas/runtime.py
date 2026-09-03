@@ -26,6 +26,7 @@ class RuntimeProfileUpdate(BaseModel):
     fallback_speech_provider: Literal["smallest", "sarvam", "elevenlabs", "inworld"] | None = None
     llm_provider: Literal["openai", "inworld"] = "openai"
     llm_model: str = Field("gpt-4o-mini", min_length=2, max_length=100)
+    voice_runtime: Literal["pipeline", "inworld_realtime"] = "pipeline"
     stt_language: str = Field("auto", min_length=2, max_length=30)
     stt_model: InworldSTTModel = "auto"
     tts_delivery_mode: Literal["stable", "balanced", "creative"] = "balanced"
@@ -61,6 +62,15 @@ class RuntimeProfileUpdate(BaseModel):
             provider_name = "OpenAI" if self.llm_provider == "openai" else "Inworld"
             raise ValueError(f"{provider_name} LLM routes support only: {choices}")
         self.llm_model = model
+        if self.voice_runtime == "inworld_realtime" and self.llm_provider != "inworld":
+            raise ValueError(
+                "Native Inworld Realtime requires the Inworld LLM route; the selected "
+                "model is then executed inside the same Inworld Realtime session"
+            )
+        if self.voice_runtime == "inworld_realtime" and model == "auto":
+            raise ValueError(
+                "Native Inworld Realtime requires an explicit production model route"
+            )
         return self
 
 
@@ -73,6 +83,7 @@ class RuntimeProfileResponse(BaseModel):
     fallback_speech_provider: str | None
     llm_provider: str
     llm_model: str
+    voice_runtime: Literal["pipeline", "inworld_realtime"]
     stt_language: str
     stt_model: InworldSTTModel
     tts_delivery_mode: Literal["stable", "balanced", "creative"]

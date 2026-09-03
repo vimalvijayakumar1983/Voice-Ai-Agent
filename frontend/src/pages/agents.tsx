@@ -735,7 +735,7 @@ function syncStatusLabel(status: VoiceAgent['sync_status']) {
 function deploymentDescription(agent: VoiceAgent) {
   if (agent.voice_provider === 'sarvam') return 'Sarvam AI · VAV realtime runtime';
   if (agent.voice_provider === 'elevenlabs') return 'ElevenLabs voice · VAV realtime runtime';
-  if (agent.voice_provider === 'inworld') return 'LiveKit AgentSession · Inworld STT/TTS';
+  if (agent.voice_provider === 'inworld') return 'LiveKit · Native Inworld Realtime available';
   if (!agent.provider_agent_id) return 'Local draft · not provisioned';
   const providerId = `Atoms ID · ${agent.provider_agent_id.slice(0, 12)}…`;
   if (agent.sync_status === 'synced') return `${providerId} · published revision recorded`;

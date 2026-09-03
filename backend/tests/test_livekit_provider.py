@@ -11,11 +11,14 @@ import pytest
 from livekit import api
 from sqlalchemy import select
 
+from app.livekit_runtime import inworld_realtime as inworld_realtime_adapter
 from app.livekit_runtime import worker as livekit_worker
 from app.livekit_runtime.worker import (
+    _build_inworld_realtime_model,
     _capture_turn_latency,
     _inworld_stt_model,
     _inworld_tts_options,
+    _inworld_voice_runtime,
     _usage_snapshot,
     _worker_http_port,
     _worker_idle_processes,
@@ -963,6 +966,83 @@ def test_inworld_stt_model_preserves_explicit_operator_choice():
     )
 
     assert selected == "inworld/inworld-stt-1"
+
+
+def test_native_inworld_realtime_model_uses_one_grounded_speech_session():
+    model = SimpleNamespace(
+        name="Al Zaabi Group Support",
+        voice_id="inworld:Ashley",
+        language="en-GB",
+        supported_languages=["en-GB"],
+        speech_rate=0.95,
+    )
+    profile = SimpleNamespace(
+        stt_language="en-GB",
+        llm_model="openai/gpt-4o-mini",
+        runtime_config={"voice_runtime": "inworld_realtime", "stt_model": "auto"},
+    )
+
+    realtime = _build_inworld_realtime_model(
+        model=model,
+        profile=profile,
+        api_key="inworld-key",
+    )
+
+    assert _inworld_voice_runtime(profile) == "inworld_realtime"
+    assert realtime.provider == "inworld"
+    assert realtime.model == "openai/gpt-4o-mini"
+    assert realtime._opts.voice == "Ashley"
+    assert realtime._opts.speed == 0.95
+    assert realtime._opts.input_audio_transcription.model == "assemblyai/u3-rt-pro"
+    assert "Al Zaabi Group Support" in realtime._opts.input_audio_transcription.prompt
+    assert realtime._opts.turn_detection.type == "semantic_vad"
+    assert realtime._opts.turn_detection.interrupt_response is True
+
+
+def test_legacy_runtime_without_voice_mode_stays_on_pipeline():
+    assert _inworld_voice_runtime(SimpleNamespace()) == "pipeline"
+
+
+@pytest.mark.asyncio
+async def test_inworld_realtime_adapter_uses_inworld_endpoint_and_basic_auth(monkeypatch):
+    captured = {}
+
+    class WebSocket:
+        async def receive_json(self):
+            return {"type": "session.created", "session": {"id": "provider-session"}}
+
+        async def close(self):
+            captured["closed"] = True
+
+    class HttpSession:
+        async def ws_connect(self, **kwargs):
+            captured.update(kwargs)
+            return WebSocket()
+
+    model = SimpleNamespace(_ensure_http_session=lambda: HttpSession())
+    session = object.__new__(inworld_realtime_adapter.InworldRealtimeSession)
+    session._realtime_model = model
+    session._opts = SimpleNamespace(
+        base_url="https://api.inworld.ai",
+        api_key="base64-inworld-key",
+        conn_options=SimpleNamespace(timeout=2.0),
+    )
+    session._report_connection_acquired = lambda duration: captured.update(duration=duration)
+    monkeypatch.setattr(
+        inworld_realtime_adapter,
+        "uuid4",
+        lambda: SimpleNamespace(hex="fixed-session-id"),
+    )
+
+    websocket = await session._create_ws_conn()
+
+    assert isinstance(websocket, WebSocket)
+    assert captured["url"] == (
+        "wss://api.inworld.ai/api/v1/realtime/session"
+        "?key=vav-fixed-session-id&protocol=realtime"
+    )
+    assert captured["headers"]["Authorization"] == "Basic base64-inworld-key"
+    assert captured["duration"] >= 0
 
 
 def test_livekit_turn_latency_is_recorded_as_public_runtime_metrics():

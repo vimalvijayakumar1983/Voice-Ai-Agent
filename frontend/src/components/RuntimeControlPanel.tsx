@@ -40,6 +40,7 @@ export default function RuntimeControlPanel({ agent, profile, onClose, onChange 
     fallback_speech_provider: form.fallback_speech_provider,
     llm_provider: form.llm_provider,
     llm_model: form.llm_model,
+    voice_runtime: form.voice_runtime,
     stt_language: form.stt_language,
     stt_model: form.stt_model,
     tts_delivery_mode: form.tts_delivery_mode,
@@ -54,6 +55,7 @@ export default function RuntimeControlPanel({ agent, profile, onClose, onChange 
     fallback_speech_provider: profile.fallback_speech_provider,
     llm_provider: profile.llm_provider,
     llm_model: profile.llm_model,
+    voice_runtime: profile.voice_runtime,
     stt_language: profile.stt_language,
     stt_model: profile.stt_model,
     tts_delivery_mode: profile.tts_delivery_mode,
@@ -111,7 +113,7 @@ export default function RuntimeControlPanel({ agent, profile, onClose, onChange 
         <div>
           <span className="page-kicker">Production serving</span>
           <h2 id="runtime-panel-title">{agent.name} runtime</h2>
-          <p>Configure the VAV-owned {inworldRuntime ? 'LiveKit SIP + Inworld speech + selectable response engine' : speechProvider === 'elevenlabs' ? 'ElevenLabs voice and Sarvam transcription' : 'Sarvam speech'} pipeline, capacity, and spend guardrails.</p>
+          <p>Configure the VAV-owned {inworldRuntime ? 'LiveKit SIP + Inworld voice runtime' : speechProvider === 'elevenlabs' ? 'ElevenLabs voice and Sarvam transcription' : 'Sarvam speech'} pipeline, capacity, and spend guardrails.</p>
         </div>
         <span className={`badge ${profile.enabled ? 'badge-success' : profile.ready ? 'badge-info' : 'badge-warning'}`}>
           {profile.enabled ? 'Active' : profile.ready ? 'Ready' : profile.status}
@@ -127,6 +129,26 @@ export default function RuntimeControlPanel({ agent, profile, onClose, onChange 
       ) : null}
 
       <div className={styles.grid}>
+        {inworldRuntime ? (
+          <div className="form-group">
+            <label htmlFor="runtime-architecture">Voice architecture</label>
+            <select id="runtime-architecture" value={form.voice_runtime} onChange={(event) => {
+              const voiceRuntime = event.target.value as RuntimeProfile['voice_runtime'];
+              setForm({
+                ...form,
+                voice_runtime: voiceRuntime,
+                llm_provider: voiceRuntime === 'inworld_realtime' ? 'inworld' : form.llm_provider,
+                llm_model: voiceRuntime === 'inworld_realtime' && (form.llm_provider !== 'inworld' || form.llm_model === 'auto')
+                  ? 'openai/gpt-4o-mini'
+                  : form.llm_model,
+              });
+            }}>
+              <option value="inworld_realtime">Native Inworld Realtime · production pilot</option>
+              <option value="pipeline">Classic component pipeline · rollback</option>
+            </select>
+            <p className="form-hint">Native mode uses one persistent Inworld speech-to-speech session for transcription, semantic turn-taking, reasoning, interruptions, and TTS. The VAV knowledge base remains available through a required grounded tool.</p>
+          </div>
+        ) : null}
         <div className="form-group">
           <label htmlFor="runtime-telephony">Telephony edge</label>
           <select id="runtime-telephony" value={form.telephony_provider} disabled={inworldRuntime} onChange={(event) => setForm({ ...form, telephony_provider: event.target.value as RuntimeProfile['telephony_provider'] })}>
@@ -139,11 +161,11 @@ export default function RuntimeControlPanel({ agent, profile, onClose, onChange 
           <label htmlFor="runtime-speech-provider">Speech output</label>
           <input
             id="runtime-speech-provider"
-            value={inworldRuntime ? 'Inworld STT + TTS 2 (direct)' : speechProvider === 'elevenlabs' ? 'ElevenLabs Flash v2.5' : 'Sarvam Bulbul v3'}
+            value={inworldRuntime ? (form.voice_runtime === 'inworld_realtime' ? 'Inworld Realtime + TTS-2' : 'Inworld STT + TTS-2 components') : speechProvider === 'elevenlabs' ? 'ElevenLabs Flash v2.5' : 'Sarvam Bulbul v3'}
             readOnly
             aria-readonly="true"
           />
-          <p className="form-hint">This follows the agent&apos;s selected voice provider. Inworld uses one direct workspace credential for STT and TTS.</p>
+          <p className="form-hint">This follows the agent&apos;s selected voice provider. Native Realtime uses the same Inworld workspace credential for the complete session.</p>
         </div>
         <div className="form-group">
           <label htmlFor="runtime-llm">LLM route</label>
@@ -155,7 +177,12 @@ export default function RuntimeControlPanel({ agent, profile, onClose, onChange 
               llm_model: modelParts.join(':'),
             });
           }}>
-            {inworldRuntime ? <>
+            {inworldRuntime && form.voice_runtime === 'inworld_realtime' ? <>
+              <optgroup label="Inside the native Inworld Realtime session">
+                <option value="inworld:openai/gpt-4o-mini">Inworld Router → GPT-4o mini</option>
+                <option value="inworld:openai/gpt-4o">Inworld Router → GPT-4o</option>
+              </optgroup>
+            </> : inworldRuntime ? <>
               <optgroup label="Recommended · full VAV knowledge and actions">
                 <option value="openai:gpt-4o-mini">OpenAI GPT-4o mini · fast and economical</option>
                 <option value="openai:gpt-4o">OpenAI GPT-4o · higher quality</option>
@@ -170,7 +197,7 @@ export default function RuntimeControlPanel({ agent, profile, onClose, onChange 
               <option value="openai:gpt-4o">OpenAI GPT-4o · higher quality</option>
             </>}
           </select>
-          <p className="form-hint">{inworldRuntime ? 'OpenAI is recommended for reliable VAV knowledge search and actions. Inworld Router remains available only when its workspace can pass the live tool-calling gate.' : 'Direct OpenAI endpoint.'}</p>
+          <p className="form-hint">{inworldRuntime && form.voice_runtime === 'inworld_realtime' ? 'The selected model runs inside Inworld Realtime; no separate VAV-to-OpenAI request is made. Readiness verifies the exact model, voice, and transcription route.' : inworldRuntime ? 'OpenAI is recommended for reliable VAV knowledge search and actions. Inworld Router remains available only when its workspace can pass the live tool-calling gate.' : 'Direct OpenAI endpoint.'}</p>
         </div>
         <div className="form-group">
           <label htmlFor="runtime-language">Realtime STT language</label>
@@ -185,10 +212,10 @@ export default function RuntimeControlPanel({ agent, profile, onClose, onChange 
               <option value="soniox/stt-rt-v4">Soniox RT v4 · multilingual including Arabic and Hindi</option>
               <option value="inworld/inworld-stt-1">Inworld STT 1 · experimental first-party</option>
             </select>
-            <p className="form-hint">Automatic uses U3 Pro for English and supported European languages, and Soniox for wider multilingual coverage. Both are routed through the existing Inworld credential.</p>
+            <p className="form-hint">Automatic uses U3 Pro for English and supported European languages, and Soniox for wider multilingual coverage. Native mode also sends a business-name transcription hint.</p>
           </div>
         ) : null}
-        {inworldRuntime ? (
+        {inworldRuntime && form.voice_runtime === 'pipeline' ? (
           <div className="form-group">
             <label htmlFor="runtime-delivery-mode">Inworld TTS delivery</label>
             <select id="runtime-delivery-mode" value={form.tts_delivery_mode} onChange={(event) => setForm({ ...form, tts_delivery_mode: event.target.value as RuntimeProfile['tts_delivery_mode'] })}>

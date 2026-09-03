@@ -22,7 +22,11 @@ from app.models.agent import (
 )
 from app.models.tenant import Tenant
 from app.models.user import User
-from app.providers.inworld import InworldClient, InworldError
+from app.providers.inworld import (
+    InworldClient,
+    InworldError,
+    inworld_realtime_websocket_url,
+)
 from app.providers.openai import OpenAIProviderClient
 from app.realtime.auth import create_media_token, verify_media_token
 from app.realtime.sarvam_stream import is_speech_start, parse_transcript_event
@@ -54,6 +58,24 @@ def test_runtime_model_identifier_is_normalized_and_limited_to_production_routes
         RuntimeProfileUpdate(llm_provider="openai", llm_model="openai/gpt-4o-mini")
     with pytest.raises(ValidationError, match="Inworld LLM routes support only"):
         RuntimeProfileUpdate(llm_provider="inworld", llm_model="customer-support-preview")
+    native = RuntimeProfileUpdate(
+        voice_runtime="inworld_realtime",
+        llm_provider="inworld",
+        llm_model="openai/gpt-4o-mini",
+    )
+    assert native.voice_runtime == "inworld_realtime"
+    with pytest.raises(ValidationError, match="Native Inworld Realtime requires"):
+        RuntimeProfileUpdate(voice_runtime="inworld_realtime")
+
+
+def test_inworld_realtime_websocket_url_uses_provider_protocol():
+    assert inworld_realtime_websocket_url(
+        "https://api.inworld.ai/v1",
+        session_id="vav-test-session",
+    ) == (
+        "wss://api.inworld.ai/api/v1/realtime/session"
+        "?key=vav-test-session&protocol=realtime"
+    )
 
 
 @pytest.mark.asyncio
@@ -602,6 +624,75 @@ async def test_inworld_readiness_reports_tts_and_router_failures_independently(
         "Inworld live TTS synthesis failed: selected voice cannot synthesize the probe",
         "Inworld Router tool-calling check failed: selected Router model was not found",
     ]
+
+
+@pytest.mark.asyncio
+async def test_native_inworld_readiness_probes_one_complete_realtime_route(
+    tenant,
+    db,
+    monkeypatch,
+):
+    from app.api.v1.endpoints import runtime as runtime_endpoint
+
+    agent = Agent(
+        tenant_id=tenant.id,
+        name="Native realtime concierge",
+        system_prompt="Use approved knowledge.",
+        voice_provider="inworld",
+        voice_id="inworld:Ashley",
+        language="en-GB",
+        supported_languages=["en-GB"],
+    )
+    profile = AgentRuntimeProfile(
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        # Isolate the provider probe here; LiveKit SIP has separate route tests.
+        telephony_provider="twilio",
+        primary_speech_provider="inworld",
+        llm_provider="inworld",
+        llm_model="openai/gpt-4o-mini",
+        stt_language="en-GB",
+        runtime_config={"voice_runtime": "inworld_realtime", "stt_model": "auto"},
+    )
+    probes = []
+
+    async def static_readiness(*_args):
+        return [], {
+            "provider_compatibility": True,
+            "tts_credential": True,
+            "voice_selection": True,
+            "llm_credential": True,
+        }
+
+    async def provider_config(*_args):
+        return {"api_key": "inworld-workspace-key-123456789"}
+
+    async def realtime_probe(_self, **kwargs):
+        probes.append(kwargs)
+
+    tts_probe = AsyncMock()
+    router_probe = AsyncMock()
+    monkeypatch.setattr(runtime_endpoint, "runtime_readiness", static_readiness)
+    monkeypatch.setattr(runtime_endpoint, "load_provider_config", provider_config)
+    monkeypatch.setattr(InworldClient, "realtime_readiness_probe", realtime_probe)
+    monkeypatch.setattr(InworldClient, "synthesize_readiness_probe", tts_probe)
+    monkeypatch.setattr(InworldClient, "router_readiness_probe", router_probe)
+
+    blockers, checks = await runtime_endpoint.live_runtime_readiness(db, agent, profile)
+
+    assert blockers == []
+    assert checks["realtime_provider_live"] is True
+    assert checks["tts_provider_live"] is True
+    assert checks["llm_provider_live"] is True
+    assert probes == [
+        {
+            "model_id": "openai/gpt-4o-mini",
+            "voice_id": "Ashley",
+            "stt_model_id": "assemblyai/u3-rt-pro",
+        }
+    ]
+    tts_probe.assert_not_awaited()
+    router_probe.assert_not_awaited()
 
 
 @pytest.mark.asyncio

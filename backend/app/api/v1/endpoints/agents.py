@@ -3779,6 +3779,14 @@ async def create_livekit_browser_session(
             "runtime": {
                 "transport": "livekit_webrtc",
                 "speech_provider": "inworld",
+                "voice_runtime": str(
+                    (
+                        profile.runtime_config.get("voice_runtime")
+                        if isinstance(profile.runtime_config, dict)
+                        else None
+                    )
+                    or "pipeline"
+                ),
                 "llm_provider": profile.llm_provider,
                 "llm_model": profile.llm_model,
                 "stt_model": str(

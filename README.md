@@ -15,7 +15,7 @@ This repository combines a multi-tenant FastAPI control plane with a polished Ne
 - Conversation reporting with accessible transcript and AI-summary review
 - Expiring single-use workspace invitations, team roles/access, one-time API-key reveal, revocation, and tenant-scoped audit history
 - Authenticated encryption at rest for write-only integration credentials, safe secret replacement, HTTPS/SSRF validation, and tenant-isolated CRUD
-- A separately deployable LiveKit worker that keeps VAV knowledge, actions, transcripts, usage, and cost attribution in the VAV control plane while using direct Inworld speech plus a tenant-selected OpenAI or Inworld Router LLM (not LiveKit Inference)
+- A separately deployable LiveKit worker that keeps VAV knowledge, actions, transcripts, usage, and cost attribution in the VAV control plane while offering a native Inworld Realtime speech-to-speech pilot and the existing component pipeline as immediate rollback (not LiveKit Inference)
 - Reproducible PostgreSQL migrations, worker queue registration tests, hardened browser/API headers, Docker builds, and PostgreSQL-backed CI migration checks
 
 The complete target product is defined in [the world-class platform blueprint](docs/WORLD_CLASS_VOICE_AI_PLATFORM.md). It specifies the 14-module information architecture, provider-neutral data and service contracts, security and compliance gates, SLOs, UAE/India/WhatsApp differentiation, and the staged R0-R5 implementation plan.

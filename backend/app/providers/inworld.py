@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import json
 from typing import Any
+from urllib.parse import urlencode, urlsplit, urlunsplit
+from uuid import uuid4
 
+import aiohttp
 import httpx
 
 from app.core.config import settings
@@ -24,6 +28,7 @@ ROUTER_PROBE_MAX_TOKENS = 64
 # ``auto`` may select a reasoning model that spends a tiny completion budget
 # before producing visible text. Keep the larger bound isolated to that route.
 ROUTER_AUTO_PROBE_MAX_TOKENS = 128
+INWORLD_REALTIME_PATH = "/api/v1/realtime/session"
 
 # Realtime TTS-2 is cross-lingual. The Voice API's ``langCode`` describes the
 # native prompt/accent of a voice; it is not that voice's complete synthesis
@@ -121,6 +126,25 @@ def _probe_value(value: str, label: str, *, max_length: int = 120) -> str:
     ):
         raise InworldError(f"Inworld {label} is invalid.", status_code=422)
     return normalized
+
+
+def inworld_realtime_websocket_url(base_url: str, *, session_id: str) -> str:
+    """Build the provider-specific WebSocket URL without exposing credentials."""
+
+    selected_session = _probe_value(session_id, "Realtime session ID", max_length=180)
+    parsed = urlsplit(str(base_url or "").strip())
+    if parsed.scheme not in {"http", "https", "ws", "wss"} or not parsed.netloc:
+        raise InworldError("Inworld Realtime base URL is invalid.", status_code=422)
+    scheme = "wss" if parsed.scheme in {"https", "wss"} else "ws"
+    return urlunsplit(
+        (
+            scheme,
+            parsed.netloc,
+            INWORLD_REALTIME_PATH,
+            urlencode({"key": selected_session, "protocol": "realtime"}),
+            "",
+        )
+    )
 
 
 def _tag_metadata(voice: dict[str, Any]) -> tuple[str | None, str | None]:
@@ -342,6 +366,89 @@ class InworldClient:
             raise InworldError(
                 "Inworld TTS readiness probe used a different model than the selected route."
             )
+
+    async def realtime_readiness_probe(
+        self,
+        *,
+        model_id: str,
+        voice_id: str,
+        stt_model_id: str,
+    ) -> None:
+        """Open and configure the exact native Realtime route without generating audio."""
+
+        if not self.is_configured:
+            raise InworldError(
+                "Inworld is not configured. Add an API key in Settings.", status_code=503
+            )
+        selected_model = _probe_value(model_id, "Realtime model")
+        selected_voice = _probe_value(voice_id, "voice ID")
+        selected_stt = _probe_value(stt_model_id, "Realtime transcription model")
+        timeout = max(1.0, min(float(self.timeout), PROBE_TIMEOUT_SECONDS))
+        url = inworld_realtime_websocket_url(
+            self.base_url,
+            session_id=f"vav-readiness-{uuid4().hex}",
+        )
+        update = {
+            "type": "session.update",
+            "session": {
+                "type": "realtime",
+                "model": selected_model,
+                "output_modalities": ["audio"],
+                "audio": {
+                    "input": {
+                        "transcription": {"model": selected_stt},
+                        "turn_detection": {
+                            "type": "semantic_vad",
+                            "eagerness": "medium",
+                            "create_response": True,
+                            "interrupt_response": True,
+                        },
+                    },
+                    "output": {
+                        "voice": selected_voice,
+                        "model": INWORLD_TTS_MODEL,
+                        "speed": 1.0,
+                    },
+                },
+            },
+        }
+        try:
+            async with aiohttp.ClientSession() as session:
+                websocket = await asyncio.wait_for(
+                    session.ws_connect(
+                        url,
+                        headers={
+                            "Authorization": f"Basic {self.api_key}",
+                            "User-Agent": "VAV readiness probe",
+                        },
+                    ),
+                    timeout,
+                )
+                async with websocket:
+                    created = await asyncio.wait_for(websocket.receive_json(), timeout)
+                    if created.get("type") == "error":
+                        raise InworldError(_payload_error_message(created))
+                    if created.get("type") != "session.created":
+                        raise InworldError(
+                            "Inworld Realtime readiness probe did not create a session."
+                        )
+                    await websocket.send_json(update)
+                    configured = await asyncio.wait_for(websocket.receive_json(), timeout)
+                    if configured.get("type") == "error":
+                        raise InworldError(_payload_error_message(configured), status_code=422)
+                    if configured.get("type") != "session.updated":
+                        raise InworldError(
+                            "Inworld Realtime readiness probe did not accept the selected route."
+                        )
+        except InworldError:
+            raise
+        except TimeoutError as exc:
+            raise InworldError(
+                f"Inworld Realtime readiness probe timed out after {timeout:g} seconds.",
+                status_code=504,
+            ) from exc
+        except (aiohttp.ClientError, ValueError, TypeError) as exc:
+            raise InworldError("Inworld Realtime readiness probe could not be completed.") from exc
 
     async def router_readiness_probe(self, *, model_id: str) -> None:
         """Prove Router can execute the tool calls every VAV knowledge agent needs."""

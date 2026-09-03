@@ -75,6 +75,8 @@ def _runtime_provider_blocker(
     if profile is None:
         return "Save a supported runtime provider route before testing readiness."
     if agent.voice_provider == "inworld":
+        runtime_config = profile.runtime_config if isinstance(profile.runtime_config, dict) else {}
+        voice_runtime = str(runtime_config.get("voice_runtime") or "pipeline")
         if (
             profile.telephony_provider != "livekit_sip"
             or profile.primary_speech_provider != "inworld"
@@ -83,6 +85,11 @@ def _runtime_provider_blocker(
             return (
                 "Inworld agents require LiveKit SIP telephony, Inworld speech, "
                 "and either the OpenAI LLM or Inworld Router."
+            )
+        if voice_runtime == "inworld_realtime" and profile.llm_provider != "inworld":
+            return (
+                "Native Inworld Realtime requires the Inworld LLM route so speech, "
+                "reasoning, turn-taking, and voice remain in one provider session."
             )
         return None
     if agent.voice_provider in {"sarvam", "elevenlabs"}:
@@ -478,6 +485,40 @@ async def live_runtime_readiness(
         return blockers, checks
 
     inworld = InworldClient(api_key=api_key)
+    runtime_config = profile.runtime_config if isinstance(profile.runtime_config, dict) else {}
+    voice_runtime = str(runtime_config.get("voice_runtime") or "pipeline")
+    if voice_runtime == "inworld_realtime":
+        checks["realtime_provider_live"] = False
+        configured_stt = str(runtime_config.get("stt_model") or "auto")
+        if configured_stt == "auto":
+            languages = {
+                str(language or "").strip().lower().split("-", 1)[0]
+                for language in (
+                    list(agent.supported_languages or [])
+                    + [agent.language, profile.stt_language]
+                )
+                if str(language or "").strip()
+                and str(language or "").strip().lower() != "auto"
+            }
+            configured_stt = (
+                "assemblyai/u3-rt-pro"
+                if languages and languages.issubset({"en", "es", "fr", "de", "it", "pt"})
+                else "soniox/stt-rt-v4"
+            )
+        try:
+            await inworld.realtime_readiness_probe(
+                model_id=profile.llm_model,
+                voice_id=agent.voice_id.removeprefix("inworld:"),
+                stt_model_id=configured_stt,
+            )
+        except InworldError as exc:
+            blockers.append(f"Inworld native Realtime validation failed: {exc}")
+        else:
+            checks["realtime_provider_live"] = True
+            checks["tts_provider_live"] = True
+            checks["llm_provider_live"] = True
+        return blockers, checks
+
     try:
         await inworld.synthesize_readiness_probe(
             voice_id=agent.voice_id.removeprefix("inworld:"),
@@ -536,6 +577,7 @@ def _response(
         "fallback_speech_provider": None,
         "llm_provider": "openai",
         "llm_model": "gpt-4o-mini",
+        "voice_runtime": "pipeline",
         "stt_language": "auto",
         "stt_model": "auto",
         "tts_delivery_mode": "balanced",
@@ -549,10 +591,16 @@ def _response(
             {
                 key: getattr(profile, key)
                 for key in values
-                if key not in {"stt_model", "tts_delivery_mode"}
+                if key not in {"voice_runtime", "stt_model", "tts_delivery_mode"}
             }
         )
         runtime_config = profile.runtime_config if isinstance(profile.runtime_config, dict) else {}
+        voice_runtime = str(runtime_config.get("voice_runtime") or "pipeline")
+        values["voice_runtime"] = (
+            voice_runtime
+            if voice_runtime in {"pipeline", "inworld_realtime"}
+            else "pipeline"
+        )
         stt_model = str(runtime_config.get("stt_model") or "auto")
         values["stt_model"] = (
             stt_model
@@ -624,10 +672,15 @@ async def update_runtime_profile(
     agent = await _agent(db, current_user.tenant_id, agent_id)
     profile = await _profile(db, current_user.tenant_id, agent_id, create=True)
     assert profile is not None
-    payload = data.model_dump(exclude={"stt_model", "tts_delivery_mode"})
+    payload = data.model_dump(exclude={"voice_runtime", "stt_model", "tts_delivery_mode"})
     for key, value in payload.items():
         setattr(profile, key, value)
     runtime_config = profile.runtime_config if isinstance(profile.runtime_config, dict) else {}
+    if "voice_runtime" in data.model_fields_set:
+        runtime_config = {
+            **runtime_config,
+            "voice_runtime": data.voice_runtime,
+        }
     if "stt_model" in data.model_fields_set:
         runtime_config = {
             **runtime_config,
@@ -658,6 +711,7 @@ async def update_runtime_profile(
             "telephony_provider": profile.telephony_provider,
             "primary_speech_provider": profile.primary_speech_provider,
             "assigned_number_count": len(profile.assigned_numbers),
+            "voice_runtime": data.voice_runtime,
             "stt_model": data.stt_model,
             "tts_delivery_mode": delivery_mode,
         },

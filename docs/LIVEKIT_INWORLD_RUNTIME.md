@@ -53,6 +53,29 @@ add the LiveKit third-party SIP line item or an e& carrier charge. An unused
 token or interrupted connection is terminalized by the same stale-session
 recovery controls and cannot reserve concurrency indefinitely.
 
+## Native Inworld Realtime pilot
+
+Inworld agents expose two explicit runtime modes. `pipeline` preserves the
+separate Inworld STT, selectable LLM/Router, and Inworld TTS-2 implementation.
+`inworld_realtime` uses one persistent Inworld Realtime WebSocket through the
+LiveKit AgentSession for transcription, semantic turn detection, response
+generation, interruption handling, and TTS-2 audio.
+
+The native route does not bypass VAV governance. Business questions must call a
+tenant- and agent-scoped `search_approved_knowledge` tool; missing evidence stays
+fail-closed. The provider connection uses Inworld's `/api/v1/realtime/session`
+endpoint and Basic API-key authentication, rather than treating the OpenAI
+Realtime URL and bearer scheme as interchangeable. Test readiness opens the
+same connection and validates the selected model, STT route, voice, semantic
+VAD, and TTS model without generating conversation audio.
+
+This remains an operator-selected production pilot because Inworld labels the
+Realtime API as research preview. Existing active profiles default to
+`pipeline`, and changing either mode deactivates the profile until readiness is
+run and activation succeeds. Inworld still meters the STT, routed LLM, and TTS
+components under its published pricing; one session is an architectural and
+latency improvement, not a claim that those components are free.
+
 ## Reference cost for a 60-second connected call
 
 Assumptions: LiveKit third-party SIP overage, conservative public on-demand Inworld rates, 1,000 TTS characters, 1,000 LLM input tokens, 500 output tokens, an explicitly selected GPT-4o mini Router route, and no e& carrier charge.

@@ -175,6 +175,7 @@ export interface RuntimeProfile {
   fallback_speech_provider: 'smallest' | 'sarvam' | 'elevenlabs' | 'inworld' | null;
   llm_provider: 'openai' | 'inworld';
   llm_model: string;
+  voice_runtime: 'pipeline' | 'inworld_realtime';
   stt_language: string;
   stt_model: 'auto' | 'assemblyai/u3-rt-pro' | 'soniox/stt-rt-v4' | 'inworld/inworld-stt-1';
   tts_delivery_mode: 'stable' | 'balanced' | 'creative';
