@@ -494,11 +494,9 @@ async def live_runtime_readiness(
             languages = {
                 str(language or "").strip().lower().split("-", 1)[0]
                 for language in (
-                    list(agent.supported_languages or [])
-                    + [agent.language, profile.stt_language]
+                    list(agent.supported_languages or []) + [agent.language, profile.stt_language]
                 )
-                if str(language or "").strip()
-                and str(language or "").strip().lower() != "auto"
+                if str(language or "").strip() and str(language or "").strip().lower() != "auto"
             }
             configured_stt = (
                 "assemblyai/u3-rt-pro"
@@ -597,9 +595,7 @@ def _response(
         runtime_config = profile.runtime_config if isinstance(profile.runtime_config, dict) else {}
         voice_runtime = str(runtime_config.get("voice_runtime") or "pipeline")
         values["voice_runtime"] = (
-            voice_runtime
-            if voice_runtime in {"pipeline", "inworld_realtime"}
-            else "pipeline"
+            voice_runtime if voice_runtime in {"pipeline", "inworld_realtime"} else "pipeline"
         )
         stt_model = str(runtime_config.get("stt_model") or "auto")
         values["stt_model"] = (

@@ -99,8 +99,7 @@ async def test_realtime_readiness_surfaces_plan_restriction_before_a_call(monkey
                 "type": "error",
                 "error": {
                     "message": (
-                        "Tool calling is currently restricted on your plan. "
-                        "Add credits to unlock."
+                        "Tool calling is currently restricted on your plan. Add credits to unlock."
                     )
                 },
             },

@@ -72,10 +72,7 @@ def test_inworld_realtime_websocket_url_uses_provider_protocol():
     assert inworld_realtime_websocket_url(
         "https://api.inworld.ai/v1",
         session_id="vav-test-session",
-    ) == (
-        "wss://api.inworld.ai/api/v1/realtime/session"
-        "?key=vav-test-session&protocol=realtime"
-    )
+    ) == ("wss://api.inworld.ai/api/v1/realtime/session?key=vav-test-session&protocol=realtime")
 
 
 @pytest.mark.asyncio

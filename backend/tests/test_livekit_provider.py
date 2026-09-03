@@ -1038,8 +1038,7 @@ async def test_inworld_realtime_adapter_uses_inworld_endpoint_and_basic_auth(mon
 
     assert isinstance(websocket, WebSocket)
     assert captured["url"] == (
-        "wss://api.inworld.ai/api/v1/realtime/session"
-        "?key=vav-fixed-session-id&protocol=realtime"
+        "wss://api.inworld.ai/api/v1/realtime/session?key=vav-fixed-session-id&protocol=realtime"
     )
     assert captured["headers"]["Authorization"] == "Basic base64-inworld-key"
     assert captured["duration"] >= 0

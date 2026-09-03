@@ -22,9 +22,7 @@ def upgrade() -> None:
         "knowledge_sources",
         sa.Column("structured_content", postgresql.JSONB(astext_type=sa.Text()), nullable=True),
     )
-    op.add_column(
-        "knowledge_sources", sa.Column("content_sha256", sa.String(64), nullable=True)
-    )
+    op.add_column("knowledge_sources", sa.Column("content_sha256", sa.String(64), nullable=True))
     op.add_column(
         "knowledge_sources",
         sa.Column("compiled_at", sa.DateTime(timezone=True), nullable=True),

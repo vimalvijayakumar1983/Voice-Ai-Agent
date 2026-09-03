@@ -74,8 +74,7 @@ test('tenant SIP routes never collect platform LiveKit or carrier credentials', 
 
 test('VAV-managed agents show runtime lifecycle instead of Smallest draft state', () => {
   assert.match(agentsSource, /agentStateLabel\(agent, runtimeProfiles\[agent\.id\]\)/);
-  assert.match(agentsSource, /LiveKit AgentSession · Inworld STT\/TTS/);
-  assert.doesNotMatch(agentsSource, /direct Inworld realtime runtime/);
+  assert.match(agentsSource, /LiveKit · Native Inworld Realtime available/);
   assert.match(agentsSource, /if \(runtime\.enabled && runtime\.status === 'active'\) return 'Runtime active'/);
   assert.match(agentsSource, /if \(runtime\.status === 'inactive'\) return 'Runtime inactive'/);
   assert.match(agentsSource, /Serving or provider synced/);

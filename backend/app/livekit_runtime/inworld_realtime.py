@@ -72,9 +72,9 @@ class InworldRealtimeSession(openai.realtime.RealtimeSession):
         # The shared OpenAI schema does not expose Inworld's output TTS model
         # extension. Add it only at the provider boundary so Realtime TTS-2 is
         # selected explicitly instead of relying on a changing provider default.
-        payload.setdefault("session", {}).setdefault("audio", {}).setdefault(
-            "output", {}
-        )["model"] = INWORLD_TTS_MODEL
+        payload.setdefault("session", {}).setdefault("audio", {}).setdefault("output", {})[
+            "model"
+        ] = INWORLD_TTS_MODEL
         return payload
 
 

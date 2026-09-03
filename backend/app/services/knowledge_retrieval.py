@@ -1126,6 +1126,8 @@ async def _contact_candidate_source_ids(
             )
         ).all()
     )
+
+
 async def _postgres_candidate_source_ids(
     db: AsyncSession,
     *,

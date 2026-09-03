@@ -68,9 +68,7 @@ class RuntimeProfileUpdate(BaseModel):
                 "model is then executed inside the same Inworld Realtime session"
             )
         if self.voice_runtime == "inworld_realtime" and model == "auto":
-            raise ValueError(
-                "Native Inworld Realtime requires an explicit production model route"
-            )
+            raise ValueError("Native Inworld Realtime requires an explicit production model route")
         return self
 
 

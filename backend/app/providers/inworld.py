@@ -475,8 +475,7 @@ class InworldClient:
                                     {
                                         "type": "input_text",
                                         "text": (
-                                            f"Call {ROUTER_TOOL_NAME} now. "
-                                            "Do not reply with text."
+                                            f"Call {ROUTER_TOOL_NAME} now. Do not reply with text."
                                         ),
                                     }
                                 ],
@@ -505,9 +504,7 @@ class InworldClient:
                             raise InworldError(
                                 "Inworld Realtime completed without executing the required tool."
                             )
-                    raise InworldError(
-                        "Inworld Realtime did not complete the required tool check."
-                    )
+                    raise InworldError("Inworld Realtime did not complete the required tool check.")
         except InworldError:
             raise
         except TimeoutError as exc:
