@@ -549,6 +549,7 @@ def _recover_terminology(query: str, terminology: Iterable[object]) -> tuple[str
                 if any(
                     window[index] in _QUERY_STOP_WORDS
                     or window[index] in _QUERY_INTENT_TOKENS
+                    or window[index] in _SEMANTIC_CONCEPTS
                     for index in mismatched_indexes
                 ):
                     # Never reinterpret ordinary grammar or an explicit intent

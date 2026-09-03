@@ -194,6 +194,16 @@ def test_contextual_plan_never_rewrites_preposition_as_part_of_source_name():
     assert plan.recovered_terms == ()
 
 
+def test_contextual_plan_never_rewrites_semantic_intent_as_entity_suffix():
+    plan = build_contextual_query_plan(
+        "How long has Al Zaabi Group existed?",
+        terminology=("Al Zaabi Group Corporate Knowledge Base",),
+    )
+
+    assert plan.recovered_terms == ()
+    assert all("Group Corporate" not in variant for variant in plan.variants)
+
+
 def test_contextual_plan_recovers_joined_spoken_brand_from_proper_name():
     plan = build_contextual_query_plan(
         "Do you have information about Sengobin?",
