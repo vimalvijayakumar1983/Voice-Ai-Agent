@@ -3268,6 +3268,32 @@ def test_deterministic_no_match_contraction_is_classified_as_safe_refusal():
     assert runtime_metrics.get("unsupported_knowledge_response_count", 0) == 0
 
 
+def test_grounded_fact_with_routine_follow_up_is_not_misclassified_as_clarification():
+    runtime_metrics = {"barge_in_count": 0}
+    telemetry = _LiveKitRuntimeTelemetry(
+        runtime_metrics=runtime_metrics,
+        end_to_end_samples=[],
+        opened_at=1.0,
+    )
+    telemetry.on_final_transcript("Who is the chairman?")
+    telemetry.record_knowledge_lookup(
+        elapsed_ms=10,
+        result="verified",
+        details={"exact_fact_action": "answer"},
+    )
+
+    telemetry.on_assistant_content(
+        "The chairman is Saeed Yousif Ibrahim Al Zaabi. Is there anything else?"
+    )
+
+    trace = telemetry.current_turn_trace
+    assert trace is not None
+    assert trace["grounding_outcome"] == "response_after_verified_retrieval"
+    assert trace["response_action"] == "responded_after_verified_retrieval"
+    grounding = summarize_runtime_grounding({"runtime": runtime_metrics})
+    assert grounding["clarified_despite_verified_exact_fact"] == 0
+
+
 def test_livekit_worker_health_server_uses_valid_railway_port():
     assert _worker_http_port("8081") == 8081
     assert _worker_http_port(None) is None

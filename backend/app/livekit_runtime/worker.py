@@ -365,9 +365,11 @@ def _no_match_response_outcome(content: str) -> str:
     normalized = " ".join(str(content or "").casefold().split())
     if any(pattern in normalized for pattern in _GROUNDING_REFUSAL_PATTERNS):
         return "no_match_correctly_refused"
-    if normalized.endswith("?") or any(
-        pattern in normalized for pattern in _GROUNDING_CLARIFICATION_PATTERNS
-    ):
+    # A grounded answer may end with a routine offer such as "Is there anything
+    # else?".  A trailing question mark is therefore not proof that the agent
+    # asked the caller to clarify the requested fact.  Only explicit repair or
+    # disambiguation language belongs in the clarification class.
+    if any(pattern in normalized for pattern in _GROUNDING_CLARIFICATION_PATTERNS):
         return "no_match_clarification"
     return "no_match_unverified_response"
 

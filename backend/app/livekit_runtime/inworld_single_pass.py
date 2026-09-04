@@ -309,7 +309,11 @@ def build_evidence_only_instructions(evidence: str | None) -> str:
     )
 
 
-def deterministic_grounded_reply(evidence: str | None) -> str | None:
+def deterministic_grounded_reply(
+    evidence: str | None,
+    *,
+    query: str = "",
+) -> str | None:
     """Return a safe spoken reply when no generative wording is required.
 
     A no-match must never reach a model that could answer from pretrained or
@@ -343,7 +347,22 @@ def deterministic_grounded_reply(evidence: str | None) -> str | None:
     if len(facts) == 1:
         subject, predicate, value = facts[0]
         if envelope.facts[0].fact_type == "founding":
+            normalized_query = " ".join(str(query or "").casefold().split())
+            duration_question = (
+                "how long" in normalized_query
+                or "since when" in normalized_query
+                or "from what year" in normalized_query
+            ) and any(
+                term in normalized_query
+                for term in ("operate", "operated", "operating", "exist", "running")
+            )
+            if duration_question:
+                return f"{subject} has operated since {value}."
             return f"According to an approved source, {subject} was established in {value}."
+        if envelope.facts[0].fact_type == "leadership":
+            return f"The {predicate} of {subject} is {value}."
+        if envelope.facts[0].fact_type == "services":
+            return f"Verified services and divisions for {subject} include {value}."
         return f"The {predicate} for {subject} is {value}."
     details = "; ".join(
         f"{predicate} for {subject} is {value}" for subject, predicate, value in facts[:4]
@@ -569,7 +588,7 @@ class InworldSinglePassController:
                 return
 
             generation_started_at = self._clock()
-            deterministic_reply = deterministic_grounded_reply(evidence)
+            deterministic_reply = deterministic_grounded_reply(evidence, query=transcript)
             if deterministic_reply is not None:
                 handle = self._session.say(
                     deterministic_reply,

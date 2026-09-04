@@ -173,6 +173,47 @@ def test_grounding_guard_keeps_correct_refusal_out_of_manual_review():
     assert guarded["disposition_details"]["needs_review"] is False
 
 
+def test_grounding_guard_downgrades_refusal_or_clarification_despite_exact_evidence():
+    analysis = normalize_call_analysis(
+        {
+            "summary": "The agent did not use exact facts that retrieval supplied.",
+            "disposition": "information_provided",
+            "resolution": "resolved",
+            "confidence": 0.94,
+        },
+        profile="receptionist",
+    )
+    grounding = summarize_runtime_grounding(
+        {
+            "runtime": {
+                "turn_diagnostics": [
+                    {
+                        "grounding_outcome": "response_after_verified_retrieval",
+                        "response_action": "refused_despite_verified_evidence",
+                        "exact_fact_action": "answer",
+                    },
+                    {
+                        "grounding_outcome": "response_after_verified_retrieval",
+                        "response_action": "asked_clarification_despite_verified_evidence",
+                        "exact_fact_action": "answer",
+                    },
+                ]
+            }
+        }
+    )
+
+    guarded = apply_grounding_quality_guard(analysis, grounding=grounding)
+
+    details = guarded["disposition_details"]
+    assert grounding["refused_despite_verified_evidence"] == 1
+    assert grounding["clarified_despite_verified_exact_fact"] == 1
+    assert details["resolution"] == "partially_resolved"
+    assert details["needs_review"] is True
+    assert details["confidence"] == 0.5
+    assert "refused despite verified evidence" in details["evidence"][-1]
+    assert "verified exact-fact answer" in details["evidence"][-1]
+
+
 def test_grounding_guard_downgrades_knowledge_tool_errors_but_not_correct_refusals():
     analysis = normalize_call_analysis(
         {

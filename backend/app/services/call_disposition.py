@@ -23,6 +23,8 @@ GROUNDING_OUTCOMES = frozenset(
 GROUNDING_QUALITY_FLAGS = frozenset(
     {
         "answered_without_grounding",
+        "refused_despite_verified_evidence",
+        "clarified_despite_verified_exact_fact",
     }
 )
 
@@ -346,6 +348,17 @@ def summarize_runtime_grounding(call_metadata: object) -> dict[str, int]:
         outcome = trace.get("grounding_outcome")
         if outcome in counts:
             counts[outcome] += 1
+        response_action = trace.get("response_action")
+        if response_action == "refused_despite_verified_evidence":
+            counts["refused_despite_verified_evidence"] += 1
+        elif (
+            response_action == "asked_clarification_despite_verified_evidence"
+            and trace.get("exact_fact_action") == "answer"
+        ):
+            # Clarification can be valid for broad or ambiguous prose. It is a
+            # deterministic quality failure only when the exact-fact resolver
+            # had already produced a single answer action for this turn.
+            counts["clarified_despite_verified_exact_fact"] += 1
         knowledge_result = trace.get("retrieval_result", trace.get("knowledge_result"))
         if (
             trace.get("outcome") == "answered"
@@ -373,7 +386,15 @@ def apply_grounding_quality_guard(
     unsupported_count = safe_counts["no_match_unverified_response"]
     knowledge_error_count = safe_counts["knowledge_error_response"]
     unlinked_answer_count = safe_counts["answered_without_grounding"]
-    grounding_issue_count = unsupported_count + knowledge_error_count + unlinked_answer_count
+    verified_refusal_count = safe_counts["refused_despite_verified_evidence"]
+    verified_exact_clarification_count = safe_counts["clarified_despite_verified_exact_fact"]
+    grounding_issue_count = (
+        unsupported_count
+        + knowledge_error_count
+        + unlinked_answer_count
+        + verified_refusal_count
+        + verified_exact_clarification_count
+    )
     if grounding_issue_count <= 0:
         return analysis
 
@@ -399,6 +420,15 @@ def apply_grounding_quality_guard(
     if unlinked_answer_count:
         warning_parts.append(
             f"{unlinked_answer_count} answered turn(s) had no completed grounding verdict"
+        )
+    if verified_refusal_count:
+        warning_parts.append(
+            f"{verified_refusal_count} response(s) refused despite verified evidence"
+        )
+    if verified_exact_clarification_count:
+        warning_parts.append(
+            f"{verified_exact_clarification_count} response(s) asked for clarification "
+            "despite a verified exact-fact answer"
         )
     warning = "; ".join(warning_parts) + "."
     details["evidence"] = [*evidence[:2], warning]

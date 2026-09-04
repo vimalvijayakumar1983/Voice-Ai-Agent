@@ -294,6 +294,52 @@ def test_no_match_and_compiler_exact_facts_have_deterministic_grounded_replies()
     assert deterministic_grounded_reply(founding_evidence) == (
         "According to an approved source, Al Zaabi Group was established in 2003."
     )
+    assert (
+        deterministic_grounded_reply(
+            founding_evidence,
+            query="How long has Al Zaabi Group been operating?",
+        )
+        == "Al Zaabi Group has operated since 2003."
+    )
+
+    leadership_evidence = encode_exact_fact_evidence(
+        response_action="answer",
+        facts=(
+            ExactFactWireFact(
+                evidence_id="exact:leadership:1",
+                fact_type="leadership",
+                subject="Al Zaabi Group",
+                predicate="chairman",
+                value="Saeed Yousif Ibrahim Al Zaabi",
+                source_name="Approved leadership profile",
+            ),
+        ),
+        max_chars=800,
+    )
+    assert leadership_evidence is not None
+    assert deterministic_grounded_reply(leadership_evidence) == (
+        "The chairman of Al Zaabi Group is Saeed Yousif Ibrahim Al Zaabi."
+    )
+
+    services_evidence = encode_exact_fact_evidence(
+        response_action="answer",
+        facts=(
+            ExactFactWireFact(
+                evidence_id="exact:services:1",
+                fact_type="services",
+                subject="Al Zaabi Group",
+                predicate="core services",
+                value="Healthcare, Trading, Contracting, Automotive and Transport",
+                source_name="Approved company profile",
+            ),
+        ),
+        max_chars=800,
+    )
+    assert services_evidence is not None
+    assert deterministic_grounded_reply(services_evidence) == (
+        "Verified services and divisions for Al Zaabi Group include Healthcare, Trading, "
+        "Contracting, Automotive and Transport."
+    )
 
 
 def test_exact_fact_json_does_not_treat_source_delimiters_as_control_syntax():

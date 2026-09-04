@@ -203,7 +203,10 @@ def tier1_quality_cases(index: ExactFactIndex):
         Tier1QualityCase(
             case_id="services_paraphrases",
             query="What services does Al Zaabi Group provide?",
-            paraphrases=("What does Al Zaabi Group do?",),
+            paraphrases=(
+                "What does Al Zaabi Group do?",
+                "What businesses or divisions does Al Zaabi Group operate?",
+            ),
             expected_action=ExactFactResponseAction.ANSWER,
             expected_intents=(ExactFactType.SERVICES,),
             expected_evidence_ids=(services_id,),
@@ -214,6 +217,7 @@ def tier1_quality_cases(index: ExactFactIndex):
             paraphrases=(
                 "When was Al Zaabi Group founded?",
                 "What is Al Zaabi Group's inception year?",
+                "How long has Al Zaabi Group been operating?",
             ),
             expected_action=ExactFactResponseAction.ANSWER,
             expected_intents=(ExactFactType.FOUNDING,),

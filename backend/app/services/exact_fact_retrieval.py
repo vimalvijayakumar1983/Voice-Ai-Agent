@@ -193,6 +193,7 @@ _QUERY_STOP_WORDS = {
     "and",
     "are",
     "at",
+    "been",
     "can",
     "could",
     "did",
@@ -213,6 +214,7 @@ _QUERY_STOP_WORDS = {
     "of",
     "on",
     "our",
+    "or",
     "please",
     "tell",
     "that",
@@ -305,10 +307,18 @@ _INTENT_QUERY_TOKENS = {
         "runs",
     },
     ExactFactType.SERVICES: {
+        "business",
+        "businesses",
+        "division",
+        "divisions",
         "do",
         "offer",
         "offering",
         "offers",
+        "operate",
+        "operates",
+        "sector",
+        "sectors",
         "provide",
         "provides",
         "service",
@@ -332,6 +342,12 @@ _INTENT_QUERY_TOKENS = {
         "incorporated",
         "inception",
         "launched",
+        "long",
+        "operate",
+        "operated",
+        "operating",
+        "operations",
+        "since",
         "started",
         "year",
     },
@@ -380,6 +396,7 @@ _INTENT_PATTERNS: tuple[tuple[ExactFactType, tuple[re.Pattern[str], ...]], ...] 
         ExactFactType.SERVICES,
         (
             re.compile(r"\b(?:services?|offerings?|treatments?)\b"),
+            re.compile(r"\b(?:business(?:es)?|divisions?|sectors?)\b"),
             re.compile(
                 r"\b(?:offer|offers|provide|provides|speciali[sz]e|speciali[sz]es)\b"
                 r".{0,80}\b(?:care|procedure|product|solution)\b"
@@ -398,6 +415,14 @@ _INTENT_PATTERNS: tuple[tuple[ExactFactType, tuple[re.Pattern[str], ...]], ...] 
             re.compile(
                 r"\b(?:was|is)\b.{0,100}\b"
                 r"(?:established|formed|founded|incorporated|launched|started)\s+(?:in|on)\b"
+            ),
+            re.compile(
+                r"\bhow\s+long\b.{0,100}\b"
+                r"(?:operate|operated|operating|operations?|exist|existed|running)\b"
+            ),
+            re.compile(
+                r"\b(?:since\s+when|from\s+what\s+year)\b.{0,100}\b"
+                r"(?:operate|operated|operating|operations?|exist|existed|running)\b"
             ),
         ),
     ),
