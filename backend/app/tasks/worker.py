@@ -1,9 +1,24 @@
 """Celery worker configuration."""
 
 from celery import Celery
+from celery.signals import after_setup_logger, after_setup_task_logger
 from kombu import Queue
 
 from app.core.config import settings
+from app.core.logging_security import install_callback_claim_log_redaction
+
+# Celery workers do not import ``app.main``, so install the same process-wide
+# callback-capability redaction before task arguments or exceptions are logged.
+install_callback_claim_log_redaction()
+
+
+@after_setup_logger.connect
+@after_setup_task_logger.connect
+def _install_worker_callback_claim_redaction(**_kwargs) -> None:
+    """Wrap handlers Celery creates after this module is imported."""
+
+    install_callback_claim_log_redaction()
+
 
 celery_app = Celery(
     "voice_ai_agent",

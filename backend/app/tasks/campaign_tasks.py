@@ -3,7 +3,7 @@
 import json
 import math
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, time, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -12,6 +12,7 @@ from sqlalchemy import func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.core.logging_security import redact_twilio_callback_claim_text
 from app.models.agent import Agent
 from app.models.call import Call
 from app.models.campaign import (
@@ -36,7 +37,21 @@ from app.services.phone_numbers import (
     normalize_e164,
     tenant_phone_dnc_lock,
 )
-from app.services.provider_credentials import load_provider_config
+from app.services.provider_credentials import (
+    load_provider_config,
+    lock_provider_runtime_boundaries,
+)
+from app.services.twilio_callback_claim import (
+    TWILIO_CALLBACK_CLAIM_METADATA_KEY,
+    append_twilio_callback_claim,
+    create_twilio_callback_claim,
+    mark_twilio_callback_claim_bound,
+    twilio_callback_claim_matches,
+)
+from app.services.twilio_route_security import (
+    TwilioRouteCredential,
+    twilio_callback_credential_fingerprint,
+)
 from app.tasks.async_runner import run_async as _run_async
 from app.tasks.worker import celery_app
 from app.telephony.base import CallRequest
@@ -77,6 +92,8 @@ class DispatchPayload:
     phone_number: str
     from_number: str | None
     context_data: dict
+    twilio_credential_binding: dict[str, str] | None
+    twilio_callback_claim_token: str | None = field(repr=False)
 
 
 @dataclass(frozen=True)
@@ -373,6 +390,61 @@ async def _provider_from_number(
             or None
         )
     return "provider-managed"
+
+
+async def _resolve_twilio_campaign_route(
+    db: AsyncSession,
+    tenant_id: uuid.UUID,
+    *,
+    for_update: bool = False,
+) -> tuple[TwilioRouteCredential, str, str | None]:
+    """Resolve one exact campaign credential and its default caller ID."""
+
+    config = await load_provider_config(
+        db,
+        tenant_id,
+        "twilio",
+        for_update=for_update,
+    )
+    if config and config.get("account_sid") and config.get("auth_token"):
+        credential = TwilioRouteCredential(
+            account_sid=str(config["account_sid"]).strip(),
+            auth_token=str(config["auth_token"]).strip(),
+        )
+        source = "workspace"
+    else:
+        credential = TwilioRouteCredential(
+            account_sid=settings.twilio_account_sid.strip(),
+            auth_token=settings.twilio_auth_token.strip(),
+        )
+        source = "platform"
+    default_from_number = str(
+        (config or {}).get("default_from_number") or settings.twilio_default_from_number
+    ).strip()
+    return credential, source, default_from_number or None
+
+
+def _twilio_campaign_credential_binding(
+    credential: TwilioRouteCredential,
+    source: str,
+) -> dict[str, str]:
+    return {
+        "provider": "twilio",
+        "source": source,
+        "account_sid": credential.account_sid,
+        "credential_fingerprint": twilio_callback_credential_fingerprint(credential),
+    }
+
+
+def _twilio_campaign_binding_is_current(
+    binding: dict[str, str] | None,
+    credential: TwilioRouteCredential,
+    source: str,
+) -> bool:
+    if not isinstance(binding, dict):
+        return False
+    expected = _twilio_campaign_credential_binding(credential, source)
+    return all(str(binding.get(key) or "") == value for key, value in expected.items())
 
 
 def _has_unverified_smallest_resources(campaign: Campaign) -> bool:
@@ -879,6 +951,7 @@ async def _prepare_attempt_dispatch(
             select(
                 CampaignContactAttempt.campaign_id,
                 CampaignContactAttempt.contact_id,
+                CampaignContactAttempt.provider,
             ).where(
                 CampaignContactAttempt.id == attempt_id,
                 CampaignContactAttempt.tenant_id == tenant_id,
@@ -889,7 +962,14 @@ async def _prepare_attempt_dispatch(
     if attempt_identity is None:
         await db.commit()
         return DispatchPreparation()
-    campaign_id, contact_id = attempt_identity
+    campaign_id, contact_id, attempt_provider = attempt_identity
+
+    twilio_route: tuple[TwilioRouteCredential, str, str | None] | None = None
+    if attempt_provider == "twilio":
+        # The provider advisory serializes credential mutation. Defer the
+        # non-locking credential read until after the campaign/Agent graph so
+        # direct Agent -> credential dispatch cannot deadlock this path.
+        await lock_provider_runtime_boundaries(db, tenant_id, "twilio")
 
     campaign = (
         await db.execute(
@@ -921,6 +1001,7 @@ async def _prepare_attempt_dispatch(
                 CampaignContactAttempt.campaign_id == campaign_id,
                 CampaignContactAttempt.contact_id == contact_id,
                 CampaignContactAttempt.state == "claimed",
+                CampaignContactAttempt.provider == attempt_provider,
             )
             .with_for_update()
             .execution_options(populate_existing=True)
@@ -1010,6 +1091,9 @@ async def _prepare_attempt_dispatch(
         await db.commit()
         return DispatchPreparation()
 
+    if attempt.provider == "twilio":
+        twilio_route = await _resolve_twilio_campaign_route(db, tenant_id)
+
     try:
         context_variables = _validated_provider_variables(contact.context_data)
     except ValueError:
@@ -1052,9 +1136,34 @@ async def _prepare_attempt_dispatch(
         await db.commit()
         return DispatchPreparation()
 
+    twilio_callback_claim_token: str | None = None
+    twilio_callback_claim_metadata: dict[str, object] | None = None
+    twilio_credential_binding: dict[str, str] | None = None
+    if attempt.provider == "twilio":
+        if twilio_route is None:
+            raise RuntimeError("Twilio campaign route was not locked")
+        twilio_credential, twilio_source, _default_from_number = twilio_route
+        twilio_credential_binding = _twilio_campaign_credential_binding(
+            twilio_credential,
+            twilio_source,
+        )
+        (
+            twilio_callback_claim_token,
+            twilio_callback_claim_metadata,
+        ) = create_twilio_callback_claim()
+
     if call is None:
         call_id = uuid.uuid4()
-        from_number = await _provider_from_number(db, tenant_id, campaign, agent)
+        if twilio_route is not None:
+            _credential, _source, route_default_from_number = twilio_route
+            configured = (campaign.settings or {}).get("from_number")
+            from_number = (
+                configured
+                if isinstance(configured, str) and configured
+                else route_default_from_number
+            )
+        else:
+            from_number = await _provider_from_number(db, tenant_id, campaign, agent)
         call = Call(
             id=call_id,
             tenant_id=tenant_id,
@@ -1073,11 +1182,28 @@ async def _prepare_attempt_dispatch(
                     "contact_id": str(contact.id),
                     "idempotency_key": attempt.idempotency_key,
                 },
+                **(
+                    {
+                        "telephony_credential_binding": twilio_credential_binding,
+                        TWILIO_CALLBACK_CLAIM_METADATA_KEY: twilio_callback_claim_metadata,
+                    }
+                    if twilio_credential_binding is not None
+                    and twilio_callback_claim_metadata is not None
+                    else {}
+                ),
             },
         )
         db.add(call)
         attempt.call_id = call_id
         contact.last_call_id = call_id
+    elif twilio_credential_binding is not None and twilio_callback_claim_metadata is not None:
+        # A claimed attempt has not reached provider I/O, so replacing any
+        # incomplete prior claim is safe and keeps recovery fail closed.
+        call.call_metadata = {
+            **(call.call_metadata or {}),
+            "telephony_credential_binding": twilio_credential_binding,
+            TWILIO_CALLBACK_CLAIM_METADATA_KEY: twilio_callback_claim_metadata,
+        }
 
     now = datetime.now(UTC)
     attempt.state = "dispatching"
@@ -1102,6 +1228,8 @@ async def _prepare_attempt_dispatch(
             phone_number=contact.phone_number,
             from_number=call.from_number,
             context_data=context_variables,
+            twilio_credential_binding=twilio_credential_binding,
+            twilio_callback_claim_token=twilio_callback_claim_token,
         )
     )
 
@@ -1145,26 +1273,41 @@ async def _call_provider(db: AsyncSession, payload: DispatchPayload) -> str:
     if payload.provider == "twilio":
         if not payload.from_number or payload.from_number == "provider-managed":
             raise DefinitiveDispatchError("Twilio campaign has no configured from number")
+        if not payload.twilio_callback_claim_token:
+            raise DefinitiveDispatchError("Twilio campaign callback claim is unavailable")
         # Twilio's existing adapter has no idempotency primitive. The durable
         # local call id in both callback URLs is therefore the reconciliation
         # identity and ambiguous dispatches are never automatically retried.
-        config = await load_provider_config(db, payload.tenant_id, "twilio")
-        provider = (
-            get_telephony_provider(
-                account_sid=str(config.get("account_sid")).strip(),
-                auth_token=str(config.get("auth_token")).strip(),
+        credential, source, _default_from_number = await _resolve_twilio_campaign_route(
+            db,
+            payload.tenant_id,
+        )
+        if not _twilio_campaign_binding_is_current(
+            payload.twilio_credential_binding,
+            credential,
+            source,
+        ):
+            raise DefinitiveDispatchError(
+                "Twilio campaign credential changed before provider dispatch"
             )
-            if config and config.get("account_sid") and config.get("auth_token")
-            else get_telephony_provider()
+        provider = get_telephony_provider(
+            account_sid=credential.account_sid,
+            auth_token=credential.auth_token,
+        )
+        webhook_url = append_twilio_callback_claim(
+            f"{settings.base_url}/api/v1/webhooks/twilio/voice/{payload.call_id}",
+            payload.twilio_callback_claim_token,
+        )
+        status_callback_url = append_twilio_callback_claim(
+            f"{settings.base_url}/api/v1/webhooks/twilio/status/{payload.call_id}",
+            payload.twilio_callback_claim_token,
         )
         result = await provider.make_call(
             CallRequest(
                 to_number=payload.phone_number,
                 from_number=payload.from_number,
-                webhook_url=(f"{settings.base_url}/api/v1/webhooks/twilio/voice/{payload.call_id}"),
-                status_callback_url=(
-                    f"{settings.base_url}/api/v1/webhooks/twilio/status/{payload.call_id}"
-                ),
+                webhook_url=webhook_url,
+                status_callback_url=status_callback_url,
             )
         )
         return result.provider_call_sid
@@ -1183,7 +1326,17 @@ async def _call_provider_with_final_guard(
     ``None`` means the durable attempt was safely cancelled or was no longer
     eligible, so the caller must not record provider acceptance/failure.
     """
+    twilio_route: tuple[TwilioRouteCredential, str, str | None] | None = None
+    twilio_binding_changed = False
     async with tenant_phone_dnc_lock(db, payload.tenant_id, payload.phone_number):
+        if payload.provider == "twilio":
+            # Credential mutations take the same provider boundary before
+            # touching an Agent or credential row. Keep campaign dispatch in
+            # that order too: DNC -> provider -> campaign graph -> Agent ->
+            # credential snapshot. Reading the credential before Agent would
+            # invert direct native dispatch's Agent -> credential order.
+            await lock_provider_runtime_boundaries(db, payload.tenant_id, "twilio")
+
         campaign = (
             await db.execute(
                 select(Campaign)
@@ -1311,16 +1464,58 @@ async def _call_provider_with_final_guard(
             payload.tenant_id,
             for_update=True,
         )
+        if agent is not None and payload.provider == "twilio":
+            # The provider advisory boundary held above makes this non-locking
+            # snapshot stable against every supported credential
+            # create/rotate/delete path. Resolve only after Agent so campaign
+            # and direct native dispatch share one row-lock order.
+            twilio_route = await _resolve_twilio_campaign_route(
+                db,
+                payload.tenant_id,
+            )
+            twilio_credential, twilio_source, _default_from_number = twilio_route
+            call_metadata = call.call_metadata if isinstance(call.call_metadata, dict) else {}
+            persisted_binding = call_metadata.get("telephony_credential_binding")
+            persisted_binding = persisted_binding if isinstance(persisted_binding, dict) else None
+            twilio_binding_changed = bool(
+                not _twilio_campaign_binding_is_current(
+                    payload.twilio_credential_binding,
+                    twilio_credential,
+                    twilio_source,
+                )
+                or payload.twilio_credential_binding != persisted_binding
+                or not _twilio_campaign_binding_is_current(
+                    persisted_binding,
+                    twilio_credential,
+                    twilio_source,
+                )
+                or not twilio_callback_claim_matches(
+                    call_metadata,
+                    payload.twilio_callback_claim_token,
+                )
+            )
         current_provider = (
             (agent.voice_provider or "").strip().lower() if agent is not None else None
         )
-        current_from_number = (
-            await _provider_from_number(db, payload.tenant_id, campaign, agent) if agent else None
-        )
+        if agent and twilio_route is not None:
+            _credential, _source, route_default_from_number = twilio_route
+            configured = (campaign.settings or {}).get("from_number")
+            current_from_number = (
+                configured
+                if isinstance(configured, str) and configured
+                else route_default_from_number
+            )
+        else:
+            current_from_number = (
+                await _provider_from_number(db, payload.tenant_id, campaign, agent)
+                if agent
+                else None
+            )
         provider_identity_changed = bool(
             agent
             and (
-                current_provider != payload.provider
+                twilio_binding_changed
+                or current_provider != payload.provider
                 or current_provider == "smallest"
                 and (
                     agent.provider_agent_id != payload.provider_agent_id
@@ -1446,13 +1641,18 @@ async def _record_provider_acceptance(
         raise RuntimeError("Provider returned conflicting call identities")
     call.provider_call_sid = provider_call_sid
     attempt.provider_call_sid = provider_call_sid
+    if payload.provider == "twilio":
+        call.call_metadata = mark_twilio_callback_claim_bound(
+            call.call_metadata,
+            source="provider_response",
+        )
 
     # A callback can win this race and make the attempt terminal before the
     # provider HTTP response is committed. Never regress that terminal state.
     if attempt.state == "dispatching":
         attempt.state = "accepted"
         attempt.accepted_at = attempt.accepted_at or datetime.now(UTC)
-    if call.status not in {"completed", "failed", "busy", "no_answer"}:
+    if call.status == "dispatching":
         call.status = "ringing"
     if contact.status == "dispatching":
         contact.status = "calling"
@@ -1511,7 +1711,7 @@ async def _record_provider_failure(
         await db.commit()
         return CampaignLifecycleResult()
 
-    message = str(exc)[:1000]
+    message = redact_twilio_callback_claim_text(str(exc))[:1000]
     attempt.error_message = message
     attempt.error_code = exc.__class__.__name__[:100]
     now = datetime.now(UTC)

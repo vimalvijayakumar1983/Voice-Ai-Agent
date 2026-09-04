@@ -21,6 +21,10 @@ _CALLBACK_CLAIM_TEXT_PATTERN = re.compile(
     r"(?i)(?P<prefix>(?:[?&]|\b[\"']?)vav_callback_claim[\"']?\s*(?:=|:)\s*[\"']?)"
     r"(?P<value>[^&\s,}\"']*)"
 )
+_CALLBACK_CLAIM_ENCODED_TEXT_PATTERN = re.compile(
+    r"(?i)(?P<prefix>vav_callback_claim%(?:25)*3d)"
+    r"(?P<value>.*?)(?=%(?:25)*26|[&\s,}\"']|$)"
+)
 
 
 def redact_twilio_callback_claim_text(value: str) -> str:
@@ -28,9 +32,15 @@ def redact_twilio_callback_claim_text(value: str) -> str:
 
     if TWILIO_CALLBACK_CLAIM_LOG_KEY not in value.lower():
         return value
-    return _CALLBACK_CLAIM_TEXT_PATTERN.sub(
+    redacted = _CALLBACK_CLAIM_TEXT_PATTERN.sub(
         lambda match: f"{match.group('prefix')}{CALLBACK_CLAIM_REDACTION}",
         value,
+    )
+    # HTTP/provider errors commonly echo form-encoded callback URLs. Match
+    # both `%3D`/`%26` and repeated percent encoding such as `%253D`/`%2526`.
+    return _CALLBACK_CLAIM_ENCODED_TEXT_PATTERN.sub(
+        lambda match: f"{match.group('prefix')}{CALLBACK_CLAIM_REDACTION}",
+        redacted,
     )
 
 

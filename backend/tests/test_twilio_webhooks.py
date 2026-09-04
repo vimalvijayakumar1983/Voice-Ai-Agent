@@ -19,6 +19,7 @@ from app.models.call import Call
 from app.models.campaign import Campaign, CampaignContact, CampaignContactAttempt
 from app.services.provider_credentials import (
     ProviderCredentialError,
+    get_provider_credential,
     invalidate_active_runtimes_for_credential,
     lock_provider_runtime_boundaries,
     store_provider_config,
@@ -145,6 +146,8 @@ async def _workspace_twilio_callback_call(
     *,
     with_campaign: bool,
     explicit_binding: bool,
+    unbound: bool = False,
+    callback_claim_metadata: dict | None = None,
 ):
     """Seed a legacy Twilio call authenticated by the workspace credential."""
 
@@ -200,7 +203,9 @@ async def _workspace_twilio_callback_call(
         db.add(contact)
         await db.flush()
 
-    call_sid = "CA-workspace-campaign" if with_campaign else "CA-workspace-direct"
+    call_sid = (
+        None if unbound else ("CA-workspace-campaign" if with_campaign else "CA-workspace-direct")
+    )
     call_metadata = {}
     if explicit_binding:
         call_metadata["telephony_credential_binding"] = {
@@ -209,6 +214,8 @@ async def _workspace_twilio_callback_call(
             "account_sid": account_sid,
             "credential_fingerprint": twilio_callback_credential_fingerprint(route_credential),
         }
+    if callback_claim_metadata is not None:
+        call_metadata[TWILIO_CALLBACK_CLAIM_METADATA_KEY] = callback_claim_metadata
     call = Call(
         tenant_id=tenant.id,
         agent_id=agent.id,
@@ -245,6 +252,32 @@ async def _workspace_twilio_callback_call(
     return call, account_sid, auth_token, campaign, contact, attempt
 
 
+async def _source_less_platform_twilio_callback_call(
+    db,
+    tenant,
+    *,
+    with_campaign: bool,
+):
+    (
+        call,
+        account_sid,
+        auth_token,
+        campaign,
+        contact,
+        attempt,
+    ) = await _workspace_twilio_callback_call(
+        db,
+        tenant,
+        with_campaign=with_campaign,
+        explicit_binding=False,
+    )
+    credential = await get_provider_credential(db, tenant.id, "twilio", for_update=True)
+    assert credential is not None
+    await db.delete(credential)
+    await db.commit()
+    return call, account_sid, auth_token, campaign, contact, attempt
+
+
 async def _post_signed_twilio_voice(
     client,
     monkeypatch,
@@ -268,6 +301,65 @@ async def _post_signed_twilio_voice(
         data=payload,
         headers={"X-Twilio-Signature": signature},
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("callback_kind", ["voice", "status"])
+async def test_twilio_callback_rejects_unsupported_explicit_credential_source(
+    client,
+    tenant,
+    db,
+    monkeypatch,
+    callback_kind,
+):
+    (
+        call,
+        account_sid,
+        auth_token,
+        _campaign,
+        _contact,
+        _attempt,
+    ) = await _workspace_twilio_callback_call(
+        db,
+        tenant,
+        with_campaign=False,
+        explicit_binding=False,
+    )
+    call.call_metadata = {
+        "telephony_credential_binding": {
+            "provider": "twilio",
+            "source": "unexpected-authority",
+            "account_sid": account_sid,
+        }
+    }
+    await db.commit()
+    call_id = call.id
+    payload = {
+        "AccountSid": account_sid,
+        "CallSid": call.provider_call_sid,
+        "CallStatus": "completed",
+    }
+
+    if callback_kind == "voice":
+        response = await _post_signed_twilio_voice(
+            client,
+            monkeypatch,
+            call,
+            payload,
+            auth_token=auth_token,
+        )
+    else:
+        response = await _post_signed_twilio_status(
+            client,
+            monkeypatch,
+            call,
+            payload,
+            auth_token=auth_token,
+        )
+
+    assert response.status_code == 409
+    db.expire_all()
+    assert (await db.get(Call, call_id)).status == "ringing"
 
 
 @pytest.mark.asyncio
@@ -1696,6 +1788,362 @@ async def test_workspace_owned_callback_rejects_rotation_between_probe_and_locke
         assert stored_campaign.status == "running"
         assert stored_contact.status == "calling"
         assert stored_attempt.state == "accepted"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("callback_kind", ["voice", "status"])
+@pytest.mark.parametrize("call_sid_variant", ["missing", "mismatched"])
+async def test_source_less_workspace_campaign_requires_exact_call_sid(
+    client,
+    tenant,
+    db,
+    monkeypatch,
+    callback_kind,
+    call_sid_variant,
+):
+    (
+        call,
+        account_sid,
+        auth_token,
+        campaign,
+        contact,
+        attempt,
+    ) = await _workspace_twilio_callback_call(
+        db,
+        tenant,
+        with_campaign=True,
+        explicit_binding=False,
+    )
+    call_id = call.id
+    campaign_id = campaign.id
+    contact_id = contact.id
+    attempt_id = attempt.id
+    payload = {
+        "AccountSid": account_sid,
+        "CallStatus": "completed",
+        "CallDuration": "31",
+    }
+    if call_sid_variant == "mismatched":
+        payload["CallSid"] = "CA-other-workspace-campaign"
+
+    if callback_kind == "voice":
+        response = await _post_signed_twilio_voice(
+            client,
+            monkeypatch,
+            call,
+            payload,
+            auth_token=auth_token,
+        )
+    else:
+        response = await _post_signed_twilio_status(
+            client,
+            monkeypatch,
+            call,
+            payload,
+            auth_token=auth_token,
+        )
+
+    assert response.status_code == 409
+    db.expire_all()
+    assert (await db.get(Call, call_id)).status == "ringing"
+    assert (await db.get(Campaign, campaign_id)).status == "running"
+    assert (await db.get(CampaignContact, contact_id)).status == "calling"
+    assert (await db.get(CampaignContactAttempt, attempt_id)).state == "accepted"
+
+
+@pytest.mark.asyncio
+async def test_workspace_campaign_first_status_callback_binds_sid_with_dispatch_claim(
+    client,
+    tenant,
+    db,
+    monkeypatch,
+):
+    callback_claim, callback_claim_metadata = create_twilio_callback_claim()
+    (
+        call,
+        account_sid,
+        auth_token,
+        _campaign,
+        _contact,
+        attempt,
+    ) = await _workspace_twilio_callback_call(
+        db,
+        tenant,
+        with_campaign=True,
+        explicit_binding=True,
+        unbound=True,
+        callback_claim_metadata=callback_claim_metadata,
+    )
+    call_id = call.id
+    attempt_id = attempt.id
+
+    response = await _post_signed_twilio_status(
+        client,
+        monkeypatch,
+        call,
+        {
+            "AccountSid": account_sid,
+            "CallSid": "CA-campaign-callback-first",
+            "CallStatus": "in-progress",
+        },
+        auth_token=auth_token,
+        callback_claim=callback_claim,
+    )
+
+    assert response.status_code == 200
+    replay = await _post_signed_twilio_status(
+        client,
+        monkeypatch,
+        call,
+        {
+            "AccountSid": account_sid,
+            "CallSid": "CA-campaign-callback-first",
+            "CallStatus": "in-progress",
+        },
+        auth_token=auth_token,
+        callback_claim=f"wrong-{callback_claim}",
+    )
+    assert replay.status_code == 200
+    db.expire_all()
+    stored_call = await db.get(Call, call_id)
+    stored_attempt = await db.get(CampaignContactAttempt, attempt_id)
+    assert stored_call.provider_call_sid == "CA-campaign-callback-first"
+    assert stored_call.status == "in_progress"
+    assert stored_attempt.provider_call_sid == "CA-campaign-callback-first"
+    assert stored_attempt.state == "accepted"
+    claim = stored_call.call_metadata[TWILIO_CALLBACK_CLAIM_METADATA_KEY]
+    assert claim["state"] == "bound"
+    assert claim["bound_via"] == "provider_callback"
+    assert callback_claim not in str(stored_call.call_metadata)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("callback_kind", ["voice", "status"])
+@pytest.mark.parametrize("with_campaign", [False, True], ids=["direct", "campaign"])
+async def test_source_less_platform_callback_rejects_workspace_credential_created_after_probe(
+    client,
+    tenant,
+    db,
+    monkeypatch,
+    callback_kind,
+    with_campaign,
+):
+    (
+        call,
+        account_sid,
+        platform_token,
+        _campaign,
+        _contact,
+        _attempt,
+    ) = await _source_less_platform_twilio_callback_call(
+        db,
+        tenant,
+        with_campaign=with_campaign,
+    )
+    call_id = call.id
+    original_local_lock = webhooks._local_provider_callback_lock
+    inserted = False
+    monkeypatch.setattr(webhooks.settings, "twilio_account_sid", account_sid)
+    monkeypatch.setattr(webhooks.settings, "twilio_auth_token", platform_token)
+
+    @asynccontextmanager
+    async def create_workspace_credential_after_probe(identity):
+        nonlocal inserted
+        async with session_factory() as credential_db:
+            await lock_provider_runtime_boundaries(credential_db, tenant.id, "twilio")
+            await store_provider_config(
+                credential_db,
+                tenant.id,
+                "twilio",
+                {
+                    "account_sid": account_sid,
+                    "auth_token": "new_workspace_insert_token_987654321",
+                    "default_from_number": "+15551234567",
+                },
+            )
+            await credential_db.commit()
+        inserted = True
+        async with original_local_lock(identity):
+            yield
+
+    monkeypatch.setattr(
+        webhooks,
+        "_local_provider_callback_lock",
+        create_workspace_credential_after_probe,
+    )
+    payload = {
+        "AccountSid": account_sid,
+        "CallSid": call.provider_call_sid,
+        "CallStatus": "completed",
+        "CallDuration": "99",
+    }
+    if callback_kind == "voice":
+        response = await _post_signed_twilio_voice(
+            client,
+            monkeypatch,
+            call,
+            payload,
+            auth_token=platform_token,
+        )
+    else:
+        response = await _post_signed_twilio_status(
+            client,
+            monkeypatch,
+            call,
+            payload,
+            auth_token=platform_token,
+        )
+
+    assert inserted is True
+    assert response.status_code == 401
+    db.expire_all()
+    stored_call = await db.get(Call, call_id)
+    assert stored_call.status == "ringing"
+    assert stored_call.ended_at is None
+    assert stored_call.duration_seconds is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("callback_kind", ["voice", "status"])
+@pytest.mark.parametrize("with_campaign", [False, True], ids=["direct", "campaign"])
+async def test_postgres_source_less_platform_callback_serializes_workspace_credential_insert(
+    client,
+    tenant,
+    db,
+    monkeypatch,
+    callback_kind,
+    with_campaign,
+):
+    """An absent-to-workspace credential transition cannot preserve platform auth."""
+
+    if test_engine.dialect.name != "postgresql":
+        pytest.skip("Requires PostgreSQL advisory-lock semantics")
+
+    (
+        call,
+        account_sid,
+        platform_token,
+        _campaign,
+        _contact,
+        _attempt,
+    ) = await _source_less_platform_twilio_callback_call(
+        db,
+        tenant,
+        with_campaign=with_campaign,
+    )
+    call_id = call.id
+    postgres_sessions = async_sessionmaker(test_engine, expire_on_commit=False)
+    preauth_complete = asyncio.Event()
+    allow_locked_phase = asyncio.Event()
+    creator_holds_boundary = asyncio.Event()
+    release_creator = asyncio.Event()
+    callback_requested_boundary = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    creator_task: asyncio.Task | None = None
+    callback_task: asyncio.Task | None = None
+    listener_installed = False
+    monkeypatch.setattr(webhooks.settings, "twilio_account_sid", account_sid)
+    monkeypatch.setattr(webhooks.settings, "twilio_auth_token", platform_token)
+
+    @asynccontextmanager
+    async def pause_after_initial_auth(_identity):
+        preauth_complete.set()
+        await allow_locked_phase.wait()
+        yield
+
+    async def create_workspace_credential() -> None:
+        async with postgres_sessions() as credential_db, credential_db.begin():
+            await lock_provider_runtime_boundaries(credential_db, tenant.id, "twilio")
+            await store_provider_config(
+                credential_db,
+                tenant.id,
+                "twilio",
+                {
+                    "account_sid": account_sid,
+                    "auth_token": "postgres_workspace_insert_token_987654321",
+                    "default_from_number": "+15551234567",
+                },
+            )
+            creator_holds_boundary.set()
+            await release_creator.wait()
+
+    def observe_callback_boundary_request(
+        _connection,
+        _cursor,
+        statement,
+        parameters,
+        _context,
+        _executemany,
+    ) -> None:
+        normalized = str(statement).upper()
+        if "PG_ADVISORY_XACT_LOCK" in normalized and "runtime-provider:" in str(parameters):
+            loop.call_soon_threadsafe(callback_requested_boundary.set)
+
+    monkeypatch.setattr(webhooks, "_local_provider_callback_lock", pause_after_initial_auth)
+    payload = {
+        "AccountSid": account_sid,
+        "CallSid": call.provider_call_sid,
+        "CallStatus": "completed",
+        "CallDuration": "99",
+    }
+
+    async def post_callback():
+        if callback_kind == "voice":
+            return await _post_signed_twilio_voice(
+                client,
+                monkeypatch,
+                call,
+                payload,
+                auth_token=platform_token,
+            )
+        return await _post_signed_twilio_status(
+            client,
+            monkeypatch,
+            call,
+            payload,
+            auth_token=platform_token,
+        )
+
+    try:
+        callback_task = asyncio.create_task(post_callback())
+        await asyncio.wait_for(preauth_complete.wait(), timeout=5)
+        creator_task = asyncio.create_task(create_workspace_credential())
+        await asyncio.wait_for(creator_holds_boundary.wait(), timeout=5)
+        event.listen(
+            test_engine.sync_engine,
+            "before_cursor_execute",
+            observe_callback_boundary_request,
+        )
+        listener_installed = True
+        allow_locked_phase.set()
+        await asyncio.wait_for(callback_requested_boundary.wait(), timeout=5)
+        assert not callback_task.done()
+
+        release_creator.set()
+        await asyncio.wait_for(creator_task, timeout=5)
+        response = await asyncio.wait_for(callback_task, timeout=5)
+    finally:
+        allow_locked_phase.set()
+        release_creator.set()
+        if listener_installed:
+            event.remove(
+                test_engine.sync_engine,
+                "before_cursor_execute",
+                observe_callback_boundary_request,
+            )
+        for task in (callback_task, creator_task):
+            if task is not None and not task.done():
+                task.cancel()
+        pending = [task for task in (callback_task, creator_task) if task is not None]
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    assert response.status_code == 401
+    db.expire_all()
+    stored_call = await db.get(Call, call_id)
+    assert stored_call.status == "ringing"
+    assert stored_call.ended_at is None
+    assert stored_call.duration_seconds is None
 
 
 @pytest.mark.asyncio
