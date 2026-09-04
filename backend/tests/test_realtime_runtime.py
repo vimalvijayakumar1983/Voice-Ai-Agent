@@ -41,6 +41,10 @@ from app.services.knowledge_retrieval import rank_knowledge
 from app.services.knowledge_serving import publish_serving_revision
 from app.services.provider_credentials import ProviderCredentialError, store_provider_config
 from app.services.speech_lexicon import publish_speech_lexicon
+from app.services.twilio_route_security import (
+    load_workspace_twilio_route_credential,
+    twilio_route_verification_is_current,
+)
 from app.telephony.livekit_provider import LiveKitSIPError, LiveKitSIPProvider, LiveKitSIPResult
 from tests.knowledge_test_utils import publish_test_knowledge
 
@@ -2127,6 +2131,119 @@ async def test_ready_runtime_can_be_activated(
     assert failed_activation.status_code == 409
     assert fail_closed_profile.json()["enabled"] is False
     assert fail_closed_profile.json()["status"] == "blocked"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("conflict_after_route_lock", [False, True])
+async def test_active_twilio_readiness_refresh_claims_route_only_after_locked_recheck(
+    client,
+    auth_headers,
+    tenant,
+    db,
+    monkeypatch,
+    conflict_after_route_lock,
+):
+    from app.api.v1.endpoints import runtime as runtime_endpoint
+
+    account_sid = "AC" + "7" * 32
+    number = "+15558675309"
+    await store_provider_config(
+        db,
+        tenant.id,
+        "twilio",
+        {
+            "account_sid": account_sid,
+            "auth_token": "readiness-refresh-token",
+        },
+    )
+    agent = Agent(
+        tenant_id=tenant.id,
+        name="Active stale Twilio route",
+        system_prompt="Keep the live route active while readiness is refreshed.",
+        voice_provider="sarvam",
+        voice_id="sarvam:ishita",
+    )
+    db.add(agent)
+    await db.flush()
+    profile = AgentRuntimeProfile(
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        enabled=True,
+        status="active",
+        telephony_provider="twilio",
+        primary_speech_provider="sarvam",
+        llm_provider="openai",
+        assigned_numbers=[number],
+        runtime_config={
+            "twilio_route_verification": {
+                "version": 1,
+                "fingerprint": "stale",
+                "verified_at": "2026-01-01T00:00:00+00:00",
+            }
+        },
+    )
+    db.add(profile)
+    await db.commit()
+
+    async def live_readiness(*_args, **_kwargs):
+        return [], {
+            "number_route_unique": True,
+            "twilio_route_live": True,
+            "twilio_route_verification_current": True,
+        }
+
+    call_order: list[str] = []
+
+    async def lock_claims(_db, *, credential, assigned_numbers):
+        assert credential.account_sid == account_sid
+        assert assigned_numbers == [number]
+        call_order.append("lock")
+
+    async def route_conflicts(_db, **kwargs):
+        assert call_order == ["lock"]
+        assert kwargs["account_sid"] == account_sid
+        assert kwargs["assigned_numbers"] == [number]
+        call_order.append("conflict_check")
+        return [agent] if conflict_after_route_lock else []
+
+    original_mark_verified = runtime_endpoint.mark_twilio_route_verified
+
+    def mark_verified(*args, **kwargs):
+        assert call_order == ["lock", "conflict_check"]
+        call_order.append("persist")
+        original_mark_verified(*args, **kwargs)
+
+    monkeypatch.setattr(runtime_endpoint, "live_runtime_readiness", live_readiness)
+    monkeypatch.setattr(runtime_endpoint, "lock_twilio_route_claims", lock_claims)
+    monkeypatch.setattr(runtime_endpoint, "active_twilio_route_conflicts", route_conflicts)
+    monkeypatch.setattr(runtime_endpoint, "mark_twilio_route_verified", mark_verified)
+
+    response = await client.post(
+        f"/api/v1/runtime/agents/{agent.id}/test",
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200
+    await db.refresh(profile)
+    credential = await load_workspace_twilio_route_credential(db, tenant.id)
+    assert credential is not None
+    is_current = twilio_route_verification_is_current(
+        profile,
+        credential,
+        expected_voice_url=runtime_endpoint._twilio_inbound_voice_url(),
+    )
+    if conflict_after_route_lock:
+        assert response.json()["ready"] is False
+        assert response.json()["checks"]["number_route_unique"] is False
+        assert response.json()["checks"]["twilio_route_verification_current"] is False
+        assert call_order == ["lock", "conflict_check"]
+        assert is_current is False
+    else:
+        assert response.json()["ready"] is True
+        assert call_order == ["lock", "conflict_check", "persist"]
+        assert is_current is True
+    assert profile.enabled is True
+    assert profile.status == "active"
 
 
 @pytest.mark.asyncio

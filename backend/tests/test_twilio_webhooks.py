@@ -34,6 +34,89 @@ async def _post_signed_twilio_status(client, monkeypatch, call, payload, *, auth
     )
 
 
+async def _native_twilio_voice_call(
+    db,
+    tenant,
+    *,
+    provider_call_sid: str | None = "CA-native-voice-bound",
+):
+    account_sid = "AC" + "7" * 32
+    auth_token = "native_voice_callback_token_123456789"
+    await store_provider_config(
+        db,
+        tenant.id,
+        "twilio",
+        {
+            "account_sid": account_sid,
+            "auth_token": auth_token,
+            "default_from_number": "+15551234567",
+        },
+    )
+    agent = Agent(
+        tenant_id=tenant.id,
+        name="Native voice callback identity",
+        system_prompt="Answer from approved knowledge.",
+        voice_provider="sarvam",
+        voice_id="sarvam:ishita",
+    )
+    db.add(agent)
+    await db.flush()
+    db.add(
+        AgentRuntimeProfile(
+            tenant_id=tenant.id,
+            agent_id=agent.id,
+            enabled=True,
+            status="active",
+            telephony_provider="twilio",
+            primary_speech_provider="sarvam",
+            assigned_numbers=["+15551234567"],
+        )
+    )
+    call = Call(
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        direction="outbound",
+        status="dispatching",
+        from_number="+15551234567",
+        to_number="+15557654321",
+        provider="twilio",
+        provider_call_sid=provider_call_sid,
+        started_at=datetime.now(UTC),
+        call_metadata={
+            "speech_provider": "sarvam",
+            "telephony_credential_binding": {
+                "provider": "twilio",
+                "source": "workspace",
+                "account_sid": account_sid,
+            },
+            "runtime": {"speech_provider": "sarvam"},
+        },
+    )
+    db.add(call)
+    await db.commit()
+    return call, account_sid, auth_token
+
+
+async def _post_signed_twilio_voice(
+    client,
+    monkeypatch,
+    call,
+    payload,
+    *,
+    auth_token: str,
+):
+    path = f"/api/v1/webhooks/twilio/voice/{call.id}"
+    signature = RequestValidator(auth_token).compute_signature(f"http://test{path}", payload)
+    monkeypatch.setattr(webhooks.settings, "base_url", "http://test")
+    monkeypatch.setattr(webhooks, "async_session_factory", session_factory)
+    monkeypatch.setattr(webhooks, "_kick_provider_outbox", lambda _ids: None)
+    return await client.post(
+        path,
+        data=payload,
+        headers={"X-Twilio-Signature": signature},
+    )
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("path", "payload"),
@@ -256,6 +339,197 @@ async def test_native_twilio_callback_never_falls_back_to_platform_credential(
     assert call.ended_at is None
     assert call.duration_seconds is None
     kick_outbox.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "incoming_call_sid",
+    ["CA-native-voice-other-call", None],
+    ids=["mismatched", "missing"],
+)
+async def test_native_voice_callback_rejects_unbound_call_identity_before_mutation_or_capability(
+    client,
+    tenant,
+    db,
+    monkeypatch,
+    incoming_call_sid,
+):
+    call, account_sid, auth_token = await _native_twilio_voice_call(db, tenant)
+    original_metadata = dict(call.call_metadata)
+    capability_factory = Mock(side_effect=AssertionError("media capability must not be minted"))
+    monkeypatch.setattr(webhooks, "_runtime_stream_parameters", capability_factory)
+    payload = {"AccountSid": account_sid}
+    if incoming_call_sid is not None:
+        payload["CallSid"] = incoming_call_sid
+
+    response = await _post_signed_twilio_voice(
+        client,
+        monkeypatch,
+        call,
+        payload,
+        auth_token=auth_token,
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "Conflicting Twilio call identity"
+    await db.refresh(call)
+    assert call.status == "dispatching"
+    assert call.answered_at is None
+    assert call.call_metadata == original_metadata
+    capability_factory.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_native_voice_callback_fails_closed_without_persisted_call_identity(
+    client,
+    tenant,
+    db,
+    monkeypatch,
+):
+    call, account_sid, auth_token = await _native_twilio_voice_call(
+        db,
+        tenant,
+        provider_call_sid=None,
+    )
+    capability_factory = Mock(side_effect=AssertionError("media capability must not be minted"))
+    monkeypatch.setattr(webhooks, "_runtime_stream_parameters", capability_factory)
+
+    response = await _post_signed_twilio_voice(
+        client,
+        monkeypatch,
+        call,
+        {"AccountSid": account_sid, "CallSid": "CA-native-voice-unbound"},
+        auth_token=auth_token,
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "Conflicting Twilio call identity"
+    await db.refresh(call)
+    assert call.status == "dispatching"
+    assert call.answered_at is None
+    capability_factory.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_native_voice_callback_accepts_matching_call_identity_and_mints_capability(
+    client,
+    tenant,
+    db,
+    monkeypatch,
+):
+    call, account_sid, auth_token = await _native_twilio_voice_call(db, tenant)
+    capability_factory = Mock(return_value={"token": "bound-media-capability"})
+    monkeypatch.setattr(webhooks, "_runtime_stream_parameters", capability_factory)
+
+    response = await _post_signed_twilio_voice(
+        client,
+        monkeypatch,
+        call,
+        {"AccountSid": account_sid, "CallSid": call.provider_call_sid},
+        auth_token=auth_token,
+    )
+
+    assert response.status_code == 200
+    assert "<Stream" in response.text
+    assert "bound-media-capability" in response.text
+    capability_factory.assert_called_once_with(call.id)
+    await db.refresh(call)
+    assert call.status == "in_progress"
+    assert call.answered_at is not None
+    assert call.call_metadata["runtime_route"] == {
+        "telephony_provider": "twilio",
+        "speech_provider": "sarvam",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("persisted_call_sid", "incoming_call_sid"),
+    [
+        ("CA-native-status-bound", "CA-native-status-other-call"),
+        ("CA-native-status-bound", None),
+        (None, "CA-native-status-unbound"),
+    ],
+    ids=["mismatched", "missing-incoming", "missing-persisted"],
+)
+async def test_native_status_callback_rejects_unbound_call_identity_before_mutation(
+    client,
+    tenant,
+    db,
+    monkeypatch,
+    persisted_call_sid,
+    incoming_call_sid,
+):
+    call, account_sid, auth_token = await _native_twilio_voice_call(
+        db,
+        tenant,
+        provider_call_sid=persisted_call_sid,
+    )
+    original_metadata = dict(call.call_metadata)
+    payload = {
+        "AccountSid": account_sid,
+        "CallStatus": "completed",
+        "CallDuration": "99",
+        "RecordingUrl": "https://recordings.example/wrong-call",
+    }
+    if incoming_call_sid is not None:
+        payload["CallSid"] = incoming_call_sid
+
+    response = await _post_signed_twilio_status(
+        client,
+        monkeypatch,
+        call,
+        payload,
+        auth_token=auth_token,
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "Conflicting Twilio call identity"
+    await db.refresh(call)
+    assert call.status == "dispatching"
+    assert call.provider_call_sid == persisted_call_sid
+    assert call.answered_at is None
+    assert call.ended_at is None
+    assert call.duration_seconds is None
+    assert call.provider_recording_url is None
+    assert call.call_metadata == original_metadata
+
+
+@pytest.mark.asyncio
+async def test_native_status_callback_accepts_matching_call_identity(
+    client,
+    tenant,
+    db,
+    monkeypatch,
+):
+    call, account_sid, auth_token = await _native_twilio_voice_call(
+        db,
+        tenant,
+        provider_call_sid="CA-native-status-match",
+    )
+
+    response = await _post_signed_twilio_status(
+        client,
+        monkeypatch,
+        call,
+        {
+            "AccountSid": account_sid,
+            "CallSid": call.provider_call_sid,
+            "CallStatus": "completed",
+            "CallDuration": "42",
+            "RecordingUrl": "https://recordings.example/matching-call",
+        },
+        auth_token=auth_token,
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "ok"
+    await db.refresh(call)
+    assert call.status == "completed"
+    assert call.provider_call_sid == "CA-native-status-match"
+    assert call.ended_at is not None
+    assert call.duration_seconds == 42
+    assert call.provider_recording_url == "https://recordings.example/matching-call"
 
 
 @pytest.mark.asyncio

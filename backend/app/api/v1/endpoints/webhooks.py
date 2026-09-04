@@ -702,6 +702,42 @@ async def _validate_twilio_call_callback(
     _validate_twilio_request(request, params, settings.twilio_auth_token)
 
 
+def _require_native_twilio_callback_identity(params: dict[str, str], call: Call) -> None:
+    """Bind a signed native callback to its exact persisted Twilio call.
+
+    A workspace Twilio secret authenticates the provider account, not one
+    particular call.  Without this second check, a validly signed callback for
+    another call in the same account could obtain this call's media capability
+    and advance its lifecycle.  New native calls persist both a speech-provider
+    marker and a workspace credential binding, so either marker is sufficient
+    to require the fail-closed identity check.
+    """
+    metadata = call.call_metadata if isinstance(call.call_metadata, dict) else {}
+    runtime = metadata.get("runtime") if isinstance(metadata.get("runtime"), dict) else {}
+    binding = (
+        metadata.get("telephony_credential_binding")
+        if isinstance(metadata.get("telephony_credential_binding"), dict)
+        else {}
+    )
+    speech_provider = str(
+        metadata.get("speech_provider") or runtime.get("speech_provider") or ""
+    ).strip()
+    native_twilio = speech_provider in {"sarvam", "elevenlabs"} or (
+        str(binding.get("source") or "").strip() == "workspace"
+    )
+    if call.provider != "twilio" or not native_twilio:
+        return
+
+    incoming_call_sid = str(params.get("CallSid") or "").strip()
+    persisted_call_sid = str(call.provider_call_sid or "").strip()
+    if (
+        not incoming_call_sid
+        or not persisted_call_sid
+        or not hmac.compare_digest(incoming_call_sid, persisted_call_sid)
+    ):
+        raise HTTPException(status_code=409, detail="Conflicting Twilio call identity")
+
+
 def _runtime_stream_url(call_id: UUID) -> str:
     public = urlsplit(settings.base_url)
     websocket_origin = urlunsplit(
@@ -1433,6 +1469,11 @@ async def twilio_voice_webhook(call_id: UUID, request: Request):
             call_probe,
         )
         call, _attempt = await _lock_callback_call_graph(db, call_probe)
+        # Signature verification proves the Twilio account, while CallSid
+        # proves this callback belongs to this exact native call.  Compare
+        # against the locked row before mutating state or minting a media token
+        # into TwiML.
+        _require_native_twilio_callback_identity(untrusted_params, call)
 
         if call.status in RUNTIME_TERMINAL_CALL_STATUSES:
             await db.commit()
@@ -1526,9 +1567,14 @@ async def twilio_status_callback(
         call_duration = params.get("CallDuration")
         recording_url = params.get("RecordingUrl", "")
         call, _attempt = await _lock_callback_call_graph(db, call_probe)
+        _require_native_twilio_callback_identity(params, call)
 
         incoming_status = _TWILIO_STATUS_MAP.get(call_status)
         is_terminal = call_status in _TWILIO_TERMINAL_STATUSES
+        # Legacy non-workspace calls did not always persist or receive a
+        # CallSid. Preserve that compatibility while continuing to reject an
+        # explicit identity conflict. Native/workspace callbacks have already
+        # passed the stricter presence-and-equality check above.
         if call.provider_call_sid and call_sid and call.provider_call_sid != call_sid:
             raise HTTPException(status_code=409, detail="Conflicting Twilio call identity")
         if incoming_status is None:

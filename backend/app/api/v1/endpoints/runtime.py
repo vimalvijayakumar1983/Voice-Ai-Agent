@@ -78,6 +78,7 @@ from app.services.recording_policy import (
     diagnostic_recording_mode,
 )
 from app.services.twilio_route_security import (
+    TwilioRouteCredential,
     TwilioRouteVerificationError,
     active_twilio_route_conflicts,
     load_workspace_twilio_route_credential,
@@ -795,6 +796,42 @@ async def _lock_number_routes(
             text("SELECT pg_advisory_xact_lock(hashtextextended(:route_key, 0))"),
             {"route_key": route_key},
         )
+
+
+async def _claim_twilio_route_verification(
+    db: AsyncSession,
+    agent: Agent,
+    profile: AgentRuntimeProfile,
+    credential: TwilioRouteCredential,
+) -> list[Agent]:
+    """Atomically claim verified Twilio account+DID routes for one profile.
+
+    The provider/agent/credential locks are acquired by the caller. This final
+    account+DID lock and conflict check closes the gap between the bounded live
+    Twilio probe and persistence of its verification marker. Activation and
+    readiness refresh deliberately share this helper so neither path can mint
+    a second current cross-tenant claim after a concurrent probe.
+    """
+    await lock_twilio_route_claims(
+        db,
+        credential=credential,
+        assigned_numbers=list(profile.assigned_numbers or []),
+    )
+    conflicts = await active_twilio_route_conflicts(
+        db,
+        agent_id=agent.id,
+        account_sid=credential.account_sid,
+        assigned_numbers=list(profile.assigned_numbers or []),
+        expected_voice_url=_twilio_inbound_voice_url(),
+    )
+    if conflicts:
+        return conflicts
+    mark_twilio_route_verified(
+        profile,
+        credential,
+        expected_voice_url=_twilio_inbound_voice_url(),
+    )
+    return []
 
 
 async def runtime_readiness(
@@ -1633,11 +1670,21 @@ async def test_runtime_profile(
         )
         if credential is None:
             raise HTTPException(status_code=409, detail="Twilio workspace credential changed")
-        mark_twilio_route_verified(
+        claim_conflicts = await _claim_twilio_route_verification(
+            db,
+            agent,
             profile,
             credential,
-            expected_voice_url=_twilio_inbound_voice_url(),
         )
+        if claim_conflicts:
+            checks["number_route_unique"] = False
+            checks["twilio_route_verification_current"] = False
+            for blocker in (
+                "Move the assigned phone number from its other active agent before activation.",
+                _TWILIO_REVERIFICATION_BLOCKER,
+            ):
+                if blocker not in blockers:
+                    blockers.append(blocker)
     tested_at = datetime.now(UTC)
     profile.last_tested_at = tested_at
     if blockers:
@@ -1787,12 +1834,14 @@ async def activate_runtime_profile(
         )
         if credential is None:
             raise HTTPException(status_code=409, detail="Twilio workspace credential changed")
-        mark_twilio_route_verified(
+        await _claim_twilio_route_verification(
+            db,
+            agent,
             profile,
             credential,
-            expected_voice_url=_twilio_inbound_voice_url(),
         )
-    await _lock_number_routes(db, agent, profile)
+    else:
+        await _lock_number_routes(db, agent, profile)
     final_blockers, _final_checks = await runtime_readiness(db, agent, profile)
     if final_blockers:
         profile.enabled = False
