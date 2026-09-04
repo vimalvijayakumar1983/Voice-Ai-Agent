@@ -970,6 +970,7 @@ async def reactivate_knowledge_release(
                 KnowledgeSpeechLexicon.knowledge_base_id == kb.id,
             )
             .options(selectinload(KnowledgeServingRevision.sources))
+            .execution_options(populate_existing=True)
         )
     ).one_or_none()
     if target_row is None:

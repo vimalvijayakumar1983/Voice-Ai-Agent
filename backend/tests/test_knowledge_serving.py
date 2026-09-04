@@ -31,6 +31,7 @@ from app.services.knowledge_serving import (
 from app.services.knowledge_sources import invalidate_knowledge_approval
 from app.services.speech_lexicon import load_agent_speech_lexicon, publish_speech_lexicon
 from tests.conftest import engine as test_engine
+from tests.conftest import test_session_factory as session_factory
 
 
 @pytest.mark.asyncio
@@ -126,6 +127,69 @@ def _structured(phone: str, service: str) -> dict:
             },
         ],
     }
+
+
+@pytest.mark.asyncio
+async def test_publishing_the_current_serving_revision_is_idempotent(db, tenant):
+    """A current-revision identity-map hit must retain its immutable sources."""
+
+    knowledge = KnowledgeBase(
+        tenant_id=tenant.id,
+        name="Idempotent publication knowledge",
+        sync_status="ready",
+        approval_status="draft",
+        source_count=1,
+        indexed_source_count=1,
+        is_active=True,
+    )
+    knowledge.sources.append(
+        KnowledgeSource(
+            tenant_id=tenant.id,
+            source_type="text",
+            name="Published directory",
+            content="Example Medical Centre telephone is +971 2 111 1111.",
+            status="indexed",
+            structured_content=_structured("+971 2 111 1111", "customer support"),
+        )
+    )
+    db.add(knowledge)
+    await db.flush()
+    lexicon = await publish_speech_lexicon(
+        db,
+        tenant_id=tenant.id,
+        knowledge_base=knowledge,
+        allow_draft_for_approval=True,
+    )
+    first = await publish_serving_revision(
+        db,
+        tenant_id=tenant.id,
+        knowledge_base=knowledge,
+        speech_lexicon=lexicon,
+        allow_draft_for_approval=True,
+    )
+    await db.commit()
+    knowledge_id = knowledge.id
+    revision_id = first.id
+
+    async with session_factory() as retry_db:
+        loaded_knowledge = await retry_db.get(KnowledgeBase, knowledge_id)
+        assert loaded_knowledge is not None
+        assert loaded_knowledge.serving_revision is not None
+        assert loaded_knowledge.serving_revision.sources == []
+        loaded_lexicon = loaded_knowledge.speech_lexicon
+        assert loaded_lexicon is not None
+
+        second = await publish_serving_revision(
+            retry_db,
+            tenant_id=tenant.id,
+            knowledge_base=loaded_knowledge,
+            speech_lexicon=loaded_lexicon,
+            allow_draft_for_approval=True,
+        )
+
+        assert second.id == revision_id
+        assert len(second.sources) == 1
+        assert second.sources[0].content.strip()
 
 
 @pytest.mark.asyncio

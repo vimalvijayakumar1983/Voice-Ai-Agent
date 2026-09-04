@@ -18,10 +18,72 @@ from app.services.knowledge_serving import (
     knowledge_admission_is_durable,
     knowledge_call_reservation_metadata,
     load_agent_serving_revision_identity,
+    load_durably_admitted_serving_revision,
 )
 from tests.conftest import engine
 from tests.conftest import test_session_factory as session_factory
 from tests.knowledge_test_utils import publish_test_knowledge
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("loader", ["agent", "durable"])
+async def test_source_loader_refreshes_revision_preloaded_without_sources(
+    db,
+    tenant,
+    loader,
+):
+    """An identity-map hit must not turn a published release into an empty corpus."""
+
+    agent = Agent(
+        tenant_id=tenant.id,
+        name="Identity-map receptionist",
+        system_prompt="Answer only from approved knowledge.",
+        voice_provider="inworld",
+        voice_id="inworld:Ashley",
+        language="en",
+        supported_languages=["en"],
+    )
+    db.add(agent)
+    await db.flush()
+    knowledge, published_revision = await publish_test_knowledge(
+        db,
+        tenant_id=tenant.id,
+        agent=agent,
+        label="Identity map",
+    )
+    await db.commit()
+
+    async with session_factory() as runtime_db:
+        loaded_knowledge = await runtime_db.scalar(
+            select(KnowledgeBase).where(KnowledgeBase.id == knowledge.id)
+        )
+        assert loaded_knowledge is not None
+        assert loaded_knowledge.serving_revision is not None
+        # KnowledgeBase.serving_revision is select-in loaded, while the nested
+        # immutable source collection is intentionally noload on hot paths.
+        assert loaded_knowledge.serving_revision.sources == []
+
+        if loader == "agent":
+            revision, generation = await load_agent_serving_revision_identity(
+                runtime_db,
+                tenant_id=tenant.id,
+                agent_id=agent.id,
+                include_sources=True,
+            )
+            assert generation == 0
+        else:
+            revision = await load_durably_admitted_serving_revision(
+                runtime_db,
+                tenant_id=tenant.id,
+                knowledge_base_id=knowledge.id,
+                serving_revision_id=published_revision.id,
+                include_sources=True,
+            )
+
+        assert revision is not None
+        assert revision.id == published_revision.id
+        assert len(revision.sources) == 1
+        assert revision.sources[0].content.strip()
 
 
 @pytest.mark.asyncio

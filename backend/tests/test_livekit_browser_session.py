@@ -36,7 +36,10 @@ from app.models.agent import (
 from app.models.audit import AuditEvent
 from app.models.call import Call
 from app.providers.inworld import InworldClient, InworldError
-from app.services.knowledge_serving import publish_serving_revision
+from app.services.knowledge_serving import (
+    knowledge_call_reservation_metadata,
+    publish_serving_revision,
+)
 from app.services.speech_lexicon import publish_speech_lexicon
 from app.telephony.livekit_provider import LiveKitSIPProvider
 from tests.conftest import test_session_factory as session_factory
@@ -1075,6 +1078,69 @@ async def test_worker_loads_draft_browser_profile_from_durable_reservation(
     db.expire_all()
     claimed_call = await db.get(Call, call_id)
     assert claimed_call.status == "in_progress"
+
+
+@pytest.mark.asyncio
+async def test_worker_loads_sources_from_the_current_published_revision(
+    db,
+    tenant,
+    monkeypatch,
+):
+    """The KB identity-map preload must not hide the current revision's corpus."""
+
+    _configure_platform(monkeypatch)
+    agent = await _configured_browser_agent(db, tenant)
+    revision = await _publish_current_knowledge_revision(db, agent)
+    call_id = uuid4()
+    room_name = f"vav-browser-{call_id}"
+    participant_identity = f"browser-{call_id}"
+    db.add(
+        Call(
+            id=call_id,
+            tenant_id=tenant.id,
+            agent_id=agent.id,
+            direction="inbound",
+            status="initiated",
+            from_number="browser",
+            to_number="voice-agent",
+            provider="livekit_webrtc",
+            provider_call_sid=room_name,
+            call_metadata={
+                "conversation_type": "webcall",
+                "channel": "browser",
+                "browser_participant_identity": participant_identity,
+                "browser_variables": {},
+                "reserved_max_duration_seconds": 90,
+                "livekit_room": room_name,
+                "runtime": {
+                    "transport": "livekit_webrtc",
+                    "speech_provider": "inworld",
+                    **knowledge_call_reservation_metadata(revision, 0),
+                },
+            },
+        )
+    )
+    await db.commit()
+    monkeypatch.setattr(livekit_worker, "async_session_factory", session_factory)
+
+    (
+        _model,
+        _profile,
+        _api_keys,
+        _variables,
+        served_configuration,
+        knowledge_pin,
+    ) = await livekit_worker._load_browser_runtime(
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        call_id=call_id,
+        room_name=room_name,
+        participant_identity=participant_identity,
+    )
+
+    assert knowledge_pin.revision_id == revision.id
+    assert served_configuration["knowledge_serving_revision_id"] == str(revision.id)
+    assert served_configuration["knowledge_source_count"] == 1
 
 
 def test_call_template_quotes_values_and_marks_missing_placeholders_as_null():

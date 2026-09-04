@@ -692,6 +692,7 @@ async def publish_serving_revision(
             KnowledgeServingRevision.knowledge_base_id == knowledge_base.id,
         )
         .options(selectinload(KnowledgeServingRevision.sources))
+        .execution_options(populate_existing=True)
     )
     if existing is not None:
         if (
@@ -830,7 +831,14 @@ async def load_agent_serving_revision_identity(
         )
     )
     if include_sources:
-        query = query.options(selectinload(KnowledgeServingRevision.sources))
+        # A KnowledgeBase loaded earlier in the same session may already have
+        # placed this revision in the identity map through its select-in
+        # ``serving_revision`` relationship. The revision's nested ``sources``
+        # relationship is noload, so without an explicit refresh SQLAlchemy
+        # keeps that cached empty collection and silently defeats selectinload.
+        query = query.options(selectinload(KnowledgeServingRevision.sources)).execution_options(
+            populate_existing=True
+        )
     if serving_revision_id is None:
         query = query.where(KnowledgeBase.serving_revision_id == KnowledgeServingRevision.id)
     else:
@@ -865,7 +873,12 @@ async def load_durably_admitted_serving_revision(
         KnowledgeServingRevision.knowledge_base_id == knowledge_base_id,
     )
     if include_sources:
-        query = query.options(selectinload(KnowledgeServingRevision.sources))
+        # Honour the include_sources contract even when this immutable
+        # revision is already present in the session identity map without its
+        # noload source collection (for example after loading KnowledgeBase).
+        query = query.options(selectinload(KnowledgeServingRevision.sources)).execution_options(
+            populate_existing=True
+        )
     return await db.scalar(query)
 
 
