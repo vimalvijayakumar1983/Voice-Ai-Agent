@@ -1453,15 +1453,13 @@ class _LiveKitRuntimeTelemetry:
         if trace is None:
             return
         if interrupted:
-            # LiveKit can publish the assistant item after audible playback was
-            # interrupted.  A provisional link created at first audio must not
-            # survive that stronger observation or make disposition report the
-            # abandoned turn as grounded and resolved.
-            if trace.get("grounding_response_observation") == "audio_started":
-                trace.pop("grounding_outcome", None)
-                trace.pop("response_action", None)
-                trace.pop("grounding_response_observation", None)
-                trace["outcome"] = "superseded_by_caller"
+            # ``interrupted`` is also emitted when a browser participant leaves
+            # after hearing the complete answer and the session is torn down.
+            # It is therefore not evidence of caller barge-in by itself.  Keep
+            # an already-audible verified-retrieval link unless the ordered
+            # user-state path observed meaningful caller speech; that path
+            # moves the trace to ``suspended_grounding_trace`` and
+            # ``commit_suspended_interruption`` removes the provisional link.
             self.runtime_metrics["ignored_interrupted_assistant_item_count"] = (
                 int(self.runtime_metrics.get("ignored_interrupted_assistant_item_count", 0)) + 1
             )

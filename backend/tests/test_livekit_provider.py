@@ -1977,7 +1977,7 @@ def test_verified_retrieval_is_linked_at_first_audio_when_completion_event_is_la
     assert grounding["answered_without_grounding"] == 0
 
 
-def test_interruption_removes_provisional_first_audio_grounding_link():
+def test_provider_interrupted_flag_without_caller_barge_in_preserves_audible_grounding_link():
     runtime_metrics = {"barge_in_count": 0}
     telemetry = _LiveKitRuntimeTelemetry(
         runtime_metrics=runtime_metrics,
@@ -1994,12 +1994,12 @@ def test_interruption_removes_provisional_first_audio_grounding_link():
         interrupted=True,
     )
 
-    assert trace["outcome"] == "superseded_by_caller"
-    assert "grounding_outcome" not in trace
-    assert "response_action" not in trace
-    assert "grounding_response_observation" not in trace
+    assert trace["outcome"] == "answered"
+    assert trace["grounding_outcome"] == "response_after_verified_retrieval"
+    assert trace["response_action"] == "response_started_after_verified_retrieval"
+    assert trace["grounding_response_observation"] == "audio_started"
     grounding = summarize_runtime_grounding({"runtime": runtime_metrics})
-    assert grounding["response_after_verified_retrieval"] == 0
+    assert grounding["response_after_verified_retrieval"] == 1
     assert grounding["answered_without_grounding"] == 0
 
 
