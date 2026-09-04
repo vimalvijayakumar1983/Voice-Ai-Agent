@@ -9,7 +9,7 @@ from unittest.mock import Mock
 import pytest
 from fastapi import HTTPException
 from httpx import AsyncClient
-from sqlalchemy import event, func, select
+from sqlalchemy import event, func, select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker
 from twilio.request_validator import RequestValidator
 
@@ -1296,6 +1296,289 @@ async def test_native_status_callback_accepts_matching_call_identity(
     assert call.ended_at is not None
     assert call.duration_seconds == 42
     assert call.provider_recording_url == "https://recordings.example/matching-call"
+
+
+@pytest.mark.asyncio
+async def test_native_status_callback_revalidates_current_credential_inside_runtime_boundary(
+    client,
+    tenant,
+    db,
+    monkeypatch,
+):
+    """Status mutation follows a second signature check under the rotation lock."""
+
+    call, account_sid, auth_token = await _native_twilio_voice_call(
+        db,
+        tenant,
+        provider_call_sid="CA-native-status-ordered",
+    )
+    events: list[str] = []
+    original_validate = webhooks._validate_twilio_request
+    original_local_lock = webhooks._local_provider_callback_lock
+    original_provider_lock = webhooks.lock_provider_runtime_boundaries
+    original_credential_loader = webhooks.load_workspace_twilio_route_credential
+    original_persist_effects = webhooks._persist_webhook_effects
+
+    def tracked_validate(*args, **kwargs):
+        events.append("signature_validated")
+        return original_validate(*args, **kwargs)
+
+    @asynccontextmanager
+    async def tracked_local_lock(identity):
+        events.append("local_lock_entered")
+        async with original_local_lock(identity):
+            yield
+
+    async def tracked_provider_lock(*args, **kwargs):
+        events.append("provider_boundary_acquired")
+        await original_provider_lock(*args, **kwargs)
+
+    async def tracked_credential_loader(*args, **kwargs):
+        events.append(
+            "locked_current_credential_loaded"
+            if kwargs.get("for_update")
+            else "probe_credential_loaded"
+        )
+        return await original_credential_loader(*args, **kwargs)
+
+    async def tracked_persist_effects(*args, **kwargs):
+        events.append("status_effects_persisted")
+        return await original_persist_effects(*args, **kwargs)
+
+    monkeypatch.setattr(webhooks, "_validate_twilio_request", tracked_validate)
+    monkeypatch.setattr(webhooks, "_local_provider_callback_lock", tracked_local_lock)
+    monkeypatch.setattr(webhooks, "lock_provider_runtime_boundaries", tracked_provider_lock)
+    monkeypatch.setattr(
+        webhooks,
+        "load_workspace_twilio_route_credential",
+        tracked_credential_loader,
+    )
+    monkeypatch.setattr(webhooks, "_persist_webhook_effects", tracked_persist_effects)
+
+    response = await _post_signed_twilio_status(
+        client,
+        monkeypatch,
+        call,
+        {
+            "AccountSid": account_sid,
+            "CallSid": call.provider_call_sid,
+            "CallStatus": "completed",
+            "CallDuration": "17",
+        },
+        auth_token=auth_token,
+    )
+
+    assert response.status_code == 200
+    first_signature = events.index("signature_validated")
+    local_lock = events.index("local_lock_entered")
+    provider_boundary = events.index("provider_boundary_acquired")
+    locked_credential = events.index("locked_current_credential_loaded")
+    second_signature = events.index("signature_validated", first_signature + 1)
+    persisted_effects = events.index("status_effects_persisted")
+    assert first_signature < local_lock < provider_boundary
+    assert provider_boundary < locked_credential < second_signature < persisted_effects
+    assert events.count("signature_validated") == 2
+    await db.refresh(call)
+    assert call.status == "completed"
+    assert call.duration_seconds == 17
+
+
+@pytest.mark.asyncio
+async def test_native_status_callback_rotation_before_locked_revalidation_cannot_mutate_call(
+    client,
+    tenant,
+    db,
+    monkeypatch,
+):
+    """A credential rotation after probe authentication wins fail-closed."""
+
+    call, account_sid, old_auth_token = await _native_twilio_voice_call(
+        db,
+        tenant,
+        provider_call_sid="CA-native-status-rotation-race",
+    )
+    call_id = call.id
+    agent_id = call.agent_id
+    original_metadata = dict(call.call_metadata)
+    original_local_lock = webhooks._local_provider_callback_lock
+    rotated = False
+
+    @asynccontextmanager
+    async def rotate_before_locked_revalidation(identity):
+        nonlocal rotated
+        async with session_factory() as rotation_db:
+            invalidated = await invalidate_active_runtimes_for_credential(
+                rotation_db,
+                tenant.id,
+                "twilio",
+            )
+            assert invalidated == [str(agent_id)]
+            await store_provider_config(
+                rotation_db,
+                tenant.id,
+                "twilio",
+                {
+                    "account_sid": account_sid,
+                    "auth_token": "rotated_status_callback_token_987654321",
+                    "default_from_number": "+15551234567",
+                },
+            )
+            await rotation_db.commit()
+        rotated = True
+        async with original_local_lock(identity):
+            yield
+
+    async def forbidden_persist_effects(*_args, **_kwargs):
+        raise AssertionError("stale callback must not persist provider effects")
+
+    monkeypatch.setattr(
+        webhooks,
+        "_local_provider_callback_lock",
+        rotate_before_locked_revalidation,
+    )
+    monkeypatch.setattr(webhooks, "_persist_webhook_effects", forbidden_persist_effects)
+
+    response = await _post_signed_twilio_status(
+        client,
+        monkeypatch,
+        call,
+        {
+            "AccountSid": account_sid,
+            "CallSid": call.provider_call_sid,
+            "CallStatus": "completed",
+            "CallDuration": "99",
+            "RecordingUrl": "https://recordings.example/stale-credential",
+        },
+        auth_token=old_auth_token,
+    )
+
+    assert rotated is True
+    assert response.status_code == 401
+    db.expire_all()
+    stored_call = await db.get(Call, call_id)
+    stored_profile = await db.scalar(
+        select(AgentRuntimeProfile).where(AgentRuntimeProfile.agent_id == agent_id)
+    )
+    assert stored_call.status == "dispatching"
+    assert stored_call.provider_call_sid == "CA-native-status-rotation-race"
+    assert stored_call.ended_at is None
+    assert stored_call.duration_seconds is None
+    assert stored_call.provider_recording_url is None
+    assert stored_call.call_metadata == original_metadata
+    assert stored_profile.enabled is False
+    assert stored_profile.status == "draft"
+
+
+@pytest.mark.asyncio
+async def test_postgres_native_status_waiting_on_call_does_not_lock_agent(
+    client,
+    tenant,
+    db,
+    monkeypatch,
+):
+    """Status reconciliation must not add an Agent -> Call deadlock edge."""
+
+    if test_engine.dialect.name != "postgresql":
+        pytest.skip("Requires PostgreSQL row-lock semantics")
+
+    call, account_sid, auth_token = await _native_twilio_voice_call(
+        db,
+        tenant,
+        provider_call_sid="CA-native-status-lock-graph",
+    )
+    call_id = call.id
+    agent_id = call.agent_id
+    postgres_sessions = async_sessionmaker(test_engine, expire_on_commit=False)
+    blocker_holds_call = asyncio.Event()
+    release_blocker = asyncio.Event()
+    callback_requested_call = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    blocker_task: asyncio.Task | None = None
+    callback_task: asyncio.Task | None = None
+    listener_installed = False
+
+    async def hold_call_row() -> None:
+        async with postgres_sessions() as blocker_db, blocker_db.begin():
+            locked = await blocker_db.scalar(
+                select(Call).where(Call.id == call_id).with_for_update()
+            )
+            assert locked is not None
+            blocker_holds_call.set()
+            await release_blocker.wait()
+
+    def observe_callback_call_lock(
+        _connection,
+        _cursor,
+        statement,
+        _parameters,
+        _context,
+        _executemany,
+    ) -> None:
+        normalized = " ".join(str(statement).upper().split())
+        if "FROM CALLS" in normalized and "FOR UPDATE" in normalized:
+            loop.call_soon_threadsafe(callback_requested_call.set)
+
+    try:
+        blocker_task = asyncio.create_task(hold_call_row())
+        await asyncio.wait_for(blocker_holds_call.wait(), timeout=5)
+        event.listen(
+            test_engine.sync_engine,
+            "before_cursor_execute",
+            observe_callback_call_lock,
+        )
+        listener_installed = True
+
+        callback_task = asyncio.create_task(
+            _post_signed_twilio_status(
+                client,
+                monkeypatch,
+                call,
+                {
+                    "AccountSid": account_sid,
+                    "CallSid": call.provider_call_sid,
+                    "CallStatus": "completed",
+                    "CallDuration": "23",
+                },
+                auth_token=auth_token,
+            )
+        )
+        await asyncio.wait_for(callback_requested_call.wait(), timeout=5)
+        assert not callback_task.done()
+
+        # A new direct-call insert needs an Agent KEY SHARE lock for its FK.
+        # It must remain available while the status callback waits on Call.
+        async with postgres_sessions() as probe_db, probe_db.begin():
+            await probe_db.execute(text("SET LOCAL lock_timeout = '500ms'"))
+            locked_agent_id = await probe_db.scalar(
+                text("SELECT id FROM agents WHERE id = :agent_id FOR KEY SHARE"),
+                {"agent_id": agent_id},
+            )
+            assert locked_agent_id == agent_id
+
+        release_blocker.set()
+        assert blocker_task is not None
+        await asyncio.wait_for(blocker_task, timeout=5)
+        response = await asyncio.wait_for(callback_task, timeout=5)
+    finally:
+        release_blocker.set()
+        if listener_installed:
+            event.remove(
+                test_engine.sync_engine,
+                "before_cursor_execute",
+                observe_callback_call_lock,
+            )
+        for task in (callback_task, blocker_task):
+            if task is not None and not task.done():
+                task.cancel()
+        pending = [task for task in (callback_task, blocker_task) if task is not None]
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    assert response.status_code == 200
+    db.expire_all()
+    stored_call = await db.get(Call, call_id)
+    assert stored_call.status == "completed"
+    assert stored_call.duration_seconds == 23
 
 
 @pytest.mark.asyncio

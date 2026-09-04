@@ -123,6 +123,17 @@ class _TwilioVoiceCallbackAuthProof:
     native_speech_provider: str | None
 
 
+@dataclass(frozen=True)
+class _TwilioStatusCallbackAuthProof:
+    """Immutable status-callback identity established before locks."""
+
+    call_id: UUID
+    tenant_id: UUID
+    agent_id: UUID | None
+    campaign_id: UUID | None
+    native_speech_provider: str | None
+
+
 def verify_smallest_signature(raw_body: bytes, signature: str) -> bool:
     """Validate Smallest.ai's hex-encoded HMAC-SHA256 signature."""
     if not settings.smallest_webhook_secret or not signature:
@@ -888,7 +899,7 @@ async def _lock_native_twilio_voice_callback_runtime(
     request: Request,
     params: dict[str, str],
 ) -> tuple[Call, Agent | None, AgentRuntimeProfile | None, bool]:
-    """Revalidate a native outbound route inside credential-rotation locks.
+    """Revalidate a native outbound callback inside credential-rotation locks.
 
     The order is shared with runtime mutation and credential rotation:
     provider boundary -> agent runtime -> Agent -> Profile -> credential.  A
@@ -952,7 +963,7 @@ async def _lock_native_twilio_voice_callback_runtime(
 
     # Authentication is deliberately repeated with the credential row locked.
     # A callback authenticated just before a credential rotation must not mint
-    # a media capability after that rotation commits.
+    # a media capability or mutate call state after that rotation commits.
     _validate_twilio_workspace_call_callback(
         request,
         params,
@@ -980,6 +991,64 @@ async def _lock_native_twilio_voice_callback_runtime(
         )
     )
     return call, agent, runtime_profile, route_is_current
+
+
+async def _lock_native_twilio_status_callback(
+    db: AsyncSession,
+    *,
+    proof: _TwilioStatusCallbackAuthProof,
+    request: Request,
+    params: dict[str, str],
+) -> Call:
+    """Revalidate status authority without introducing Agent/Call inversion.
+
+    Status callbacks reconcile calls that have already been dispatched, so
+    they do not need the Agent/Profile admission graph used before minting a
+    voice media capability. The shared provider boundary serializes credential
+    rotation, then the current credential and exact Call are locked in that
+    order before the signature is checked again.
+    """
+
+    await lock_provider_runtime_boundaries(db, proof.tenant_id, "twilio")
+    try:
+        route_credential = await load_workspace_twilio_route_credential(
+            db,
+            proof.tenant_id,
+            for_update=True,
+        )
+    except ProviderCredentialError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Twilio workspace callback credential is unavailable",
+        ) from exc
+    if route_credential is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Twilio workspace callback credential is unavailable",
+        )
+
+    call = await db.scalar(
+        select(Call)
+        .where(
+            Call.id == proof.call_id,
+            Call.tenant_id == proof.tenant_id,
+            Call.agent_id == proof.agent_id,
+            Call.campaign_id.is_(None),
+            Call.provider == "twilio",
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if call is None or _native_twilio_speech_provider(call) != proof.native_speech_provider:
+        raise HTTPException(status_code=409, detail="Call mapping changed during callback")
+
+    _validate_twilio_workspace_call_callback(
+        request,
+        params,
+        call,
+        route_credential,
+    )
+    return call
 
 
 _INBOUND_CAPACITY_LIFECYCLE_ERRORS = {
@@ -1923,31 +1992,75 @@ async def twilio_status_callback(
     request: Request,
 ):
     """Handle Twilio status callbacks for call state changes."""
-    async with _local_provider_callback_lock(f"twilio:direct:{call_id}"):
-        return await _twilio_status_callback_locked(call_id, request)
-
-
-async def _twilio_status_callback_locked(call_id: UUID, request: Request):
     untrusted_params = await _parse_twilio_request(request)
     callback_claim = _twilio_callback_claim_from_request(request)
     async with async_session_factory() as db:
-        result = await db.execute(select(Call).where(Call.id == call_id))
-        call_probe = result.scalar_one_or_none()
-        if not call_probe:
+        call_probe = await db.scalar(select(Call).where(Call.id == call_id))
+        if call_probe is None:
             await _verify_twilio_request(request)
             return {"status": "not_found"}
+        # Authenticate before taking the local contention lock so invalid
+        # requests cannot queue behind a legitimate callback. Native callbacks
+        # are authenticated again under the provider/credential boundary below.
         await _validate_twilio_call_callback(
             db,
             request,
             untrusted_params,
             call_probe,
         )
-        params = untrusted_params
+        proof = _TwilioStatusCallbackAuthProof(
+            call_id=call_probe.id,
+            tenant_id=call_probe.tenant_id,
+            agent_id=call_probe.agent_id,
+            campaign_id=call_probe.campaign_id,
+            native_speech_provider=_native_twilio_speech_provider(call_probe),
+        )
+
+    async with _local_provider_callback_lock(f"twilio:direct:{call_id}"):
+        return await _twilio_status_callback_locked(
+            request,
+            params=untrusted_params,
+            callback_claim=callback_claim,
+            proof=proof,
+        )
+
+
+async def _twilio_status_callback_locked(
+    request: Request,
+    *,
+    params: dict[str, str],
+    callback_claim: str | None,
+    proof: _TwilioStatusCallbackAuthProof,
+):
+    async with async_session_factory() as db:
+        if proof.native_speech_provider is not None and proof.campaign_id is None:
+            call = await _lock_native_twilio_status_callback(
+                db,
+                proof=proof,
+                request=request,
+                params=params,
+            )
+        else:
+            call_probe = await db.scalar(
+                select(Call).where(
+                    Call.id == proof.call_id,
+                    Call.tenant_id == proof.tenant_id,
+                    Call.agent_id == proof.agent_id,
+                    Call.campaign_id == proof.campaign_id,
+                )
+            )
+            if call_probe is None:
+                return {"status": "not_found"}
+            # Preserve legacy/campaign lock order, but revalidate after the
+            # local guard so a changed routing identity cannot authorize a
+            # state transition.
+            await _validate_twilio_call_callback(db, request, params, call_probe)
+            call, _attempt = await _lock_callback_call_graph(db, call_probe)
+
         call_sid = params.get("CallSid", "")
         call_status = params.get("CallStatus", "")
         call_duration = params.get("CallDuration")
         recording_url = params.get("RecordingUrl", "")
-        call, _attempt = await _lock_callback_call_graph(db, call_probe)
         await _require_and_persist_native_twilio_callback_identity(
             db,
             params,
