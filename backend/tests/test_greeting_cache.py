@@ -7,14 +7,20 @@ from types import SimpleNamespace
 
 import pytest
 from livekit import rtc
+from redis.exceptions import RedisError
 
+from app.livekit_runtime import greeting_cache as greeting_cache_module
 from app.livekit_runtime.greeting_cache import (
     CachedGreetingAudio,
     FrozenAudioFrame,
     GreetingAudioCache,
+    _deserialize_cached_audio,
+    _serialize_cached_audio,
     greeting_cache_key,
     greeting_is_static,
+    load_shared_greeting_audio,
     prepare_greeting_audio,
+    store_shared_greeting_audio,
 )
 
 
@@ -116,6 +122,44 @@ class _StreamingTTS:
     def synthesize(self, _text: str):
         self.synthesize_calls += 1
         raise AssertionError("streaming-capable greeting TTS must not use chunked synthesis")
+
+
+class _Redis:
+    def __init__(
+        self,
+        value: bytes | None = None,
+        *,
+        error: BaseException | bool = False,
+        store_result: int = 1,
+    ):
+        self.value = value
+        self.error = error
+        self.store_result = store_result
+        self.get_calls: list[tuple[str, int]] = []
+        self.set_calls: list[tuple[str, bytes, int]] = []
+        self.set_limits: list[tuple[int, int]] = []
+        self.close_calls = 0
+
+    async def eval(self, script: str, _key_count: int, *args):
+        if self.error:
+            if isinstance(self.error, BaseException):
+                raise self.error
+            raise RedisError("unavailable")
+        key = args[0]
+        if "return value" in script:
+            assert len(args) == 5
+            self.get_calls.append((key, int(args[4])))
+            return self.value
+        assert len(args) == 9
+        payload = args[3]
+        ttl = int(args[4])
+        self.set_calls.append((key, payload, ttl))
+        self.set_limits.append((int(args[7]), int(args[8])))
+        self.value = payload
+        return self.store_result
+
+    async def aclose(self):
+        self.close_calls += 1
 
 
 class _StalledPushStream(_PushStream):
@@ -284,6 +328,7 @@ def test_only_static_greetings_are_cacheable():
 
 def test_cache_key_changes_for_audio_affecting_configuration():
     base = {
+        "tenant_id": "tenant-1",
         "agent_id": "agent-1",
         "greeting": "Welcome",
         "voice_id": "Ashley",
@@ -295,6 +340,7 @@ def test_cache_key_changes_for_audio_affecting_configuration():
     first = greeting_cache_key(**base)
     assert first == greeting_cache_key(**base)
     assert first != greeting_cache_key(**{**base, "speech_rate": 1.1})
+    assert first != greeting_cache_key(**{**base, "tenant_id": "tenant-2"})
     assert "Welcome" not in first
 
 
@@ -309,6 +355,237 @@ def test_cache_enforces_entry_and_byte_bounds():
     assert cache.get("b") is None
     assert cache.entry_count == 2
     assert cache.byte_count <= 1_000
+
+
+def test_shared_cache_binary_round_trip_is_strict_and_content_agnostic():
+    frames = tuple(FrozenAudioFrame.from_frame(_frame(value)) for value in (1, 2))
+    item = CachedGreetingAudio(
+        frames=frames,
+        byte_count=sum(len(frame.data) for frame in frames),
+        duration_seconds=sum(frame.duration for frame in frames),
+    )
+
+    cache_key = "d" * 64
+    payload = _serialize_cached_audio(item, cache_key=cache_key)
+    restored = _deserialize_cached_audio(payload, cache_key=cache_key)
+
+    assert restored == item
+    assert all(frame.thaw().sample_rate == 24_000 for frame in restored.frames)
+    with pytest.raises(ValueError, match="integrity"):
+        _deserialize_cached_audio(payload + b"unexpected", cache_key=cache_key)
+    with pytest.raises(ValueError, match="integrity"):
+        _deserialize_cached_audio(payload, cache_key="e" * 64)
+    tampered = bytearray(payload)
+    tampered[0] ^= 1
+    with pytest.raises(ValueError, match="integrity"):
+        _deserialize_cached_audio(bytes(tampered), cache_key=cache_key)
+
+
+def test_shared_cache_serializer_rejects_invalid_pcm_format_and_duration():
+    cache_key = "f" * 64
+    malformed = FrozenAudioFrame(
+        data=b"\x00\x00",
+        sample_rate=24_000,
+        num_channels=1,
+        samples_per_channel=240,
+    )
+    with pytest.raises(ValueError, match="metadata"):
+        _serialize_cached_audio(
+            CachedGreetingAudio((malformed,), 2, malformed.duration),
+            cache_key=cache_key,
+        )
+
+    first = FrozenAudioFrame.from_frame(_frame(1))
+    changed_format = FrozenAudioFrame(
+        data=b"\x00\x00" * 80,
+        sample_rate=8_000,
+        num_channels=1,
+        samples_per_channel=80,
+    )
+    with pytest.raises(ValueError, match="metadata"):
+        _serialize_cached_audio(
+            CachedGreetingAudio(
+                (first, changed_format),
+                len(first.data) + len(changed_format.data),
+                first.duration + changed_format.duration,
+            ),
+            cache_key=cache_key,
+        )
+
+    one_second = FrozenAudioFrame(
+        data=b"\x00\x00" * 8_000,
+        sample_rate=8_000,
+        num_channels=1,
+        samples_per_channel=8_000,
+    )
+    too_long = CachedGreetingAudio(
+        frames=(one_second,) * 13,
+        byte_count=len(one_second.data) * 13,
+        duration_seconds=13.0,
+    )
+    with pytest.raises(ValueError, match="duration"):
+        _serialize_cached_audio(too_long, cache_key=cache_key)
+
+
+def test_shared_cache_decoder_enforces_pcm_length_even_with_a_valid_mac():
+    cache_key = "9" * 64
+    frame = FrozenAudioFrame.from_frame(_frame(1))
+    item = CachedGreetingAudio((frame,), len(frame.data), frame.duration)
+    payload = _serialize_cached_audio(item, cache_key=cache_key)
+    body = bytearray(payload[: -greeting_cache_module._SHARED_CACHE_MAC_BYTES])
+    samples_offset = greeting_cache_module._SHARED_CACHE_HEADER.size + 6
+    body[samples_offset : samples_offset + 4] = (241).to_bytes(4, "big")
+    forged = bytes(body) + greeting_cache_module._shared_cache_mac(cache_key, bytes(body))
+
+    with pytest.raises(ValueError, match="frame"):
+        _deserialize_cached_audio(forged, cache_key=cache_key)
+
+
+@pytest.mark.asyncio
+async def test_shared_cache_hit_uses_fixed_ttl_and_avoids_provider_request():
+    frames = (FrozenAudioFrame.from_frame(_frame(7)),)
+    item = CachedGreetingAudio(
+        frames=frames,
+        byte_count=len(frames[0].data),
+        duration_seconds=frames[0].duration,
+    )
+    key = "a" * 64
+    redis = _Redis(_serialize_cached_audio(item, cache_key=key))
+
+    lookup = await load_shared_greeting_audio(
+        key,
+        enabled=True,
+        client=redis,
+        ttl_seconds=60,
+    )
+    engine = _TTS([_frame(9)])
+    prepared = prepare_greeting_audio(
+        tts_engine=engine,
+        text="Welcome",
+        cache_key=key,
+        preloaded_audio=lookup.item,
+        cache=GreetingAudioCache(max_entries=2, max_bytes=10_000),
+    )
+
+    assert lookup.status == "hit"
+    assert redis.get_calls == [("voiceai:greeting-audio:v1:" + key, 120)]
+    assert "EXPIRE', KEYS[1]" not in greeting_cache_module._SHARED_CACHE_GET_LUA
+    assert len(await _collect_frames(prepared)) == 1
+    assert prepared.cache_status == "hit"
+    assert prepared.provider_request_count == 0
+    assert engine.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_shared_cache_miss_is_stored_with_bounded_ttl():
+    redis = _Redis()
+    key = "b" * 64
+    lookup = await load_shared_greeting_audio(key, enabled=True, client=redis, ttl_seconds=60)
+    frames = (FrozenAudioFrame.from_frame(_frame(3)),)
+    item = CachedGreetingAudio(
+        frames=frames,
+        byte_count=len(frames[0].data),
+        duration_seconds=frames[0].duration,
+    )
+
+    stored = await store_shared_greeting_audio(
+        key,
+        item,
+        enabled=True,
+        client=redis,
+        ttl_seconds=60,
+    )
+
+    assert lookup.status == "miss"
+    assert stored.status == "stored"
+    assert len(redis.set_calls) == 1
+    redis_key, payload, ttl = redis.set_calls[0]
+    assert redis_key == "voiceai:greeting-audio:v1:" + key
+    assert ttl == 60
+    assert redis.set_limits == [(128, 32 * 1024 * 1024)]
+    assert _deserialize_cached_audio(payload, cache_key=key) == item
+
+
+@pytest.mark.asyncio
+async def test_shared_cache_owned_clients_are_closed_per_operation(monkeypatch):
+    key = "8" * 64
+    frame = FrozenAudioFrame.from_frame(_frame(2))
+    item = CachedGreetingAudio((frame,), len(frame.data), frame.duration)
+    redis = _Redis(_serialize_cached_audio(item, cache_key=key))
+    monkeypatch.setattr(greeting_cache_module, "_shared_redis", lambda: redis)
+
+    lookup = await load_shared_greeting_audio(key, enabled=True)
+    stored = await store_shared_greeting_audio(key, item, enabled=True)
+
+    assert lookup.status == "hit"
+    assert stored.status == "stored"
+    assert redis.close_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_shared_cache_reports_when_quota_evicts_the_written_item():
+    key = "6" * 64
+    frame = FrozenAudioFrame.from_frame(_frame(2))
+    item = CachedGreetingAudio((frame,), len(frame.data), frame.duration)
+
+    stored = await store_shared_greeting_audio(
+        key,
+        item,
+        enabled=True,
+        client=_Redis(store_result=0),
+    )
+
+    assert stored.status == "quota_rejected"
+
+
+@pytest.mark.asyncio
+async def test_shared_cache_runtime_errors_fail_open_but_cancellation_propagates():
+    key = "7" * 64
+
+    unavailable = await load_shared_greeting_audio(
+        key,
+        enabled=True,
+        client=_Redis(error=RuntimeError("different event loop")),
+    )
+    assert unavailable.status == "unavailable"
+
+    with pytest.raises(asyncio.CancelledError):
+        await load_shared_greeting_audio(
+            key,
+            enabled=True,
+            client=_Redis(error=asyncio.CancelledError()),
+        )
+
+
+@pytest.mark.asyncio
+async def test_shared_cache_corruption_and_outage_fail_open_without_content_in_status():
+    key = "c" * 64
+    corrupted = await load_shared_greeting_audio(
+        key,
+        enabled=True,
+        client=_Redis(b"not-a-valid-frame"),
+    )
+    unavailable = await load_shared_greeting_audio(
+        key,
+        enabled=True,
+        client=_Redis(error=True),
+    )
+
+    assert corrupted.item is None
+    assert corrupted.status == "invalid"
+    assert unavailable.item is None
+    assert unavailable.status == "unavailable"
+
+    engine = _TTS([_frame(4)])
+    prepared = prepare_greeting_audio(
+        tts_engine=engine,
+        text="Welcome",
+        cache_key=key,
+        preloaded_audio=unavailable.item,
+        cache=GreetingAudioCache(max_entries=2, max_bytes=10_000),
+    )
+    assert len(await _collect_frames(prepared)) == 1
+    assert prepared.provider_request_count == 1
 
 
 @pytest.mark.asyncio

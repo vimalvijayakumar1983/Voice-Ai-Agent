@@ -316,6 +316,11 @@ def test_public_call_metadata_projects_versioned_knowledge_and_repair_diagnostic
             "agent_configuration": {"language": "en-GB"},
             "runtime": {
                 "greeting_cache_status": "hit",
+                "greeting_shared_cache_lookup_status": "hit",
+                "greeting_shared_cache_store_status": "not_attempted",
+                "greeting_shared_cache_lookup_ms": 3,
+                "greeting_shared_cache_store_ms": 0,
+                "greeting_tts_warmup_attempted": False,
                 "greeting_preparation_overlap_ms": 82,
                 "speech_lexicon_source": "versioned_artifact",
                 "speech_lexicon_artifact_id": "artifact-42",
@@ -371,6 +376,11 @@ def test_public_call_metadata_projects_versioned_knowledge_and_repair_diagnostic
 
     runtime = projected["runtime"]
     assert runtime["greeting_cache_status"] == "hit"
+    assert runtime["greeting_shared_cache_lookup_status"] == "hit"
+    assert runtime["greeting_shared_cache_store_status"] == "not_attempted"
+    assert runtime["greeting_shared_cache_lookup_ms"] == 3
+    assert runtime["greeting_shared_cache_store_ms"] == 0
+    assert runtime["greeting_tts_warmup_attempted"] is False
     assert runtime["speech_lexicon_artifact_id"] == "artifact-42"
     assert runtime["speech_lexicon_tier_one_coverage_pct"] == 100.0
     assert runtime["knowledge_turn_mode"] == "single_pass_experimental"

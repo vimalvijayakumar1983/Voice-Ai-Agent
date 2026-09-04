@@ -478,6 +478,72 @@ def test_founding_fact_on_partial_corpus_is_source_qualified_and_positive_only()
     assert matched.evidence[0].value == "2003"
 
 
+def test_founding_fact_accepts_source_scoped_first_person_corporate_statement():
+    evidence = (
+        "Al Zaabi Group has come to stay as an integral part of life in the UAE with "
+        "its excellent performance and ever expanding presence in the emerging market "
+        "segments.\n\nPresident’s Message\n\nStrive for Excellence\n\nThe world is "
+        "constantly undergoing changes and market competition is more intense than "
+        "ever. We unwaveringly uphold the basic policy of contributing to society "
+        "through fair business activities since our inception in 2003."
+    )
+    fact = {
+        "subject": "Al Zaabi Group",
+        "predicate": "inception year",
+        "value": "2003",
+        "evidence": evidence,
+    }
+
+    scoped = build_exact_fact_index(
+        (
+            ExactFactSource(
+                source_id="management-page",
+                source_name="Management - Al Zaabi Group",
+                structured_content={"facts": [fact]},
+            ),
+        )
+    )
+    unscoped = build_exact_fact_index(
+        (
+            ExactFactSource(
+                source_id="generic-page",
+                source_name="Management",
+                structured_content={"facts": [fact]},
+            ),
+        )
+    )
+    deceptively_named = build_exact_fact_index(
+        (
+            ExactFactSource(
+                source_id="third-party-page",
+                source_name="Beta Holdings profile mentioning Al Zaabi Group",
+                structured_content={"facts": [fact]},
+            ),
+        )
+    )
+
+    scoped_result = resolve_exact_fact(
+        scoped,
+        query="When was Al Zaabi Group established?",
+    )
+    unscoped_result = resolve_exact_fact(
+        unscoped,
+        query="When was Al Zaabi Group established?",
+    )
+    deceptively_named_result = resolve_exact_fact(
+        deceptively_named,
+        query="When was Al Zaabi Group established?",
+    )
+
+    assert scoped_result.response_action == ExactFactResponseAction.ANSWER
+    assert scoped_result.reason == "source_qualified_founding_fact"
+    assert scoped_result.evidence[0].value == "2003"
+    assert unscoped_result.response_action == ExactFactResponseAction.FALLBACK
+    assert unscoped_result.evidence == ()
+    assert deceptively_named_result.response_action == ExactFactResponseAction.FALLBACK
+    assert deceptively_named_result.evidence == ()
+
+
 def test_founding_classification_rejects_program_dates_and_invalid_conflicts():
     programme = ExactFactSource(
         source_id="programme-page",

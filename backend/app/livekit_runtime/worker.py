@@ -41,7 +41,9 @@ from app.livekit_runtime.dispatch_auth import verify_browser_dispatch_metadata
 from app.livekit_runtime.greeting_cache import (
     greeting_cache_key,
     greeting_is_static,
+    load_shared_greeting_audio,
     prepare_greeting_audio,
+    store_shared_greeting_audio,
 )
 from app.livekit_runtime.inworld_realtime import InworldRealtimeModel
 from app.livekit_runtime.inworld_single_pass import (
@@ -4128,6 +4130,9 @@ async def vav_inworld_session(ctx: JobContext) -> None:
     single_pass_controller: InworldSinglePassController | None = None
     prepared_greeting: Any | None = None
     prepared_greeting_usage_task: asyncio.Task[None] | None = None
+    prepared_greeting_cache_key: str | None = None
+    shared_greeting_cache_enabled = settings.is_production
+    shared_greeting_cache_lookup_status = "disabled"
     session_ready_at: float | None = None
 
     async def _collect_prepared_greeting_usage(current: Any) -> None:
@@ -4137,16 +4142,37 @@ async def vav_inworld_session(ctx: JobContext) -> None:
         try:
             await current.aclose()
         finally:
+            try:
+                shared_store = await store_shared_greeting_audio(
+                    prepared_greeting_cache_key,
+                    getattr(current, "cached_audio", None),
+                    enabled=(
+                        shared_greeting_cache_enabled
+                        and shared_greeting_cache_lookup_status != "hit"
+                    ),
+                )
+                usage_totals["greeting_shared_cache_store_status"] = shared_store.status
+                usage_totals["greeting_shared_cache_store_ms"] = shared_store.elapsed_ms
+            except Exception:
+                # Shared greeting persistence must never mask session cleanup or
+                # call finalization. Cancellation still propagates normally.
+                usage_totals["greeting_shared_cache_store_status"] = "unavailable"
+                usage_totals["greeting_shared_cache_store_ms"] = 0
             greeting_provider_request_count = current.provider_request_count
             usage_totals["greeting_provider_tts_request_count"] = greeting_provider_request_count
             usage_totals["greeting_tts_charge_expected"] = greeting_provider_request_count > 0
+            usage_totals["greeting_tts_warmup_attempted"] = greeting_provider_request_count > 0
             _record_external_tts_request(
                 usage_totals,
                 _render_greeting(model.greeting_message, variables),
                 "greeting_preparation",
                 count=greeting_provider_request_count,
             )
-            usage_totals["greeting_cache_status"] = current.cache_status
+            usage_totals["greeting_cache_status"] = (
+                "shared_hit"
+                if shared_greeting_cache_lookup_status == "hit"
+                else current.cache_status
+            )
             first_frame_at = current.first_frame_at_monotonic
             completed_at = current.completed_at_monotonic
             if first_frame_at is not None:
@@ -4245,6 +4271,52 @@ async def vav_inworld_session(ctx: JobContext) -> None:
             usage_totals["inworld_single_pass_blocker"] = single_pass_decision.blocker
         single_pass_decision.require_supported()
         usage_totals["voice_runtime"] = voice_runtime
+
+        # Greeting synthesis is independent of recognition context and the LLM.
+        # Start it at the first billable, durably admitted boundary so its
+        # provider latency overlaps lexicon loading and session construction.
+        tts_options = _inworld_tts_options(
+            model=model,
+            api_key=api_keys.speech,
+            profile=profile,
+        )
+        tts_engine = inworld.TTS(**tts_options)
+        greeting = _render_greeting(model.greeting_message, variables)
+        prepared_greeting_cache_key = (
+            greeting_cache_key(
+                tenant_id=model.tenant_id,
+                agent_id=model.id,
+                greeting=greeting,
+                voice_id=str(tts_options.get("voice") or ""),
+                model_id=str(tts_options.get("model") or "inworld-tts-2"),
+                language=str(tts_options.get("language") or "auto"),
+                speech_rate=float(model.speech_rate),
+                delivery_mode=str(tts_options.get("delivery_mode") or "balanced"),
+            )
+            if greeting_is_static(model.greeting_message)
+            else None
+        )
+        shared_greeting = await load_shared_greeting_audio(
+            prepared_greeting_cache_key,
+            enabled=shared_greeting_cache_enabled,
+        )
+        shared_greeting_cache_lookup_status = shared_greeting.status
+        usage_totals["greeting_shared_cache_lookup_status"] = shared_greeting.status
+        usage_totals["greeting_shared_cache_lookup_ms"] = shared_greeting.elapsed_ms
+        # A shared PCM hit removes the greeting provider request and therefore
+        # does not warm Inworld's TTS transport. Keep that trade-off explicit in
+        # telemetry; ordinary turn diagnostics continue measuring answer TTS
+        # first-byte time, without relying on an undocumented empty synthesis.
+        prepared_greeting = prepare_greeting_audio(
+            tts_engine=tts_engine,
+            text=greeting,
+            cache_key=prepared_greeting_cache_key,
+            preloaded_audio=shared_greeting.item,
+        )
+        usage_totals["greeting_cache_status"] = (
+            "shared_hit" if shared_greeting.status == "hit" else prepared_greeting.cache_status
+        )
+
         knowledge_terminology: tuple[str, ...] = ()
         recognition_context = _RuntimeRecognitionContext()
         if native_realtime:
@@ -4306,12 +4378,6 @@ async def vav_inworld_session(ctx: JobContext) -> None:
             # speech-to-speech connection, while giving deterministic authored
             # messages (especially the greeting) a direct streaming TTS path.
             # This removes a full LLM turn before the caller hears the first word.
-            tts_options = _inworld_tts_options(
-                model=model,
-                api_key=api_keys.speech,
-                profile=profile,
-            )
-            tts_engine = inworld.TTS(**tts_options)
             realtime_model = _build_inworld_realtime_model(
                 model=model,
                 profile=profile,
@@ -4360,18 +4426,12 @@ async def vav_inworld_session(ctx: JobContext) -> None:
                 "min_end_of_turn_silence_when_confident": 300,
                 "end_of_turn_confidence_threshold": 0.5,
             }
-            tts_options = _inworld_tts_options(
-                model=model,
-                api_key=api_keys.speech,
-                profile=profile,
-            )
             llm_options: dict[str, Any] = {
                 "api_key": api_keys.llm,
                 "model": profile.llm_model,
             }
             if getattr(profile, "llm_provider", "inworld") == "inworld":
                 llm_options["base_url"] = f"{settings.inworld_base_url.rstrip('/')}/v1"
-            tts_engine = inworld.TTS(**tts_options)
             session = AgentSession(
                 stt=inworld.STT(**stt_options),
                 llm=openai.LLM(**llm_options),
@@ -4448,27 +4508,6 @@ async def vav_inworld_session(ctx: JobContext) -> None:
                 record_timing=telemetry.record_single_pass_timing,
                 record_error=_record_single_pass_error,
             )
-
-        greeting = _render_greeting(model.greeting_message, variables)
-        greeting_key = (
-            greeting_cache_key(
-                agent_id=model.id,
-                greeting=greeting,
-                voice_id=str(tts_options.get("voice") or ""),
-                model_id=str(tts_options.get("model") or "inworld-tts-2"),
-                language=str(tts_options.get("language") or "auto"),
-                speech_rate=float(model.speech_rate),
-                delivery_mode=str(tts_options.get("delivery_mode") or "balanced"),
-            )
-            if greeting_is_static(model.greeting_message)
-            else None
-        )
-        prepared_greeting = prepare_greeting_audio(
-            tts_engine=tts_engine,
-            text=greeting,
-            cache_key=greeting_key,
-        )
-        usage_totals["greeting_cache_status"] = prepared_greeting.cache_status
 
         def _cancel_stale_generation() -> None:
             try:

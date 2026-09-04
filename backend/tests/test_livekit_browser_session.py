@@ -1304,6 +1304,11 @@ async def test_worker_browser_branch_uses_signed_identity_not_participant_metada
     monkeypatch.setattr(livekit_worker.inworld, "STT", lambda **_kwargs: object())
     monkeypatch.setattr(livekit_worker.inworld, "TTS", lambda **_kwargs: object())
     monkeypatch.setattr(livekit_worker.openai, "LLM", lambda **_kwargs: object())
+    monkeypatch.setattr(
+        livekit_worker,
+        "store_shared_greeting_audio",
+        AsyncMock(side_effect=RuntimeError("shared cache unavailable")),
+    )
     monkeypatch.setattr(livekit_worker, "AgentSession", lambda **_kwargs: FailingStartSession())
     monkeypatch.setattr(
         livekit_worker,
@@ -1328,6 +1333,8 @@ async def test_worker_browser_branch_uses_signed_identity_not_participant_metada
     finalized_usage = finalize.await_args.args[2]
     assert finalized_usage["greeting_provider_tts_request_count"] == 1
     assert finalized_usage["greeting_tts_charge_expected"] is True
+    assert finalized_usage["greeting_tts_warmup_attempted"] is True
+    assert finalized_usage["greeting_shared_cache_store_status"] == "unavailable"
     assert finalized_usage["external_tts_request_count"] == 1
     assert finalized_usage["external_tts_provider_reconciliation_required"] is True
     assert "external_tts" in finalized_usage["usage_components_expected"]

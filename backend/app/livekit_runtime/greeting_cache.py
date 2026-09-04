@@ -2,8 +2,9 @@
 
 The first spoken message is authored content and does not need an LLM turn. This
 module starts TTS while the realtime session is connecting and retains only
-static (non-personalised) audio in a small process-local cache. Concurrent cache
-misses for the same greeting share one synthesis inside the worker process.
+static (non-personalised) audio. A bounded Redis copy survives LiveKit's
+one-job worker processes; the process-local LRU remains the playout fast path
+and singleflight coordinator for a job.
 
 Only the bounded playout queue temporarily holds personalised or oversized PCM;
 neither is retained as a cache candidate after synthesis.
@@ -13,7 +14,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import re
+import struct
 import threading
 import time
 from collections import OrderedDict
@@ -23,6 +26,9 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from livekit import rtc
+from redis.asyncio import Redis
+
+from app.core.config import settings
 
 _TEMPLATE_MARKER = re.compile(r"{{|}}|\$\{|{%|%}")
 _END = object()
@@ -33,6 +39,92 @@ DEFAULT_MAX_SYNTHESIS_DURATION_SECONDS = 30.0
 DEFAULT_SYNTHESIS_TOTAL_TIMEOUT_SECONDS = 45.0
 DEFAULT_SYNTHESIS_IDLE_TIMEOUT_SECONDS = 8.0
 DEFAULT_SYNTHESIS_CANCEL_TIMEOUT_SECONDS = 1.0
+DEFAULT_SHARED_CACHE_TTL_SECONDS = 24 * 60 * 60
+DEFAULT_SHARED_CACHE_TIMEOUT_SECONDS = 0.1
+DEFAULT_SHARED_CACHE_MAX_FRAMES = 4096
+DEFAULT_SHARED_CACHE_MAX_ENTRIES = 128
+DEFAULT_SHARED_CACHE_MAX_ITEM_BYTES = 512 * 1024
+DEFAULT_SHARED_CACHE_MAX_DURATION_SECONDS = 12.0
+DEFAULT_SHARED_CACHE_MAX_BYTES = 32 * 1024 * 1024
+
+_SHARED_CACHE_PREFIX = "voiceai:greeting-audio:v1:"
+_SHARED_CACHE_INDEX_KEY = "voiceai:greeting-audio:v1:index"
+_SHARED_CACHE_SIZE_KEY = "voiceai:greeting-audio:v1:sizes"
+_SHARED_CACHE_MAGIC = b"VAVGRT01"
+_SHARED_CACHE_HEADER = struct.Struct(">8sII")
+_SHARED_CACHE_FRAME_HEADER = struct.Struct(">IHII")
+_SHARED_CACHE_MAC_BYTES = hashlib.sha256().digest_size
+_SHARED_CACHE_MAX_PAYLOAD_BYTES = (
+    _SHARED_CACHE_HEADER.size
+    + DEFAULT_SHARED_CACHE_MAX_ITEM_BYTES
+    + (DEFAULT_SHARED_CACHE_MAX_FRAMES * _SHARED_CACHE_FRAME_HEADER.size)
+    + _SHARED_CACHE_MAC_BYTES
+)
+
+SharedGreetingCacheStatus = Literal[
+    "disabled",
+    "bypassed_personalized",
+    "hit",
+    "miss",
+    "invalid",
+    "unavailable",
+]
+
+SharedGreetingStoreStatus = Literal[
+    "not_attempted",
+    "stored",
+    "oversize",
+    "quota_rejected",
+    "unavailable",
+]
+
+_SHARED_CACHE_GET_LUA = """
+local value = redis.call('GET', KEYS[1])
+if not value then
+  redis.call('ZREM', KEYS[2], KEYS[1])
+  redis.call('HDEL', KEYS[3], KEYS[1])
+  return false
+end
+redis.call('ZADD', KEYS[2], ARGV[1], KEYS[1])
+redis.call('HSET', KEYS[3], KEYS[1], string.len(value))
+redis.call('EXPIRE', KEYS[2], ARGV[2])
+redis.call('EXPIRE', KEYS[3], ARGV[2])
+return value
+"""
+
+_SHARED_CACHE_SET_LUA = """
+redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])
+redis.call('ZADD', KEYS[2], ARGV[3], KEYS[1])
+redis.call('HSET', KEYS[3], KEYS[1], string.len(ARGV[1]))
+redis.call('EXPIRE', KEYS[2], ARGV[4])
+redis.call('EXPIRE', KEYS[3], ARGV[4])
+
+while true do
+  local members = redis.call('ZRANGE', KEYS[2], 0, -1)
+  local live_count = 0
+  local total_bytes = 0
+  for _, member in ipairs(members) do
+    if redis.call('EXISTS', member) == 1 then
+      live_count = live_count + 1
+      total_bytes = total_bytes + tonumber(redis.call('HGET', KEYS[3], member) or '0')
+    else
+      redis.call('ZREM', KEYS[2], member)
+      redis.call('HDEL', KEYS[3], member)
+    end
+  end
+  if live_count <= tonumber(ARGV[5]) and total_bytes <= tonumber(ARGV[6]) then
+    break
+  end
+  local victim = redis.call('ZRANGE', KEYS[2], 0, 0)[1]
+  if not victim then
+    break
+  end
+  redis.call('DEL', victim)
+  redis.call('ZREM', KEYS[2], victim)
+  redis.call('HDEL', KEYS[3], victim)
+end
+return redis.call('EXISTS', KEYS[1])
+"""
 
 GreetingCacheResultState = Literal[
     "hit",
@@ -83,6 +175,333 @@ class CachedGreetingAudio:
     frames: tuple[FrozenAudioFrame, ...]
     byte_count: int
     duration_seconds: float
+
+
+@dataclass(frozen=True, slots=True)
+class SharedGreetingCacheLookup:
+    """Content-free result of one bounded shared-cache lookup."""
+
+    item: CachedGreetingAudio | None
+    status: SharedGreetingCacheStatus
+    elapsed_ms: int
+
+
+@dataclass(frozen=True, slots=True)
+class SharedGreetingCacheStore:
+    """Content-free result of one bounded shared-cache write."""
+
+    status: SharedGreetingStoreStatus
+    elapsed_ms: int
+
+
+def _shared_redis() -> Redis:
+    """Create a Redis client for one bounded cache operation.
+
+    LiveKit can run jobs on different event loops over the lifetime of a worker.
+    Reusing a module-global async client would retain loop-bound pools and can
+    fail with ``Event loop is closed``. Callers close this client immediately
+    after the operation; explicitly injected clients remain caller-owned.
+    """
+
+    return Redis.from_url(
+        settings.redis_url,
+        decode_responses=False,
+        socket_connect_timeout=DEFAULT_SHARED_CACHE_TIMEOUT_SECONDS,
+        socket_timeout=DEFAULT_SHARED_CACHE_TIMEOUT_SECONDS,
+    )
+
+
+async def _close_shared_redis(client: Redis, *, timeout_seconds: float) -> None:
+    """Close an owned client without turning cache cleanup into a call failure."""
+
+    try:
+        await asyncio.wait_for(client.aclose(), timeout=timeout_seconds)
+    except Exception:
+        # Cache cleanup is best effort. asyncio.CancelledError intentionally is
+        # not swallowed (it inherits BaseException on supported Python versions).
+        return
+
+
+async def _eval_shared_redis(
+    client: Redis | None,
+    script: str,
+    key_count: int,
+    *args: object,
+    timeout_seconds: float,
+) -> object:
+    """Run one bounded Lua operation and close any internally-owned client."""
+
+    redis_client = client or _shared_redis()
+    try:
+        return await asyncio.wait_for(
+            redis_client.eval(script, key_count, *args),
+            timeout=timeout_seconds,
+        )
+    finally:
+        if client is None:
+            await _close_shared_redis(redis_client, timeout_seconds=timeout_seconds)
+
+
+def _shared_cache_key(cache_key: str) -> str:
+    """Namespace only the opaque, versioned SHA-256 local-cache identity."""
+
+    normalized = str(cache_key or "").strip().casefold()
+    if not re.fullmatch(r"[0-9a-f]{64}", normalized):
+        raise ValueError("Shared greeting cache key must be a SHA-256 digest")
+    return f"{_SHARED_CACHE_PREFIX}{normalized}"
+
+
+def _shared_cache_mac(cache_key: str, payload: bytes) -> bytes:
+    secret = str(settings.integration_encryption_key or settings.secret_key or "").encode()
+    if not secret:
+        raise ValueError("Shared greeting integrity key is unavailable")
+    signed = b"vav-greeting-audio-v1\x00" + cache_key.encode() + b"\x00" + payload
+    return hmac.new(secret, signed, hashlib.sha256).digest()
+
+
+def _serialize_cached_audio(item: CachedGreetingAudio, *, cache_key: str) -> bytes:
+    """Encode PCM frames without pickle or caller-controlled field names."""
+
+    if not item.frames or len(item.frames) > DEFAULT_SHARED_CACHE_MAX_FRAMES:
+        raise ValueError("Shared greeting frame count is invalid")
+    byte_count = sum(len(frame.data) for frame in item.frames)
+    if (
+        byte_count < 1
+        or byte_count != item.byte_count
+        or byte_count > DEFAULT_SHARED_CACHE_MAX_ITEM_BYTES
+    ):
+        raise ValueError("Shared greeting byte count is invalid")
+    if not 0 < item.duration_seconds <= DEFAULT_SHARED_CACHE_MAX_DURATION_SECONDS:
+        raise ValueError("Shared greeting duration is invalid")
+
+    parts = [
+        _SHARED_CACHE_HEADER.pack(
+            _SHARED_CACHE_MAGIC,
+            len(item.frames),
+            byte_count,
+        )
+    ]
+    expected_format = (item.frames[0].sample_rate, item.frames[0].num_channels)
+    calculated_duration = 0.0
+    for frame in item.frames:
+        data = bytes(frame.data)
+        if (
+            not data
+            or not 8_000 <= frame.sample_rate <= 192_000
+            or not 1 <= frame.num_channels <= 8
+            or not 1 <= frame.samples_per_channel <= 10_000_000
+            or len(data) != frame.samples_per_channel * frame.num_channels * 2
+            or (frame.sample_rate, frame.num_channels) != expected_format
+        ):
+            raise ValueError("Shared greeting frame metadata is invalid")
+        calculated_duration += frame.duration
+        if calculated_duration > DEFAULT_SHARED_CACHE_MAX_DURATION_SECONDS:
+            raise ValueError("Shared greeting duration is invalid")
+        parts.append(
+            _SHARED_CACHE_FRAME_HEADER.pack(
+                frame.sample_rate,
+                frame.num_channels,
+                frame.samples_per_channel,
+                len(data),
+            )
+        )
+        parts.append(data)
+    body = b"".join(parts)
+    payload = body + _shared_cache_mac(cache_key, body)
+    if abs(calculated_duration - item.duration_seconds) > 0.001:
+        raise ValueError("Shared greeting duration is invalid")
+    if len(payload) > _SHARED_CACHE_MAX_PAYLOAD_BYTES:
+        raise ValueError("Shared greeting payload is too large")
+    return payload
+
+
+def _deserialize_cached_audio(payload: object, *, cache_key: str) -> CachedGreetingAudio:
+    """Decode one strictly bounded Redis value into immutable PCM frames."""
+
+    if not isinstance(payload, (bytes, bytearray, memoryview)):
+        raise ValueError("Shared greeting payload must be binary")
+    raw = bytes(payload)
+    if not (
+        _SHARED_CACHE_HEADER.size + _SHARED_CACHE_MAC_BYTES
+        <= len(raw)
+        <= _SHARED_CACHE_MAX_PAYLOAD_BYTES
+    ):
+        raise ValueError("Shared greeting payload size is invalid")
+    body = raw[:-_SHARED_CACHE_MAC_BYTES]
+    supplied_mac = raw[-_SHARED_CACHE_MAC_BYTES:]
+    if not hmac.compare_digest(supplied_mac, _shared_cache_mac(cache_key, body)):
+        raise ValueError("Shared greeting payload integrity check failed")
+    magic, frame_count, expected_bytes = _SHARED_CACHE_HEADER.unpack_from(body)
+    if magic != _SHARED_CACHE_MAGIC:
+        raise ValueError("Shared greeting payload version is invalid")
+    if not 1 <= frame_count <= DEFAULT_SHARED_CACHE_MAX_FRAMES:
+        raise ValueError("Shared greeting frame count is invalid")
+    if not 1 <= expected_bytes <= DEFAULT_SHARED_CACHE_MAX_ITEM_BYTES:
+        raise ValueError("Shared greeting byte count is invalid")
+
+    offset = _SHARED_CACHE_HEADER.size
+    byte_count = 0
+    duration_seconds = 0.0
+    frames: list[FrozenAudioFrame] = []
+    expected_format: tuple[int, int] | None = None
+    for _index in range(frame_count):
+        header_end = offset + _SHARED_CACHE_FRAME_HEADER.size
+        if header_end > len(body):
+            raise ValueError("Shared greeting frame header is truncated")
+        sample_rate, num_channels, samples_per_channel, data_length = (
+            _SHARED_CACHE_FRAME_HEADER.unpack_from(raw, offset)
+        )
+        offset = header_end
+        data_end = offset + data_length
+        if (
+            not 8_000 <= sample_rate <= 192_000
+            or not 1 <= num_channels <= 8
+            or not 1 <= samples_per_channel <= 10_000_000
+            or data_length < 1
+            or data_end > len(body)
+            or byte_count + data_length > DEFAULT_SHARED_CACHE_MAX_ITEM_BYTES
+            or data_length != samples_per_channel * num_channels * 2
+        ):
+            raise ValueError("Shared greeting frame is invalid")
+        frame_format = (sample_rate, num_channels)
+        if expected_format is None:
+            expected_format = frame_format
+        elif frame_format != expected_format:
+            raise ValueError("Shared greeting frame format changed")
+        frame = FrozenAudioFrame(
+            data=body[offset:data_end],
+            sample_rate=sample_rate,
+            num_channels=num_channels,
+            samples_per_channel=samples_per_channel,
+        )
+        frames.append(frame)
+        byte_count += data_length
+        duration_seconds += frame.duration
+        if duration_seconds > DEFAULT_SHARED_CACHE_MAX_DURATION_SECONDS:
+            raise ValueError("Shared greeting duration is invalid")
+        offset = data_end
+    if offset != len(body) or byte_count != expected_bytes:
+        raise ValueError("Shared greeting payload integrity check failed")
+    return CachedGreetingAudio(
+        frames=tuple(frames),
+        byte_count=byte_count,
+        duration_seconds=duration_seconds,
+    )
+
+
+async def load_shared_greeting_audio(
+    cache_key: str | None,
+    *,
+    enabled: bool,
+    client: Redis | None = None,
+    ttl_seconds: int = DEFAULT_SHARED_CACHE_TTL_SECONDS,
+    timeout_seconds: float = DEFAULT_SHARED_CACHE_TIMEOUT_SECONDS,
+) -> SharedGreetingCacheLookup:
+    """Read one static greeting from Redis, failing open to ordinary TTS."""
+
+    started_at = time.monotonic()
+    if not enabled:
+        return SharedGreetingCacheLookup(None, "disabled", 0)
+    if cache_key is None:
+        return SharedGreetingCacheLookup(None, "bypassed_personalized", 0)
+    if ttl_seconds < 1 or timeout_seconds <= 0:
+        raise ValueError("Shared greeting cache bounds must be positive")
+    try:
+        redis_key = _shared_cache_key(cache_key)
+        payload = await _eval_shared_redis(
+            client,
+            _SHARED_CACHE_GET_LUA,
+            3,
+            redis_key,
+            _SHARED_CACHE_INDEX_KEY,
+            _SHARED_CACHE_SIZE_KEY,
+            time.time_ns() // 1_000_000,
+            ttl_seconds * 2,
+            timeout_seconds=timeout_seconds,
+        )
+    except Exception:
+        return SharedGreetingCacheLookup(
+            None,
+            "unavailable",
+            round((time.monotonic() - started_at) * 1000),
+        )
+    if payload is None:
+        return SharedGreetingCacheLookup(
+            None,
+            "miss",
+            round((time.monotonic() - started_at) * 1000),
+        )
+    try:
+        item = _deserialize_cached_audio(payload, cache_key=cache_key)
+    except Exception:
+        return SharedGreetingCacheLookup(
+            None,
+            "invalid",
+            round((time.monotonic() - started_at) * 1000),
+        )
+    return SharedGreetingCacheLookup(
+        item,
+        "hit",
+        round((time.monotonic() - started_at) * 1000),
+    )
+
+
+async def store_shared_greeting_audio(
+    cache_key: str | None,
+    item: CachedGreetingAudio | None,
+    *,
+    enabled: bool,
+    client: Redis | None = None,
+    ttl_seconds: int = DEFAULT_SHARED_CACHE_TTL_SECONDS,
+    timeout_seconds: float = DEFAULT_SHARED_CACHE_TIMEOUT_SECONDS,
+    max_entries: int = DEFAULT_SHARED_CACHE_MAX_ENTRIES,
+    max_total_bytes: int = DEFAULT_SHARED_CACHE_MAX_BYTES,
+) -> SharedGreetingCacheStore:
+    """Persist one immutable static greeting, failing open after a strict bound."""
+
+    started_at = time.monotonic()
+    if not enabled or cache_key is None or item is None:
+        return SharedGreetingCacheStore("not_attempted", 0)
+    if ttl_seconds < 1 or timeout_seconds <= 0 or max_entries < 1 or max_total_bytes < 1:
+        raise ValueError("Shared greeting cache bounds must be positive")
+    try:
+        redis_key = _shared_cache_key(cache_key)
+        payload = _serialize_cached_audio(item, cache_key=cache_key)
+    except ValueError:
+        return SharedGreetingCacheStore(
+            "oversize",
+            round((time.monotonic() - started_at) * 1000),
+        )
+    try:
+        survived_quota = await _eval_shared_redis(
+            client,
+            _SHARED_CACHE_SET_LUA,
+            3,
+            redis_key,
+            _SHARED_CACHE_INDEX_KEY,
+            _SHARED_CACHE_SIZE_KEY,
+            payload,
+            ttl_seconds,
+            time.time_ns() // 1_000_000,
+            ttl_seconds * 2,
+            max_entries,
+            max_total_bytes,
+            timeout_seconds=timeout_seconds,
+        )
+    except Exception:
+        return SharedGreetingCacheStore(
+            "unavailable",
+            round((time.monotonic() - started_at) * 1000),
+        )
+    if not survived_quota:
+        return SharedGreetingCacheStore(
+            "quota_rejected",
+            round((time.monotonic() - started_at) * 1000),
+        )
+    return SharedGreetingCacheStore(
+        "stored",
+        round((time.monotonic() - started_at) * 1000),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -222,6 +641,7 @@ def greeting_is_static(template: str | None) -> bool:
 
 def greeting_cache_key(
     *,
+    tenant_id: object,
     agent_id: object,
     greeting: str,
     voice_id: str,
@@ -232,6 +652,7 @@ def greeting_cache_key(
 ) -> str:
     payload = "\x1f".join(
         (
+            str(tenant_id),
             str(agent_id),
             hashlib.sha256(greeting.encode("utf-8")).hexdigest(),
             voice_id,
@@ -239,7 +660,7 @@ def greeting_cache_key(
             language,
             f"{speech_rate:.4f}",
             delivery_mode,
-            "greeting-audio-v2",
+            "greeting-audio-v3",
         )
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
@@ -909,12 +1330,22 @@ class PreparedGreetingAudio:
 
         return self._provider_request_count
 
+    @property
+    def cached_audio(self) -> CachedGreetingAudio | None:
+        """Return the completed immutable item without exposing authored text."""
+
+        self._sync_from_flight()
+        if self._cache_key is None or self._completed_at_monotonic is None:
+            return None
+        return self._cache.get(self._cache_key)
+
 
 def prepare_greeting_audio(
     *,
     tts_engine: Any,
     text: str,
     cache_key: str | None,
+    preloaded_audio: CachedGreetingAudio | None = None,
     cache: GreetingAudioCache = GREETING_AUDIO_CACHE,
     queue_max_frames: int = DEFAULT_QUEUE_MAX_FRAMES,
     max_synthesis_bytes: int = DEFAULT_MAX_SYNTHESIS_BYTES,
@@ -924,6 +1355,9 @@ def prepare_greeting_audio(
     synthesis_cancel_timeout_seconds: float = DEFAULT_SYNTHESIS_CANCEL_TIMEOUT_SECONDS,
 ) -> PreparedGreetingAudio:
     """Start bounded synthesis immediately and return an async playout source."""
+
+    if cache_key is not None and preloaded_audio is not None:
+        cache.put(cache_key, preloaded_audio)
 
     return PreparedGreetingAudio(
         tts_engine=tts_engine,

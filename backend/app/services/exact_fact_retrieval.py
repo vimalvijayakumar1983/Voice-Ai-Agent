@@ -512,6 +512,20 @@ _NON_NAME_QUESTION_TERMS = {
     "responsible",
     "service",
 }
+_SOURCE_SCOPE_TITLE_TOKENS = {
+    "about",
+    "company",
+    "corporate",
+    "home",
+    "homepage",
+    "management",
+    "message",
+    "official",
+    "overview",
+    "page",
+    "profile",
+    "website",
+}
 
 
 def _clean_text(value: object, *, limit: int = 4_000) -> str:
@@ -584,7 +598,13 @@ def _subject_is_grounded(subject: str, evidence: str) -> bool:
     return bool(normalized_subject and normalized_subject in normalized_evidence)
 
 
-def _founding_relationship_is_grounded(*, subject: str, value: str, evidence: str) -> bool:
+def _founding_relationship_is_grounded(
+    *,
+    subject: str,
+    value: str,
+    evidence: str,
+    source_name: str,
+) -> bool:
     """Prove a bounded organization -> founding-year clause in the quoted evidence."""
 
     if _FOUNDING_YEAR_RE.fullmatch(_normalized(value)) is None:
@@ -595,7 +615,8 @@ def _founding_relationship_is_grounded(*, subject: str, value: str, evidence: st
     # Split raw punctuation first. Grounding normalization intentionally drops
     # punctuation, which would otherwise let a different company's statement
     # in the next sentence appear to support this subject.
-    for raw_clause in re.split(r"[.!?;\n]+", str(evidence or "")):
+    clauses = tuple(re.split(r"[.!?;\n]+", str(evidence or "")))
+    for raw_clause in clauses:
         clause = _grounding_normalized(raw_clause)
         if not clause:
             continue
@@ -617,6 +638,39 @@ def _founding_relationship_is_grounded(*, subject: str, value: str, evidence: st
             rf"(?:in\s+)?{year_pattern}\b",
         )
         if any(re.search(pattern, clause) for pattern in patterns):
+            return True
+
+    # Corporate pages commonly introduce the organization in their title or
+    # opening paragraph and then state its age in first person, for example:
+    # "Al Zaabi Group ... . We ... since our inception in 2003."  Treat that
+    # as a relationship only when the immutable source itself is explicitly
+    # scoped to the same subject.  The source-name guard is deliberate: a
+    # generic document that merely mentions Acme must not let an unrelated
+    # "our inception" sentence become Acme's founding year.
+    normalized_source_name = _grounding_normalized(source_name)
+    subject_tokens = _tokens(subject)
+    source_name_tokens = _tokens(source_name)
+    source_is_subject_scoped = bool(
+        normalized_subject
+        and normalized_subject in normalized_source_name
+        and subject_tokens
+        and source_name_tokens - subject_tokens <= _SOURCE_SCOPE_TITLE_TOKENS
+    )
+    if not source_is_subject_scoped:
+        return False
+    subject_seen = False
+    first_person_pattern = re.compile(
+        rf"^we\b.{{0,320}}\bsince\s+our\s+"
+        rf"(?:establishment|formation|founding|incorporation|inception)"
+        rf"(?:\s+(?:date|year))?\s+(?:was\s+|is\s+)?(?:in\s+)?{year_pattern}\b"
+    )
+    for raw_clause in clauses:
+        clause = _grounding_normalized(raw_clause)
+        if not clause:
+            continue
+        if re.search(rf"\b{subject_pattern}\b", clause):
+            subject_seen = True
+        if subject_seen and first_person_pattern.search(clause):
             return True
     return False
 
@@ -886,6 +940,7 @@ def build_exact_fact_index(
                 subject=subject,
                 value=value,
                 evidence=evidence,
+                source_name=provenance.source_name,
             ):
                 truncation_reasons.add("invalid_structured_fact")
                 continue
