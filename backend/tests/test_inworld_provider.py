@@ -87,7 +87,10 @@ async def test_realtime_readiness_executes_required_tool_without_generating_audi
     websocket = _RealtimeProbeWebSocket(
         [
             {"type": "session.created"},
-            {"type": "session.updated"},
+            {
+                "type": "session.updated",
+                "session": {"audio": {"output": {"model": "inworld-tts-2"}}},
+            },
             {
                 "type": "response.function_call_arguments.done",
                 "name": "vav_readiness_check",
@@ -126,7 +129,10 @@ async def test_realtime_readiness_preserves_multilingual_auto_language_on_wire(m
     websocket = _RealtimeProbeWebSocket(
         [
             {"type": "session.created"},
-            {"type": "session.updated"},
+            {
+                "type": "session.updated",
+                "session": {"audio": {"output": {"model": "inworld-tts-2"}}},
+            },
             {
                 "type": "response.function_call_arguments.done",
                 "name": "vav_readiness_check",
@@ -173,7 +179,8 @@ async def test_realtime_readiness_proves_manual_tool_free_single_pass(monkeypatc
                                 "create_response": False,
                                 "interrupt_response": False,
                             },
-                        }
+                        },
+                        "output": {"model": "inworld-tts-2"},
                     },
                 },
             },
@@ -254,7 +261,8 @@ async def test_realtime_single_pass_readiness_fails_if_provider_calls_a_tool(mon
                                 "create_response": False,
                                 "interrupt_response": False,
                             },
-                        }
+                        },
+                        "output": {"model": "inworld-tts-2"},
                     },
                 },
             },
@@ -331,7 +339,8 @@ async def test_realtime_single_pass_readiness_rejects_missing_livekit_correlatio
                                 "create_response": False,
                                 "interrupt_response": False,
                             },
-                        }
+                        },
+                        "output": {"model": "inworld-tts-2"},
                     },
                 },
             },
@@ -383,7 +392,8 @@ async def test_realtime_single_pass_readiness_rejects_automatic_response(monkeyp
                                 "create_response": False,
                                 "interrupt_response": False,
                             },
-                        }
+                        },
+                        "output": {"model": "inworld-tts-2"},
                     },
                 },
             },
@@ -411,7 +421,10 @@ async def test_realtime_readiness_surfaces_plan_restriction_before_a_call(monkey
     websocket = _RealtimeProbeWebSocket(
         [
             {"type": "session.created"},
-            {"type": "session.updated"},
+            {
+                "type": "session.updated",
+                "session": {"audio": {"output": {"model": "inworld-tts-2"}}},
+            },
             {
                 "type": "error",
                 "error": {

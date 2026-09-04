@@ -2675,6 +2675,7 @@ async def test_native_inworld_realtime_model_uses_one_grounded_speech_session(mo
     assert realtime._opts.turn_detection.type == "semantic_vad"
     assert realtime._opts.turn_detection.create_response is True
     assert realtime._opts.turn_detection.interrupt_response is True
+    assert realtime.output_tts_model == "inworld-tts-1.5-max"
 
     session = realtime.session()
     serialized_before_explicit_update = int(
@@ -2682,6 +2683,8 @@ async def test_native_inworld_realtime_model_uses_one_grounded_speech_session(mo
     )
     update = session._create_session_update_event()
     transcription = update["session"]["audio"]["input"]["transcription"]
+    assert update["session"]["audio"]["output"]["model"] == "inworld-tts-1.5-max"
+    assert wire_telemetry["realtime_tts_session_update_serialized_model"] == ("inworld-tts-1.5-max")
     assert transcription["model"] == "assemblyai/u3-rt-pro"
     assert transcription["language"] == "en-GB"
     assert wire_telemetry["stt_session_update_serialized_model"] == "assemblyai/u3-rt-pro"

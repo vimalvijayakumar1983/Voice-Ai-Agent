@@ -18,6 +18,11 @@ InworldSTTModel = Literal[
     "soniox/stt-rt-v4",
     "inworld/inworld-stt-1",
 ]
+InworldRealtimeTTSModel = Literal[
+    "inworld-tts-1.5-max",
+    "inworld-tts-1.5-mini",
+    "inworld-tts-2",
+]
 
 DiagnosticRecordingMode = Literal["off", "livekit_egress_explicit_consent"]
 KnowledgeTurnMode = Literal["tool_loop", "single_pass_experimental"]
@@ -34,6 +39,7 @@ class RuntimeProfileUpdate(BaseModel):
     stt_language: str = Field("auto", min_length=2, max_length=30)
     stt_model: InworldSTTModel = "auto"
     tts_delivery_mode: Literal["stable", "balanced", "creative"] = "balanced"
+    inworld_realtime_tts_model: InworldRealtimeTTSModel = "inworld-tts-1.5-max"
     diagnostic_recording_mode: DiagnosticRecordingMode = "off"
     max_concurrent_calls: int = Field(1, ge=1, le=100)
     daily_call_limit: int = Field(100, ge=1, le=100_000)
@@ -96,6 +102,7 @@ class RuntimeProfileResponse(BaseModel):
     stt_language: str
     stt_model: InworldSTTModel
     tts_delivery_mode: Literal["stable", "balanced", "creative"]
+    inworld_realtime_tts_model: InworldRealtimeTTSModel
     diagnostic_recording_mode: DiagnosticRecordingMode
     max_concurrent_calls: int
     daily_call_limit: int

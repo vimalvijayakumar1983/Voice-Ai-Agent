@@ -75,7 +75,7 @@ class InworldRealtimeSession(openai.realtime.RealtimeSession):
         # selected explicitly instead of relying on a changing provider default.
         payload.setdefault("session", {}).setdefault("audio", {}).setdefault("output", {})[
             "model"
-        ] = INWORLD_TTS_MODEL
+        ] = self._realtime_model.output_tts_model
         self._record_wire_telemetry(payload)
         return payload
 
@@ -99,11 +99,16 @@ class InworldRealtimeSession(openai.realtime.RealtimeSession):
                 "stt_session_update_provider_acknowledgement_observed": False,
                 "stt_session_update_serialized_sequence": sequence,
                 "stt_session_update_serialized_at": datetime.now(UTC).isoformat(),
+                "realtime_tts_session_update_serialized_model": None,
             }
         )
         session = payload.get("session")
         audio = session.get("audio") if isinstance(session, dict) else None
         input_audio = audio.get("input") if isinstance(audio, dict) else None
+        output_audio = audio.get("output") if isinstance(audio, dict) else None
+        if isinstance(output_audio, dict):
+            output_model = str(output_audio.get("model") or "").strip()
+            telemetry["realtime_tts_session_update_serialized_model"] = output_model or None
         transcription = input_audio.get("transcription") if isinstance(input_audio, dict) else None
         if not isinstance(transcription, dict):
             return
@@ -136,12 +141,14 @@ class InworldRealtimeModel(openai.realtime.RealtimeModel):
         *,
         wire_telemetry: dict[str, Any] | None = None,
         recognition_lexicon_count: int = 0,
+        output_tts_model: str = INWORLD_TTS_MODEL,
         **kwargs,
     ):
         super().__init__(**kwargs)
         self._provider_label = "Inworld Realtime API"
         self._wire_telemetry = wire_telemetry
         self._recognition_lexicon_count = max(0, int(recognition_lexicon_count))
+        self.output_tts_model = output_tts_model
 
     @property
     def provider(self) -> str:

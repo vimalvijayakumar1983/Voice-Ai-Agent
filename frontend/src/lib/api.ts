@@ -184,6 +184,7 @@ export interface RuntimeProfile {
   stt_language: string;
   stt_model: 'auto' | 'assemblyai/u3-rt-pro' | 'soniox/stt-rt-v4' | 'inworld/inworld-stt-1';
   tts_delivery_mode: 'stable' | 'balanced' | 'creative';
+  inworld_realtime_tts_model: 'inworld-tts-1.5-max' | 'inworld-tts-1.5-mini' | 'inworld-tts-2';
   diagnostic_recording_mode: 'off' | 'livekit_egress_explicit_consent';
   max_concurrent_calls: number;
   daily_call_limit: number;

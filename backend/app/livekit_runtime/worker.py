@@ -1784,6 +1784,19 @@ def _inworld_voice_runtime(profile: AgentRuntimeProfile) -> str:
     return configured if configured in INWORLD_VOICE_RUNTIMES else "pipeline"
 
 
+def _inworld_realtime_tts_model(profile: AgentRuntimeProfile | None) -> str:
+    raw_runtime_config = getattr(profile, "runtime_config", None) if profile is not None else None
+    runtime_config = raw_runtime_config if isinstance(raw_runtime_config, dict) else {}
+    configured = str(
+        runtime_config.get("inworld_realtime_tts_model") or "inworld-tts-1.5-max"
+    ).strip()
+    return (
+        configured
+        if configured in {"inworld-tts-1.5-max", "inworld-tts-1.5-mini", "inworld-tts-2"}
+        else "inworld-tts-1.5-max"
+    )
+
+
 def _build_inworld_realtime_model(
     *,
     model: AgentModel,
@@ -1827,6 +1840,7 @@ def _build_inworld_realtime_model(
         speed=model.speech_rate,
         wire_telemetry=wire_telemetry,
         recognition_lexicon_count=len(recognition_terms),
+        output_tts_model=_inworld_realtime_tts_model(profile),
     )
 
 
@@ -1911,6 +1925,7 @@ def _served_browser_configuration(
         "knowledge_turn_mode": knowledge_turn_mode,
         "stt_model": _inworld_stt_model(model=model, profile=profile),
         "tts_delivery_mode": _inworld_delivery_mode(profile),
+        "inworld_realtime_tts_model": _inworld_realtime_tts_model(profile),
         "llm_provider": profile.llm_provider,
         "llm_model": profile.llm_model,
         "system_prompt_sha256": _sha256_text(model.system_prompt),

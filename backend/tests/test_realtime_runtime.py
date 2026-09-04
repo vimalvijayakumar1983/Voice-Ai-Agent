@@ -96,6 +96,18 @@ def test_single_pass_policy_is_typed_native_only_and_defaults_to_control():
         RuntimeProfileUpdate(knowledge_turn_mode="single_pass")
 
 
+def test_realtime_speech_model_is_typed_and_defaults_to_quality_latency_balance():
+    assert RuntimeProfileUpdate().inworld_realtime_tts_model == "inworld-tts-1.5-max"
+    assert (
+        RuntimeProfileUpdate(
+            inworld_realtime_tts_model="inworld-tts-1.5-mini"
+        ).inworld_realtime_tts_model
+        == "inworld-tts-1.5-mini"
+    )
+    with pytest.raises(ValidationError):
+        RuntimeProfileUpdate(inworld_realtime_tts_model="provider-default")
+
+
 def test_diagnostic_recording_defaults_off_and_requires_every_runtime_prerequisite():
     from app.api.v1.endpoints.runtime import _diagnostic_recording_readiness
 
@@ -976,6 +988,7 @@ async def test_native_inworld_readiness_probes_one_complete_realtime_route(
         "voice_id": "Ashley",
         "stt_model_id": "assemblyai/u3-rt-pro",
         "stt_language": "en-GB",
+        "output_tts_model": "inworld-tts-1.5-max",
     }
     if single_pass:
         expected_probe["single_pass"] = True
@@ -1053,6 +1066,7 @@ async def test_native_readiness_uses_the_production_multilingual_auto_stt_payloa
             "voice_id": "Ashley",
             "stt_model_id": transcription.model,
             "stt_language": transcription.language,
+            "output_tts_model": "inworld-tts-1.5-max",
         }
     ]
     assert transcription.model == "soniox/stt-rt-v4"

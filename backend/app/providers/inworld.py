@@ -17,6 +17,12 @@ import httpx
 from app.core.config import settings
 
 INWORLD_TTS_MODEL = "inworld-tts-2"
+INWORLD_REALTIME_TTS_MODELS = (
+    "inworld-tts-1.5-max",
+    "inworld-tts-1.5-mini",
+    INWORLD_TTS_MODEL,
+)
+INWORLD_REALTIME_TTS_DEFAULT = "inworld-tts-1.5-max"
 MAX_CATALOG_VOICES = 500
 MAX_PREVIEW_BYTES = 8 * 1024 * 1024
 MAX_PROBE_RESPONSE_BYTES = 512 * 1024
@@ -385,6 +391,7 @@ class InworldClient:
         voice_id: str,
         stt_model_id: str,
         stt_language: str | None,
+        output_tts_model: str = INWORLD_TTS_MODEL,
         single_pass: bool = False,
     ) -> None:
         """Prove the exact native response path selected by the runtime policy.
@@ -402,6 +409,9 @@ class InworldClient:
         selected_model = _probe_value(model_id, "Realtime model")
         selected_voice = _probe_value(voice_id, "voice ID")
         selected_stt = _probe_value(stt_model_id, "Realtime transcription model")
+        selected_tts = _probe_value(output_tts_model, "Realtime speech model")
+        if selected_tts not in INWORLD_REALTIME_TTS_MODELS:
+            raise InworldError("Unsupported Inworld Realtime speech model.", status_code=422)
         selected_language = (
             None
             if stt_language is None
@@ -449,7 +459,7 @@ class InworldClient:
                     },
                     "output": {
                         "voice": selected_voice,
-                        "model": INWORLD_TTS_MODEL,
+                        "model": selected_tts,
                         "speed": 1.0,
                     },
                 },
@@ -483,8 +493,11 @@ class InworldClient:
                         raise InworldError(
                             "Inworld Realtime readiness probe did not accept the selected route."
                         )
+                    effective = configured.get("session")
+                    effective_audio = (
+                        effective.get("audio") if isinstance(effective, dict) else None
+                    )
                     if single_pass:
-                        effective = configured.get("session")
                         effective_audio = (
                             effective.get("audio") if isinstance(effective, dict) else None
                         )
@@ -519,6 +532,17 @@ class InworldClient:
                                 "session configuration.",
                                 status_code=422,
                             )
+                    effective_output = (
+                        effective_audio.get("output") if isinstance(effective_audio, dict) else None
+                    )
+                    if not (
+                        isinstance(effective_output, dict)
+                        and effective_output.get("model") == selected_tts
+                    ):
+                        raise InworldError(
+                            "Inworld Realtime did not echo the selected speech model.",
+                            status_code=422,
+                        )
                     await websocket.send_json(
                         {
                             "type": "conversation.item.create",

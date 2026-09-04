@@ -32,7 +32,12 @@ from app.models.agent import (
 )
 from app.models.provider_credential import ProviderCredential
 from app.providers.elevenlabs import ElevenLabsClient, ElevenLabsError
-from app.providers.inworld import INWORLD_TTS_MODEL, InworldClient, InworldError
+from app.providers.inworld import (
+    INWORLD_REALTIME_TTS_DEFAULT,
+    INWORLD_TTS_MODEL,
+    InworldClient,
+    InworldError,
+)
 from app.providers.openai import OpenAIProviderClient, OpenAIProviderError
 from app.providers.sarvam import SarvamAIClient, SarvamAIError
 from app.realtime.sarvam_stream import SarvamStreamError, SarvamSTTStream
@@ -391,6 +396,15 @@ def _knowledge_turn_mode(profile: AgentRuntimeProfile | None) -> str:
         if runtime_config.get("inworld_single_pass") is True
         else InworldTurnMode.TOOL_LOOP.value
     )
+
+
+def _inworld_realtime_tts_model(profile: AgentRuntimeProfile | None) -> str:
+    runtime_config = (
+        profile.runtime_config
+        if profile is not None and isinstance(profile.runtime_config, dict)
+        else {}
+    )
+    return str(runtime_config.get("inworld_realtime_tts_model") or INWORLD_REALTIME_TTS_DEFAULT)
 
 
 def _knowledge_turn_audit_details(
@@ -1331,6 +1345,7 @@ async def live_runtime_readiness(
                 "voice_id": agent.voice_id.removeprefix("inworld:"),
                 "stt_model_id": configured_stt,
                 "stt_language": configured_language,
+                "output_tts_model": _inworld_realtime_tts_model(profile),
             }
             if single_pass_enabled:
                 # Preserve the deployed control probe byte-for-byte while making
@@ -1412,6 +1427,7 @@ def _response(
         "stt_language": "auto",
         "stt_model": "auto",
         "tts_delivery_mode": "balanced",
+        "inworld_realtime_tts_model": INWORLD_REALTIME_TTS_DEFAULT,
         "diagnostic_recording_mode": DIAGNOSTIC_RECORDING_OFF,
         "max_concurrent_calls": 1,
         "daily_call_limit": 100,
@@ -1429,6 +1445,7 @@ def _response(
                     "knowledge_turn_mode",
                     "stt_model",
                     "tts_delivery_mode",
+                    "inworld_realtime_tts_model",
                     "diagnostic_recording_mode",
                 }
             }
@@ -1455,6 +1472,7 @@ def _response(
         values["tts_delivery_mode"] = (
             delivery_mode if delivery_mode in {"stable", "balanced", "creative"} else "balanced"
         )
+        values["inworld_realtime_tts_model"] = _inworld_realtime_tts_model(profile)
         values["diagnostic_recording_mode"] = _diagnostic_recording_mode(profile)
     return RuntimeProfileResponse(
         id=profile.id if profile else None,
@@ -1521,6 +1539,7 @@ async def update_runtime_profile(
             "knowledge_turn_mode",
             "stt_model",
             "tts_delivery_mode",
+            "inworld_realtime_tts_model",
             "diagnostic_recording_mode",
         }
     )
@@ -1545,6 +1564,11 @@ async def update_runtime_profile(
         runtime_config = {
             **runtime_config,
             "tts_delivery_mode": data.tts_delivery_mode,
+        }
+    if "inworld_realtime_tts_model" in data.model_fields_set:
+        runtime_config = {
+            **runtime_config,
+            "inworld_realtime_tts_model": data.inworld_realtime_tts_model,
         }
     if "diagnostic_recording_mode" in data.model_fields_set:
         runtime_config = {
@@ -1574,6 +1598,7 @@ async def update_runtime_profile(
             "voice_runtime": data.voice_runtime,
             "stt_model": data.stt_model,
             "tts_delivery_mode": delivery_mode,
+            "inworld_realtime_tts_model": _inworld_realtime_tts_model(profile),
             "diagnostic_recording_mode": _diagnostic_recording_mode(profile),
             "diagnostic_recording_opted_in": (
                 _diagnostic_recording_mode(profile) != DIAGNOSTIC_RECORDING_OFF

@@ -45,6 +45,7 @@ export default function RuntimeControlPanel({ agent, profile, onClose, onChange 
     stt_language: form.stt_language,
     stt_model: form.stt_model,
     tts_delivery_mode: form.tts_delivery_mode,
+    inworld_realtime_tts_model: form.inworld_realtime_tts_model,
     diagnostic_recording_mode: form.diagnostic_recording_mode,
     max_concurrent_calls: Number(form.max_concurrent_calls),
     daily_call_limit: Number(form.daily_call_limit),
@@ -62,6 +63,7 @@ export default function RuntimeControlPanel({ agent, profile, onClose, onChange 
     stt_language: profile.stt_language,
     stt_model: profile.stt_model,
     tts_delivery_mode: profile.tts_delivery_mode,
+    inworld_realtime_tts_model: profile.inworld_realtime_tts_model,
     diagnostic_recording_mode: profile.diagnostic_recording_mode,
     max_concurrent_calls: Number(profile.max_concurrent_calls),
     daily_call_limit: Number(profile.daily_call_limit),
@@ -217,12 +219,23 @@ export default function RuntimeControlPanel({ agent, profile, onClose, onChange 
           <label htmlFor="runtime-speech-provider">Speech output</label>
           <input
             id="runtime-speech-provider"
-            value={inworldRuntime ? (form.voice_runtime === 'inworld_realtime' ? 'Inworld Realtime + TTS-2' : 'Inworld STT + TTS-2 components') : speechProvider === 'elevenlabs' ? 'ElevenLabs Flash v2.5' : 'Sarvam Bulbul v3'}
+            value={inworldRuntime ? (form.voice_runtime === 'inworld_realtime' ? `Inworld Realtime + ${form.inworld_realtime_tts_model}` : 'Inworld STT + TTS-2 components') : speechProvider === 'elevenlabs' ? 'ElevenLabs Flash v2.5' : 'Sarvam Bulbul v3'}
             readOnly
             aria-readonly="true"
           />
           <p className="form-hint">This follows the agent&apos;s selected voice provider. Native Realtime uses the same Inworld workspace credential for the complete session.</p>
         </div>
+        {inworldRuntime && form.voice_runtime === 'inworld_realtime' ? (
+          <div className="form-group">
+            <label htmlFor="runtime-realtime-tts-model">Realtime voice engine</label>
+            <select id="runtime-realtime-tts-model" value={form.inworld_realtime_tts_model} onChange={(event) => setForm({ ...form, inworld_realtime_tts_model: event.target.value as RuntimeProfile['inworld_realtime_tts_model'] })}>
+              <option value="inworld-tts-1.5-max">TTS 1.5 Max · recommended quality and speed</option>
+              <option value="inworld-tts-1.5-mini">TTS 1.5 Mini · lowest latency</option>
+              <option value="inworld-tts-2">TTS-2 · expressive rollback option</option>
+            </select>
+            <p className="form-hint">Saved per agent, verified by readiness, and stamped into every call trace. Start with Max; use Mini only when the latency gate requires it.</p>
+          </div>
+        ) : null}
         <div className="form-group">
           <label htmlFor="runtime-llm">LLM route</label>
           <select id="runtime-llm" value={`${form.llm_provider}:${form.llm_model}`} onChange={(event) => {
