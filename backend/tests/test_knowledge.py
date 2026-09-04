@@ -893,6 +893,91 @@ async def test_pdf_delete_commits_cleanup_intent_before_remote_delete(
 
 
 @pytest.mark.asyncio
+async def test_provider_item_url_delete_commits_cleanup_intent(
+    client,
+    auth_headers,
+    tenant,
+    db,
+    monkeypatch,
+):
+    class KnowledgeClient:
+        async def list_scraped_knowledge_urls(self, knowledge_base_id):
+            assert knowledge_base_id == "provider-kb-item-url-delete"
+            return []
+
+        async def list_knowledge_items(self, knowledge_base_id):
+            assert knowledge_base_id == "provider-kb-item-url-delete"
+            return [
+                {
+                    "_id": "provider-item-url-retire",
+                    "url": "https://example.com/retire",
+                    "processingStatus": "completed",
+                }
+            ]
+
+        async def delete_knowledge_item(self, **_kwargs):
+            raise AssertionError("The request must not perform an inline remote delete")
+
+    monkeypatch.setattr(knowledge_endpoint, "get_smallest_client", KnowledgeClient)
+    kicked_cleanup_ids: list[UUID] = []
+    monkeypatch.setattr(
+        knowledge_endpoint,
+        "_kick_provider_cleanup",
+        lambda cleanup_ids: kicked_cleanup_ids.extend(cleanup_ids),
+    )
+    knowledge = KnowledgeBase(
+        tenant_id=tenant.id,
+        name="Provider item URL deletion safety",
+        provider="smallest",
+        provider_knowledge_base_id="provider-kb-item-url-delete",
+        sync_status="ready",
+        approval_status="approved",
+        source_count=2,
+        indexed_source_count=2,
+    )
+    url_source = KnowledgeSource(
+        tenant_id=tenant.id,
+        source_type="url",
+        name="Retired page",
+        location="https://example.com/retire",
+        content="Provider-backed URL to retire.",
+        status="indexed",
+        provider_item_id="provider-item-url-retire",
+    )
+    text_source = KnowledgeSource(
+        tenant_id=tenant.id,
+        source_type="text",
+        name="Retained text",
+        content="Approved content that keeps the mutable draft retrieval-ready.",
+        status="indexed",
+    )
+    knowledge.sources.extend([url_source, text_source])
+    db.add(knowledge)
+    await db.commit()
+    knowledge_id = knowledge.id
+    url_source_id = url_source.id
+
+    response = await client.delete(
+        f"/api/v1/knowledge/{knowledge_id}/sources/{url_source_id}",
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200
+    assert [source["name"] for source in response.json()["sources"]] == ["Retained text"]
+    cleanup = await db.scalar(
+        select(KnowledgeProviderCleanup).where(
+            KnowledgeProviderCleanup.provider_item_id == "provider-item-url-retire"
+        )
+    )
+    assert cleanup is not None
+    assert cleanup.status == "pending"
+    assert cleanup.knowledge_source_id is None
+    assert kicked_cleanup_ids == [cleanup.id]
+    db.expire_all()
+    assert await db.get(KnowledgeSource, url_source_id) is None
+
+
+@pytest.mark.asyncio
 async def test_delete_grouped_url_source_removes_provider_and_local_group(
     client,
     auth_headers,

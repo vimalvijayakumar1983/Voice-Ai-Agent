@@ -733,7 +733,7 @@ def _provider_source_delete_target(
     if source.provider_item_id in scraped_parent_by_child_id:
         return "scraped", scraped_parent_by_child_id[source.provider_item_id]
     if source.provider_item_id in items_by_id:
-        return "item", source.provider_item_id
+        return "items", source.provider_item_id
 
     if source.location:
         source_key = _provider_url_key(source.location)
@@ -750,14 +750,14 @@ def _provider_source_delete_target(
             ):
                 provider_id = str(item.get("_id") or item.get("id") or "")
                 if provider_id:
-                    return "item", provider_id
+                    return "items", provider_id
 
     if source.source_type == "file":
         for item in items:
             if _provider_file_name(item) == source.name:
                 provider_id = str(item.get("_id") or item.get("id") or "")
                 if provider_id:
-                    return "item", provider_id
+                    return "items", provider_id
     return None
 
 

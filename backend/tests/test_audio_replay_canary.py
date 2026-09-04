@@ -135,6 +135,7 @@ def _completed_call(call_id: UUID, agent_id: UUID) -> dict:
         "provider_call_sid": f"vav-browser-{call_id}",
         "status": "completed",
         "call_metadata": {
+            "livekit_room": f"vav-browser-{call_id}",
             "runtime": {
                 "participant_active_to_first_server_speaking_ms": 800,
                 "turn_latency_p50_ms": 900,
@@ -151,7 +152,7 @@ def _completed_call(call_id: UUID, agent_id: UUID) -> dict:
                         "private_transcript": "must-not-leak",
                     }
                 ],
-            }
+            },
         },
     }
 
@@ -377,7 +378,10 @@ class _FakeSIPAPI(_FakeAPI):
     async def get_call(self, call_id: UUID) -> dict:
         call = await super().get_call(call_id)
         call["provider"] = "livekit_sip"
-        call["provider_call_sid"] = "qa-sip-room"
+        # Inbound SIP persists the provider's SIP Call-ID here. The LiveKit
+        # room is a separate, canonical transport identity in call metadata.
+        call["provider_call_sid"] = "sip-call-id-full-123"
+        call["call_metadata"]["livekit_room"] = "qa-sip-room"
         return call
 
 
@@ -397,6 +401,55 @@ async def test_sip_replay_only_joins_precreated_allowlisted_fixture(tmp_path):
     assert report.passed
     assert publisher.arguments["room_name"] == "qa-sip-room"
     assert publisher.arguments["access_token"] == "private-livekit-token"
+
+
+@pytest.mark.asyncio
+async def test_sip_replay_rejects_call_with_different_canonical_room(tmp_path):
+    manifest = _manifest(mode="sip_fixture")
+    environ, agent_id = _environment(tmp_path, mode="sip_fixture")
+    call_id = UUID(environ["TEST_CALL_ID"])
+
+    class WrongRoomSIPAPI(_FakeSIPAPI):
+        async def get_call(self, call_id: UUID) -> dict:
+            call = await super().get_call(call_id)
+            call["call_metadata"]["livekit_room"] = "qa-different-room"
+            return call
+
+    publisher = _FakePublisher()
+    with pytest.raises(ReplayExecutionError, match="explicit test room"):
+        await run_live_audio_replay(
+            manifest,
+            environ=environ,
+            api=WrongRoomSIPAPI(agent_id=agent_id, call_id=call_id),
+            publisher=publisher,
+        )
+    assert publisher.arguments is None
+
+
+@pytest.mark.asyncio
+async def test_sip_replay_requires_canonical_room_metadata(tmp_path):
+    manifest = _manifest(mode="sip_fixture")
+    environ, agent_id = _environment(tmp_path, mode="sip_fixture")
+    call_id = UUID(environ["TEST_CALL_ID"])
+
+    class MissingRoomSIPAPI(_FakeSIPAPI):
+        async def get_call(self, call_id: UUID) -> dict:
+            call = await super().get_call(call_id)
+            call["call_metadata"].pop("livekit_room")
+            # Matching the old overloaded field must not bypass the
+            # fail-closed canonical-room check.
+            call["provider_call_sid"] = "qa-sip-room"
+            return call
+
+    publisher = _FakePublisher()
+    with pytest.raises(ReplayExecutionError, match="canonical LiveKit room metadata"):
+        await run_live_audio_replay(
+            manifest,
+            environ=environ,
+            api=MissingRoomSIPAPI(agent_id=agent_id, call_id=call_id),
+            publisher=publisher,
+        )
+    assert publisher.arguments is None
 
 
 @pytest.mark.asyncio

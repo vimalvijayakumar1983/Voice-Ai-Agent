@@ -1051,8 +1051,13 @@ def _validate_call_target(
         raise ReplayExecutionError("VAV call does not belong to the allowlisted QA agent")
     if str(call.get("provider") or "") != expected_provider:
         raise ReplayExecutionError("VAV call transport does not match the replay manifest")
-    provider_room = str(call.get("provider_call_sid") or "")
-    if provider_room and provider_room != room_name:
+    call_metadata = call.get("call_metadata")
+    if not isinstance(call_metadata, Mapping):
+        raise ReplayExecutionError("VAV call is missing its canonical LiveKit room metadata")
+    provider_room = str(call_metadata.get("livekit_room") or "").strip()
+    if not provider_room:
+        raise ReplayExecutionError("VAV call is missing its canonical LiveKit room metadata")
+    if provider_room != room_name:
         raise ReplayExecutionError("VAV call room does not match the explicit test room")
     if str(call.get("status") or "") in TERMINAL_CALL_STATUSES:
         raise ReplayExecutionError("VAV test call is already terminal")
