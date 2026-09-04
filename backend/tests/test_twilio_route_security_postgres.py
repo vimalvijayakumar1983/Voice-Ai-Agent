@@ -72,6 +72,7 @@ async def test_postgres_same_account_did_can_activate_for_only_one_tenant(db, te
         profiles.append(profile)
     await db.commit()
     identities = [(agent.id, agent.tenant_id) for agent in agents]
+    profile_ids = [profile.id for profile in profiles]
 
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     first_has_route_lock = asyncio.Event()
@@ -123,7 +124,7 @@ async def test_postgres_same_account_did_can_activate_for_only_one_tenant(db, te
 
     db.expire_all()
     active_count = 0
-    for profile in profiles:
-        stored = await db.get(AgentRuntimeProfile, profile.id)
+    for profile_id in profile_ids:
+        stored = await db.get(AgentRuntimeProfile, profile_id)
         active_count += int(bool(stored and stored.enabled and stored.status == "active"))
     assert active_count == 1

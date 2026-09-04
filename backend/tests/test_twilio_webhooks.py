@@ -365,7 +365,7 @@ async def test_late_nonterminal_callback_cannot_mutate_completed_call(
     await db.refresh(call)
     assert call.status == "completed"
     assert call.duration_seconds == 37
-    assert call.ended_at == original_ended_at.replace(tzinfo=None)
+    assert call.ended_at.replace(tzinfo=UTC) == original_ended_at.replace(tzinfo=UTC)
     assert call.provider_recording_url == "https://recordings.example/original"
 
 
