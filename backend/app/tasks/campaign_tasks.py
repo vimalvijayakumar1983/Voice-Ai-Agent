@@ -112,8 +112,31 @@ def run_campaign(self, campaign_id: str, tenant_id: str):
     try:
         return _run_async(_run_campaign_async(campaign_id, tenant_id))
     except Exception as exc:
-        logger.exception("campaign_task_failed", campaign_id=campaign_id, tenant_id=tenant_id)
-        raise self.retry(exc=exc, countdown=min(2 ** (self.request.retries + 1), 60)) from exc
+        # This module may run with structlog's direct PrintLogger backend,
+        # which bypasses stdlib handler/traceback redaction. Keep this event
+        # useful without handing the raw exception to structlog; Celery logs
+        # the retry traceback through its already-redacted stdlib handlers.
+        error_type = type(exc).__name__
+        error_message = redact_twilio_callback_claim_text(str(exc))[:1000]
+        logger.error(
+            "campaign_task_failed",
+            campaign_id=campaign_id,
+            tenant_id=tenant_id,
+            error_type=error_type,
+            error=error_message,
+        )
+        # Never pass the provider exception itself to Celery: retry results,
+        # serializers, or handlers outside this process may render it. Build a
+        # generic sanitized exception, then leave this exception handler before
+        # asking Celery to schedule or raise the retry.
+        retry_exception = RuntimeError(error_message or "Campaign task failed")
+        retry_countdown = min(2 ** (self.request.retries + 1), 60)
+    retry_signal = self.retry(
+        exc=retry_exception,
+        countdown=retry_countdown,
+        throw=False,
+    )
+    raise retry_signal from None
 
 
 @celery_app.task(name="app.tasks.campaign_tasks.sweep_running_campaigns")

@@ -2,12 +2,16 @@
 
 import io
 import logging
+from unittest.mock import Mock
+
+import pytest
 
 from app.core.logging_security import (
     CALLBACK_CLAIM_REDACTION,
     install_callback_claim_log_redaction,
     redact_twilio_callback_claims,
 )
+from app.tasks import campaign_tasks
 from app.tasks.worker import _install_worker_callback_claim_redaction
 
 
@@ -147,3 +151,42 @@ def test_celery_logger_setup_redacts_handler_added_after_worker_import():
     rendered = stream.getvalue()
     assert secret not in rendered
     assert CALLBACK_CLAIM_REDACTION in rendered
+
+
+def test_campaign_task_structlog_failure_redacts_encoded_callback_claim(
+    capsys,
+    monkeypatch,
+):
+    secret = "campaign-structlog-callback-secret"
+    encoded_callback_url = (
+        "Url=https%3A%2F%2Fvoice.example.test%2Fcallback%3F"
+        f"vav_callback_claim%3D{secret}%26keep%3D1"
+    )
+    provider_error = RuntimeError(f"provider echoed {encoded_callback_url}")
+    retry_scheduled = RuntimeError("retry scheduled")
+
+    async def fail_campaign(_campaign_id, _tenant_id):
+        raise provider_error
+
+    monkeypatch.setattr(campaign_tasks, "_run_campaign_async", fail_campaign)
+    retry = Mock(return_value=retry_scheduled)
+    monkeypatch.setattr(campaign_tasks.run_campaign, "retry", retry)
+
+    with pytest.raises(RuntimeError, match="retry scheduled") as exc_info:
+        campaign_tasks.run_campaign.run("campaign-id", "tenant-id")
+
+    captured = capsys.readouterr()
+    rendered = f"{captured.out}\n{captured.err}"
+    assert secret not in rendered
+    assert "campaign_task_failed" in rendered
+    assert "RuntimeError" in rendered
+    assert CALLBACK_CLAIM_REDACTION in rendered
+    retry.assert_called_once()
+    retry_kwargs = retry.call_args.kwargs
+    assert retry_kwargs["throw"] is False
+    assert retry_kwargs["exc"] is not provider_error
+    assert type(retry_kwargs["exc"]) is RuntimeError
+    assert secret not in str(retry_kwargs)
+    assert CALLBACK_CLAIM_REDACTION in str(retry_kwargs["exc"])
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
