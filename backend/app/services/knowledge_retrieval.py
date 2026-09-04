@@ -11,7 +11,17 @@ from difflib import SequenceMatcher
 from urllib.parse import unquote, urlsplit
 from uuid import UUID
 
-from sqlalchemy import Text, case, cast, func, literal_column, or_, select
+from sqlalchemy import (
+    Text,
+    case,
+    cast,
+    func,
+    literal,
+    literal_column,
+    or_,
+    select,
+    union_all,
+)
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.agent import (
@@ -244,6 +254,7 @@ _ENTITY_SEQUENCE = re.compile(
 )
 _UPPERCASE_ENTITY = re.compile(r"\b[A-Z][A-Z0-9&'’-]{3,}\b", re.UNICODE)
 _CONTACT_SOURCE_MARKERS = (
+    "call us",
     "contact",
     "phone",
     "telephone",
@@ -254,6 +265,14 @@ _CONTACT_SOURCE_MARKERS = (
     "mailto:",
     "@",
 )
+_STRONG_CONTACT_TITLE_LOCATION_MARKERS = (
+    "contact",
+    "reach us",
+    "reach-us",
+    "reach_us",
+    "reachus",
+)
+_STRONG_CONTACT_CONTENT_MARKERS = ("call us", "tel:", "telephone", "phone", "mobile")
 _PHONE_TERMS = {"mobile", "phone", "tel", "telephone"}
 _PHONE_NUMBER = re.compile(r"(?<!\w)\+?\d[\d\s().-]{6,}\d(?!\w)")
 
@@ -1461,6 +1480,44 @@ async def _broad_title_candidate_ids(
     )
 
 
+def _contact_candidate_predicate_and_priority(lower_name, lower_location, lower_content):
+    """Build consistent contact-page selection for draft and release corpora.
+
+    Generic website footers make ``email``, ``mailto:`` and ``@`` ubiquitous.
+    Keep those rows eligible, but rank a named Contact/Reach Us page or explicit
+    telephone evidence ahead of them before applying the bounded candidate limit.
+    """
+
+    strong_contact_identity = or_(
+        *(lower_name.contains(marker) for marker in _STRONG_CONTACT_TITLE_LOCATION_MARKERS),
+        *(lower_location.contains(marker) for marker in _STRONG_CONTACT_TITLE_LOCATION_MARKERS),
+    )
+    strong_phone_evidence = or_(
+        *(
+            column.contains(marker)
+            for column in (lower_name, lower_content)
+            for marker in _STRONG_CONTACT_CONTENT_MARKERS
+        )
+    )
+    weaker_named_contact = or_(
+        *(lower_name.contains(marker) for marker in sorted(_CONTACT_QUERY_TOKENS)),
+        lower_location.contains("location"),
+    )
+    predicate = or_(
+        strong_contact_identity,
+        strong_phone_evidence,
+        weaker_named_contact,
+        *(lower_content.contains(marker) for marker in _CONTACT_SOURCE_MARKERS),
+    )
+    priority = case(
+        (strong_contact_identity, 0),
+        (strong_phone_evidence, 1),
+        (weaker_named_contact, 2),
+        else_=3,
+    )
+    return predicate, priority
+
+
 def _is_contact_query(query: str) -> bool:
     return bool(_query_tokens(query) & _CONTACT_QUERY_TOKENS)
 
@@ -1475,16 +1532,10 @@ async def _contact_candidate_source_ids(
     lower_name = func.lower(KnowledgeSource.name)
     lower_location = func.lower(func.coalesce(KnowledgeSource.location, ""))
     lower_content = func.lower(KnowledgeSource.content)
-    contact_predicate = or_(
-        *(lower_name.contains(marker) for marker in _CONTACT_QUERY_TOKENS),
-        *(lower_location.contains(marker) for marker in ("contact", "location")),
-        *(lower_content.contains(marker) for marker in _CONTACT_SOURCE_MARKERS),
-    )
-    title_priority = case(
-        (lower_name.contains("contact"), 0),
-        (lower_location.contains("contact"), 1),
-        (lower_name.contains("location"), 2),
-        else_=3,
+    contact_predicate, contact_priority = _contact_candidate_predicate_and_priority(
+        lower_name,
+        lower_location,
+        lower_content,
     )
     return list(
         (
@@ -1497,7 +1548,7 @@ async def _contact_candidate_source_ids(
                     ),
                     contact_predicate,
                 )
-                .order_by(title_priority, KnowledgeSource.updated_at.desc(), KnowledgeSource.id)
+                .order_by(contact_priority, KnowledgeSource.updated_at.desc(), KnowledgeSource.id)
                 .limit(_CONTACT_CANDIDATE_LIMIT)
             )
         ).all()
@@ -1686,6 +1737,170 @@ async def _candidate_source_ids(
     )
 
 
+def _postgres_serving_revision_source_query(
+    *,
+    tenant_id: UUID,
+    serving_revision_id: UUID,
+    query: str,
+    contact_query: bool,
+    broad_query: bool,
+):
+    """Build one bounded PostgreSQL candidate union for an immutable release.
+
+    Full-text search is intentionally only one candidate lane. A contact page
+    can contain ``Call us at +971 ...`` without the caller's literal words
+    ``phone number``, while a general company question can require an About or
+    Overview page whose body does not repeat the query. Each fallback lane has
+    its own limit so a large FTS result set cannot crowd it out; the outer query
+    then deduplicates and reapplies the global source bound.
+    """
+
+    source = KnowledgeServingRevisionSource
+    scope_filters = (
+        source.tenant_id == tenant_id,
+        source.serving_revision_id == serving_revision_id,
+    )
+    fts_terms = _postgres_fts_terms(query)
+    candidate_lanes = []
+    if fts_terms:
+        empty_text = literal_column("''", type_=Text())
+        search_text = (
+            func.coalesce(cast(source.name, Text), empty_text)
+            + literal_column("' '", type_=Text())
+            + func.coalesce(source.location, empty_text)
+            + literal_column("' '", type_=Text())
+            + func.coalesce(source.content, empty_text)
+        )
+        search_vector = func.to_tsvector(
+            literal_column("'simple'::regconfig"),
+            search_text,
+        )
+        ts_query = _postgres_ts_query(query)
+        rank = func.ts_rank_cd(search_vector, ts_query)
+        fts_lane = (
+            select(
+                source.original_source_id.label("original_source_id"),
+                literal(2).label("lane_priority"),
+                rank.label("fts_rank"),
+            )
+            .where(*scope_filters, search_vector.op("@@")(ts_query))
+            .order_by(rank.desc(), source.created_at.desc(), source.original_source_id)
+            .limit(_FTS_CANDIDATE_LIMIT)
+            .subquery("revision_fts_candidates")
+        )
+        candidate_lanes.append(
+            select(
+                fts_lane.c.original_source_id,
+                fts_lane.c.lane_priority,
+                fts_lane.c.fts_rank,
+            )
+        )
+
+    lower_name = func.lower(source.name)
+    if contact_query:
+        lower_location = func.lower(func.coalesce(source.location, ""))
+        lower_content = func.lower(source.content)
+        contact_predicate, contact_priority = _contact_candidate_predicate_and_priority(
+            lower_name,
+            lower_location,
+            lower_content,
+        )
+        contact_lane = (
+            select(
+                source.original_source_id.label("original_source_id"),
+                literal(0).label("lane_priority"),
+                literal(0.0).label("fts_rank"),
+            )
+            .where(*scope_filters, contact_predicate)
+            .order_by(
+                contact_priority,
+                source.created_at.desc(),
+                source.original_source_id,
+            )
+            .limit(_CONTACT_CANDIDATE_LIMIT)
+            .subquery("revision_contact_candidates")
+        )
+        candidate_lanes.append(
+            select(
+                contact_lane.c.original_source_id,
+                contact_lane.c.lane_priority,
+                contact_lane.c.fts_rank,
+            )
+        )
+
+    if broad_query:
+        broad_title = or_(
+            lower_name.like("the group%"),
+            lower_name.contains("overview"),
+            lower_name.contains("about"),
+            lower_name.contains("profile"),
+            lower_name.contains("division"),
+        )
+        broad_priority = case(
+            (lower_name.like("the group%"), 0),
+            (lower_name.contains("overview"), 1),
+            (lower_name.contains("about"), 1),
+            (lower_name.contains("profile"), 2),
+            (lower_name.contains("division"), 3),
+            else_=4,
+        )
+        broad_lane = (
+            select(
+                source.original_source_id.label("original_source_id"),
+                literal(1).label("lane_priority"),
+                literal(0.0).label("fts_rank"),
+            )
+            .where(*scope_filters, broad_title)
+            .order_by(
+                broad_priority,
+                source.created_at.desc(),
+                source.original_source_id,
+            )
+            .limit(_TITLE_CANDIDATE_LIMIT)
+            .subquery("revision_broad_title_candidates")
+        )
+        candidate_lanes.append(
+            select(
+                broad_lane.c.original_source_id,
+                broad_lane.c.lane_priority,
+                broad_lane.c.fts_rank,
+            )
+        )
+
+    if not candidate_lanes:
+        raise ValueError("PostgreSQL revision candidate search requires a search lane")
+    candidate_union = union_all(*candidate_lanes).subquery("revision_candidate_union")
+    deduplicated_candidates = (
+        select(
+            candidate_union.c.original_source_id,
+            func.min(candidate_union.c.lane_priority).label("lane_priority"),
+            func.max(candidate_union.c.fts_rank).label("fts_rank"),
+        )
+        .group_by(candidate_union.c.original_source_id)
+        .subquery("revision_candidates")
+    )
+    return (
+        select(
+            source.original_source_id,
+            source.name,
+            source.content,
+            source.structured_content,
+        )
+        .join(
+            deduplicated_candidates,
+            deduplicated_candidates.c.original_source_id == source.original_source_id,
+        )
+        .where(*scope_filters)
+        .order_by(
+            deduplicated_candidates.c.lane_priority,
+            deduplicated_candidates.c.fts_rank.desc(),
+            source.created_at.desc(),
+            source.original_source_id,
+        )
+        .limit(MAX_SOURCE_CANDIDATES)
+    )
+
+
 async def _retrieve_serving_revision_context(
     db: AsyncSession,
     *,
@@ -1717,7 +1932,7 @@ async def _retrieve_serving_revision_context(
     if contact_query:
         predicates.extend(
             [
-                *(lower_name.contains(marker) for marker in _CONTACT_QUERY_TOKENS),
+                *(lower_name.contains(marker) for marker in sorted(_CONTACT_QUERY_TOKENS)),
                 *(lower_location.contains(marker) for marker in ("contact", "location")),
                 *(lower_content.contains(marker) for marker in _CONTACT_SOURCE_MARKERS),
             ]
@@ -1726,6 +1941,7 @@ async def _retrieve_serving_revision_context(
     if broad_query:
         predicates.extend(
             (
+                lower_name.like("the group%"),
                 lower_name.contains("overview"),
                 lower_name.contains("about"),
                 lower_name.contains("profile"),
@@ -1733,47 +1949,34 @@ async def _retrieve_serving_revision_context(
             )
         )
 
-    source_query = select(
-        KnowledgeServingRevisionSource.original_source_id,
-        KnowledgeServingRevisionSource.name,
-        KnowledgeServingRevisionSource.content,
-        KnowledgeServingRevisionSource.structured_content,
-    ).where(
-        KnowledgeServingRevisionSource.tenant_id == tenant_id,
-        KnowledgeServingRevisionSource.serving_revision_id == revision.id,
-    )
     dialect = db.get_bind().dialect.name
     order_by: tuple[object, ...] = (
         KnowledgeServingRevisionSource.created_at.desc(),
         KnowledgeServingRevisionSource.original_source_id,
     )
-    if dialect == "postgresql" and _postgres_fts_terms(combined_query):
-        # Rank immutable release rows in PostgreSQL *before* applying the
-        # candidate limit.  The matching expression is backed by the GIN index
-        # created with migration 023, so a relevant page cannot disappear just
-        # because more than 48 pages were published after it.
-        empty_text = literal_column("''", type_=Text())
-        search_text = (
-            func.coalesce(cast(KnowledgeServingRevisionSource.name, Text), empty_text)
-            + literal_column("' '", type_=Text())
-            + func.coalesce(KnowledgeServingRevisionSource.location, empty_text)
-            + literal_column("' '", type_=Text())
-            + func.coalesce(KnowledgeServingRevisionSource.content, empty_text)
+    if dialect == "postgresql":
+        if not (_postgres_fts_terms(combined_query) or contact_query or broad_query):
+            # A stopword-only query has no safe retrieval signal. Returning
+            # before executing a source query avoids loading the whole pinned
+            # revision only for the ranker to reject its empty query tokens.
+            return None
+        source_query = _postgres_serving_revision_source_query(
+            tenant_id=tenant_id,
+            serving_revision_id=revision.id,
+            query=combined_query,
+            contact_query=contact_query,
+            broad_query=broad_query,
         )
-        search_vector = func.to_tsvector(
-            literal_column("'simple'::regconfig"),
-            search_text,
-        )
-        ts_query = _postgres_ts_query(combined_query)
-        rank = func.ts_rank_cd(search_vector, ts_query)
-        source_query = source_query.where(search_vector.op("@@")(ts_query))
-        order_by = (
-            rank.desc(),
-            KnowledgeServingRevisionSource.created_at.desc(),
-            KnowledgeServingRevisionSource.original_source_id,
-        )
-        source_query = source_query.order_by(*order_by).limit(MAX_SOURCE_CANDIDATES)
     else:
+        source_query = select(
+            KnowledgeServingRevisionSource.original_source_id,
+            KnowledgeServingRevisionSource.name,
+            KnowledgeServingRevisionSource.content,
+            KnowledgeServingRevisionSource.structured_content,
+        ).where(
+            KnowledgeServingRevisionSource.tenant_id == tenant_id,
+            KnowledgeServingRevisionSource.serving_revision_id == revision.id,
+        )
         if predicates:
             source_query = source_query.where(or_(*predicates))
         # SQLite is used only for local/test execution and has no production

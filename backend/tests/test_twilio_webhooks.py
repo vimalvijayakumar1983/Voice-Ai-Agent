@@ -2,20 +2,26 @@
 
 import asyncio
 import uuid
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from unittest.mock import Mock
 
 import pytest
 from fastapi import HTTPException
 from httpx import AsyncClient
-from sqlalchemy import func, select
+from sqlalchemy import event, func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 from twilio.request_validator import RequestValidator
 
 from app.api.v1.endpoints import webhooks
 from app.models.agent import Agent, AgentRuntimeProfile
 from app.models.call import Call
-from app.services.provider_credentials import ProviderCredentialError, store_provider_config
+from app.services.provider_credentials import (
+    ProviderCredentialError,
+    invalidate_active_runtimes_for_credential,
+    lock_provider_runtime_boundaries,
+    store_provider_config,
+)
 from app.services.twilio_callback_claim import (
     TWILIO_CALLBACK_CLAIM_METADATA_KEY,
     append_twilio_callback_claim,
@@ -24,6 +30,7 @@ from app.services.twilio_callback_claim import (
 from app.services.twilio_route_security import (
     load_workspace_twilio_route_credential,
     mark_twilio_route_verified,
+    twilio_callback_credential_fingerprint,
 )
 from tests.conftest import engine as test_engine
 from tests.conftest import test_session_factory as session_factory
@@ -83,16 +90,22 @@ async def _native_twilio_voice_call(
     )
     db.add(agent)
     await db.flush()
-    db.add(
-        AgentRuntimeProfile(
-            tenant_id=tenant.id,
-            agent_id=agent.id,
-            enabled=True,
-            status="active",
-            telephony_provider="twilio",
-            primary_speech_provider="sarvam",
-            assigned_numbers=["+15551234567"],
-        )
+    profile = AgentRuntimeProfile(
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        enabled=True,
+        status="active",
+        telephony_provider="twilio",
+        primary_speech_provider="sarvam",
+        assigned_numbers=["+15551234567"],
+    )
+    db.add(profile)
+    route_credential = await load_workspace_twilio_route_credential(db, tenant.id)
+    assert route_credential is not None
+    mark_twilio_route_verified(
+        profile,
+        route_credential,
+        expected_voice_url="http://test/api/v1/webhooks/twilio/voice/inbound",
     )
     call = Call(
         tenant_id=tenant.id,
@@ -110,6 +123,7 @@ async def _native_twilio_voice_call(
                 "provider": "twilio",
                 "source": "workspace",
                 "account_sid": account_sid,
+                "credential_fingerprint": twilio_callback_credential_fingerprint(route_credential),
             },
             "runtime": {"speech_provider": "sarvam"},
             **(
@@ -742,6 +756,448 @@ async def test_native_voice_callback_accepts_matching_call_identity_and_mints_ca
         "telephony_provider": "twilio",
         "speech_provider": "sarvam",
     }
+
+
+@pytest.mark.asyncio
+async def test_native_voice_callback_rejects_bad_signature_before_any_contention_lock(
+    client,
+    tenant,
+    db,
+    monkeypatch,
+):
+    """An unauthenticated request cannot queue behind a real callback."""
+
+    call, account_sid, _auth_token = await _native_twilio_voice_call(db, tenant)
+    call_id = call.id
+    original_metadata = dict(call.call_metadata)
+
+    @asynccontextmanager
+    async def forbidden_local_lock(_identity):
+        raise AssertionError("invalid callbacks must not enter the local contention lock")
+        yield  # pragma: no cover - makes this an async context manager
+
+    async def forbidden_provider_lock(*_args, **_kwargs):
+        raise AssertionError("invalid callbacks must not enter the provider contention lock")
+
+    capability_factory = Mock(side_effect=AssertionError("media capability must not be minted"))
+    monkeypatch.setattr(webhooks, "_local_provider_callback_lock", forbidden_local_lock)
+    monkeypatch.setattr(webhooks, "lock_provider_runtime_boundaries", forbidden_provider_lock)
+    monkeypatch.setattr(webhooks, "_runtime_stream_parameters", capability_factory)
+    monkeypatch.setattr(webhooks.settings, "base_url", "http://test")
+    monkeypatch.setattr(webhooks, "async_session_factory", session_factory)
+
+    response = await client.post(
+        f"/api/v1/webhooks/twilio/voice/{call_id}",
+        data={"AccountSid": account_sid, "CallSid": call.provider_call_sid},
+        headers={"X-Twilio-Signature": "invalid"},
+    )
+
+    assert response.status_code == 401
+    db.expire_all()
+    stored = await db.get(Call, call_id)
+    assert stored.status == "dispatching"
+    assert stored.answered_at is None
+    assert stored.call_metadata == original_metadata
+    capability_factory.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_native_voice_callback_revalidates_current_credential_inside_runtime_boundary(
+    client,
+    tenant,
+    db,
+    monkeypatch,
+):
+    """The same credential must authorize both the cheap probe and locked admission."""
+
+    call, account_sid, auth_token = await _native_twilio_voice_call(db, tenant)
+    events: list[str] = []
+    original_validate = webhooks._validate_twilio_request
+    original_local_lock = webhooks._local_provider_callback_lock
+    original_provider_lock = webhooks.lock_provider_runtime_boundaries
+    original_credential_loader = webhooks.load_workspace_twilio_route_credential
+
+    def tracked_validate(*args, **kwargs):
+        events.append("signature_validated")
+        return original_validate(*args, **kwargs)
+
+    @asynccontextmanager
+    async def tracked_local_lock(identity):
+        events.append("local_lock_entered")
+        async with original_local_lock(identity):
+            yield
+
+    async def tracked_provider_lock(*args, **kwargs):
+        events.append("provider_boundary_acquired")
+        await original_provider_lock(*args, **kwargs)
+
+    async def tracked_credential_loader(*args, **kwargs):
+        events.append(
+            "locked_current_credential_loaded"
+            if kwargs.get("for_update")
+            else "probe_credential_loaded"
+        )
+        return await original_credential_loader(*args, **kwargs)
+
+    def tracked_capability(_call_id):
+        events.append("media_capability_minted")
+        return {"token": "ordered-media-capability"}
+
+    monkeypatch.setattr(webhooks, "_validate_twilio_request", tracked_validate)
+    monkeypatch.setattr(webhooks, "_local_provider_callback_lock", tracked_local_lock)
+    monkeypatch.setattr(webhooks, "lock_provider_runtime_boundaries", tracked_provider_lock)
+    monkeypatch.setattr(
+        webhooks,
+        "load_workspace_twilio_route_credential",
+        tracked_credential_loader,
+    )
+    monkeypatch.setattr(webhooks, "_runtime_stream_parameters", tracked_capability)
+
+    response = await _post_signed_twilio_voice(
+        client,
+        monkeypatch,
+        call,
+        {"AccountSid": account_sid, "CallSid": call.provider_call_sid},
+        auth_token=auth_token,
+    )
+
+    assert response.status_code == 200
+    assert "ordered-media-capability" in response.text
+    first_signature = events.index("signature_validated")
+    local_lock = events.index("local_lock_entered")
+    provider_boundary = events.index("provider_boundary_acquired")
+    locked_credential = events.index("locked_current_credential_loaded")
+    second_signature = events.index("signature_validated", first_signature + 1)
+    media_capability = events.index("media_capability_minted")
+    assert first_signature < local_lock < provider_boundary
+    assert provider_boundary < locked_credential < second_signature < media_capability
+    assert events.count("signature_validated") == 2
+
+
+@pytest.mark.asyncio
+async def test_native_voice_callback_rotation_first_rejects_without_media_or_mutation(
+    client,
+    tenant,
+    db,
+    monkeypatch,
+):
+    """A rotation between probe authentication and admission wins fail-closed."""
+
+    call, account_sid, old_auth_token = await _native_twilio_voice_call(db, tenant)
+    call_id = call.id
+    agent_id = call.agent_id
+    original_metadata = dict(call.call_metadata)
+    original_local_lock = webhooks._local_provider_callback_lock
+    rotated = False
+
+    @asynccontextmanager
+    async def rotate_before_admission(identity):
+        nonlocal rotated
+        async with session_factory() as rotation_db:
+            invalidated = await invalidate_active_runtimes_for_credential(
+                rotation_db,
+                tenant.id,
+                "twilio",
+            )
+            assert invalidated == [str(agent_id)]
+            await store_provider_config(
+                rotation_db,
+                tenant.id,
+                "twilio",
+                {
+                    "account_sid": account_sid,
+                    "auth_token": "rotated_callback_token_987654321",
+                    "default_from_number": "+15551234567",
+                },
+            )
+            await rotation_db.commit()
+        rotated = True
+        async with original_local_lock(identity):
+            yield
+
+    capability_factory = Mock(side_effect=AssertionError("media capability must not be minted"))
+    monkeypatch.setattr(webhooks, "_local_provider_callback_lock", rotate_before_admission)
+    monkeypatch.setattr(webhooks, "_runtime_stream_parameters", capability_factory)
+
+    response = await _post_signed_twilio_voice(
+        client,
+        monkeypatch,
+        call,
+        {"AccountSid": account_sid, "CallSid": call.provider_call_sid},
+        auth_token=old_auth_token,
+    )
+
+    assert rotated is True
+    assert response.status_code == 401
+    assert "<Stream" not in response.text
+    db.expire_all()
+    stored_call = await db.get(Call, call_id)
+    stored_profile = await db.scalar(
+        select(AgentRuntimeProfile).where(AgentRuntimeProfile.agent_id == agent_id)
+    )
+    assert stored_call.status == "dispatching"
+    assert stored_call.answered_at is None
+    assert stored_call.call_metadata == original_metadata
+    assert stored_profile.enabled is False
+    assert stored_profile.status == "draft"
+    capability_factory.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_postgres_native_voice_rotation_first_blocks_then_rejects_callback(
+    client,
+    tenant,
+    db,
+    monkeypatch,
+):
+    """A committed rotation wins when its provider boundary was acquired first."""
+
+    if test_engine.dialect.name != "postgresql":
+        pytest.skip("Requires PostgreSQL advisory-lock semantics")
+
+    call, account_sid, old_auth_token = await _native_twilio_voice_call(db, tenant)
+    call_id = call.id
+    agent_id = call.agent_id
+    original_metadata = dict(call.call_metadata)
+    postgres_sessions = async_sessionmaker(test_engine, expire_on_commit=False)
+    rotation_holds_boundary = asyncio.Event()
+    release_rotation = asyncio.Event()
+    callback_requested_boundary = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    callback_task: asyncio.Task | None = None
+    rotation_task: asyncio.Task | None = None
+    listener_installed = False
+
+    async def rotate_while_holding_boundary() -> None:
+        async with postgres_sessions() as rotation_db, rotation_db.begin():
+            await lock_provider_runtime_boundaries(rotation_db, tenant.id, "twilio")
+            invalidated = await invalidate_active_runtimes_for_credential(
+                rotation_db,
+                tenant.id,
+                "twilio",
+            )
+            assert invalidated == [str(agent_id)]
+            await store_provider_config(
+                rotation_db,
+                tenant.id,
+                "twilio",
+                {
+                    "account_sid": account_sid,
+                    "auth_token": "postgres_rotation_first_token_987654321",
+                    "default_from_number": "+15551234567",
+                },
+            )
+            await rotation_db.flush()
+            rotation_holds_boundary.set()
+            await release_rotation.wait()
+
+    def observe_callback_boundary_request(
+        _connection,
+        _cursor,
+        statement,
+        parameters,
+        _context,
+        _executemany,
+    ) -> None:
+        normalized = str(statement).upper()
+        values = str(parameters)
+        if "PG_ADVISORY_XACT_LOCK" in normalized and "runtime-provider:" in values:
+            loop.call_soon_threadsafe(callback_requested_boundary.set)
+
+    capability_factory = Mock(side_effect=AssertionError("media capability must not be minted"))
+    monkeypatch.setattr(webhooks, "_runtime_stream_parameters", capability_factory)
+
+    try:
+        rotation_task = asyncio.create_task(rotate_while_holding_boundary())
+        await asyncio.wait_for(rotation_holds_boundary.wait(), timeout=5)
+
+        event.listen(
+            test_engine.sync_engine,
+            "before_cursor_execute",
+            observe_callback_boundary_request,
+        )
+        listener_installed = True
+        callback_task = asyncio.create_task(
+            _post_signed_twilio_voice(
+                client,
+                monkeypatch,
+                call,
+                {"AccountSid": account_sid, "CallSid": call.provider_call_sid},
+                auth_token=old_auth_token,
+            )
+        )
+        await asyncio.wait_for(callback_requested_boundary.wait(), timeout=5)
+
+        assert not callback_task.done()
+        release_rotation.set()
+
+        await asyncio.wait_for(rotation_task, timeout=5)
+        response = await asyncio.wait_for(callback_task, timeout=5)
+    finally:
+        release_rotation.set()
+        if listener_installed:
+            event.remove(
+                test_engine.sync_engine,
+                "before_cursor_execute",
+                observe_callback_boundary_request,
+            )
+        for task in (callback_task, rotation_task):
+            if task is not None and not task.done():
+                task.cancel()
+        pending = [task for task in (callback_task, rotation_task) if task is not None]
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    assert response.status_code == 401
+    assert "<Stream" not in response.text
+    db.expire_all()
+    stored_call = await db.get(Call, call_id)
+    stored_profile = await db.scalar(
+        select(AgentRuntimeProfile).where(AgentRuntimeProfile.agent_id == agent_id)
+    )
+    assert stored_call.status == "dispatching"
+    assert stored_call.answered_at is None
+    assert stored_call.call_metadata == original_metadata
+    assert stored_profile.enabled is False
+    assert stored_profile.status == "draft"
+    capability_factory.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_postgres_native_voice_callback_first_serializes_credential_rotation(
+    client,
+    tenant,
+    db,
+    monkeypatch,
+):
+    """A callback holding provider/runtime authority may finish before rotation."""
+
+    if test_engine.dialect.name != "postgresql":
+        pytest.skip("Requires PostgreSQL advisory-lock semantics")
+
+    call, account_sid, auth_token = await _native_twilio_voice_call(db, tenant)
+    call_id = call.id
+    agent_id = call.agent_id
+    postgres_sessions = async_sessionmaker(test_engine, expire_on_commit=False)
+    callback_holds_boundary = asyncio.Event()
+    release_callback = asyncio.Event()
+    rotation_requested_boundary = asyncio.Event()
+    rotation_acquired_boundary = asyncio.Event()
+    original_runtime_lock = webhooks._lock_native_twilio_voice_callback_runtime
+    loop = asyncio.get_running_loop()
+    callback_task: asyncio.Task | None = None
+    rotation_task: asyncio.Task | None = None
+    listener_installed = False
+
+    async def hold_callback_boundary(*args, **kwargs):
+        result = await original_runtime_lock(*args, **kwargs)
+        callback_holds_boundary.set()
+        await release_callback.wait()
+        return result
+
+    async def rotate_after_callback() -> None:
+        async with postgres_sessions() as rotation_db, rotation_db.begin():
+            await lock_provider_runtime_boundaries(rotation_db, tenant.id, "twilio")
+            rotation_acquired_boundary.set()
+            invalidated = await invalidate_active_runtimes_for_credential(
+                rotation_db,
+                tenant.id,
+                "twilio",
+            )
+            assert invalidated == [str(agent_id)]
+            await store_provider_config(
+                rotation_db,
+                tenant.id,
+                "twilio",
+                {
+                    "account_sid": account_sid,
+                    "auth_token": "postgres_callback_first_rotated_987654321",
+                    "default_from_number": "+15551234567",
+                },
+            )
+
+    def observe_rotation_boundary_request(
+        _connection,
+        _cursor,
+        statement,
+        parameters,
+        _context,
+        _executemany,
+    ) -> None:
+        normalized = str(statement).upper()
+        values = str(parameters)
+        if "PG_ADVISORY_XACT_LOCK" in normalized and "runtime-provider:" in values:
+            loop.call_soon_threadsafe(rotation_requested_boundary.set)
+
+    monkeypatch.setattr(
+        webhooks,
+        "_lock_native_twilio_voice_callback_runtime",
+        hold_callback_boundary,
+    )
+    monkeypatch.setattr(
+        webhooks,
+        "_runtime_stream_parameters",
+        lambda _call_id: {"token": "callback-first-media-capability"},
+    )
+
+    try:
+        callback_task = asyncio.create_task(
+            _post_signed_twilio_voice(
+                client,
+                monkeypatch,
+                call,
+                {"AccountSid": account_sid, "CallSid": call.provider_call_sid},
+                auth_token=auth_token,
+            )
+        )
+        await asyncio.wait_for(callback_holds_boundary.wait(), timeout=5)
+
+        event.listen(
+            test_engine.sync_engine,
+            "before_cursor_execute",
+            observe_rotation_boundary_request,
+        )
+        listener_installed = True
+        rotation_task = asyncio.create_task(rotate_after_callback())
+        await asyncio.wait_for(rotation_requested_boundary.wait(), timeout=5)
+
+        assert not rotation_acquired_boundary.is_set()
+        assert not rotation_task.done()
+        release_callback.set()
+
+        response = await asyncio.wait_for(callback_task, timeout=5)
+        await asyncio.wait_for(rotation_task, timeout=5)
+    finally:
+        release_callback.set()
+        if listener_installed:
+            event.remove(
+                test_engine.sync_engine,
+                "before_cursor_execute",
+                observe_rotation_boundary_request,
+            )
+        for task in (callback_task, rotation_task):
+            if task is not None and not task.done():
+                task.cancel()
+        pending = [task for task in (callback_task, rotation_task) if task is not None]
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    assert response.status_code == 200
+    assert "<Stream" in response.text
+    assert "callback-first-media-capability" in response.text
+    db.expire_all()
+    stored_call = await db.get(Call, call_id)
+    stored_profile = await db.scalar(
+        select(AgentRuntimeProfile).where(AgentRuntimeProfile.agent_id == agent_id)
+    )
+    assert stored_call.status == "in_progress"
+    assert stored_call.answered_at is not None
+    assert stored_call.call_metadata["runtime_route"] == {
+        "telephony_provider": "twilio",
+        "speech_provider": "sarvam",
+    }
+    assert stored_profile.enabled is False
+    assert stored_profile.status == "draft"
 
 
 @pytest.mark.asyncio

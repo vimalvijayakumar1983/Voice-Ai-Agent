@@ -53,7 +53,11 @@ def twilio_callback_claim_matches(metadata: dict, supplied_token: str | None) ->
     if not supplied_token:
         return False
     claim = metadata.get(TWILIO_CALLBACK_CLAIM_METADATA_KEY)
-    if not isinstance(claim, dict) or claim.get("version") != TWILIO_CALLBACK_CLAIM_VERSION:
+    if (
+        not isinstance(claim, dict)
+        or claim.get("version") != TWILIO_CALLBACK_CLAIM_VERSION
+        or claim.get("state") != "pending"
+    ):
         return False
     expected = str(claim.get("sha256") or "").strip().lower()
     if len(expected) != 64:

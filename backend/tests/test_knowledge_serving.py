@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
 import pytest
@@ -30,6 +30,7 @@ from app.services.knowledge_serving import (
 )
 from app.services.knowledge_sources import invalidate_knowledge_approval
 from app.services.speech_lexicon import load_agent_speech_lexicon, publish_speech_lexicon
+from tests.conftest import engine as test_engine
 
 
 @pytest.mark.asyncio
@@ -925,6 +926,171 @@ async def test_serving_revision_ranks_before_candidate_limit(db, tenant):
 
     assert context is not None
     assert "cardiothoracic service" in context
+
+
+@pytest.mark.asyncio
+async def test_serving_revision_unions_contact_fallback_with_postgres_fts(db, tenant):
+    """A ranked FTS hit must not hide a differently worded contact page."""
+
+    agent = Agent(
+        tenant_id=tenant.id,
+        name="Contact fallback agent",
+        system_prompt="Use approved evidence only.",
+    )
+    knowledge = KnowledgeBase(
+        tenant_id=tenant.id,
+        name="Contact fallback knowledge",
+        approval_status="approved",
+        sync_status="ready",
+        source_count=2,
+        indexed_source_count=2,
+        is_active=True,
+    )
+    knowledge.sources.extend(
+        (
+            KnowledgeSource(
+                tenant_id=tenant.id,
+                source_type="website",
+                name="Contact",
+                status="indexed",
+                content="Call us at +971 2 665 9998.",
+            ),
+            KnowledgeSource(
+                tenant_id=tenant.id,
+                source_type="website",
+                name="Telephone enquiry policy",
+                status="indexed",
+                content=(
+                    "Phone number questions are handled according to the approved enquiry policy."
+                ),
+            ),
+        )
+    )
+    db.add_all((agent, knowledge))
+    await db.flush()
+    db.add(
+        AgentKnowledgeBinding(
+            tenant_id=tenant.id,
+            agent_id=agent.id,
+            knowledge_base_id=knowledge.id,
+        )
+    )
+    lexicon = await publish_speech_lexicon(
+        db,
+        tenant_id=tenant.id,
+        knowledge_base=knowledge,
+    )
+    revision = await publish_serving_revision(
+        db,
+        tenant_id=tenant.id,
+        knowledge_base=knowledge,
+        speech_lexicon=lexicon,
+    )
+    await db.commit()
+
+    context = await retrieve_knowledge_context(
+        db,
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        query="What is the phone number?",
+        serving_revision_id=revision.id,
+    )
+
+    assert context is not None
+    assert "+971 2 665 9998" in context
+
+
+@pytest.mark.asyncio
+async def test_postgres_contact_lane_keeps_reach_us_ahead_of_footer_noise(db, tenant):
+    """A real contact page survives the 12-row lane limit on footer-heavy sites."""
+
+    if test_engine.dialect.name != "postgresql":
+        pytest.skip("requires PostgreSQL candidate ordering")
+
+    contact_source_id = UUID(int=1)
+    noise_count = 13
+    agent = Agent(
+        tenant_id=tenant.id,
+        name="Footer-heavy contact agent",
+        system_prompt="Use approved evidence only.",
+    )
+    knowledge = KnowledgeBase(
+        tenant_id=tenant.id,
+        name="Footer-heavy website",
+        approval_status="approved",
+        sync_status="ready",
+        source_count=noise_count + 1,
+        indexed_source_count=noise_count + 1,
+        is_active=True,
+    )
+    knowledge.sources.append(
+        KnowledgeSource(
+            id=contact_source_id,
+            tenant_id=tenant.id,
+            source_type="website",
+            name="Reach Us",
+            location="https://company.example/reach-us",
+            status="indexed",
+            content="Call us at +971 2 665 9998 for the main reception desk.",
+        )
+    )
+    for index in range(noise_count):
+        knowledge.sources.append(
+            KnowledgeSource(
+                id=UUID(int=index + 2),
+                tenant_id=tenant.id,
+                source_type="website",
+                name=f"Company news {index:02d}",
+                location=f"https://company.example/news/{index}",
+                status="indexed",
+                content=(
+                    f"Approved company news item {index}. "
+                    f"Footer email: newsletter-{index}@company.example."
+                ),
+            )
+        )
+    db.add_all((agent, knowledge))
+    await db.flush()
+    db.add(
+        AgentKnowledgeBinding(
+            tenant_id=tenant.id,
+            agent_id=agent.id,
+            knowledge_base_id=knowledge.id,
+        )
+    )
+    lexicon = await publish_speech_lexicon(
+        db,
+        tenant_id=tenant.id,
+        knowledge_base=knowledge,
+    )
+    revision = await publish_serving_revision(
+        db,
+        tenant_id=tenant.id,
+        knowledge_base=knowledge,
+        speech_lexicon=lexicon,
+    )
+
+    # Make the strong source older than every weak footer match. Without the
+    # evidence-priority CASE, the newest 12 rows crowd it out deterministically.
+    baseline = datetime(2024, 1, 1, tzinfo=UTC)
+    for source in revision.sources:
+        source.created_at = (
+            baseline
+            if source.original_source_id == contact_source_id
+            else baseline + timedelta(days=1, seconds=source.original_source_id.int)
+        )
+    await db.commit()
+
+    context = await retrieve_knowledge_context(
+        db,
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        query="What is the phone number?",
+        serving_revision_id=revision.id,
+    )
+
+    assert context is not None
+    assert "+971 2 665 9998" in context
 
 
 @pytest.mark.asyncio

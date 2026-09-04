@@ -72,7 +72,7 @@ jobs:
           for attempt in 1 2 3; do
             audit_log="$(mktemp)"
             audit_status=0
-            if timeout 90s npm audit --omit=dev --audit-level=high 2>&1 | tee "$audit_log"; then
+            if timeout --kill-after=10s 90s npm audit --omit=dev --audit-level=high 2>&1 | tee "$audit_log"; then
               rm -f "$audit_log"
               exit 0
             else
@@ -82,7 +82,7 @@ jobs:
             # Vulnerability findings are deterministic and must fail
             # immediately. Retry only registry/network failures, which have
             # otherwise made a clean dependency tree randomly fail CI.
-            if [ "$audit_status" -ne 124 ] && ! grep -Eiq '503|service unavailable|429|too many requests|EAI_AGAIN|ECONNRESET|ETIMEDOUT|ENETUNREACH|audit endpoint returned an error' "$audit_log"; then
+            if [ "$audit_status" -ne 124 ] && [ "$audit_status" -ne 137 ] && ! grep -Eiq '503|service unavailable|429|too many requests|EAI_AGAIN|ECONNRESET|ETIMEDOUT|ENETUNREACH|audit endpoint returned an error' "$audit_log"; then
               rm -f "$audit_log"
               exit 1
             fi
