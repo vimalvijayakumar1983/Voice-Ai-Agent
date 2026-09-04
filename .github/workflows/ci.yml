@@ -65,7 +65,35 @@ jobs:
       # runtime stable while using npm's supported bulk-advisory client.
       - run: npm install --global npm@11.9.0
       - run: npm ci
-      - run: npm audit --omit=dev --audit-level=high
+      - name: Audit production dependencies
+        shell: bash
+        run: |
+          set -o pipefail
+          for attempt in 1 2 3; do
+            audit_log="$(mktemp)"
+            audit_status=0
+            if timeout 90s npm audit --omit=dev --audit-level=high 2>&1 | tee "$audit_log"; then
+              rm -f "$audit_log"
+              exit 0
+            else
+              audit_status="${PIPESTATUS[0]}"
+            fi
+
+            # Vulnerability findings are deterministic and must fail
+            # immediately. Retry only registry/network failures, which have
+            # otherwise made a clean dependency tree randomly fail CI.
+            if [ "$audit_status" -ne 124 ] && ! grep -Eiq '503|service unavailable|429|too many requests|EAI_AGAIN|ECONNRESET|ETIMEDOUT|ENETUNREACH|audit endpoint returned an error' "$audit_log"; then
+              rm -f "$audit_log"
+              exit 1
+            fi
+            rm -f "$audit_log"
+
+            if [ "$attempt" -eq 3 ]; then
+              echo "npm audit service remained unavailable after 3 attempts" >&2
+              exit 1
+            fi
+            sleep "$((attempt * 10))"
+          done
       - run: npm run test:session-boundary
       - run: npm run lint
       - run: npm run build
