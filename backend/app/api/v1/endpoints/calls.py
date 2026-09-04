@@ -481,6 +481,25 @@ async def get_call(
     return CallResponse.model_validate(call)
 
 
+async def _lock_call_after_provider_dispatch(
+    db: AsyncSession,
+    *,
+    call: Call,
+    tenant_id: UUID,
+) -> Call:
+    """Reload and lock a call before merging its provider response."""
+
+    call_id = call.id
+    db.expire(call)
+    current_result = await db.execute(
+        select(Call)
+        .where(Call.id == call_id, Call.tenant_id == tenant_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    return current_result.scalar_one()
+
+
 @router.post("", response_model=CallResponse, status_code=201)
 async def initiate_outbound_call(
     data: CallOutbound,
@@ -1155,14 +1174,11 @@ async def initiate_outbound_call(
     # A signed callback may update this row while the provider request is in
     # flight. Re-lock and repopulate before merging the request result so a late
     # HTTP response can never regress an answered/completed call.
-    db.expire(call)
-    current_result = await db.execute(
-        select(Call)
-        .where(Call.id == call_id, Call.tenant_id == current_user.tenant_id)
-        .with_for_update()
-        .execution_options(populate_existing=True)
+    current_call = await _lock_call_after_provider_dispatch(
+        db,
+        call=call,
+        tenant_id=current_user.tenant_id,
     )
-    current_call = current_result.scalar_one()
     if dispatch_error is None and provider_call_sid:
         if livekit_room_name is not None:
             current_call.call_metadata = {

@@ -244,8 +244,10 @@ async def test_native_make_call_response_cannot_overwrite_callback_bound_sid(
     await db.commit()
 
     callback_sid = "CA-callback-bound-before-response"
+    callback_task: asyncio.Task | None = None
 
     async def make_call(request):
+        nonlocal callback_task
         callback_url = urlsplit(request.webhook_url)
         callback_target = callback_url.path
         if callback_url.query:
@@ -258,36 +260,65 @@ async def test_native_make_call_response_cannot_overwrite_callback_bound_sid(
             request.webhook_url,
             payload,
         )
-        callback_response = await client.post(
-            callback_target,
-            data=payload,
-            headers={"X-Twilio-Signature": signature},
+        # A real Twilio REST response does not wait for its voice webhook to
+        # finish. Start the callback concurrently so PostgreSQL can correctly
+        # hold the dispatch safety locks until make_call() returns.
+        callback_task = asyncio.create_task(
+            client.post(
+                callback_target,
+                data=payload,
+                headers={"X-Twilio-Signature": signature},
+            )
         )
-        assert callback_response.status_code == 200
         return SimpleNamespace(provider_call_sid="CA-conflicting-late-provider-response")
+
+    real_call_relock = calls_endpoint._lock_call_after_provider_dispatch
+
+    async def wait_for_callback_before_provider_merge(*args, **kwargs):
+        # initiate_outbound_call commits and releases its dispatch locks before
+        # this merge hook. Let the already-started callback bind its SID first,
+        # without asking it to defeat any production row or advisory lock.
+        assert callback_task is not None
+        callback_response = await asyncio.wait_for(callback_task, timeout=5)
+        assert callback_response.status_code == 200
+        return await real_call_relock(*args, **kwargs)
 
     monkeypatch.setattr(
         calls_endpoint,
         "get_telephony_provider",
         lambda **_kwargs: SimpleNamespace(make_call=make_call),
     )
+    monkeypatch.setattr(
+        calls_endpoint,
+        "_lock_call_after_provider_dispatch",
+        wait_for_callback_before_provider_merge,
+    )
     monkeypatch.setattr(webhooks, "async_session_factory", session_factory)
     monkeypatch.setattr(webhooks, "_kick_provider_outbox", lambda _ids: None)
     monkeypatch.setattr(call_tasks.reconcile_call_dispatch, "apply_async", Mock())
     monkeypatch.setattr(call_tasks.reconcile_direct_call_terminal, "apply_async", Mock())
 
-    response = await client.post(
-        "/api/v1/calls",
-        headers={
-            **auth_headers,
-            "Idempotency-Key": "native-callback-provider-response-race-0001",
-        },
-        json={
-            "agent_id": str(agent.id),
-            "to_number": "+15550100001",
-            "from_number": from_number,
-        },
-    )
+    try:
+        response = await asyncio.wait_for(
+            client.post(
+                "/api/v1/calls",
+                headers={
+                    **auth_headers,
+                    "Idempotency-Key": "native-callback-provider-response-race-0001",
+                },
+                json={
+                    "agent_id": str(agent.id),
+                    "to_number": "+15550100001",
+                    "from_number": from_number,
+                },
+            ),
+            timeout=5,
+        )
+    finally:
+        if callback_task is not None and not callback_task.done():
+            callback_task.cancel()
+        if callback_task is not None:
+            await asyncio.gather(callback_task, return_exceptions=True)
 
     assert response.status_code == 201
     assert response.json()["provider_call_sid"] == callback_sid

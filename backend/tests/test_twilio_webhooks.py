@@ -673,7 +673,10 @@ async def test_concurrent_native_first_callbacks_with_different_sids_have_one_wi
             callback_claim=callback_claim,
         )
 
-    responses = await asyncio.gather(send("CA-first-race-a"), send("CA-first-race-b"))
+    responses = await asyncio.wait_for(
+        asyncio.gather(send("CA-first-race-a"), send("CA-first-race-b")),
+        timeout=5,
+    )
 
     assert sorted(response.status_code for response in responses) == [200, 409]
     db.expire_all()
@@ -718,7 +721,10 @@ async def test_postgres_native_first_callback_binding_has_one_cross_replica_winn
             await callback_db.commit()
             return "bound"
 
-    outcomes = await asyncio.gather(bind("CA-cross-replica-a"), bind("CA-cross-replica-b"))
+    outcomes = await asyncio.wait_for(
+        asyncio.gather(bind("CA-cross-replica-a"), bind("CA-cross-replica-b")),
+        timeout=5,
+    )
 
     assert sorted(outcomes) == ["bound", "rejected"]
     db.expire_all()
