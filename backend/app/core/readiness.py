@@ -9,10 +9,13 @@ from app.core.database import engine
 
 logger = structlog.get_logger()
 
-# Keep this in lockstep with the Alembic script head. A test compares the two so
-# adding a migration without updating API readiness fails CI instead of making a
-# newly deployed service advertise an older schema as ready.
-EXPECTED_DATABASE_REVISIONS = frozenset({"20260904_021"})
+# Compatibility release for the additive 022/023/024 migration rollout. Deploy
+# this small revision before applying those migrations so the previous app can
+# remain healthy while Alembic advances, and retain its image as the safe
+# application rollback target. The feature release closes this window again.
+EXPECTED_DATABASE_REVISIONS = frozenset(
+    {"20260904_021", "20260904_022", "20260904_023", "20260904_024"}
+)
 READINESS_TIMEOUT_SECONDS = 3.0
 
 
@@ -37,4 +40,4 @@ async def database_schema_is_ready() -> bool:
         )
         return False
 
-    return applied_revisions == EXPECTED_DATABASE_REVISIONS
+    return len(applied_revisions) == 1 and applied_revisions.issubset(EXPECTED_DATABASE_REVISIONS)

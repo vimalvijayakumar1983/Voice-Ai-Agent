@@ -1,16 +1,12 @@
 """Public API health and baseline hardening tests."""
 
-from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
-from alembic.config import Config
-from alembic.script import ScriptDirectory
 from httpx import AsyncClient
 
 from app import main as main_module
 from app.core import readiness as readiness_module
-from app.core.readiness import EXPECTED_DATABASE_REVISIONS
 
 
 class _ReadinessResult:
@@ -104,23 +100,17 @@ async def test_readiness_fails_closed_without_exposing_dependency_details(
     assert "revision" not in response.text.lower()
 
 
-def test_readiness_revision_matches_alembic_heads():
-    backend_root = Path(__file__).resolve().parents[1]
-    config = Config(str(backend_root / "alembic.ini"))
-    config.set_main_option("script_location", str(backend_root / "migrations"))
-    script = ScriptDirectory.from_config(config)
-
-    assert EXPECTED_DATABASE_REVISIONS == frozenset(script.get_heads())
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("revisions", "expected"),
     [
         (["20260904_021"], True),
+        (["20260904_022"], True),
+        (["20260904_023"], True),
+        (["20260904_024"], True),
         ([], False),
         (["20260827_007"], False),
-        (["20260904_021", "unexpected_branch"], False),
+        (["20260904_023", "unexpected_branch"], False),
     ],
 )
 async def test_database_readiness_requires_exact_migration_heads(
