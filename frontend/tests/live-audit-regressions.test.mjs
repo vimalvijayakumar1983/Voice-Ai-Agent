@@ -81,10 +81,73 @@ test('VAV-managed agents show runtime lifecycle instead of Smallest draft state'
   assert.match(agentsSource, /Serving or provider synced/);
 });
 
+test('knowledge approval reports the immutable voice-recognition artifact', () => {
+  assert.match(apiSource, /speech_lexicon:/);
+  assert.match(knowledgeSource, /Voice recognition artifact/);
+  assert.match(knowledgeSource, /critical-name coverage/);
+  assert.match(knowledgeSource, /pinned to this approved source revision/);
+  assert.match(knowledgeSource, /awaiting its versioned voice-recognition backfill/);
+});
+
+test('knowledge release rollback is audited compare-and-swap, not a pointer rewrite', () => {
+  assert.match(apiSource, /listKnowledgeReleases/);
+  assert.match(apiSource, /expected_current_revision_id: string \| null/);
+  assert.match(apiSource, /reactivateKnowledgeRelease/);
+  assert.match(knowledgeSource, /Restore a previous VAV release/);
+  assert.match(knowledgeSource, /Incident or rollback reason/);
+  assert.match(knowledgeSource, /selected\.serving_revision\?\.revision_id \|\| null/);
+  assert.match(knowledgeSource, /matching voice-recognition artifact move together/);
+});
+
+test('native Inworld runtime exposes a typed agent-level single-pass canary', () => {
+  assert.match(apiSource, /knowledge_turn_mode: 'tool_loop' \| 'single_pass_experimental'/);
+  assert.match(runtimeSource, /id="runtime-knowledge-turn-mode"/);
+  assert.match(runtimeSource, /Grounded tool loop · control/);
+  assert.match(runtimeSource, /Single pass · experimental canary/);
+  assert.match(runtimeSource, /Agent-level A\/B warning/);
+  assert.match(runtimeSource, /this is not a per-call split/);
+  assert.match(runtimeSource, /one approved evidence lookup/);
+  assert.match(runtimeSource, /one tool-free reply/);
+  assert.match(runtimeSource, /knowledge_turn_mode: voiceRuntime === 'inworld_realtime'/);
+});
+
+test('diagnostic recording is opt-in, governed, and does not imply capture or playback', () => {
+  assert.match(apiSource, /diagnostic_recording_mode: 'off' \| 'livekit_egress_explicit_consent'/);
+  assert.match(runtimeSource, /id="runtime-diagnostic-recording"/);
+  assert.match(runtimeSource, /value="off">Off · safe default/);
+  assert.match(runtimeSource, /Request LiveKit diagnostic capture · explicit consent/);
+  assert.match(runtimeSource, /does not start LiveKit Egress, store audio, or make VAV playback available/);
+  assert.match(runtimeSource, /absence is not consent/);
+  assert.match(runtimeSource, /encrypted regional storage, retention, deletion, and access auditing/);
+  assert.match(callsSource, /LiveKit recording state/);
+  assert.match(callsSource, /LiveKit recording blocker/);
+  assert.match(callsSource, /A saved operator request is not consent/);
+  assert.match(callsSource, /legacy access rule never authorizes LiveKit capture/);
+});
+
 test('call diagnostics separate recognition, retrieval, grounding, and session latency', () => {
   assert.match(callsSource, /Realtime session connection/);
+  assert.match(callsSource, /Participant active → LiveKit server speaking/);
+  assert.match(callsSource, /Worker entry → LiveKit server speaking/);
+  assert.match(callsSource, /Runtime admission → LiveKit server speaking \(legacy\)/);
   assert.match(callsSource, /Last knowledge search/);
   assert.match(callsSource, /Recognition model/);
   assert.match(callsSource, /Unsupported factual responses/);
   assert.match(callsSource, /trace\.grounding_outcome/);
+  assert.match(callsSource, /Server-observed response latency p95/);
+  assert.match(callsSource, /Latency sample size/);
+  assert.match(callsSource, /Latency not measured/);
+  assert.match(callsSource, /SIP\/RTP arrival at the caller/);
+  assert.match(callsSource, /not a provider bill/);
+  assert.match(callsSource, /Provider acknowledgement on this call/);
+  assert.match(callsSource, /Not captured; readiness is a separate probe/);
+  assert.doesNotMatch(callsSource, /provider acceptance checked by readiness/);
+  assert.match(callsSource, /Critical-name coverage/);
+  assert.match(callsSource, /Wrong-script repairs/);
+  assert.match(callsSource, /Last exact-fact path/);
+  assert.match(callsSource, /wrong-script clarification/);
+  assert.match(callsSource, /Knowledge turn policy/);
+  assert.match(callsSource, /Last single-pass orchestration/);
+  assert.match(callsSource, /single_pass_total_ms/);
+  assert.match(callsSource, /response_action/);
 });

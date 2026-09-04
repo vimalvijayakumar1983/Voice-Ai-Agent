@@ -7,7 +7,7 @@ import json
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import PurePath
-from typing import Annotated
+from typing import Annotated, Any
 from uuid import UUID, uuid4, uuid5
 
 from fastapi import (
@@ -40,6 +40,10 @@ from app.models.agent import (
     AgentKnowledgeBinding,
     AgentRuntimeProfile,
     KnowledgeBase,
+    KnowledgeCrawl,
+    KnowledgeProviderCleanup,
+    KnowledgeServingRevision,
+    KnowledgeServingRevisionSource,
     KnowledgeSource,
 )
 from app.models.call import Call
@@ -116,6 +120,13 @@ from app.services.integration_security import (
 )
 from app.services.provider_credentials import ProviderCredentialError, load_provider_config
 from app.services.rate_limit import enforce_rate_limit
+from app.services.realtime_speech_config import (
+    configured_inworld_stt_model,
+    inworld_stt_wire_language,
+    resolve_inworld_stt_language,
+    resolve_inworld_stt_model,
+)
+from app.services.recording_policy import recording_runtime_metadata
 from app.services.runtime_capacity import RuntimeCapacityError, enforce_runtime_capacity
 from app.services.usage_ledger import lock_agent_runtime_limits
 from app.telephony.livekit_provider import LiveKitSIPError, LiveKitSIPProvider
@@ -622,22 +633,103 @@ async def _approved_bound_provider_knowledge_base_id(
     tenant_id: UUID,
 ) -> str | None:
     """Resolve one approved, provisioned KB bound to an agent."""
-    knowledge_binding = await db.scalar(
-        select(AgentKnowledgeBinding).where(
+    # Discover without a row lock so we can follow the global order below.
+    discovered_binding = await db.scalar(
+        select(AgentKnowledgeBinding)
+        .where(
             AgentKnowledgeBinding.agent_id == agent_id,
             AgentKnowledgeBinding.tenant_id == tenant_id,
         )
+        .execution_options(populate_existing=True)
     )
-    if not knowledge_binding:
+    if not discovered_binding:
         return None
+    discovered_knowledge_base_id = discovered_binding.knowledge_base_id
     bound_knowledge = await db.scalar(
-        select(KnowledgeBase).where(
-            KnowledgeBase.id == knowledge_binding.knowledge_base_id,
+        select(KnowledgeBase)
+        .where(
+            KnowledgeBase.id == discovered_knowledge_base_id,
             KnowledgeBase.tenant_id == tenant_id,
-            KnowledgeBase.approval_status == "approved",
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if not bound_knowledge:
+        raise HTTPException(status_code=409, detail="Bound knowledge no longer exists")
+    knowledge_binding = await db.scalar(
+        select(AgentKnowledgeBinding)
+        .where(
+            AgentKnowledgeBinding.agent_id == agent_id,
+            AgentKnowledgeBinding.tenant_id == tenant_id,
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if (
+        knowledge_binding is None
+        or knowledge_binding.knowledge_base_id != discovered_knowledge_base_id
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Knowledge binding changed during provider publication; retry",
+        )
+    pending_provider_cleanup = await db.scalar(
+        select(KnowledgeProviderCleanup.id).where(
+            KnowledgeProviderCleanup.tenant_id == tenant_id,
+            KnowledgeProviderCleanup.knowledge_base_id == bound_knowledge.id,
+            KnowledgeProviderCleanup.status != "completed",
         )
     )
-    if not bound_knowledge or not bound_knowledge.provider_knowledge_base_id:
+    if pending_provider_cleanup is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Bound knowledge has remote artifact cleanup pending. Wait for cleanup "
+                "before publishing the Smallest.ai agent."
+            ),
+        )
+    sources = list(
+        (
+            await db.scalars(
+                select(KnowledgeSource)
+                .where(
+                    KnowledgeSource.knowledge_base_id == bound_knowledge.id,
+                    KnowledgeSource.tenant_id == tenant_id,
+                )
+                .order_by(KnowledgeSource.id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).all()
+    )
+    active_crawl = await db.scalar(
+        select(KnowledgeCrawl.id)
+        .where(
+            KnowledgeCrawl.knowledge_base_id == bound_knowledge.id,
+            KnowledgeCrawl.tenant_id == tenant_id,
+            KnowledgeCrawl.status.in_({"queued", "discovering", "indexing", "retrying"}),
+        )
+        .order_by(KnowledgeCrawl.id)
+        .with_for_update()
+    )
+    active_recovery = any(
+        isinstance(source.source_metadata, dict)
+        and isinstance(source.source_metadata.get("recovery"), dict)
+        and source.source_metadata["recovery"].get("status") in {"queued", "processing"}
+        for source in sources
+    )
+    if active_crawl is not None or active_recovery:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Bound knowledge has website crawl or recovery work in progress. Wait for it "
+                "to finish before publishing a Smallest.ai agent."
+            ),
+        )
+    if (
+        bound_knowledge.approval_status != "approved"
+        or not bound_knowledge.provider_knowledge_base_id
+    ):
         raise HTTPException(
             status_code=409,
             detail="Bound knowledge must be approved and provisioned before publishing",
@@ -878,12 +970,102 @@ async def _tenant_inworld_client(
     return client, "platform" if client.is_configured else "none", None
 
 
+async def _lock_livekit_browser_call(
+    db: AsyncSession,
+    *,
+    tenant_id: UUID,
+    call_id: UUID,
+) -> Call | None:
+    """Take the deterministic browser reservation row lock, if it exists."""
+
+    return await db.scalar(
+        select(Call)
+        .where(Call.id == call_id, Call.tenant_id == tenant_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+
+
+async def _validate_livekit_browser_knowledge(
+    db: AsyncSession,
+    *,
+    tenant_id: UUID,
+    agent: Agent,
+    for_update: bool,
+) -> None:
+    """Validate searchable knowledge in the global KB -> binding -> source order."""
+
+    binding_query = (
+        select(AgentKnowledgeBinding)
+        .where(
+            AgentKnowledgeBinding.agent_id == agent.id,
+            AgentKnowledgeBinding.tenant_id == tenant_id,
+        )
+        .execution_options(populate_existing=True)
+    )
+    binding = await db.scalar(binding_query)
+    if binding is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Bind an approved searchable knowledge base before browser testing",
+        )
+    knowledge_query = (
+        select(KnowledgeBase)
+        .where(
+            KnowledgeBase.id == binding.knowledge_base_id,
+            KnowledgeBase.tenant_id == tenant_id,
+            KnowledgeBase.is_active.is_(True),
+            KnowledgeBase.serving_revision_id.is_not(None),
+        )
+        .execution_options(populate_existing=True)
+    )
+    if for_update:
+        knowledge_query = knowledge_query.with_for_update()
+    knowledge = await db.scalar(knowledge_query)
+    if knowledge is None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Approve and publish the bound knowledge base before browser testing; "
+                "legacy approved knowledge must be backfilled first"
+            ),
+        )
+    if for_update:
+        # Discover the binding without a lock so the KB can be locked first,
+        # then lock and revalidate it. This remains after the deterministic Call
+        # lock in the authoritative reservation path.
+        locked_binding = await db.scalar(binding_query.with_for_update())
+        if locked_binding is None or locked_binding.knowledge_base_id != knowledge.id:
+            raise HTTPException(
+                status_code=409,
+                detail="The agent knowledge binding changed during browser call reservation",
+            )
+        binding = locked_binding
+    source_contents = (
+        await db.scalars(
+            select(KnowledgeServingRevisionSource.content).where(
+                KnowledgeServingRevisionSource.serving_revision_id == knowledge.serving_revision_id,
+                KnowledgeServingRevisionSource.tenant_id == tenant_id,
+            )
+        )
+    ).all()
+    searchable = bool(source_contents) and all(
+        bool(str(content or "").strip()) for content in source_contents
+    )
+    if not searchable:
+        raise HTTPException(
+            status_code=409,
+            detail="Repair the bound knowledge base so every source has searchable text",
+        )
+
+
 async def _livekit_browser_runtime(
     db: AsyncSession,
     *,
     tenant_id: UUID,
     agent_id: UUID,
     for_update: bool = False,
+    validate_knowledge: bool = True,
 ) -> tuple[Agent, AgentRuntimeProfile]:
     """Load the exact active Inworld runtime and its governed searchable KB."""
     agent_query = (
@@ -954,80 +1136,18 @@ async def _livekit_browser_runtime(
         if not openai_key:
             raise HTTPException(status_code=409, detail="Add a valid OpenAI API key first")
 
-    binding_query = (
-        select(AgentKnowledgeBinding)
-        .where(
-            AgentKnowledgeBinding.agent_id == agent.id,
-            AgentKnowledgeBinding.tenant_id == tenant_id,
-        )
-        .execution_options(populate_existing=True)
-    )
-    if for_update:
-        binding_query = binding_query.with_for_update()
-    binding = await db.scalar(binding_query)
-    if binding is None:
-        raise HTTPException(
-            status_code=409,
-            detail="Bind an approved searchable knowledge base before browser testing",
-        )
-    knowledge_query = (
-        select(KnowledgeBase)
-        .where(
-            KnowledgeBase.id == binding.knowledge_base_id,
-            KnowledgeBase.tenant_id == tenant_id,
-            KnowledgeBase.is_active.is_(True),
-            KnowledgeBase.approval_status == "approved",
-        )
-        .execution_options(populate_existing=True)
-    )
-    if for_update:
-        knowledge_query = knowledge_query.with_for_update()
-    knowledge = await db.scalar(knowledge_query)
-    if knowledge is None:
-        raise HTTPException(
-            status_code=409,
-            detail="Approve the bound knowledge base before browser testing",
-        )
-    source_query = (
-        select(KnowledgeSource)
-        .where(
-            KnowledgeSource.knowledge_base_id == knowledge.id,
-            KnowledgeSource.tenant_id == tenant_id,
-        )
-        .execution_options(populate_existing=True)
-    )
-    if for_update:
-        source_query = source_query.with_for_update()
-    sources = (await db.scalars(source_query)).all()
-    if not sources or not all(
-        source.status in {"processing", "indexed", "local_only"}
-        and bool(str(source.content or "").strip())
-        for source in sources
-    ):
-        raise HTTPException(
-            status_code=409,
-            detail="Repair the bound knowledge base so every source has searchable text",
+    if validate_knowledge:
+        await _validate_livekit_browser_knowledge(
+            db,
+            tenant_id=tenant_id,
+            agent=agent,
+            for_update=for_update,
         )
     return agent, profile
 
 
 def _native_browser_stt_model(agent: Agent, profile: AgentRuntimeProfile) -> str:
-    runtime_config = profile.runtime_config if isinstance(profile.runtime_config, dict) else {}
-    configured = str(runtime_config.get("stt_model") or "auto").strip().lower()
-    if configured != "auto":
-        return configured
-    languages = {
-        str(language or "").strip().lower().split("-", 1)[0]
-        for language in (
-            list(agent.supported_languages or []) + [agent.language, profile.stt_language]
-        )
-        if str(language or "").strip() and str(language or "").strip().lower() != "auto"
-    }
-    return (
-        "assemblyai/u3-rt-pro"
-        if languages and languages.issubset({"en", "es", "fr", "de", "it", "pt"})
-        else "soniox/stt-rt-v4"
-    )
+    return resolve_inworld_stt_model(model=agent, profile=profile)
 
 
 async def _verify_native_browser_capability(
@@ -1036,13 +1156,19 @@ async def _verify_native_browser_capability(
     model_id: str,
     voice_id: str,
     stt_model_id: str,
+    stt_language: str | None,
+    single_pass: bool = False,
 ) -> None:
     try:
-        await inworld.realtime_readiness_probe(
-            model_id=model_id,
-            voice_id=voice_id,
-            stt_model_id=stt_model_id,
-        )
+        probe_options: dict[str, Any] = {
+            "model_id": model_id,
+            "voice_id": voice_id,
+            "stt_model_id": stt_model_id,
+            "stt_language": stt_language,
+        }
+        if single_pass:
+            probe_options["single_pass"] = True
+        await inworld.realtime_readiness_probe(**probe_options)
     except InworldError as exc:
         raise HTTPException(
             status_code=409,
@@ -2523,7 +2649,10 @@ async def create_agent_ai_draft(
         select(KnowledgeBase)
         .where(
             KnowledgeBase.tenant_id == current_user.tenant_id,
-            KnowledgeBase.approval_status == "approved",
+            or_(
+                KnowledgeBase.approval_status == "approved",
+                KnowledgeBase.serving_revision_id.is_not(None),
+            ),
         )
         .order_by(KnowledgeBase.name.asc())
     )
@@ -3663,6 +3792,7 @@ async def create_livekit_browser_session(
     )
     native_inworld = None
     native_route = None
+    native_single_pass = False
     if str(runtime_config.get("voice_runtime") or "pipeline") == "inworld_realtime":
         native_inworld, _source, _updated_at = await _tenant_inworld_client(
             db, current_user.tenant_id
@@ -3671,7 +3801,9 @@ async def create_livekit_browser_session(
             preflight_profile.llm_model,
             preflight_agent.voice_id.removeprefix("inworld:"),
             _native_browser_stt_model(preflight_agent, preflight_profile),
+            inworld_stt_wire_language(model=preflight_agent, profile=preflight_profile),
         )
+        native_single_pass = runtime_config.get("inworld_single_pass") is True
     await db.rollback()
     if native_inworld is not None and native_route is not None:
         await _verify_native_browser_capability(
@@ -3679,6 +3811,8 @@ async def create_livekit_browser_session(
             model_id=native_route[0],
             voice_id=native_route[1],
             stt_model_id=native_route[2],
+            stt_language=native_route[3],
+            single_pass=native_single_pass,
         )
     try:
         await LiveKitSIPProvider(
@@ -3703,17 +3837,27 @@ async def create_livekit_browser_session(
         tenant_id=current_user.tenant_id,
         agent_id=agent_id,
     )
+    # Global browser reservation order is advisory -> Agent/Profile -> Call ->
+    # KnowledgeBase -> binding -> source. The worker uses Call -> KB -> binding;
+    # taking the Call row before knowledge prevents token reissue from
+    # deadlocking a participant that is concurrently claiming the reservation.
     agent, profile = await _livekit_browser_runtime(
         db,
         tenant_id=current_user.tenant_id,
         agent_id=agent_id,
         for_update=True,
+        validate_knowledge=False,
     )
-    existing_call = await db.scalar(
-        select(Call)
-        .where(Call.id == call_id, Call.tenant_id == current_user.tenant_id)
-        .with_for_update()
-        .execution_options(populate_existing=True)
+    existing_call = await _lock_livekit_browser_call(
+        db,
+        tenant_id=current_user.tenant_id,
+        call_id=call_id,
+    )
+    await _validate_livekit_browser_knowledge(
+        db,
+        tenant_id=current_user.tenant_id,
+        agent=agent,
+        for_update=True,
     )
     if existing_call is not None:
         metadata = (
@@ -3820,6 +3964,40 @@ async def create_livekit_browser_session(
         ) from exc
 
     reserved_max_duration_seconds = int(agent.max_call_duration_seconds)
+    serving_identity = (
+        await db.execute(
+            select(
+                KnowledgeServingRevision.id,
+                KnowledgeServingRevision.content_sha256,
+                KnowledgeServingRevision.source_revision_sha256,
+                KnowledgeBase.id.label("knowledge_base_id"),
+                KnowledgeBase.serving_revocation_generation,
+            )
+            .join(
+                KnowledgeBase,
+                KnowledgeBase.serving_revision_id == KnowledgeServingRevision.id,
+            )
+            .join(
+                AgentKnowledgeBinding,
+                AgentKnowledgeBinding.knowledge_base_id == KnowledgeBase.id,
+            )
+            .where(
+                AgentKnowledgeBinding.tenant_id == current_user.tenant_id,
+                AgentKnowledgeBinding.agent_id == agent.id,
+                KnowledgeBase.tenant_id == current_user.tenant_id,
+                KnowledgeServingRevision.tenant_id == current_user.tenant_id,
+            )
+        )
+    ).one_or_none()
+    if serving_identity is None:
+        await db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Approve and publish the bound knowledge base before browser testing; "
+                "an immutable serving revision is required"
+            ),
+        )
     room_name = f"vav-browser-{call_id}"
     participant_identity = f"browser-{call_id}"
     issued_at = datetime.now(UTC)
@@ -3859,17 +4037,9 @@ async def create_livekit_browser_session(
                 ),
                 "llm_provider": profile.llm_provider,
                 "llm_model": profile.llm_model,
-                "stt_model": str(
-                    (
-                        profile.runtime_config.get("stt_model")
-                        if isinstance(profile.runtime_config, dict)
-                        else None
-                    )
-                    or "auto"
-                ),
-                "stt_language": (
-                    agent.language if profile.stt_language == "auto" else profile.stt_language
-                ),
+                "stt_model": resolve_inworld_stt_model(model=agent, profile=profile),
+                "stt_model_configured": configured_inworld_stt_model(profile=profile),
+                "stt_language": resolve_inworld_stt_language(model=agent, profile=profile),
                 "stt_language_configured": profile.stt_language,
                 "tts_model": "inworld-tts-2",
                 "tts_delivery_mode": str(
@@ -3880,8 +4050,29 @@ async def create_livekit_browser_session(
                     )
                     or "balanced"
                 ).lower(),
-                "recording_enabled": False,
+                **recording_runtime_metadata(profile, transport="livekit_webrtc"),
                 "max_duration_seconds": reserved_max_duration_seconds,
+                "knowledge_serving_revision_id": (
+                    str(serving_identity.id) if serving_identity is not None else None
+                ),
+                "knowledge_serving_knowledge_base_id": (
+                    str(serving_identity.knowledge_base_id)
+                    if serving_identity is not None
+                    else None
+                ),
+                "knowledge_serving_content_sha256": (
+                    serving_identity.content_sha256 if serving_identity is not None else None
+                ),
+                "knowledge_source_revision_sha256": (
+                    serving_identity.source_revision_sha256
+                    if serving_identity is not None
+                    else None
+                ),
+                "knowledge_serving_revocation_generation": (
+                    serving_identity.serving_revocation_generation
+                    if serving_identity is not None
+                    else None
+                ),
             },
             "livekit_room": room_name,
             "session_issuance": "reserved",

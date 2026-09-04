@@ -1,5 +1,6 @@
 """Direct Inworld provider adapter tests."""
 
+import asyncio
 import base64
 import json
 
@@ -20,6 +21,16 @@ from app.services.agent_catalog import (
 )
 
 
+@pytest.mark.parametrize("value", ["NOT READY", "UNREADY", "READY later", ""])
+def test_realtime_readiness_sentinel_rejects_substring_matches(value):
+    assert inworld_module._is_exact_readiness_response([value]) is False
+
+
+@pytest.mark.parametrize("value", ["READY", "ready", "READY.", " READY! "])
+def test_realtime_readiness_sentinel_accepts_only_exact_confirmation(value):
+    assert inworld_module._is_exact_readiness_response([value]) is True
+
+
 class _RealtimeProbeWebSocket:
     def __init__(self, events):
         self.events = list(events)
@@ -32,7 +43,23 @@ class _RealtimeProbeWebSocket:
         return None
 
     async def receive_json(self):
-        return self.events.pop(0)
+        next_event = self.events[0]
+        if str(next_event.get("type") or "").startswith("response.") and not any(
+            sent.get("type") == "response.create" for sent in self.sent
+        ):
+            await asyncio.Future()
+        event = self.events.pop(0)
+        response_create = next(
+            (sent for sent in reversed(self.sent) if sent.get("type") == "response.create"),
+            None,
+        )
+        if response_create is not None:
+            serialized = json.dumps(event).replace(
+                "$CLIENT_EVENT_ID",
+                str(response_create.get("event_id") or ""),
+            )
+            event = json.loads(serialized)
+        return event
 
     async def send_json(self, payload):
         self.sent.append(payload)
@@ -79,14 +106,304 @@ async def test_realtime_readiness_executes_required_tool_without_generating_audi
         model_id="openai/gpt-4o-mini",
         voice_id="Ashley",
         stt_model_id="assemblyai/u3-rt-pro",
+        stt_language="en-GB",
     )
 
     update = websocket.sent[0]
     assert update["session"]["output_modalities"] == ["text"]
     assert update["session"]["tool_choice"] == "required"
     assert update["session"]["tools"][0]["name"] == "vav_readiness_check"
+    assert update["session"]["audio"]["input"]["transcription"] == {
+        "model": "assemblyai/u3-rt-pro",
+        "language": "en-GB",
+    }
     assert websocket.sent[-1] == {"type": "response.create"}
     assert captured["headers"]["Authorization"] == "Basic workspace-inworld-key-123456"
+
+
+@pytest.mark.asyncio
+async def test_realtime_readiness_preserves_multilingual_auto_language_on_wire(monkeypatch):
+    websocket = _RealtimeProbeWebSocket(
+        [
+            {"type": "session.created"},
+            {"type": "session.updated"},
+            {
+                "type": "response.function_call_arguments.done",
+                "name": "vav_readiness_check",
+                "arguments": "{}",
+            },
+        ]
+    )
+    monkeypatch.setattr(
+        inworld_module.aiohttp,
+        "ClientSession",
+        lambda: _RealtimeProbeClientSession(websocket, {}),
+    )
+
+    await InworldClient(api_key="workspace-inworld-key-123456").realtime_readiness_probe(
+        model_id="openai/gpt-4o-mini",
+        voice_id="Ashley",
+        stt_model_id="soniox/stt-rt-v4",
+        stt_language=None,
+    )
+
+    assert websocket.sent[0]["session"]["audio"]["input"]["transcription"] == {
+        "model": "soniox/stt-rt-v4",
+        "language": None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_realtime_readiness_proves_manual_tool_free_single_pass(monkeypatch):
+    websocket = _RealtimeProbeWebSocket(
+        [
+            {"type": "session.created"},
+            {
+                "type": "session.updated",
+                "session": {
+                    "tools": [],
+                    "tool_choice": "none",
+                    "audio": {
+                        "input": {
+                            "transcription": {
+                                "model": "assemblyai/u3-rt-pro",
+                                "language": "en-GB",
+                            },
+                            "turn_detection": {
+                                "create_response": False,
+                                "interrupt_response": False,
+                            },
+                        }
+                    },
+                },
+            },
+            {
+                "type": "response.created",
+                "response": {
+                    "id": "response-1",
+                    "metadata": {"client_event_id": "$CLIENT_EVENT_ID"},
+                },
+            },
+            {
+                "type": "response.done",
+                "response": {
+                    "id": "response-1",
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "READY"}],
+                        }
+                    ],
+                },
+            },
+        ]
+    )
+    monkeypatch.setattr(
+        inworld_module.aiohttp,
+        "ClientSession",
+        lambda: _RealtimeProbeClientSession(websocket, {}),
+    )
+
+    await InworldClient(api_key="workspace-inworld-key-123456").realtime_readiness_probe(
+        model_id="openai/gpt-4o-mini",
+        voice_id="Ashley",
+        stt_model_id="assemblyai/u3-rt-pro",
+        stt_language="en-GB",
+        single_pass=True,
+    )
+
+    update = websocket.sent[0]["session"]
+    assert update["tools"] == []
+    assert update["tool_choice"] == "none"
+    assert update["audio"]["input"]["turn_detection"] == {
+        "type": "semantic_vad",
+        "eagerness": "medium",
+        "create_response": False,
+        "interrupt_response": False,
+    }
+    response_create = websocket.sent[-1]
+    assert response_create["type"] == "response.create"
+    assert response_create["event_id"].startswith("vav_readiness_")
+    assert response_create["response"] == {
+        "instructions": "Reply with READY only. Do not call tools.",
+        "tools": [],
+        "tool_choice": "none",
+        "metadata": {"client_event_id": response_create["event_id"]},
+    }
+
+
+@pytest.mark.asyncio
+async def test_realtime_single_pass_readiness_fails_if_provider_calls_a_tool(monkeypatch):
+    websocket = _RealtimeProbeWebSocket(
+        [
+            {"type": "session.created"},
+            {
+                "type": "session.updated",
+                "session": {
+                    "tools": [],
+                    "tool_choice": "none",
+                    "audio": {
+                        "input": {
+                            "transcription": {
+                                "model": "assemblyai/u3-rt-pro",
+                                "language": "en-GB",
+                            },
+                            "turn_detection": {
+                                "create_response": False,
+                                "interrupt_response": False,
+                            },
+                        }
+                    },
+                },
+            },
+            {
+                "type": "response.created",
+                "response": {
+                    "id": "response-1",
+                    "metadata": {"client_event_id": "$CLIENT_EVENT_ID"},
+                },
+            },
+            {
+                "type": "response.function_call_arguments.done",
+                "name": "unexpected_tool",
+            },
+        ]
+    )
+    monkeypatch.setattr(
+        inworld_module.aiohttp,
+        "ClientSession",
+        lambda: _RealtimeProbeClientSession(websocket, {}),
+    )
+
+    with pytest.raises(InworldError, match="ignored the single-pass tool lockout"):
+        await InworldClient(api_key="workspace-inworld-key-123456").realtime_readiness_probe(
+            model_id="openai/gpt-4o-mini",
+            voice_id="Ashley",
+            stt_model_id="assemblyai/u3-rt-pro",
+            stt_language="en-GB",
+            single_pass=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_realtime_single_pass_readiness_rejects_unconfirmed_session_policy(monkeypatch):
+    websocket = _RealtimeProbeWebSocket(
+        [
+            {"type": "session.created"},
+            {"type": "session.updated", "session": {}},
+        ]
+    )
+    monkeypatch.setattr(
+        inworld_module.aiohttp,
+        "ClientSession",
+        lambda: _RealtimeProbeClientSession(websocket, {}),
+    )
+
+    with pytest.raises(InworldError, match="did not echo the required single-pass"):
+        await InworldClient(api_key="workspace-inworld-key-123456").realtime_readiness_probe(
+            model_id="openai/gpt-4o-mini",
+            voice_id="Ashley",
+            stt_model_id="assemblyai/u3-rt-pro",
+            stt_language="en-GB",
+            single_pass=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_realtime_single_pass_readiness_rejects_missing_livekit_correlation(monkeypatch):
+    websocket = _RealtimeProbeWebSocket(
+        [
+            {"type": "session.created"},
+            {
+                "type": "session.updated",
+                "session": {
+                    "tools": [],
+                    "tool_choice": "none",
+                    "audio": {
+                        "input": {
+                            "transcription": {
+                                "model": "assemblyai/u3-rt-pro",
+                                "language": "en-GB",
+                            },
+                            "turn_detection": {
+                                "create_response": False,
+                                "interrupt_response": False,
+                            },
+                        }
+                    },
+                },
+            },
+            {
+                "type": "response.created",
+                "response": {"id": "response-1", "metadata": {}},
+            },
+        ]
+    )
+    monkeypatch.setattr(
+        inworld_module.aiohttp,
+        "ClientSession",
+        lambda: _RealtimeProbeClientSession(websocket, {}),
+    )
+
+    with pytest.raises(InworldError, match="correlation metadata"):
+        await InworldClient(api_key="workspace-inworld-key-123456").realtime_readiness_probe(
+            model_id="openai/gpt-4o-mini",
+            voice_id="Ashley",
+            stt_model_id="assemblyai/u3-rt-pro",
+            stt_language="en-GB",
+            single_pass=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_realtime_single_pass_readiness_rejects_automatic_response(monkeypatch):
+    class _AutomaticResponseWebSocket(_RealtimeProbeWebSocket):
+        async def receive_json(self):
+            if len(self.sent) == 2 and self.events[0]["type"] == "response.created":
+                return self.events.pop(0)
+            return await super().receive_json()
+
+    websocket = _AutomaticResponseWebSocket(
+        [
+            {"type": "session.created"},
+            {
+                "type": "session.updated",
+                "session": {
+                    "tools": [],
+                    "tool_choice": "none",
+                    "audio": {
+                        "input": {
+                            "transcription": {
+                                "model": "assemblyai/u3-rt-pro",
+                                "language": "en-GB",
+                            },
+                            "turn_detection": {
+                                "create_response": False,
+                                "interrupt_response": False,
+                            },
+                        }
+                    },
+                },
+            },
+            {"type": "response.created", "response": {"id": "automatic"}},
+        ]
+    )
+    monkeypatch.setattr(
+        inworld_module.aiohttp,
+        "ClientSession",
+        lambda: _RealtimeProbeClientSession(websocket, {}),
+    )
+
+    with pytest.raises(InworldError, match="generated an automatic response"):
+        await InworldClient(api_key="workspace-inworld-key-123456").realtime_readiness_probe(
+            model_id="openai/gpt-4o-mini",
+            voice_id="Ashley",
+            stt_model_id="assemblyai/u3-rt-pro",
+            stt_language="en-GB",
+            single_pass=True,
+        )
 
 
 @pytest.mark.asyncio
@@ -117,6 +434,7 @@ async def test_realtime_readiness_surfaces_plan_restriction_before_a_call(monkey
             model_id="openai/gpt-4o-mini",
             voice_id="Ashley",
             stt_model_id="assemblyai/u3-rt-pro",
+            stt_language="en-GB",
         )
 
 

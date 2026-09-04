@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.provider_credential import ProviderCredential
@@ -18,6 +18,28 @@ from app.services.integration_security import (
 
 class ProviderCredentialError(RuntimeError):
     pass
+
+
+async def lock_provider_cleanup_boundary(
+    db: AsyncSession,
+    tenant_id: UUID,
+    provider: str,
+) -> None:
+    """Serialize provider credentials with durable remote-cleanup intents.
+
+    Credential rotation/deletion and every cleanup reservation use the same
+    transaction-scoped lock.  This closes the empty-result race where a
+    credential could disappear immediately before a cleanup row is inserted.
+    SQLite test databases do not offer advisory locks; their single-process
+    transactions still exercise the surrounding state machine.
+    """
+    if db.get_bind().dialect.name != "postgresql":
+        return
+    lock_key = f"provider-cleanup:{tenant_id}:{provider}"
+    await db.execute(
+        text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
+        {"lock_key": lock_key},
+    )
 
 
 async def get_provider_credential(

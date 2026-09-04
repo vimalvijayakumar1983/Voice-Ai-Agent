@@ -136,7 +136,7 @@ def test_grounding_guard_downgrades_only_unsupported_no_match_answer():
         {
             "runtime": {
                 "turn_diagnostics": [
-                    {"grounding_outcome": "verified_answer"},
+                    {"grounding_outcome": "response_after_verified_retrieval"},
                     {"grounding_outcome": "no_match_correctly_refused"},
                     {"grounding_outcome": "no_match_unverified_response"},
                 ]
@@ -149,7 +149,7 @@ def test_grounding_guard_downgrades_only_unsupported_no_match_answer():
     assert guarded["disposition_details"]["resolution"] == "partially_resolved"
     assert guarded["disposition_details"]["needs_review"] is True
     assert guarded["disposition_details"]["confidence"] == 0.5
-    assert guarded["disposition_details"]["grounding"]["verified_answer"] == 1
+    assert guarded["disposition_details"]["grounding"]["response_after_verified_retrieval"] == 1
     assert guarded["disposition_details"]["grounding"]["no_match_correctly_refused"] == 1
 
 
@@ -171,3 +171,30 @@ def test_grounding_guard_keeps_correct_refusal_out_of_manual_review():
 
     assert guarded["disposition_details"]["resolution"] == "resolved"
     assert guarded["disposition_details"]["needs_review"] is False
+
+
+def test_grounding_guard_downgrades_knowledge_tool_errors_but_not_correct_refusals():
+    analysis = normalize_call_analysis(
+        {
+            "summary": "The call ended after the knowledge tool failed.",
+            "disposition": "information_provided",
+            "resolution": "resolved",
+            "confidence": 0.95,
+        },
+        profile="receptionist",
+    )
+
+    guarded = apply_grounding_quality_guard(
+        analysis,
+        grounding={
+            "knowledge_error_response": 1,
+            "no_match_correctly_refused": 2,
+        },
+    )
+
+    details = guarded["disposition_details"]
+    assert details["resolution"] == "partially_resolved"
+    assert details["needs_review"] is True
+    assert details["confidence"] == 0.5
+    assert details["grounding"]["no_match_correctly_refused"] == 2
+    assert "knowledge retrieval error" in details["evidence"][-1]

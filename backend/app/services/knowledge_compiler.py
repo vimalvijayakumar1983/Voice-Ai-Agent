@@ -6,6 +6,7 @@ realtime call path: callers search the already-compiled document.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from dataclasses import dataclass
@@ -16,7 +17,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 ProcessingMode = Literal["automatic", "fast", "ai_verified"]
 
-COMPILER_VERSION = "vav-knowledge-compiler-7"
+COMPILER_VERSION = "vav-knowledge-compiler-8"
 AUTOMATIC_MODEL = "gpt-5.6-luna"
 VERIFIED_MODEL = "gpt-5.6-terra"
 _MODEL_PRICES_PER_MILLION = {
@@ -123,7 +124,13 @@ def _value_is_grounded(value: str, evidence: str) -> bool:
     return len(value_digits) >= 7 and value_digits in evidence_digits
 
 
-def _subject_is_grounded_in_context(source: str, subject: str, evidence: str) -> bool:
+def _subject_is_grounded_in_context(
+    source: str,
+    subject: str,
+    evidence: str,
+    *,
+    strict_block: bool = False,
+) -> bool:
     """Require a fact's subject in its evidence or its immediate heading block."""
 
     if _value_is_grounded(subject, evidence):
@@ -140,17 +147,18 @@ def _subject_is_grounded_in_context(source: str, subject: str, evidence: str) ->
         evidence_index = normalized_paragraph.find(normalized_evidence)
         if evidence_index < 0:
             continue
-        # Narrative pages often name the organization at the start of a
-        # paragraph and use "we" later in that same paragraph. Accept that
-        # bounded, explicit context without allowing a fact to borrow a subject
-        # from another paragraph or section.
-        subject_index = normalized_paragraph.rfind(
-            normalized_subject,
-            0,
-            evidence_index + len(normalized_subject),
-        )
-        if subject_index >= 0 and evidence_index - subject_index <= 1_200:
-            return True
+        if not strict_block:
+            # Narrative pages often name the organization at the start of a
+            # paragraph and use "we" later in that same paragraph. Contact
+            # facts deliberately cannot use this allowance: one flattened
+            # directory paragraph may contain several organizations.
+            subject_index = normalized_paragraph.rfind(
+                normalized_subject,
+                0,
+                evidence_index + len(normalized_subject),
+            )
+            if subject_index >= 0 and evidence_index - subject_index <= 1_200:
+                return True
         if index == 0:
             continue
         previous = _grounding_normalized(paragraphs[index - 1])
@@ -172,12 +180,18 @@ def _validated_fact(source: str, fact: _Fact) -> dict | None:
     """
 
     evidence = fact.evidence
-    if not _value_is_grounded(fact.subject, evidence) and not (
+    normalized_predicate = _grounding_normalized(fact.predicate)
+    is_contact_fact = bool(
         _PHONE_RE.search(fact.value)
         or _PHONE_RE.search(evidence)
         or _EMAIL_RE.search(fact.value)
         or _EMAIL_RE.search(evidence)
-    ):
+        or any(
+            marker in normalized_predicate.split()
+            for marker in ("phone", "telephone", "email", "address", "location", "contact")
+        )
+    )
+    if not _value_is_grounded(fact.subject, evidence) and not is_contact_fact:
         evidence_start = source.find(evidence)
         if evidence_start >= 0:
             subject_start = source.rfind(
@@ -191,7 +205,12 @@ def _validated_fact(source: str, fact: _Fact) -> dict | None:
                     evidence = candidate
     if not (
         _evidence_is_grounded(source, evidence)
-        and _subject_is_grounded_in_context(source, fact.subject, evidence)
+        and _subject_is_grounded_in_context(
+            source,
+            fact.subject,
+            evidence,
+            strict_block=is_contact_fact,
+        )
         and _value_is_grounded(fact.value, evidence)
     ):
         return None
@@ -212,10 +231,71 @@ def _deterministic_structure(*, title: str, url: str, text: str) -> dict:
         "schema_version": COMPILER_VERSION,
         "page_type": "other",
         "entities": [],
+        "speech_entities": [],
         "facts": [],
+        "exact_fact_coverage": {
+            "complete": False,
+            "reason": "deterministic_extraction_only",
+        },
         "deterministic_contacts": {"phones": phones[:50], "emails": emails[:50]},
         "source": {"title": title, "url": url},
     }
+
+
+def _speech_entity_hints(
+    *,
+    title: str,
+    page_type: str,
+    entities: list[dict],
+    facts: list[dict],
+) -> list[dict]:
+    """Derive source-grounded speech hints without inventing aliases.
+
+    The realtime layer should never have to rediscover which structured values
+    are names.  These hints retain entity type, criticality and an evidence
+    stamp; provider-specific limits and pronunciation repair are handled by the
+    versioned speech-lexicon compiler.
+    """
+
+    normalized_title = _grounding_normalized(title)
+    fact_subjects = {
+        _grounding_normalized(str(fact.get("subject") or ""))
+        for fact in facts
+        if str(fact.get("subject") or "").strip()
+    }
+    selected: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for entity in entities:
+        canonical = " ".join(str(entity.get("name") or "").split()).strip(" |,.;:")
+        entity_type = str(entity.get("entity_type") or "other").strip().lower()
+        evidence = str(entity.get("evidence") or "").strip()
+        folded = canonical.casefold()
+        key = (folded, entity_type)
+        if not canonical or key in seen:
+            continue
+        critical = entity_type in {"organization", "person", "location"} or (
+            entity_type in {"service", "product"}
+            and (
+                page_type == "service"
+                or _grounding_normalized(canonical) in normalized_title
+                or _grounding_normalized(canonical) in fact_subjects
+            )
+        )
+        selected.append(
+            {
+                "canonical": canonical,
+                "entity_type": entity_type,
+                "language": "und",
+                "critical": critical,
+                # Aliases are deliberately empty unless a future governed
+                # source explicitly supplies them.  A generative alias must
+                # never silently become a verified business fact.
+                "aliases": [],
+                "evidence_sha256": hashlib.sha256(evidence.encode("utf-8")).hexdigest(),
+            }
+        )
+        seen.add(key)
+    return selected
 
 
 def _build_document(*, title: str, url: str, text: str, structured: dict) -> str:
@@ -339,7 +419,29 @@ fact. Do not produce medical advice."""
         {
             "page_type": result.page_type,
             "entities": accepted_entities,
+            "speech_entities": _speech_entity_hints(
+                title=title,
+                page_type=result.page_type,
+                entities=accepted_entities,
+                facts=accepted_facts,
+            ),
             "facts": accepted_facts,
+            "exact_fact_coverage": {
+                # A generative extractor can prove that returned facts are
+                # source-grounded; it cannot prove that it returned *every*
+                # fact present in the source. Absence must therefore never be
+                # used as an authoritative refusal boundary.
+                "complete": False,
+                "absence_authoritative": False,
+                "returned_facts_validated": (
+                    len(text) <= 120_000 and len(accepted_facts) == len(result.facts)
+                ),
+                "reason": (
+                    "validated_ai_facts_without_absence_audit"
+                    if len(text) <= 120_000 and len(accepted_facts) == len(result.facts)
+                    else "partial_or_rejected_ai_extraction"
+                ),
+            },
             "validation": {
                 "entities_accepted": len(accepted_entities),
                 "entities_rejected": len(result.entities) - len(accepted_entities),

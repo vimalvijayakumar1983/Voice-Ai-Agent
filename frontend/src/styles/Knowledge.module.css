@@ -238,6 +238,14 @@
 .miniLabel { display: block; margin-bottom: 5px; color: var(--accent); font-size: 9px; font-weight: 800; letter-spacing: .09em; text-transform: uppercase; }
 .approvalCard > strong { font-size: 12px; }
 .approvalCard > p { min-height: 48px; margin: 6px 0 12px; color: var(--text-secondary); font-size: 10px; line-height: 1.55; }
+.releaseHistory { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--border); }
+.releaseHistory summary { cursor: pointer; color: var(--text-secondary); font-size: 10px; font-weight: 750; }
+.releaseHistory > p { margin: 8px 0; color: var(--text-tertiary); font-size: 9px; line-height: 1.5; }
+.releaseHistory form { display: grid; gap: 6px; }
+.releaseHistory label { color: var(--text-secondary); font-size: 9px; font-weight: 700; }
+.releaseHistory select,
+.releaseHistory input { min-width: 0; min-height: 36px; padding: 7px 8px; color: var(--text-secondary); background: white; border: 1px solid var(--border); border-radius: 8px; font-size: 9px; }
+.releaseHistory button { justify-self: start; margin-top: 2px; }
 .bindingHeader { display: flex; justify-content: space-between; align-items: flex-start; color: var(--accent); }
 .bindingHeader strong { color: var(--text-primary); font-size: 12px; }
 .bindingList { min-height: 52px; margin: 10px 0; display: grid; gap: 6px; }

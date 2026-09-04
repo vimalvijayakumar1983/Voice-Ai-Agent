@@ -303,3 +303,57 @@ async def test_inworld_auto_router_cost_is_partial_without_actual_model(
     assert "Railway LiveKit worker hosting allocation" in row["missing_cost_inputs"]
     assert all(component["provider"] != "Inworld Router" for component in row["components"])
     assert report["summary"]["fully_priced_calls"] == 0
+
+
+@pytest.mark.asyncio
+async def test_cost_report_counts_session_and_direct_prewarm_tts_once(
+    client,
+    auth_headers,
+    db,
+    tenant,
+):
+    agent = Agent(
+        tenant_id=tenant.id,
+        name="Mixed TTS accounting",
+        system_prompt="Use approved knowledge.",
+        voice_provider="inworld",
+        voice_id="inworld:Ashley",
+    )
+    db.add(agent)
+    await db.flush()
+    call = Call(
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        direction="inbound",
+        status="completed",
+        from_number="+971500000001",
+        to_number="+971500000002",
+        provider="livekit_sip",
+        duration_seconds=60,
+        call_metadata={
+            "runtime": {
+                "speech_provider": "inworld",
+                "llm_provider": "inworld",
+                # Includes deterministic/clarification text spoken through
+                # session.say, but excludes audio= prewarmed outside session.
+                "tts_characters": 200,
+                "external_tts_request_count": 1,
+                "external_tts_characters": 7,
+                "external_tts_sources": ["greeting_preparation"],
+                "external_tts_provider_reconciliation_required": True,
+            }
+        },
+    )
+    db.add(call)
+    await db.commit()
+
+    response = await client.get("/api/v1/billing/cost-report?days=30", headers=auth_headers)
+
+    assert response.status_code == 200
+    row = next(item for item in response.json()["calls"] if item["call_id"] == str(call.id))
+    tts = next(item for item in row["components"] if item["service"] == "TTS 2")
+    assert tts["quantity"] == pytest.approx(0.207)
+    assert "session + direct prewarm" in tts["basis"]
+    assert row["cost_state"] == "pending_provider_billing_sync"
+    assert "External TTS provider invoice reconciliation" in row["missing_cost_inputs"]
+    assert row["pricing_completeness"] == "partial"

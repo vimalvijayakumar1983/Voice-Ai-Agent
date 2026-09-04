@@ -3,21 +3,28 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Any
 from urllib.parse import urlsplit
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from sqlalchemy import select, text
+from sqlalchemy import or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.database import get_db
+from app.livekit_runtime.inworld_single_pass import (
+    InworldTurnMode,
+    decide_single_pass_runtime,
+)
 from app.middleware.tenant import CurrentUser, get_current_user, require_role
 from app.models.agent import (
     Agent,
     AgentKnowledgeBinding,
     AgentRuntimeProfile,
     KnowledgeBase,
+    KnowledgeProviderCleanup,
+    KnowledgeServingRevisionSource,
     KnowledgeSource,
 )
 from app.models.provider_credential import ProviderCredential
@@ -44,12 +51,46 @@ from app.services.provider_credentials import (
     ProviderCredentialError,
     get_provider_credential,
     load_provider_config,
+    lock_provider_cleanup_boundary,
     store_provider_config,
 )
 from app.services.rate_limit import enforce_rate_limit
+from app.services.realtime_speech_config import (
+    inworld_stt_wire_language,
+    resolve_inworld_stt_model,
+)
+from app.services.recording_policy import (
+    DIAGNOSTIC_RECORDING_OFF,
+    diagnostic_recording_mode,
+)
 from app.telephony.livekit_provider import LiveKitSIPError, LiveKitSIPProvider
 
 router = APIRouter(prefix="/runtime", tags=["Realtime Runtime"])
+
+_SMALLEST_CLEANUP_PROVIDER = "smallest"
+
+
+async def _has_pending_smallest_cleanup(db: AsyncSession, tenant_id: UUID) -> bool:
+    cleanup_id = await db.scalar(
+        select(KnowledgeProviderCleanup.id)
+        .where(
+            KnowledgeProviderCleanup.tenant_id == tenant_id,
+            KnowledgeProviderCleanup.provider == _SMALLEST_CLEANUP_PROVIDER,
+            KnowledgeProviderCleanup.status != "completed",
+        )
+        .limit(1)
+    )
+    return cleanup_id is not None
+
+
+def _smallest_cleanup_credential_conflict() -> HTTPException:
+    return HTTPException(
+        status_code=409,
+        detail=(
+            "Smallest credential cannot be changed while remote knowledge cleanup "
+            "is pending. Wait for Knowledge Studio cleanup to finish, then retry."
+        ),
+    )
 
 
 def _speech_provider_name(provider: str) -> str:
@@ -67,6 +108,96 @@ def _api_key_configured(config: dict | None, platform_key: str) -> bool:
     return bool(str(platform_key or "").strip())
 
 
+def _diagnostic_recording_mode(profile: AgentRuntimeProfile | None) -> str:
+    """Return the governed mode without trusting arbitrary legacy JSON."""
+    return diagnostic_recording_mode(profile)
+
+
+def _knowledge_turn_mode(profile: AgentRuntimeProfile | None) -> str:
+    """Map the public mode onto the strict persisted experiment boolean."""
+
+    runtime_config = (
+        profile.runtime_config
+        if profile is not None and isinstance(profile.runtime_config, dict)
+        else {}
+    )
+    return (
+        InworldTurnMode.SINGLE_PASS.value
+        if runtime_config.get("inworld_single_pass") is True
+        else InworldTurnMode.TOOL_LOOP.value
+    )
+
+
+def _knowledge_turn_audit_details(
+    profile: AgentRuntimeProfile | None,
+) -> dict[str, Any]:
+    runtime_config = (
+        profile.runtime_config
+        if profile is not None and isinstance(profile.runtime_config, dict)
+        else {}
+    )
+    voice_runtime = str(runtime_config.get("voice_runtime") or "pipeline")
+    decision = decide_single_pass_runtime(runtime_config, voice_runtime=voice_runtime)
+    details: dict[str, Any] = {
+        "knowledge_turn_mode": _knowledge_turn_mode(profile),
+        "inworld_single_pass": runtime_config.get("inworld_single_pass") is True,
+        "knowledge_turn_mode_supported": decision.mode != InworldTurnMode.BLOCKED,
+    }
+    if decision.blocker:
+        details["knowledge_turn_mode_blocker"] = decision.blocker
+    return details
+
+
+def _diagnostic_recording_readiness(
+    profile: AgentRuntimeProfile | None,
+) -> tuple[dict[str, bool], dict[str, str]]:
+    """Fail closed until capture, consent, storage, and deletion are real.
+
+    This control plane currently stores only an operator's policy intent.  It
+    does not start LiveKit Egress, write audio, or make VAV playback available.
+    Keep each missing prerequisite explicit so a future implementation cannot
+    accidentally treat a saved opt-in as permission or operational readiness.
+    """
+    if _diagnostic_recording_mode(profile) == DIAGNOSTIC_RECORDING_OFF:
+        return {}, {}
+
+    checks = {
+        "diagnostic_recording_livekit_transport": bool(
+            profile and profile.telephony_provider == "livekit_sip"
+        ),
+        # No current call boundary requires and persists an explicit grant
+        # before capture. Absence of a ConsentRecord must never become consent.
+        "diagnostic_recording_explicit_consent_enforced": False,
+        # The installed LiveKit SDK is used for rooms/SIP only. There is no
+        # governed Egress start/stop implementation in the deployed runtime.
+        "diagnostic_recording_egress_configured": False,
+        # Provider-hosted playback URLs are not a verified VAV-owned output
+        # destination for LiveKit Egress.
+        "diagnostic_recording_storage_configured": False,
+        "diagnostic_recording_retention_enforced": False,
+    }
+    labels = {
+        "diagnostic_recording_livekit_transport": (
+            "Diagnostic audio requires the LiveKit SIP telephony route."
+        ),
+        "diagnostic_recording_explicit_consent_enforced": (
+            "Implement and verify per-call explicit recording consent before capture; "
+            "the absence of consent is not permission."
+        ),
+        "diagnostic_recording_egress_configured": (
+            "Provision and verify a governed LiveKit Egress start/stop lifecycle."
+        ),
+        "diagnostic_recording_storage_configured": (
+            "Configure and verify an encrypted, tenant-approved regional recording "
+            "destination; this policy does not provide VAV playback."
+        ),
+        "diagnostic_recording_retention_enforced": (
+            "Configure and verify recording retention, deletion, and access-audit controls."
+        ),
+    }
+    return checks, labels
+
+
 def _runtime_provider_blocker(
     agent: Agent,
     profile: AgentRuntimeProfile | None,
@@ -77,6 +208,12 @@ def _runtime_provider_blocker(
     if agent.voice_provider == "inworld":
         runtime_config = profile.runtime_config if isinstance(profile.runtime_config, dict) else {}
         voice_runtime = str(runtime_config.get("voice_runtime") or "pipeline")
+        single_pass = decide_single_pass_runtime(
+            runtime_config,
+            voice_runtime=voice_runtime,
+        )
+        if single_pass.blocker:
+            return single_pass.blocker
         if (
             profile.telephony_provider != "livekit_sip"
             or profile.primary_speech_provider != "inworld"
@@ -233,33 +370,58 @@ async def runtime_readiness(
         )
     )
     # The production Inworld lane is intended for governed customer-facing
-    # agents, so it fails closed unless approved searchable knowledge is bound.
-    knowledge_ready = not (profile and profile.primary_speech_provider == "inworld")
+    # agents, so all new calls require an immutable, published serving release.
+    # Mutable approval-only rows remain readable only by already-persisted calls
+    # during the bounded migration window.
+    immutable_knowledge_required = bool(profile and profile.primary_speech_provider == "inworld")
+    knowledge_ready = not immutable_knowledge_required
     if knowledge_binding is not None:
+        approval_clause = (
+            KnowledgeBase.serving_revision_id.is_not(None)
+            if immutable_knowledge_required
+            else or_(
+                KnowledgeBase.serving_revision_id.is_not(None),
+                KnowledgeBase.approval_status == "approved",
+            )
+        )
         bound_knowledge = await db.scalar(
             select(KnowledgeBase).where(
                 KnowledgeBase.id == knowledge_binding.knowledge_base_id,
                 KnowledgeBase.tenant_id == agent.tenant_id,
                 KnowledgeBase.is_active.is_(True),
-                KnowledgeBase.approval_status == "approved",
+                approval_clause,
             )
         )
         if bound_knowledge is None:
             knowledge_ready = False
         else:
-            source_states = (
-                await db.execute(
-                    select(KnowledgeSource.status, KnowledgeSource.content).where(
-                        KnowledgeSource.knowledge_base_id == bound_knowledge.id,
-                        KnowledgeSource.tenant_id == agent.tenant_id,
+            if bound_knowledge.serving_revision_id is not None:
+                source_contents = (
+                    await db.scalars(
+                        select(KnowledgeServingRevisionSource.content).where(
+                            KnowledgeServingRevisionSource.serving_revision_id
+                            == bound_knowledge.serving_revision_id,
+                            KnowledgeServingRevisionSource.tenant_id == agent.tenant_id,
+                        )
                     )
+                ).all()
+                knowledge_ready = bool(source_contents) and all(
+                    bool(str(content or "").strip()) for content in source_contents
                 )
-            ).all()
-            knowledge_ready = bool(source_states) and all(
-                status in {"processing", "indexed", "local_only"}
-                and bool(str(content or "").strip())
-                for status, content in source_states
-            )
+            else:
+                source_states = (
+                    await db.execute(
+                        select(KnowledgeSource.status, KnowledgeSource.content).where(
+                            KnowledgeSource.knowledge_base_id == bound_knowledge.id,
+                            KnowledgeSource.tenant_id == agent.tenant_id,
+                        )
+                    )
+                ).all()
+                knowledge_ready = bool(source_states) and all(
+                    status in {"processing", "indexed", "local_only"}
+                    and bool(str(content or "").strip())
+                    for status, content in source_states
+                )
 
     number_route_conflicts = await _number_route_conflicts(db, agent, profile)
 
@@ -284,6 +446,15 @@ async def runtime_readiness(
         and agent.voice_id.startswith(f"{agent.voice_provider}:")
     )
     provider_compatibility_blocker = _runtime_provider_blocker(agent, profile)
+    runtime_config = (
+        profile.runtime_config
+        if profile is not None and isinstance(profile.runtime_config, dict)
+        else {}
+    )
+    knowledge_turn_decision = decide_single_pass_runtime(
+        runtime_config,
+        voice_runtime=str(runtime_config.get("voice_runtime") or "pipeline"),
+    )
     checks = {
         "agent_active": bool(agent.is_active),
         "vav_speech_agent": vav_speech_agent,
@@ -300,7 +471,10 @@ async def runtime_readiness(
         "number_assigned": bool(profile and profile.assigned_numbers),
         "number_route_unique": not number_route_conflicts,
         "knowledge_retrieval": knowledge_ready,
+        "knowledge_turn_mode_supported": knowledge_turn_decision.mode != InworldTurnMode.BLOCKED,
     }
+    recording_checks, recording_labels = _diagnostic_recording_readiness(profile)
+    checks.update(recording_checks)
     if profile and profile.telephony_provider == "twilio":
         checks["telephony_credential"] = bool(
             (twilio_config and twilio_config.get("account_sid") and twilio_config.get("auth_token"))
@@ -356,8 +530,15 @@ async def runtime_readiness(
             "Move the assigned phone number from its other active agent before activation."
         ),
         "knowledge_retrieval": (
-            "Repair the bound knowledge base so every source has searchable text."
+            (
+                "Approve and publish the bound knowledge base so it has an immutable "
+                "serving revision; backfill legacy approved knowledge before activation."
+            )
+            if immutable_knowledge_required
+            else "Repair the bound knowledge base so every source has searchable text."
         ),
+        "knowledge_turn_mode_supported": knowledge_turn_decision.blocker
+        or "Select a supported knowledge turn mode.",
         "sip_gateway_provisioned": (
             "Enter the verified LiveKit inbound trunk and dispatch-rule IDs for the e& SIP trunk."
         ),
@@ -372,6 +553,7 @@ async def runtime_readiness(
             "Configure LIVEKIT_WORKER_HEALTH_URL on the API with the LiveKit worker's "
             "private HTTP origin."
         ),
+        **recording_labels,
     }
     return [labels[name] for name, passed in checks.items() if not passed], checks
 
@@ -489,25 +671,24 @@ async def live_runtime_readiness(
     voice_runtime = str(runtime_config.get("voice_runtime") or "pipeline")
     if voice_runtime == "inworld_realtime":
         checks["realtime_provider_live"] = False
-        configured_stt = str(runtime_config.get("stt_model") or "auto")
-        if configured_stt == "auto":
-            languages = {
-                str(language or "").strip().lower().split("-", 1)[0]
-                for language in (
-                    list(agent.supported_languages or []) + [agent.language, profile.stt_language]
-                )
-                if str(language or "").strip() and str(language or "").strip().lower() != "auto"
-            }
-            configured_stt = (
-                "assemblyai/u3-rt-pro"
-                if languages and languages.issubset({"en", "es", "fr", "de", "it", "pt"})
-                else "soniox/stt-rt-v4"
-            )
+        single_pass_enabled = _knowledge_turn_mode(profile) == InworldTurnMode.SINGLE_PASS.value
+        if single_pass_enabled:
+            checks["knowledge_single_pass_provider_live"] = False
+        configured_stt = resolve_inworld_stt_model(model=agent, profile=profile)
+        configured_language = inworld_stt_wire_language(model=agent, profile=profile)
         try:
+            probe_options: dict[str, Any] = {
+                "model_id": profile.llm_model,
+                "voice_id": agent.voice_id.removeprefix("inworld:"),
+                "stt_model_id": configured_stt,
+                "stt_language": configured_language,
+            }
+            if single_pass_enabled:
+                # Preserve the deployed control probe byte-for-byte while making
+                # the canary prove the distinct manual, tool-free response path.
+                probe_options["single_pass"] = True
             await inworld.realtime_readiness_probe(
-                model_id=profile.llm_model,
-                voice_id=agent.voice_id.removeprefix("inworld:"),
-                stt_model_id=configured_stt,
+                **probe_options,
             )
         except InworldError as exc:
             blockers.append(f"Inworld native Realtime validation failed: {exc}")
@@ -515,6 +696,8 @@ async def live_runtime_readiness(
             checks["realtime_provider_live"] = True
             checks["tts_provider_live"] = True
             checks["llm_provider_live"] = True
+            if single_pass_enabled:
+                checks["knowledge_single_pass_provider_live"] = True
         return blockers, checks
 
     try:
@@ -576,9 +759,11 @@ def _response(
         "llm_provider": "openai",
         "llm_model": "gpt-4o-mini",
         "voice_runtime": "pipeline",
+        "knowledge_turn_mode": InworldTurnMode.TOOL_LOOP.value,
         "stt_language": "auto",
         "stt_model": "auto",
         "tts_delivery_mode": "balanced",
+        "diagnostic_recording_mode": DIAGNOSTIC_RECORDING_OFF,
         "max_concurrent_calls": 1,
         "daily_call_limit": 100,
         "monthly_budget_cents": 5000,
@@ -589,7 +774,14 @@ def _response(
             {
                 key: getattr(profile, key)
                 for key in values
-                if key not in {"voice_runtime", "stt_model", "tts_delivery_mode"}
+                if key
+                not in {
+                    "voice_runtime",
+                    "knowledge_turn_mode",
+                    "stt_model",
+                    "tts_delivery_mode",
+                    "diagnostic_recording_mode",
+                }
             }
         )
         runtime_config = profile.runtime_config if isinstance(profile.runtime_config, dict) else {}
@@ -597,6 +789,7 @@ def _response(
         values["voice_runtime"] = (
             voice_runtime if voice_runtime in {"pipeline", "inworld_realtime"} else "pipeline"
         )
+        values["knowledge_turn_mode"] = _knowledge_turn_mode(profile)
         stt_model = str(runtime_config.get("stt_model") or "auto")
         values["stt_model"] = (
             stt_model
@@ -613,6 +806,7 @@ def _response(
         values["tts_delivery_mode"] = (
             delivery_mode if delivery_mode in {"stable", "balanced", "creative"} else "balanced"
         )
+        values["diagnostic_recording_mode"] = _diagnostic_recording_mode(profile)
     return RuntimeProfileResponse(
         id=profile.id if profile else None,
         agent_id=agent.id,
@@ -668,7 +862,15 @@ async def update_runtime_profile(
     agent = await _agent(db, current_user.tenant_id, agent_id)
     profile = await _profile(db, current_user.tenant_id, agent_id, create=True)
     assert profile is not None
-    payload = data.model_dump(exclude={"voice_runtime", "stt_model", "tts_delivery_mode"})
+    payload = data.model_dump(
+        exclude={
+            "voice_runtime",
+            "knowledge_turn_mode",
+            "stt_model",
+            "tts_delivery_mode",
+            "diagnostic_recording_mode",
+        }
+    )
     for key, value in payload.items():
         setattr(profile, key, value)
     runtime_config = profile.runtime_config if isinstance(profile.runtime_config, dict) else {}
@@ -677,6 +879,10 @@ async def update_runtime_profile(
             **runtime_config,
             "voice_runtime": data.voice_runtime,
         }
+    runtime_config = {
+        **runtime_config,
+        "inworld_single_pass": data.knowledge_turn_mode == InworldTurnMode.SINGLE_PASS.value,
+    }
     if "stt_model" in data.model_fields_set:
         runtime_config = {
             **runtime_config,
@@ -686,6 +892,11 @@ async def update_runtime_profile(
         runtime_config = {
             **runtime_config,
             "tts_delivery_mode": data.tts_delivery_mode,
+        }
+    if "diagnostic_recording_mode" in data.model_fields_set:
+        runtime_config = {
+            **runtime_config,
+            "diagnostic_recording_mode": data.diagnostic_recording_mode,
         }
     profile.runtime_config = runtime_config
     delivery_mode = str(runtime_config.get("tts_delivery_mode") or "balanced").lower()
@@ -710,6 +921,11 @@ async def update_runtime_profile(
             "voice_runtime": data.voice_runtime,
             "stt_model": data.stt_model,
             "tts_delivery_mode": delivery_mode,
+            "diagnostic_recording_mode": _diagnostic_recording_mode(profile),
+            "diagnostic_recording_opted_in": (
+                _diagnostic_recording_mode(profile) != DIAGNOSTIC_RECORDING_OFF
+            ),
+            **_knowledge_turn_audit_details(profile),
         },
     )
     blockers, _checks = await runtime_readiness(db, agent, profile)
@@ -757,7 +973,12 @@ async def test_runtime_profile(
         action="agent.runtime_tested",
         resource_type="agent",
         resource_id=str(agent.id),
-        details={"ready": not blockers, "checks": checks},
+        details={
+            "ready": not blockers,
+            "checks": checks,
+            "diagnostic_recording_mode": _diagnostic_recording_mode(profile),
+            **_knowledge_turn_audit_details(profile),
+        },
     )
     return RuntimeReadinessResponse(
         agent_id=agent.id,
@@ -801,7 +1022,11 @@ async def activate_runtime_profile(
             action="agent.runtime_activation_blocked",
             resource_type="agent",
             resource_id=str(agent.id),
-            details={"blockers": blockers},
+            details={
+                "blockers": blockers,
+                "diagnostic_recording_mode": _diagnostic_recording_mode(profile),
+                **_knowledge_turn_audit_details(profile),
+            },
         )
         # FastAPI's session dependency rolls back on HTTPException. Commit the
         # fail-closed state before returning 409 so a formerly active route
@@ -820,7 +1045,11 @@ async def activate_runtime_profile(
         action="agent.runtime_activated",
         resource_type="agent",
         resource_id=str(agent.id),
-        details={"telephony_provider": profile.telephony_provider},
+        details={
+            "telephony_provider": profile.telephony_provider,
+            "diagnostic_recording_mode": _diagnostic_recording_mode(profile),
+            **_knowledge_turn_audit_details(profile),
+        },
     )
     return _response(agent, profile, blockers)
 
@@ -844,6 +1073,10 @@ async def deactivate_runtime_profile(
         action="agent.runtime_deactivated",
         resource_type="agent",
         resource_id=str(agent.id),
+        details={
+            "diagnostic_recording_mode": _diagnostic_recording_mode(profile),
+            **_knowledge_turn_audit_details(profile),
+        },
     )
     return _response(agent, profile, blockers)
 
@@ -932,6 +1165,22 @@ async def save_api_key_credential(
 ):
     if provider not in {"smallest", "sarvam", "elevenlabs", "inworld", "openai"}:
         raise HTTPException(status_code=404, detail="Unsupported API-key provider")
+    if provider == _SMALLEST_CLEANUP_PROVIDER:
+        await lock_provider_cleanup_boundary(db, current_user.tenant_id, _SMALLEST_CLEANUP_PROVIDER)
+        existing = await get_provider_credential(
+            db,
+            current_user.tenant_id,
+            provider,
+            for_update=True,
+        )
+        if (
+            existing is not None
+            and existing.is_active
+            and await _has_pending_smallest_cleanup(db, current_user.tenant_id)
+        ):
+            raise _smallest_cleanup_credential_conflict()
+    else:
+        existing = await get_provider_credential(db, current_user.tenant_id, provider)
     if provider == "elevenlabs":
         try:
             await ElevenLabsClient(api_key=data.api_key).validate_connection()
@@ -952,7 +1201,6 @@ async def save_api_key_credential(
                 status_code=status_code,
                 detail=f"Inworld API key validation failed: {exc}",
             ) from exc
-    existing = await get_provider_credential(db, current_user.tenant_id, provider)
     try:
         credential = await store_provider_config(
             db, current_user.tenant_id, provider, data.model_dump()
@@ -1007,6 +1255,10 @@ async def delete_workspace_credential(
 ):
     if provider not in {"smallest", "sarvam", "elevenlabs", "inworld", "openai", "twilio"}:
         raise HTTPException(status_code=404, detail="Unsupported credential provider")
+    if provider == _SMALLEST_CLEANUP_PROVIDER:
+        await lock_provider_cleanup_boundary(db, current_user.tenant_id, _SMALLEST_CLEANUP_PROVIDER)
+        if await _has_pending_smallest_cleanup(db, current_user.tenant_id):
+            raise _smallest_cleanup_credential_conflict()
     credential = await get_provider_credential(
         db, current_user.tenant_id, provider, for_update=True
     )

@@ -10,7 +10,10 @@ ANALYSIS_SOURCES = frozenset({"provider_analytics", "vav_ai", "rules", "unavaila
 
 GROUNDING_OUTCOMES = frozenset(
     {
+        # ``verified_answer`` is retained only for historical call rows. New
+        # runtime traces use the truthful retrieval-level label below.
         "verified_answer",
+        "response_after_verified_retrieval",
         "no_match_correctly_refused",
         "no_match_clarification",
         "no_match_unverified_response",
@@ -355,7 +358,9 @@ def apply_grounding_quality_guard(
     }
     details["grounding"] = safe_counts
     unsupported_count = safe_counts["no_match_unverified_response"]
-    if unsupported_count <= 0:
+    knowledge_error_count = safe_counts["knowledge_error_response"]
+    grounding_issue_count = unsupported_count + knowledge_error_count
+    if grounding_issue_count <= 0:
         return analysis
 
     if details.get("resolution") == "resolved":
@@ -368,6 +373,15 @@ def apply_grounding_quality_guard(
     evidence = details.get("evidence")
     if not isinstance(evidence, list):
         evidence = []
-    warning = f"{unsupported_count} response(s) followed a no-match knowledge result."
+    warning_parts: list[str] = []
+    if unsupported_count:
+        warning_parts.append(
+            f"{unsupported_count} response(s) followed a no-match knowledge result"
+        )
+    if knowledge_error_count:
+        warning_parts.append(
+            f"{knowledge_error_count} response(s) followed a knowledge retrieval error"
+        )
+    warning = "; ".join(warning_parts) + "."
     details["evidence"] = [*evidence[:2], warning]
     return analysis

@@ -491,9 +491,28 @@ def _call_components(
         )
 
         tracked_characters = runtime.get("tts_characters")
-        if isinstance(tracked_characters, (int, float)) and tracked_characters >= 0:
+        external_tts_characters = runtime.get("external_tts_characters")
+        external_tts_pending = runtime.get("external_tts_provider_reconciliation_required") is True
+        if (
+            isinstance(tracked_characters, (int, float))
+            and not isinstance(tracked_characters, bool)
+            and tracked_characters >= 0
+        ):
             tts_characters = int(tracked_characters)
-            character_basis = "Runtime-metered characters"
+            if (
+                isinstance(external_tts_characters, (int, float))
+                and not isinstance(external_tts_characters, bool)
+                and external_tts_characters >= 0
+            ):
+                # Direct prewarm synthesis is outside AgentSession usage. Text
+                # spoken through session.say remains in tts_characters, so the
+                # two quantities are disjoint and counted exactly once.
+                tts_characters += int(external_tts_characters)
+                character_basis = "Runtime-metered session + direct prewarm characters"
+            else:
+                character_basis = "Runtime-metered characters"
+                if external_tts_pending:
+                    missing.append("Direct prewarm TTS characters")
         else:
             tts_characters, origin = _assistant_characters(transcript)
             character_basis = (
@@ -501,6 +520,12 @@ def _call_components(
                 if origin == "transcript_derived"
                 else ""
             )
+            if not tts_characters and isinstance(external_tts_characters, (int, float)):
+                tts_characters = max(0, int(external_tts_characters))
+                character_basis = "VAV-observed direct prewarm characters only"
+                missing.append("Session TTS characters")
+        if external_tts_pending:
+            missing.append("External TTS provider invoice reconciliation")
         if tts_characters:
             thousands = Decimal(tts_characters) / Decimal("1000")
             if speech == "inworld":
@@ -668,9 +693,19 @@ async def build_cost_report(
         components, missing = _call_components(call, agent, transcript)
         estimated = sum((Decimal(str(item["cost_usd"])) for item in components), Decimal("0"))
         ledger = ledger_by_call.get(call.id, Decimal("0"))
+        call_metadata = call.call_metadata if isinstance(call.call_metadata, dict) else {}
+        runtime_value = call_metadata.get("runtime")
+        runtime = runtime_value if isinstance(runtime_value, dict) else {}
+        provider_reconciliation_pending = (
+            runtime.get("external_tts_provider_reconciliation_required") is True
+        )
         if estimated > 0:
             primary_cost = estimated
-            cost_state = "public_rate_estimate"
+            cost_state = (
+                "pending_provider_billing_sync"
+                if provider_reconciliation_pending
+                else "public_rate_estimate"
+            )
         elif ledger > 0:
             primary_cost = ledger
             cost_state = "recorded_ledger_estimate"
@@ -692,7 +727,12 @@ async def build_cost_report(
             primary_cost = Decimal("0")
             cost_state = "unpriced"
 
-        if cost_state in {"public_rate_estimate", "recorded_ledger_estimate", "zero_duration"}:
+        if cost_state in {
+            "pending_provider_billing_sync",
+            "public_rate_estimate",
+            "recorded_ledger_estimate",
+            "zero_duration",
+        }:
             priced += 1
         if not missing and cost_state in {"public_rate_estimate", "zero_duration"}:
             fully_priced += 1

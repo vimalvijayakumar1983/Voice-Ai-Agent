@@ -3,7 +3,7 @@
 import json
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
 
 import httpx
@@ -13,6 +13,7 @@ from sqlalchemy import select
 
 from app.livekit_runtime import inworld_realtime as inworld_realtime_adapter
 from app.livekit_runtime import worker as livekit_worker
+from app.livekit_runtime.inworld_single_pass import SinglePassTurnOutcome
 from app.livekit_runtime.worker import (
     _build_inworld_realtime_model,
     _capture_turn_latency,
@@ -22,14 +23,27 @@ from app.livekit_runtime.worker import (
     _inworld_voice_runtime,
     _LiveKitRuntimeTelemetry,
     _no_match_response_outcome,
+    _record_external_tts_request,
     _runtime_date_context,
     _usage_snapshot,
     _worker_http_port,
     _worker_idle_processes,
 )
-from app.models.agent import Agent, AgentRuntimeProfile
+from app.models.agent import (
+    Agent,
+    AgentKnowledgeBinding,
+    AgentRuntimeProfile,
+    KnowledgeBase,
+    KnowledgeSource,
+)
 from app.models.call import Call
+from app.services.knowledge_serving import (
+    knowledge_admission_is_durable,
+    pre_admit_outbound_knowledge_call,
+    publish_serving_revision,
+)
 from app.services.provider_credentials import ProviderCredentialError
+from app.services.speech_lexicon import publish_speech_lexicon
 from app.telephony.livekit_provider import LiveKitSIPError, LiveKitSIPProvider
 from tests.conftest import test_session_factory as session_factory
 
@@ -103,6 +117,299 @@ async def test_open_outbound_call_merges_durable_context_into_session_variables(
 
     assert opened_call_id == call.id
     assert variables == {"customer_name": "Maya", "balance": 125.5}
+
+
+@pytest.mark.asyncio
+async def test_inbound_open_locks_capacity_before_knowledge_admission(
+    db,
+    tenant,
+    monkeypatch,
+):
+    agent = Agent(
+        tenant_id=tenant.id,
+        name="Inbound lock-order agent",
+        system_prompt="Use approved evidence only.",
+        voice_provider="inworld",
+        voice_id="inworld:Ashley",
+        language="en-GB",
+        supported_languages=["en-GB"],
+        max_call_duration_seconds=60,
+    )
+    db.add(agent)
+    await db.flush()
+    profile = AgentRuntimeProfile(
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        enabled=True,
+        status="active",
+        telephony_provider="livekit_sip",
+        primary_speech_provider="inworld",
+        llm_provider="inworld",
+        llm_model="openai/gpt-4o-mini",
+        assigned_numbers=["+97141234567"],
+    )
+    db.add(profile)
+    await db.commit()
+    lock_order: list[str] = []
+
+    async def track_capacity(*_args, **_kwargs):
+        lock_order.append("capacity")
+
+    async def track_knowledge(*_args, **_kwargs):
+        lock_order.append("knowledge")
+
+    monkeypatch.setattr(livekit_worker, "async_session_factory", session_factory)
+    monkeypatch.setattr(livekit_worker, "_enforce_inbound_limits", track_capacity)
+    monkeypatch.setattr(livekit_worker, "_admit_reserved_knowledge_pin", track_knowledge)
+
+    call_id = await livekit_worker._open_call(
+        model=agent,
+        profile=profile,
+        room_name=f"vav-inbound-lock-order-{uuid4()}",
+        attributes={
+            "sip.callDirection": "inbound",
+            "sip.phoneNumber": "+971501234567",
+            "sip.trunkPhoneNumber": "+97141234567",
+        },
+    )
+
+    assert lock_order == ["capacity", "knowledge"]
+    assert await db.get(Call, call_id) is not None
+
+
+@pytest.mark.asyncio
+async def test_pre_admitted_outbound_worker_keeps_reserved_revision_after_later_changes(
+    db,
+    tenant,
+    monkeypatch,
+):
+    monkeypatch.setattr(livekit_worker.settings, "inworld_api_key", "inworld-test-key")
+    agent = Agent(
+        tenant_id=tenant.id,
+        name="Pinned outbound agent",
+        system_prompt="Use approved evidence only.",
+        voice_provider="inworld",
+        voice_id="inworld:Ashley",
+        language="en-GB",
+        supported_languages=["en-GB"],
+        max_call_duration_seconds=60,
+    )
+    knowledge = KnowledgeBase(
+        tenant_id=tenant.id,
+        name="Pinned outbound knowledge",
+        approval_status="approved",
+        sync_status="ready",
+        source_count=1,
+        indexed_source_count=1,
+        is_active=True,
+    )
+    source = KnowledgeSource(
+        tenant_id=tenant.id,
+        source_type="text",
+        name="Version one",
+        status="indexed",
+        content="The approved support number is +971 2 111 1111.",
+    )
+    knowledge.sources.append(source)
+    db.add_all((agent, knowledge))
+    await db.flush()
+    profile = AgentRuntimeProfile(
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        enabled=True,
+        status="active",
+        telephony_provider="livekit_sip",
+        primary_speech_provider="inworld",
+        llm_provider="inworld",
+        llm_model="openai/gpt-4o-mini",
+        stt_language="en-GB",
+        assigned_numbers=["+97141234567"],
+    )
+    db.add_all(
+        (
+            profile,
+            AgentKnowledgeBinding(
+                tenant_id=tenant.id,
+                agent_id=agent.id,
+                knowledge_base_id=knowledge.id,
+            ),
+        )
+    )
+    first_lexicon = await publish_speech_lexicon(
+        db,
+        tenant_id=tenant.id,
+        knowledge_base=knowledge,
+    )
+    first_revision = await publish_serving_revision(
+        db,
+        tenant_id=tenant.id,
+        knowledge_base=knowledge,
+        speech_lexicon=first_lexicon,
+    )
+    call = Call(
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        direction="outbound",
+        status="dispatching",
+        from_number="+97141234567",
+        to_number="+971501234567",
+        provider="livekit_sip",
+        call_metadata={
+            "speech_provider": "inworld",
+            "runtime": {
+                "transport": "livekit_sip",
+                "speech_provider": "inworld",
+                "knowledge_serving_revision_id": str(first_revision.id),
+                "knowledge_serving_knowledge_base_id": str(first_revision.knowledge_base_id),
+                "knowledge_serving_content_sha256": first_revision.content_sha256,
+                "knowledge_source_revision_sha256": first_revision.source_revision_sha256,
+                "knowledge_serving_revocation_generation": 0,
+            },
+        },
+    )
+    db.add(call)
+    await db.flush()
+    call = await pre_admit_outbound_knowledge_call(
+        db,
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        call_id=call.id,
+    )
+    assert knowledge_admission_is_durable(call.call_metadata)
+    await db.commit()
+    agent_id = agent.id
+    knowledge_id = knowledge.id
+    call_id = call.id
+    first_revision_id = first_revision.id
+    first_content_sha256 = first_revision.content_sha256
+    first_source_sha256 = first_revision.source_revision_sha256
+
+    # Publish a new green revision after the outbound reservation was created
+    # but before the worker joins the LiveKit room.
+    source.content = "The new support number is +971 2 222 2222."
+    await db.flush()
+    second_lexicon = await publish_speech_lexicon(
+        db,
+        tenant_id=tenant.id,
+        knowledge_base=knowledge,
+    )
+    second_revision = await publish_serving_revision(
+        db,
+        tenant_id=tenant.id,
+        knowledge_base=knowledge,
+        speech_lexicon=second_lexicon,
+    )
+    await db.commit()
+    second_revision_id = second_revision.id
+    assert second_revision_id != first_revision_id
+    assert knowledge.serving_revision_id == second_revision_id
+
+    monkeypatch.setattr(livekit_worker, "async_session_factory", session_factory)
+    original_hashes = {
+        "knowledge_serving_content_sha256": first_content_sha256,
+        "knowledge_source_revision_sha256": first_source_sha256,
+    }
+    for field_name, expected_hash in original_hashes.items():
+        reserved_call = await db.get(Call, call_id)
+        metadata = dict(reserved_call.call_metadata)
+        runtime = dict(metadata["runtime"])
+        runtime[field_name] = "tampered"
+        reserved_call.call_metadata = {**metadata, "runtime": runtime}
+        await db.commit()
+
+        with pytest.raises(RuntimeError, match="failed integrity validation"):
+            await livekit_worker._load_runtime(agent_id, call_id=call_id)
+
+        reserved_call = await db.get(Call, call_id)
+        metadata = dict(reserved_call.call_metadata)
+        reserved_call.call_metadata = {
+            **metadata,
+            "runtime": {**dict(metadata["runtime"]), field_name: expected_hash},
+        }
+        await db.commit()
+
+    loaded_model, loaded_profile, _api_keys, knowledge_pin = await livekit_worker._load_runtime(
+        agent_id, call_id=call_id
+    )
+    assert knowledge_pin.revision_id == first_revision_id
+    assert knowledge_pin.content_sha256 == first_content_sha256
+    assert knowledge_pin.revocation_generation == 0
+    assert knowledge_pin.revision_id != second_revision_id
+
+    with pytest.raises(RuntimeError, match="knowledge revision changed before connect"):
+        await livekit_worker._open_call(
+            model=loaded_model,
+            profile=loaded_profile,
+            room_name=f"vav-call-{call_id}",
+            attributes={"sip.callDirection": "outbound"},
+            dispatched_call_id=call_id,
+            knowledge_pin=livekit_worker._RuntimeKnowledgePin.from_revision(second_revision),
+        )
+
+    # A later ordinary publication may move the live pointer, but does not
+    # invalidate the immutable release already reserved for this paid call.
+    current_knowledge = await db.get(KnowledgeBase, knowledge_id)
+    await livekit_worker._admit_reserved_knowledge_pin(
+        db,
+        model=loaded_model,
+        knowledge_pin=knowledge_pin,
+        call=await db.get(Call, call_id),
+    )
+
+    # This outbound reservation crossed its durable admission boundary before
+    # dialing. A later rebind or explicit revoke must not make an answered,
+    # paid call go silent; it keeps only the immutable release it admitted.
+    alternate_knowledge = KnowledgeBase(
+        tenant_id=tenant.id,
+        name="Alternate approved knowledge",
+        approval_status="approved",
+        sync_status="ready",
+        is_active=True,
+    )
+    db.add(alternate_knowledge)
+    await db.flush()
+    binding = await db.scalar(
+        select(AgentKnowledgeBinding).where(AgentKnowledgeBinding.agent_id == agent_id)
+    )
+    binding.knowledge_base_id = alternate_knowledge.id
+    await db.commit()
+    current_knowledge = await db.get(KnowledgeBase, knowledge_id)
+    current_knowledge.serving_revocation_generation += 1
+    current_knowledge.serving_revision_id = None
+    current_knowledge.approval_status = "draft"
+    await db.commit()
+    reloaded_model, reloaded_profile, _api_keys, reloaded_pin = await livekit_worker._load_runtime(
+        agent_id, call_id=call_id
+    )
+    assert reloaded_pin.knowledge_base_id == knowledge_id
+    assert reloaded_pin.revision_id == first_revision_id
+    assert (
+        await livekit_worker._open_call(
+            model=reloaded_model,
+            profile=reloaded_profile,
+            room_name=f"vav-call-{call_id}",
+            attributes={"sip.callDirection": "outbound"},
+            dispatched_call_id=call_id,
+            knowledge_pin=reloaded_pin,
+        )
+        == call_id
+    )
+
+    # Once admitted, a later publication/revocation does not mutate the
+    # immutable release already serving the active call, and a duplicate job
+    # cannot start a second agent session for that same paid call.
+    with pytest.raises(
+        livekit_worker.OutboundReservationAlreadyClaimedError,
+        match="already claimed",
+    ):
+        await livekit_worker._open_call(
+            model=loaded_model,
+            profile=loaded_profile,
+            room_name=f"vav-call-{call_id}",
+            attributes={"sip.callDirection": "outbound"},
+            dispatched_call_id=call_id,
+            knowledge_pin=reloaded_pin,
+        )
 
 
 @pytest.mark.asyncio
@@ -421,6 +728,93 @@ async def test_worker_preopen_failure_terminalizes_exact_outbound_call_once(
 
 
 @pytest.mark.asyncio
+async def test_duplicate_outbound_worker_never_fails_or_hangs_up_active_call(
+    db,
+    tenant,
+    monkeypatch,
+):
+    agent = Agent(
+        tenant_id=tenant.id,
+        name="Already active outbound agent",
+        system_prompt="Use approved knowledge.",
+        voice_provider="inworld",
+        voice_id="inworld:Ashley",
+        language="en-GB",
+    )
+    db.add(agent)
+    await db.flush()
+    call_id = uuid4()
+    room_name = f"vav-call-{call_id}"
+    call = Call(
+        id=call_id,
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        direction="outbound",
+        status="in_progress",
+        from_number="+97141234567",
+        to_number="+971501234567",
+        provider="livekit_sip",
+        call_metadata={
+            "speech_provider": "inworld",
+            "livekit_room": room_name,
+            "runtime": {"transport": "livekit_sip", "speech_provider": "inworld"},
+        },
+    )
+    db.add(call)
+    await db.commit()
+
+    class Room:
+        name = room_name
+
+    class Context:
+        job = SimpleNamespace(
+            metadata=json.dumps({"agent_id": str(agent.id), "call_id": str(call_id)})
+        )
+        room = Room()
+
+        async def connect(self):
+            return None
+
+        async def wait_for_participant(self):
+            return SimpleNamespace(
+                identity=f"sip-{call_id}",
+                attributes={
+                    "sip.callDirection": "outbound",
+                    "sip.callStatus": "active",
+                },
+            )
+
+    profile = SimpleNamespace()
+    load_runtime = AsyncMock(
+        return_value=(
+            agent,
+            profile,
+            livekit_worker._RuntimeApiKeys(speech="inworld-key", llm="inworld-key"),
+            livekit_worker._RuntimeKnowledgePin(),
+        )
+    )
+    open_call = AsyncMock(
+        side_effect=livekit_worker.OutboundReservationAlreadyClaimedError(
+            "Outbound call reservation was already claimed"
+        )
+    )
+    delete_room = AsyncMock(return_value=True)
+    monkeypatch.setattr(livekit_worker, "_load_runtime", load_runtime)
+    monkeypatch.setattr(livekit_worker, "_open_call", open_call)
+    monkeypatch.setattr(livekit_worker, "delete_browser_room", delete_room)
+
+    with pytest.raises(livekit_worker.OutboundReservationAlreadyClaimedError):
+        await livekit_worker.vav_inworld_session(Context())
+
+    delete_room.assert_not_awaited()
+    db.expire_all()
+    unchanged = await db.get(Call, call_id)
+    assert unchanged.status == "in_progress"
+    assert unchanged.ended_at is None
+    assert "lifecycle_error" not in unchanged.call_metadata
+
+
+@pytest.mark.asyncio
 async def test_worker_logs_only_keyed_inbound_route_references(caplog, monkeypatch):
     trunk_id = "ST_sensitive_inbound_trunk"
     called_number = "+97141234567"
@@ -539,7 +933,8 @@ async def test_worker_failure_after_call_persistence_finalizes_once_and_resolves
         def shutdown(self, reason=""):
             return None
 
-    async def load_runtime(_agent_id):
+    async def load_runtime(_agent_id, **kwargs):
+        assert kwargs["call_id"] == call_id
         return (
             model,
             profile,
@@ -547,6 +942,7 @@ async def test_worker_failure_after_call_persistence_finalizes_once_and_resolves
                 speech="inworld-key",
                 llm="tenant-openai-key",
             ),
+            livekit_worker._RuntimeKnowledgePin(),
         )
 
     def stt(**kwargs):
@@ -653,6 +1049,131 @@ def test_livekit_agent_enforces_fixed_language_and_repairs_uncertain_transcripts
     assert "verified founding year" in instructions
 
 
+@pytest.mark.parametrize(
+    ("utterance", "is_control"),
+    [
+        ("Can you hear me?", True),
+        ("Please speak slower.", True),
+        ("How do you pronounce Al Zaabi?", True),
+        ("Can you help me with pricing?", False),
+        ("What languages do your services support?", False),
+        ("What is your delivery latency?", False),
+    ],
+)
+def test_conversation_control_grammar_does_not_bypass_factual_grounding(
+    utterance,
+    is_control,
+):
+    assert livekit_worker._is_conversation_control_utterance(utterance) is is_control
+
+
+@pytest.mark.parametrize(
+    ("partial", "meaningful"),
+    [
+        ("yes", False),
+        ("okay", False),
+        ("can", False),
+        ("phone", True),
+        ("can you", True),
+        ("stop", True),
+    ],
+)
+def test_single_pass_interruption_waits_for_meaningful_transcript(partial, meaningful):
+    assert livekit_worker._is_meaningful_single_pass_interruption(partial) is meaningful
+
+
+def test_passive_single_pass_backchannel_is_consumed_before_fragment_cancellation():
+    controller = SimpleNamespace(on_suppressed_final_transcript=Mock())
+    runtime_agent = SimpleNamespace(should_expand_single_pass_backchannel=Mock(return_value=False))
+
+    # "Okay" is deliberately a general incomplete-fragment candidate. The
+    # single-pass gate consumes it first and never requests active cancellation.
+    assert livekit_worker._is_incomplete_barge_in_fragment("Okay") is True
+    assert (
+        livekit_worker._consume_passive_single_pass_backchannel(
+            transcript="Okay",
+            runtime_agent=runtime_agent,
+            controller=controller,
+        )
+        is True
+    )
+    controller.on_suppressed_final_transcript.assert_called_once_with(cancel_active=False)
+
+
+def test_affirmative_answer_to_explicit_offer_reaches_single_pass_turn():
+    controller = SimpleNamespace(on_suppressed_final_transcript=Mock())
+    runtime_agent = SimpleNamespace(should_expand_single_pass_backchannel=Mock(return_value=True))
+
+    assert (
+        livekit_worker._consume_passive_single_pass_backchannel(
+            transcript="Yes",
+            runtime_agent=runtime_agent,
+            controller=controller,
+        )
+        is False
+    )
+    controller.on_suppressed_final_transcript.assert_not_called()
+
+
+def test_passive_backchannel_does_not_create_a_fake_turn_or_steal_grounding():
+    runtime_metrics = {"barge_in_count": 0}
+    telemetry = _LiveKitRuntimeTelemetry(
+        runtime_metrics=runtime_metrics,
+        end_to_end_samples=[],
+        opened_at=1.0,
+    )
+    telemetry.on_final_transcript("Who is the chairman?")
+    telemetry.record_knowledge_lookup(elapsed_ms=10, result="no_match")
+    original_trace = telemetry.current_turn_trace
+    telemetry.on_agent_state(new_state="speaking")
+    telemetry.on_user_state(old_state="listening", new_state="speaking", agent_state="speaking")
+    telemetry.on_user_state(old_state="speaking", new_state="listening", agent_state="speaking")
+    telemetry.on_final_transcript("Okay")
+
+    controller = SimpleNamespace(on_suppressed_final_transcript=Mock())
+    runtime_agent = SimpleNamespace(should_expand_single_pass_backchannel=Mock(return_value=False))
+    assert livekit_worker._consume_passive_single_pass_backchannel(
+        transcript="Okay",
+        runtime_agent=runtime_agent,
+        controller=controller,
+        telemetry=telemetry,
+    )
+
+    assert telemetry.current_turn_trace is None
+    assert runtime_metrics["turn_diagnostics"] == [original_trace]
+    assert telemetry.pending_grounding_trace is original_trace
+    telemetry.on_assistant_content("I couldn't verify that from the approved information.")
+    assert original_trace["grounding_outcome"] == "no_match_correctly_refused"
+
+
+def test_late_interrupted_assistant_item_cannot_consume_newer_grounding_verdict():
+    runtime_metrics = {"barge_in_count": 0}
+    telemetry = _LiveKitRuntimeTelemetry(
+        runtime_metrics=runtime_metrics,
+        end_to_end_samples=[],
+        opened_at=1.0,
+    )
+    telemetry.on_final_transcript("Where is branch B?")
+    telemetry.record_knowledge_lookup(elapsed_ms=10, result="no_match")
+    trace = telemetry.current_turn_trace
+
+    telemetry.on_assistant_content(
+        "The old answer is unsupported.",
+        item_id="old-response",
+        interrupted=True,
+    )
+
+    assert trace is not None
+    assert "grounding_outcome" not in trace
+    assert telemetry.pending_grounding_trace is trace
+    telemetry.on_assistant_content(
+        "I couldn't verify that from the approved information.",
+        item_id="current-response",
+    )
+    assert trace["grounding_response_item_id"] == "current-response"
+    assert trace["grounding_outcome"] == "no_match_correctly_refused"
+
+
 def test_runtime_date_context_uses_agent_timezone_and_falls_back_safely():
     observed = datetime(2026, 9, 3, 21, 30, tzinfo=UTC)
 
@@ -699,7 +1220,13 @@ async def test_livekit_agent_injects_bounded_knowledge_before_one_llm_response(m
     retrieval = AsyncMock(return_value="Source: Group overview\nVerified group companies.")
     monkeypatch.setattr(livekit_worker, "retrieve_knowledge_context", retrieval)
     monkeypatch.setattr(livekit_worker, "async_session_factory", session_factory)
-    agent = livekit_worker.VAVInworldAgent(model=model)
+    serving_revision_id = uuid4()
+    knowledge_base_id = uuid4()
+    agent = livekit_worker.VAVInworldAgent(
+        model=model,
+        knowledge_serving_revision_id=serving_revision_id,
+        knowledge_base_id=knowledge_base_id,
+    )
     turn_ctx = livekit_worker.llm.ChatContext.empty()
     message = turn_ctx.add_message(role="user", content="Which companies are in the group?")
 
@@ -712,6 +1239,8 @@ async def test_livekit_agent_injects_bounded_knowledge_before_one_llm_response(m
         retrieval.await_args.kwargs["max_context_chars"]
         == livekit_worker.VOICE_KNOWLEDGE_CONTEXT_CHARS
     )
+    assert retrieval.await_args.kwargs["serving_revision_id"] == serving_revision_id
+    assert retrieval.await_args.kwargs["knowledge_base_id"] == knowledge_base_id
     assert "Verified group companies" in turn_ctx.messages()[-1].text_content
 
 
@@ -736,6 +1265,13 @@ async def test_native_realtime_agent_uses_tool_without_duplicate_context_injecti
     retrieval.assert_not_awaited()
     assert len(turn_ctx.messages()) == 1
     assert "alternative semantic query" in agent.instructions
+
+    canary_agent = livekit_worker.VAVInworldRealtimeAgent(
+        model=model,
+        single_pass=True,
+    )
+    assert "automatically added to the current turn" in canary_agent.instructions
+    assert "call\n  `search_approved_knowledge` before answering" not in (canary_agent.instructions)
 
 
 @pytest.mark.asyncio
@@ -762,6 +1298,41 @@ async def test_native_realtime_tool_passes_semantic_terms_to_shared_retrieval(mo
         query="When was Al Zaabi Group formed?",
         query_variants=("What is the Al Zaabi Group inception year?",),
     )
+
+
+@pytest.mark.asyncio
+async def test_single_pass_backchannel_expands_only_after_an_explicit_offer(monkeypatch):
+    model = Agent(
+        tenant_id=uuid4(),
+        name="Al Zaabi Group Receptionist",
+        system_prompt="Answer from approved knowledge.",
+        voice_provider="inworld",
+        voice_id="inworld:Ashley",
+        language="en-GB",
+    )
+    agent = livekit_worker.VAVInworldRealtimeAgent(model=model, single_pass=True)
+    retrieval = AsyncMock(return_value="Approved evidence")
+    monkeypatch.setattr(agent, "_retrieve_approved_knowledge", retrieval)
+
+    assert (
+        await agent.retrieve_single_pass_evidence("Where are you located?") == "Approved evidence"
+    )
+    agent.observe_single_pass_assistant_content("We are on Example Road.")
+    assert await agent.retrieve_single_pass_evidence("Okay") == (
+        livekit_worker.NO_KNOWLEDGE_REQUIRED
+    )
+    assert retrieval.await_count == 1
+
+    assert await agent.retrieve_single_pass_evidence("What are your hours?") == (
+        "Approved evidence"
+    )
+    assert retrieval.await_count == 2
+    assert retrieval.await_args.kwargs["query"] == "What are your hours?"
+
+    agent.observe_single_pass_assistant_content("Would you like me to give you the weekend hours?")
+    assert await agent.retrieve_single_pass_evidence("Yes") == "Approved evidence"
+    assert retrieval.await_count == 3
+    assert retrieval.await_args.kwargs["query"] == "What are your hours. Yes"
 
 
 @pytest.mark.asyncio
@@ -974,7 +1545,72 @@ def test_livekit_usage_snapshot_reads_cumulative_model_usage_once():
         "tts_audio_seconds": 9.25,
         "stt_audio_seconds": 42.5,
         "llm_tokens": 1500,
+        "usage_source": "livekit_session_usage",
+        "runtime_usage_components_complete": True,
+        "usage_components_expected": ["llm", "tts", "stt"],
+        "usage_components_reported": ["llm", "stt", "tts"],
     }
+
+
+def test_livekit_usage_snapshot_preserves_unreported_usage_as_unknown():
+    assert _usage_snapshot(SimpleNamespace(model_usage=[])) == {
+        "llm_input_tokens": None,
+        "llm_output_tokens": None,
+        "llm_input_audio_tokens": None,
+        "llm_output_audio_tokens": None,
+        "llm_input_text_tokens": None,
+        "llm_output_text_tokens": None,
+        "realtime_session_seconds": None,
+        "tts_characters": None,
+        "tts_audio_seconds": None,
+        "stt_audio_seconds": None,
+        "llm_tokens": None,
+        "usage_source": "livekit_session_usage",
+        "runtime_usage_components_complete": False,
+        "usage_components_expected": ["llm", "tts", "stt"],
+        "usage_components_reported": [],
+    }
+
+
+def test_native_usage_completeness_means_expected_metric_presence_not_billing():
+    usage = SimpleNamespace(model_usage=[SimpleNamespace(type="llm_usage", session_duration=12.5)])
+
+    snapshot = _usage_snapshot(usage, expected_components=("llm",))
+
+    assert snapshot["usage_components_expected"] == ["llm"]
+    assert snapshot["usage_components_reported"] == ["llm"]
+    assert snapshot["runtime_usage_components_complete"] is True
+    assert snapshot["llm_tokens"] is None
+    assert snapshot["tts_audio_seconds"] is None
+    assert snapshot["stt_audio_seconds"] is None
+
+
+def test_native_external_tts_is_a_separate_observed_component():
+    usage = SimpleNamespace(model_usage=[SimpleNamespace(type="llm_usage", session_duration=12.5)])
+    snapshot = _usage_snapshot(usage, expected_components=("llm",))
+
+    _record_external_tts_request(
+        snapshot,
+        "The verified phone number is +971 2 665 9998.",
+        "single_pass_deterministic",
+    )
+
+    assert snapshot["usage_components_expected"] == ["external_tts", "llm"]
+    assert snapshot["usage_components_reported"] == ["external_tts", "llm"]
+    assert snapshot["runtime_usage_components_complete"] is True
+    assert snapshot["external_tts_request_count"] == 1
+    assert snapshot["external_tts_characters"] == 45
+    assert snapshot["external_tts_provider_reconciliation_required"] is True
+
+
+def test_external_tts_cannot_make_missing_native_llm_usage_look_complete():
+    snapshot = _usage_snapshot(SimpleNamespace(model_usage=[]), expected_components=("llm",))
+
+    _record_external_tts_request(snapshot, "Welcome", "greeting_preparation")
+
+    assert snapshot["usage_components_expected"] == ["external_tts", "llm"]
+    assert snapshot["usage_components_reported"] == ["external_tts"]
+    assert snapshot["runtime_usage_components_complete"] is False
 
 
 @pytest.mark.asyncio
@@ -1054,6 +1690,38 @@ def test_inworld_stt_model_uses_fast_accurate_route_for_english():
     assert selected == "assemblyai/u3-rt-pro"
 
 
+def test_multilingual_auto_stt_does_not_pin_provider_to_primary_language():
+    model = SimpleNamespace(
+        language="en-GB",
+        supported_languages=["en-GB", "ar-AE", "hi-IN"],
+        language_switching_enabled=True,
+    )
+    profile = SimpleNamespace(stt_language="auto", runtime_config=None)
+
+    assert livekit_worker._effective_stt_language(model=model, profile=profile) == "auto"
+    assert _inworld_stt_model(model=model, profile=profile) == "soniox/stt-rt-v4"
+
+
+def test_explicit_english_stt_keeps_wrong_script_guard_narrow_when_agent_is_multilingual():
+    model = SimpleNamespace(
+        language="en-GB",
+        supported_languages=["en-GB", "ar-AE", "hi-IN"],
+        language_switching_enabled=True,
+    )
+    profile = SimpleNamespace(stt_language="en", runtime_config=None)
+
+    allowed = livekit_worker.resolved_stt_script_languages(model=model, profile=profile)
+    assessment = livekit_worker.detect_unexpected_script(
+        "The chairman is सईद अल ज़ाबी",
+        expected_language="en",
+        allowed_languages=allowed,
+    )
+
+    assert allowed == ("en",)
+    assert assessment.is_unexpected is True
+    assert "DEVANAGARI" in assessment.unexpected_scripts
+
+
 def test_inworld_stt_model_uses_wide_multilingual_route_for_arabic_and_hindi():
     selected = _inworld_stt_model(
         model=SimpleNamespace(language="ar-AE", supported_languages=["ar-AE", "hi-IN"]),
@@ -1075,7 +1743,16 @@ def test_inworld_stt_model_preserves_explicit_operator_choice():
     assert selected == "inworld/inworld-stt-1"
 
 
-def test_native_inworld_realtime_model_uses_one_grounded_speech_session():
+@pytest.mark.asyncio
+async def test_native_inworld_realtime_model_uses_one_grounded_speech_session(monkeypatch):
+    async def no_network_main(_session):
+        return None
+
+    monkeypatch.setattr(
+        inworld_realtime_adapter.InworldRealtimeSession,
+        "_main_task",
+        no_network_main,
+    )
     model = SimpleNamespace(
         name="Al Zaabi Group Support",
         voice_id="inworld:Ashley",
@@ -1089,11 +1766,13 @@ def test_native_inworld_realtime_model_uses_one_grounded_speech_session():
         runtime_config={"voice_runtime": "inworld_realtime", "stt_model": "auto"},
     )
 
+    wire_telemetry = {}
     realtime = _build_inworld_realtime_model(
         model=model,
         profile=profile,
         api_key="inworld-key",
         terminology=("Al Zaabi Group", "Saeed Al Zaabi Tire Factory"),
+        wire_telemetry=wire_telemetry,
     )
 
     assert _inworld_voice_runtime(profile) == "inworld_realtime"
@@ -1105,7 +1784,101 @@ def test_native_inworld_realtime_model_uses_one_grounded_speech_session():
     assert "Al Zaabi Group Support" in realtime._opts.input_audio_transcription.prompt
     assert "Saeed Al Zaabi Tire Factory" in realtime._opts.input_audio_transcription.prompt
     assert realtime._opts.turn_detection.type == "semantic_vad"
+    assert realtime._opts.turn_detection.create_response is True
     assert realtime._opts.turn_detection.interrupt_response is True
+
+    session = realtime.session()
+    serialized_before_explicit_update = int(
+        wire_telemetry.get("stt_session_update_serialized_sequence") or 0
+    )
+    update = session._create_session_update_event()
+    transcription = update["session"]["audio"]["input"]["transcription"]
+    assert transcription["model"] == "assemblyai/u3-rt-pro"
+    assert transcription["language"] == "en-GB"
+    assert wire_telemetry["stt_session_update_serialized_model"] == "assemblyai/u3-rt-pro"
+    assert wire_telemetry["stt_session_update_serialized_language"] == "en-GB"
+    assert wire_telemetry["stt_session_update_serialized_lexicon_count"] == 2
+    assert wire_telemetry["stt_session_update_serialized_prompt_chars"] == len(
+        transcription["prompt"]
+    )
+    assert wire_telemetry["stt_session_update_serialized_sequence"] == (
+        serialized_before_explicit_update + 1
+    )
+    assert transcription["prompt"] not in repr(wire_telemetry)
+    assert not any("hash" in key or "sha" in key for key in wire_telemetry)
+    assert wire_telemetry["stt_session_update_provider_acknowledgement_observed"] is False
+    assert wire_telemetry["stt_session_update_serialized_complete"] is True
+    await session.aclose()
+
+    canary = _build_inworld_realtime_model(
+        model=model,
+        profile=profile,
+        api_key="inworld-key",
+        terminology=("Al Zaabi Group",),
+        wire_telemetry={},
+        single_pass=True,
+    )
+    assert canary._opts.turn_detection.create_response is False
+    assert canary._opts.turn_detection.interrupt_response is False
+    assert canary.capabilities.turn_detection is False
+    canary_session = canary.session()
+    canary_update = canary_session._create_session_update_event()
+    assert canary_update["session"]["audio"]["input"]["turn_detection"] == {
+        "type": "semantic_vad",
+        "eagerness": "medium",
+        "create_response": False,
+        "interrupt_response": False,
+    }
+    await canary_session.aclose()
+
+
+def test_inworld_stt_serialization_diagnostics_reset_atomically_for_every_update():
+    private_prompt = "Private company names and caller vocabulary"
+    wire_telemetry = {
+        "stt_session_update_serialized_model": "stale-model",
+        "stt_session_update_serialized_language": "stale-language",
+        "stt_session_update_serialized_prompt_chars": 999,
+        "stt_session_update_serialized_lexicon_count": 999,
+        "stt_session_update_serialized_complete": True,
+        "stt_session_update_serialized_sequence": 8,
+    }
+    model = SimpleNamespace(
+        _wire_telemetry=wire_telemetry,
+        _recognition_lexicon_count=3,
+    )
+    session = object.__new__(inworld_realtime_adapter.InworldRealtimeSession)
+    session._realtime_model = model
+
+    session._record_wire_telemetry(
+        {
+            "session": {
+                "audio": {
+                    "input": {
+                        "transcription": {
+                            "model": "assemblyai/u3-rt-pro",
+                            "language": "en-GB",
+                            "prompt": private_prompt,
+                        }
+                    }
+                }
+            }
+        }
+    )
+    assert wire_telemetry["stt_session_update_serialized_sequence"] == 9
+    assert wire_telemetry["stt_session_update_serialized_prompt_chars"] == len(private_prompt)
+    assert private_prompt not in repr(wire_telemetry)
+    assert not any("hash" in key or "sha" in key for key in wire_telemetry)
+
+    # A later update with no transcription block must clear the previous
+    # observation. Carrying it forward would falsely describe the new payload.
+    session._record_wire_telemetry({"session": {"audio": {"input": {}}}})
+    assert wire_telemetry["stt_session_update_serialized_sequence"] == 10
+    assert wire_telemetry["stt_session_update_serialized_model"] is None
+    assert wire_telemetry["stt_session_update_serialized_language"] is None
+    assert wire_telemetry["stt_session_update_serialized_prompt_chars"] is None
+    assert wire_telemetry["stt_session_update_serialized_lexicon_count"] is None
+    assert wire_telemetry["stt_session_update_serialized_complete"] is False
+    assert wire_telemetry["stt_session_update_provider_acknowledgement_observed"] is False
 
 
 def test_legacy_runtime_without_voice_mode_stays_on_pipeline():
@@ -1171,7 +1944,11 @@ def test_livekit_turn_latency_is_recorded_as_public_runtime_metrics():
     )
     _capture_turn_latency(
         role="user",
-        metrics={"e2e_latency": 0.1},
+        metrics={
+            "end_of_turn_delay": 0.15,
+            "transcription_delay": 0.08,
+            "on_user_turn_completed_delay": 0.04,
+        },
         runtime_metrics=runtime_metrics,
         end_to_end_samples=samples,
     )
@@ -1180,12 +1957,57 @@ def test_livekit_turn_latency_is_recorded_as_public_runtime_metrics():
         "turn_count": 2,
         "last_llm_first_token_ms": 200,
         "last_tts_first_byte_ms": 300,
-        "last_transcript_to_first_audio_ms": 500,
         "last_speech_end_to_first_audio_ms": 1200,
+        "last_end_of_utterance_ms": 150,
+        "last_transcription_delay_ms": 80,
+        "last_knowledge_hook_ms": 40,
+        "turn_latency_sample_count": 2,
         "turn_latency_p50_ms": 910,
         "turn_latency_p90_ms": 1200,
         "turn_latency_p95_ms": 1200,
     }
+
+
+def test_livekit_native_chat_metrics_keep_supported_ttft_without_duplicate_e2e():
+    runtime_metrics = {"turn_count": 0}
+    samples = [875]
+
+    _capture_turn_latency(
+        role="assistant",
+        metrics={"llm_node_ttft": 0.24, "e2e_latency": 0.91},
+        runtime_metrics=runtime_metrics,
+        end_to_end_samples=samples,
+        include_end_to_end=False,
+    )
+
+    assert runtime_metrics == {
+        "turn_count": 1,
+        "last_llm_first_token_ms": 240,
+    }
+    assert samples == [875]
+
+
+def test_pipeline_server_speaking_event_does_not_duplicate_chat_e2e_sample(monkeypatch):
+    timestamps = iter([10.0, 10.2])
+    monkeypatch.setattr(livekit_worker.time, "monotonic", lambda: next(timestamps))
+    runtime_metrics = {"barge_in_count": 0}
+    samples = [910]
+    telemetry = _LiveKitRuntimeTelemetry(
+        runtime_metrics=runtime_metrics,
+        end_to_end_samples=samples,
+        opened_at=9.0,
+    )
+
+    telemetry.on_user_state(
+        old_state="speaking",
+        new_state="listening",
+        agent_state="listening",
+    )
+    telemetry.on_agent_state(new_state="speaking", capture_end_to_end=False)
+
+    assert samples == [910]
+    assert "last_speech_end_to_first_audio_ms" not in runtime_metrics
+    assert telemetry.last_user_speech_end_at is None
 
 
 def test_livekit_native_events_capture_exact_turn_and_interruption_metrics(monkeypatch):
@@ -1250,6 +2072,7 @@ def test_livekit_native_events_capture_exact_turn_and_interruption_metrics(monke
         "session_start_to_greeting_ms": 200,
         "last_transcript_to_first_audio_ms": 400,
         "last_speech_end_to_first_audio_ms": 1400,
+        "turn_latency_sample_count": 1,
         "turn_latency_p50_ms": 1400,
         "turn_latency_p90_ms": 1400,
         "turn_latency_p95_ms": 1400,
@@ -1259,6 +2082,31 @@ def test_livekit_native_events_capture_exact_turn_and_interruption_metrics(monke
         "last_knowledge_hook_ms": 80,
         "last_interruption_detection_ms": 180,
     }
+
+
+def test_launch_latency_includes_work_before_runtime_admission(monkeypatch):
+    timestamps = iter([12.0, 12.3, 12.7])
+    monkeypatch.setattr(livekit_worker.time, "monotonic", lambda: next(timestamps))
+    runtime_metrics: dict[str, object] = {}
+    telemetry = _LiveKitRuntimeTelemetry(
+        runtime_metrics=runtime_metrics,
+        end_to_end_samples=[],
+        opened_at=11.5,
+        worker_job_started_at=8.0,
+        participant_active_at=9.0,
+    )
+
+    telemetry.mark_session_started()
+    telemetry.mark_session_ready()
+    telemetry.on_agent_state(new_state="speaking")
+
+    assert runtime_metrics["session_connection_ms"] == 300
+    assert runtime_metrics["worker_job_entry_to_session_ready_ms"] == 4300
+    assert runtime_metrics["participant_active_to_session_ready_ms"] == 3300
+    assert runtime_metrics["worker_job_entry_to_first_server_speaking_ms"] == 4700
+    assert runtime_metrics["participant_active_to_first_server_speaking_ms"] == 3700
+    assert runtime_metrics["call_open_to_greeting_ms"] == 1200
+    assert runtime_metrics["session_start_to_greeting_ms"] == 700
 
 
 @pytest.mark.parametrize(
@@ -1321,6 +2169,43 @@ def test_livekit_native_fragment_is_consumed_once_and_recorded(monkeypatch):
     }
 
 
+def test_livekit_single_pass_stage_timings_are_attached_to_the_exact_turn():
+    runtime_metrics = {"barge_in_count": 0}
+    telemetry = _LiveKitRuntimeTelemetry(
+        runtime_metrics=runtime_metrics,
+        end_to_end_samples=[],
+        opened_at=1.0,
+    )
+    telemetry.on_final_transcript("What is the phone number?")
+    telemetry.mark_single_pass_turn(7)
+
+    telemetry.record_single_pass_timing(
+        livekit_worker.SinglePassTurnTiming(
+            sequence=7,
+            outcome=SinglePassTurnOutcome.COMPLETED,
+            transcript_chars=25,
+            evidence_chars=180,
+            retrieval_ms=12.5,
+            generation_dispatch_ms=1.5,
+            generation_ms=240.0,
+            total_ms=252.5,
+        )
+    )
+
+    assert runtime_metrics["single_pass_turn_count"] == 1
+    assert runtime_metrics["last_single_pass_retrieval_ms"] == 12.5
+    assert runtime_metrics["last_single_pass_generation_dispatch_ms"] == 1.5
+    assert runtime_metrics["last_single_pass_generation_ms"] == 240.0
+    assert runtime_metrics["last_single_pass_total_ms"] == 252.5
+    assert runtime_metrics["last_single_pass_outcome"] == "completed"
+    trace = telemetry.current_turn_trace
+    assert trace is not None
+    assert trace["inworld_turn_mode"] == "single_pass_experimental"
+    assert trace["single_pass_sequence"] == 7
+    assert trace["single_pass_outcome"] == "completed"
+    assert trace["single_pass_evidence_chars"] == 180
+
+
 def test_livekit_grounding_telemetry_links_tool_result_to_spoken_answer():
     runtime_metrics = {"barge_in_count": 0}
     telemetry = _LiveKitRuntimeTelemetry(
@@ -1346,10 +2231,149 @@ def test_livekit_grounding_telemetry_links_tool_result_to_spoken_answer():
     assert trace["tool_call"] is True
     assert trace["knowledge_tool_ms"] == 43
     assert trace["knowledge_result"] == "no_match"
+    assert trace["retrieval_result"] == "no_match"
     assert trace["knowledge_query_variant_count"] == 2
     assert trace["knowledge_fallback_used"] is True
     assert trace["grounding_outcome"] == "no_match_unverified_response"
+    assert trace["response_action"] == "answered_without_verified_evidence"
     assert "grounding_outcome" not in telemetry.current_turn_trace
+
+
+def test_late_knowledge_result_stays_on_originating_turn_and_cannot_ground_next_turn():
+    runtime_metrics = {"barge_in_count": 0}
+    telemetry = _LiveKitRuntimeTelemetry(
+        runtime_metrics=runtime_metrics,
+        end_to_end_samples=[],
+        opened_at=1.0,
+    )
+    telemetry.on_final_transcript("What is the phone number?")
+    originating_trace = telemetry.begin_knowledge_lookup()
+    telemetry.on_user_state(old_state="listening", new_state="speaking", agent_state="thinking")
+    telemetry.on_user_state(old_state="speaking", new_state="listening", agent_state="listening")
+    telemetry.on_final_transcript("Where are you located?")
+    next_trace = telemetry.current_turn_trace
+
+    telemetry.record_knowledge_lookup(
+        elapsed_ms=900,
+        result="verified",
+        evidence_chars=50,
+        originating_trace=originating_trace,
+    )
+    telemetry.on_assistant_content("The location is Example Road.")
+
+    assert originating_trace["knowledge_result"] == "verified"
+    assert originating_trace["knowledge_result_late"] is True
+    assert runtime_metrics["late_knowledge_result_count"] == 1
+    assert next_trace is telemetry.current_turn_trace
+    assert "knowledge_result" not in next_trace
+    assert "grounding_outcome" not in next_trace
+
+
+def test_late_knowledge_completion_cannot_overwrite_newer_last_metrics():
+    runtime_metrics = {"barge_in_count": 0}
+    telemetry = _LiveKitRuntimeTelemetry(
+        runtime_metrics=runtime_metrics,
+        end_to_end_samples=[],
+        opened_at=1.0,
+    )
+    telemetry.on_final_transcript("First question")
+    first_trace = telemetry.begin_knowledge_lookup()
+    telemetry.on_user_state(old_state="listening", new_state="speaking", agent_state="thinking")
+    telemetry.on_user_state(old_state="speaking", new_state="listening", agent_state="listening")
+    telemetry.on_final_transcript("Second question")
+    second_trace = telemetry.begin_knowledge_lookup()
+
+    telemetry.record_knowledge_lookup(
+        elapsed_ms=20,
+        result="verified",
+        details={"exact_fact_total_ms": 19.5},
+        originating_trace=second_trace,
+    )
+    telemetry.record_knowledge_lookup(
+        elapsed_ms=900,
+        result="no_match",
+        details={"exact_fact_total_ms": 899.5},
+        originating_trace=first_trace,
+    )
+
+    assert runtime_metrics["knowledge_lookup_count"] == 2
+    assert runtime_metrics["last_knowledge_tool_ms"] == 20
+    assert runtime_metrics["last_exact_fact_total_ms"] == 19.5
+    assert first_trace["knowledge_tool_ms"] == 900
+    assert second_trace["knowledge_tool_ms"] == 20
+
+
+def test_late_single_pass_completion_cannot_overwrite_newer_last_metrics():
+    runtime_metrics = {"barge_in_count": 0}
+    telemetry = _LiveKitRuntimeTelemetry(
+        runtime_metrics=runtime_metrics,
+        end_to_end_samples=[],
+        opened_at=1.0,
+    )
+    telemetry.on_final_transcript("First question")
+    telemetry.mark_single_pass_turn(1)
+    telemetry._finish_trace("superseded_by_caller")
+    telemetry.on_final_transcript("Second question")
+    telemetry.mark_single_pass_turn(2)
+
+    telemetry.record_single_pass_timing(
+        livekit_worker.SinglePassTurnTiming(
+            sequence=2,
+            outcome=SinglePassTurnOutcome.COMPLETED,
+            transcript_chars=15,
+            evidence_chars=50,
+            retrieval_ms=10,
+            generation_dispatch_ms=2,
+            generation_ms=100,
+            total_ms=112,
+        )
+    )
+    telemetry.record_single_pass_timing(
+        livekit_worker.SinglePassTurnTiming(
+            sequence=1,
+            outcome=SinglePassTurnOutcome.CANCELLED,
+            transcript_chars=14,
+            evidence_chars=40,
+            retrieval_ms=800,
+            generation_dispatch_ms=3,
+            generation_ms=0,
+            total_ms=803,
+        )
+    )
+
+    assert runtime_metrics["single_pass_turn_count"] == 2
+    assert runtime_metrics["single_pass_cancelled_count"] == 1
+    assert runtime_metrics["last_single_pass_outcome"] == "completed"
+    assert runtime_metrics["last_single_pass_total_ms"] == 112
+    assert telemetry.turn_diagnostics[0]["single_pass_total_ms"] == 803
+    assert telemetry.current_turn_trace is not None
+    assert telemetry.current_turn_trace["single_pass_total_ms"] == 112
+
+
+def test_deterministic_no_match_contraction_is_classified_as_safe_refusal():
+    from app.livekit_runtime.inworld_single_pass import (
+        NO_VERIFIED_KNOWLEDGE_MATCH,
+        deterministic_grounded_reply,
+    )
+
+    runtime_metrics = {"barge_in_count": 0}
+    telemetry = _LiveKitRuntimeTelemetry(
+        runtime_metrics=runtime_metrics,
+        end_to_end_samples=[],
+        opened_at=1.0,
+    )
+    telemetry.on_final_transcript("Who is the chairman?")
+    telemetry.record_knowledge_lookup(elapsed_ms=10, result="no_match")
+    reply = deterministic_grounded_reply(NO_VERIFIED_KNOWLEDGE_MATCH)
+    assert reply is not None
+
+    telemetry.on_assistant_content(reply)
+
+    trace = telemetry.current_turn_trace
+    assert trace is not None
+    assert trace["grounding_outcome"] == "no_match_correctly_refused"
+    assert trace["response_action"] == "refused_unverified"
+    assert runtime_metrics.get("unsupported_knowledge_response_count", 0) == 0
 
 
 def test_livekit_worker_health_server_uses_valid_railway_port():

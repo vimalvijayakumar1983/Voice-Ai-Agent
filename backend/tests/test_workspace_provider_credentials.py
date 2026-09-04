@@ -1,3 +1,4 @@
+from datetime import UTC, datetime
 from uuid import UUID
 from xml.etree import ElementTree
 
@@ -9,12 +10,13 @@ from app.api.v1.endpoints import agents as agents_endpoint
 from app.api.v1.endpoints import runtime as runtime_endpoint
 from app.api.v1.endpoints import webhooks
 from app.core.config import settings
-from app.models.agent import Agent, AgentRuntimeProfile
+from app.models.agent import Agent, AgentRuntimeProfile, KnowledgeProviderCleanup
 from app.models.call import Call
 from app.models.provider_credential import ProviderCredential
 from app.models.tenant import Tenant
 from app.providers.elevenlabs import ElevenLabsError
 from app.realtime.auth import verify_media_token
+from app.services.provider_credentials import load_provider_config
 from tests.conftest import test_session_factory as session_factory
 
 
@@ -225,6 +227,82 @@ async def test_smallest_operations_resolve_the_workspace_key(
     assert saved.status_code == 200
     assert source == "workspace"
     assert smallest.api_key == api_key
+
+
+@pytest.mark.asyncio
+async def test_smallest_credential_rotation_and_deletion_wait_for_cleanup(
+    client,
+    auth_headers,
+    tenant,
+    db,
+):
+    original_key = "smallest_cleanup_owner_key_123456789"
+    saved = await client.put(
+        "/api/v1/runtime/credentials/smallest",
+        headers=auth_headers,
+        json={"api_key": original_key},
+    )
+    assert saved.status_code == 200
+
+    db.add(
+        KnowledgeProviderCleanup(
+            tenant_id=tenant.id,
+            provider="smallest",
+            provider_knowledge_base_id="provider-kb-owned-by-original-key",
+            provider_item_id="provider-item-awaiting-delete",
+            status="pending",
+            attempts=0,
+            available_at=datetime.now(UTC),
+        )
+    )
+    await db.commit()
+
+    rotated = await client.put(
+        "/api/v1/runtime/credentials/smallest",
+        headers=auth_headers,
+        json={"api_key": "different_smallest_account_key_123456789"},
+    )
+    removed = await client.delete(
+        "/api/v1/runtime/credentials/smallest",
+        headers=auth_headers,
+    )
+
+    assert rotated.status_code == 409
+    assert removed.status_code == 409
+    assert "remote knowledge cleanup is pending" in rotated.json()["detail"]
+    assert "remote knowledge cleanup is pending" in removed.json()["detail"]
+    config = await load_provider_config(db, tenant.id, "smallest")
+    assert config == {"api_key": original_key}
+
+
+@pytest.mark.asyncio
+async def test_missing_smallest_credential_can_be_added_to_unblock_cleanup(
+    client,
+    auth_headers,
+    tenant,
+    db,
+):
+    db.add(
+        KnowledgeProviderCleanup(
+            tenant_id=tenant.id,
+            provider="smallest",
+            provider_knowledge_base_id="provider-kb-needing-credential",
+            provider_item_id="provider-item-needing-credential",
+            status="pending",
+            attempts=0,
+            available_at=datetime.now(UTC),
+        )
+    )
+    await db.commit()
+
+    saved = await client.put(
+        "/api/v1/runtime/credentials/smallest",
+        headers=auth_headers,
+        json={"api_key": "restored_smallest_account_key_123456789"},
+    )
+
+    assert saved.status_code == 200
+    assert saved.json()["source"] == "workspace"
 
 
 @pytest.mark.asyncio

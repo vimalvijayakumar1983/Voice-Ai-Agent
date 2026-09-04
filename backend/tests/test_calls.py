@@ -12,7 +12,7 @@ from httpx import AsyncClient
 from sqlalchemy import func, select
 
 from app.api.v1.endpoints import calls as calls_endpoint
-from app.models.agent import Agent
+from app.models.agent import Agent, AgentKnowledgeBinding
 from app.models.audit import AuditEvent
 from app.models.call import Call
 from app.models.compliance import DncEntry
@@ -437,7 +437,7 @@ async def test_dnc_delete_commits_before_number_can_be_dispatched(
 
 
 @pytest.mark.asyncio
-async def test_provider_acceptance_arms_one_direct_terminal_watchdog(
+async def test_no_knowledge_smallest_call_is_allowed_and_arms_terminal_watchdog(
     client: AsyncClient,
     auth_headers,
     tenant,
@@ -475,6 +475,14 @@ async def test_provider_acceptance_arms_one_direct_terminal_watchdog(
     headers = {**auth_headers, "Idempotency-Key": "direct-terminal-watchdog-0001"}
     payload = {"agent_id": str(agent.id), "to_number": "+971501234567"}
 
+    assert (
+        await db.scalar(
+            select(func.count())
+            .select_from(AgentKnowledgeBinding)
+            .where(AgentKnowledgeBinding.agent_id == agent.id)
+        )
+        == 0
+    )
     response = await client.post("/api/v1/calls", headers=headers, json=payload)
     replay = await client.post("/api/v1/calls", headers=headers, json=payload)
 

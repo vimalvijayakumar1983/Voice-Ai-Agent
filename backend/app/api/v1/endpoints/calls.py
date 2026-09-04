@@ -32,8 +32,19 @@ from app.services.compliance_policy import (
     is_outbound_consent_revoked,
     is_recording_consent_revoked,
 )
+from app.services.knowledge_serving import (
+    KnowledgeServingError,
+    load_agent_serving_revision_identity,
+    pre_admit_outbound_knowledge_call,
+)
 from app.services.phone_numbers import is_number_on_tenant_dnc, tenant_phone_dnc_lock
 from app.services.provider_credentials import load_provider_config
+from app.services.realtime_speech_config import (
+    configured_inworld_stt_model,
+    resolve_inworld_stt_language,
+    resolve_inworld_stt_model,
+)
+from app.services.recording_policy import recording_runtime_metadata
 from app.services.recordings import RecordingError, fetch_call_recording
 from app.services.usage_ledger import (
     lock_agent_runtime_limits,
@@ -525,6 +536,8 @@ async def initiate_outbound_call(
         (twilio_config or {}).get("default_from_number") or settings.twilio_default_from_number
     ).strip()
     runtime_profile = None
+    knowledge_serving_revision = None
+    knowledge_serving_revocation_generation = None
     if agent.voice_provider in {"sarvam", "elevenlabs", "inworld"}:
         runtime_profile = await db.scalar(
             select(AgentRuntimeProfile).where(
@@ -553,6 +566,26 @@ async def initiate_outbound_call(
                 status_code=409,
                 detail="Record a verified LiveKit outbound trunk ID before placing outbound calls",
             )
+        if is_inworld:
+            (
+                knowledge_serving_revision,
+                knowledge_serving_revocation_generation,
+            ) = await load_agent_serving_revision_identity(
+                db,
+                tenant_id=current_user.tenant_id,
+                agent_id=agent.id,
+            )
+            if (
+                knowledge_serving_revision is None
+                or knowledge_serving_revocation_generation is None
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Approve and publish the agent's knowledge base before placing "
+                        "an Inworld call"
+                    ),
+                )
         now = datetime.now(UTC)
         day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         month_start = day_start.replace(day=1)
@@ -678,11 +711,14 @@ async def initiate_outbound_call(
                     "speech_provider": "inworld",
                     "llm_provider": runtime_profile.llm_provider,
                     "llm_model": runtime_profile.llm_model,
-                    "stt_model": "inworld/inworld-stt-1",
-                    "stt_language": (
-                        agent.language
-                        if runtime_profile.stt_language == "auto"
-                        else runtime_profile.stt_language
+                    "stt_model": resolve_inworld_stt_model(
+                        model=agent,
+                        profile=runtime_profile,
+                    ),
+                    "stt_model_configured": configured_inworld_stt_model(profile=runtime_profile),
+                    "stt_language": resolve_inworld_stt_language(
+                        model=agent,
+                        profile=runtime_profile,
                     ),
                     "stt_language_configured": runtime_profile.stt_language,
                     "tts_model": "inworld-tts-2",
@@ -694,7 +730,29 @@ async def initiate_outbound_call(
                         )
                         or "balanced"
                     ).lower(),
-                    "recording_enabled": False,
+                    **recording_runtime_metadata(
+                        runtime_profile,
+                        transport="livekit_sip",
+                    ),
+                    **(
+                        {
+                            "knowledge_serving_revision_id": str(knowledge_serving_revision.id),
+                            "knowledge_serving_knowledge_base_id": str(
+                                knowledge_serving_revision.knowledge_base_id
+                            ),
+                            "knowledge_serving_content_sha256": (
+                                knowledge_serving_revision.content_sha256
+                            ),
+                            "knowledge_source_revision_sha256": (
+                                knowledge_serving_revision.source_revision_sha256
+                            ),
+                            "knowledge_serving_revocation_generation": (
+                                knowledge_serving_revocation_generation
+                            ),
+                        }
+                        if knowledge_serving_revision is not None
+                        else {}
+                    ),
                 }
                 if is_inworld and runtime_profile
                 else {}
@@ -703,6 +761,16 @@ async def initiate_outbound_call(
     )
     db.add(call)
     try:
+        if is_inworld:
+            try:
+                call = await pre_admit_outbound_knowledge_call(
+                    db,
+                    tenant_id=current_user.tenant_id,
+                    agent_id=agent.id,
+                    call_id=call.id,
+                )
+            except KnowledgeServingError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
         # Persist the durable dispatch claim before the paid provider side
         # effect. A crash leaves a reconcilable `dispatching` record; a retry
         # with the same key never dials again.
@@ -743,6 +811,7 @@ async def initiate_outbound_call(
         return CallResponse.model_validate(call)
 
     provider_call_sid: str | None = None
+    livekit_room_name: str | None = None
     dispatch_error: Exception | None = None
     dispatch_is_ambiguous = True
     dispatch_terminal_status: str | None = None
@@ -888,10 +957,7 @@ async def initiate_outbound_call(
                     max_call_duration_seconds=current_agent.max_call_duration_seconds,
                 )
                 provider_call_sid = livekit_result.provider_call_sid
-                call.call_metadata = {
-                    **(call.call_metadata or {}),
-                    "livekit_room": livekit_result.room_name,
-                }
+                livekit_room_name = livekit_result.room_name
             else:
                 provider = (
                     get_telephony_provider(
@@ -937,6 +1003,11 @@ async def initiate_outbound_call(
     )
     current_call = current_result.scalar_one()
     if dispatch_error is None and provider_call_sid:
+        if livekit_room_name is not None:
+            current_call.call_metadata = {
+                **(current_call.call_metadata or {}),
+                "livekit_room": livekit_room_name,
+            }
         if current_call.provider_call_sid and current_call.provider_call_sid != provider_call_sid:
             current_call.call_metadata = {
                 **(current_call.call_metadata or {}),

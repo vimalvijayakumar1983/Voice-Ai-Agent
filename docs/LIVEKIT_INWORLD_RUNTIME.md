@@ -1,5 +1,9 @@
 # LiveKit + direct Inworld production runtime
 
+The operational release sequence for immutable knowledge, replay gates,
+single-pass canaries, telemetry limits, greeting prewarm, and rollback is in
+[Realtime quality production rollout](REALTIME_QUALITY_ROLLOUT.md).
+
 ## Locked responsibility split
 
 | Layer | Owner | Responsibility |
@@ -19,7 +23,7 @@ VAV does not use LiveKit Inference in this lane. This prevents a second AI-servi
 4. The worker resolves exactly one active tenant/agent from the trusted LiveKit trunk ID plus called DID, then opens a VAV call ledger row. Inbound metadata never selects an agent.
 5. Inworld STT streams the caller's speech. For any business fact, the LLM must call `search_approved_knowledge`; the tool searches only the approved knowledge base bound to that agent.
 6. Inworld Router generates the response and Inworld TTS 2 speaks it through the LiveKit room.
-7. On shutdown, VAV saves transcript turns, token/character/audio usage, SIP IDs, duration and provider labels. The cost report converts each measurable component into USD and AED.
+7. On shutdown, VAV saves transcript turns, provider-reported runtime usage, SIP IDs, duration and provider labels. Unreported usage remains `null`; the cost report converts only measurable components into USD and AED and keeps provider-billing reconciliation separate.
 
 Outbound is the same after connection. VAV creates a LiveKit SIP participant through the recorded outbound trunk; the AI costs are the same for the same duration and usage. Only the customer's e& carrier tariff normally differs by destination. That carrier invoice is a direct customer cost and is deliberately excluded from VAV margin.
 
@@ -47,7 +51,8 @@ usage and finalization code. They do not prove the same things:
 - **Place outbound test call** validates the outbound trunk, caller ID and
   destination routing and therefore must remain consent- and DNC-gated.
 
-Browser calls are recorded as `livekit_webrtc`, not `livekit_sip`. Cost reports
+Browser calls are classified in the call ledger as `livekit_webrtc`, not
+`livekit_sip`; this does not mean audio recording is enabled. Cost reports
 include their metered Inworld usage and fixed-worker allocation gap, but never
 add the LiveKit third-party SIP line item or an e& carrier charge. An unused
 token or interrupted connection is terminalized by the same stale-session
@@ -75,6 +80,24 @@ Realtime API as research preview. Existing active profiles default to
 run and activation succeeds. Inworld still meters the STT, routed LLM, and TTS
 components under its published pricing; one session is an architectural and
 latency improvement, not a claim that those components are free.
+
+### Telemetry interpretation
+
+- STT session diagnostics prove only what VAV serialized immediately before a
+  WebSocket send. They retain model, language, term count, timestamp and prompt
+  character count, but never the recognition prompt, its hash or its terms.
+  Provider acknowledgement is reported as unobserved on a call unless a future
+  provider event supplies that evidence; readiness is a separate live probe.
+- Response-latency percentiles include their sample count. They end at the
+  LiveKit server response/speaking boundary, not at audio heard by the caller.
+  Downstream network time, browser audio rendering and SIP/RTP arrival are not
+  yet observed and must not be inferred from these values.
+- Runtime-usage completeness means the expected LiveKit metric components for
+  that runtime lane emitted at least one usage value. It does not mean an
+  invoice is complete or reconciled. Missing values remain unknown, never zero.
+- Public call metadata includes evidence counts and grounding outcomes, not raw
+  internal evidence identifiers or source identifiers. Internal identifiers
+  remain available to the governed audit path.
 
 ## Reference cost for a 60-second connected call
 
@@ -180,7 +203,7 @@ Do not use `railway up` from an uncommitted working tree for production. The thr
 - A Railway deployment is unhealthy when `/` returns `503`, the process repeatedly restarts, the `registered worker` record is absent, or the record names the wrong agent/project/region. Do not bypass these checks by removing the health path.
 - Keep Sarvam/Twilio credentials, profiles and the previous production commit unchanged during the pilot.
 - To roll back call traffic, first deactivate the LiveKit/Inworld profile, verify the prior Sarvam/Twilio profile is ready, and only then repoint the DID. Never repoint the DID to an untested route.
-- After traffic has left the lane, stop or scale down `livekit-agent`, revert the release commit on the Railway-tracked branch, and wait for API, Celery and frontend health before closing the incident. This release adds no database migration, so rollback does not require destructive schema work.
+- After traffic has left the lane, stop or scale down `livekit-agent` and deploy a tested pointer-aware build from the full release with experimental single-pass disabled. Keep migrations `022`, `023`, and `024`, verify API, Celery, frontend and worker health, and verify every approved native knowledge base points to a matching immutable release. The readiness-compatibility commit is a pre-schema bridge only; never deploy it after pointer-aware knowledge writes. Returning to older code requires frozen knowledge writes, drained calls, a verified backup, mutable/live reconciliation, then schema downgrade as documented in the rollout runbook.
 - Retain encrypted LiveKit/Inworld credentials and route identifiers until rollback verification is complete. Deleting them early removes evidence and makes a controlled retry harder.
 - Record the failed deployment ID, Git SHA, worker registration ID, last successful call ID and rollback time in the incident log.
 - Do not mark the integration production-ready merely because credentials save successfully. A completed test call plus the acceptance matrix is the release gate.

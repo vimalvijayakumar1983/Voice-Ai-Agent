@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock
 from uuid import UUID, uuid4
 
 import pytest
+from fastapi import HTTPException
 from jose import jwt
 from sqlalchemy import select
 
@@ -35,6 +36,8 @@ from app.models.agent import (
 from app.models.audit import AuditEvent
 from app.models.call import Call
 from app.providers.inworld import InworldClient, InworldError
+from app.services.knowledge_serving import publish_serving_revision
+from app.services.speech_lexicon import publish_speech_lexicon
 from app.telephony.livekit_provider import LiveKitSIPProvider
 from tests.conftest import test_session_factory as session_factory
 
@@ -51,6 +54,29 @@ class _CompletedSpeechHandle:
 
     def exception(self):
         return self.failure
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stt_language", ["en-GB", None])
+async def test_native_browser_preflight_selects_single_pass_capability_probe(stt_language):
+    inworld = SimpleNamespace(realtime_readiness_probe=AsyncMock())
+
+    await agents_endpoint._verify_native_browser_capability(
+        inworld=inworld,
+        model_id="openai/gpt-4o-mini",
+        voice_id="Ashley",
+        stt_model_id="assemblyai/u3-rt-pro",
+        stt_language=stt_language,
+        single_pass=True,
+    )
+
+    inworld.realtime_readiness_probe.assert_awaited_once_with(
+        model_id="openai/gpt-4o-mini",
+        voice_id="Ashley",
+        stt_model_id="assemblyai/u3-rt-pro",
+        stt_language=stt_language,
+        single_pass=True,
+    )
 
 
 async def _configured_browser_agent(db, tenant) -> Agent:
@@ -107,6 +133,31 @@ async def _configured_browser_agent(db, tenant) -> Agent:
     return agent
 
 
+async def _publish_current_knowledge_revision(db, agent: Agent):
+    binding = await db.scalar(
+        select(AgentKnowledgeBinding).where(AgentKnowledgeBinding.agent_id == agent.id)
+    )
+    knowledge = await db.get(KnowledgeBase, binding.knowledge_base_id)
+    await db.refresh(knowledge, attribute_names=["sources"])
+    knowledge.sync_status = "ready"
+    knowledge.source_count = len(knowledge.sources)
+    knowledge.indexed_source_count = len(knowledge.sources)
+    await db.flush()
+    lexicon = await publish_speech_lexicon(
+        db,
+        tenant_id=agent.tenant_id,
+        knowledge_base=knowledge,
+    )
+    revision = await publish_serving_revision(
+        db,
+        tenant_id=agent.tenant_id,
+        knowledge_base=knowledge,
+        speech_lexicon=lexicon,
+    )
+    await db.commit()
+    return revision
+
+
 def _configure_platform(monkeypatch) -> None:
     monkeypatch.setattr(settings, "livekit_url", "wss://example.livekit.cloud")
     monkeypatch.setattr(settings, "livekit_api_key", "livekit-key")
@@ -119,6 +170,58 @@ def _configure_platform(monkeypatch) -> None:
     )
     monkeypatch.setattr(settings, "inworld_api_key", "inworld-test-key-123456789")
     monkeypatch.setattr(settings, "integration_encryption_key", "i" * 40)
+
+
+@pytest.mark.asyncio
+async def test_browser_runtime_revalidates_binding_after_locking_knowledge_base(
+    db,
+    tenant,
+    monkeypatch,
+):
+    _configure_platform(monkeypatch)
+    agent = await _configured_browser_agent(db, tenant)
+    await _publish_current_knowledge_revision(db, agent)
+    alternate_knowledge = KnowledgeBase(
+        tenant_id=tenant.id,
+        name="Concurrent replacement knowledge",
+        approval_status="approved",
+        is_active=True,
+    )
+    db.add(alternate_knowledge)
+    await db.commit()
+
+    original_scalar = db.scalar
+    binding_changed = False
+
+    async def scalar_with_rebind_after_kb_lock(statement, *args, **kwargs):
+        nonlocal binding_changed
+        result = await original_scalar(statement, *args, **kwargs)
+        selected_entity = statement.column_descriptions[0].get("entity")
+        if (
+            not binding_changed
+            and selected_entity is KnowledgeBase
+            and statement._for_update_arg is not None
+        ):
+            binding = await original_scalar(
+                select(AgentKnowledgeBinding).where(
+                    AgentKnowledgeBinding.agent_id == agent.id,
+                    AgentKnowledgeBinding.tenant_id == tenant.id,
+                )
+            )
+            binding.knowledge_base_id = alternate_knowledge.id
+            await db.flush()
+            binding_changed = True
+        return result
+
+    monkeypatch.setattr(db, "scalar", scalar_with_rebind_after_kb_lock)
+
+    with pytest.raises(HTTPException, match="binding changed during browser call reservation"):
+        await agents_endpoint._livekit_browser_runtime(
+            db,
+            tenant_id=tenant.id,
+            agent_id=agent.id,
+            for_update=True,
+        )
 
 
 def test_browser_dispatch_signature_binds_every_authorization_identifier(monkeypatch):
@@ -299,6 +402,45 @@ async def test_livekit_provider_rejects_incomplete_token_dispatch(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_new_browser_session_requires_immutable_knowledge_before_provider_io(
+    client,
+    auth_headers,
+    db,
+    tenant,
+    monkeypatch,
+):
+    _configure_platform(monkeypatch)
+    agent = await _configured_browser_agent(db, tenant)
+    worker_probe = AsyncMock()
+    session_create = AsyncMock()
+    monkeypatch.setattr(LiveKitSIPProvider, "verify_worker", worker_probe)
+    monkeypatch.setattr(LiveKitBrowserSessionProvider, "create_session", session_create)
+
+    response = await client.post(
+        f"/api/v1/agents/{agent.id}/livekit/session",
+        headers={
+            **auth_headers,
+            "Idempotency-Key": "livekit-browser-unpublished-0001",
+        },
+        json={"variables": {}},
+    )
+
+    assert response.status_code == 409
+    assert "Approve and publish" in response.json()["detail"]
+    worker_probe.assert_not_awaited()
+    session_create.assert_not_awaited()
+    assert (
+        await db.scalar(
+            select(Call).where(
+                Call.agent_id == agent.id,
+                Call.provider == "livekit_webrtc",
+            )
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
 async def test_endpoint_issues_durable_preconnect_browser_call_without_sip(
     client,
     auth_headers,
@@ -308,6 +450,11 @@ async def test_endpoint_issues_durable_preconnect_browser_call_without_sip(
 ):
     _configure_platform(monkeypatch)
     agent = await _configured_browser_agent(db, tenant)
+    first_revision = await _publish_current_knowledge_revision(db, agent)
+    first_revision_id = first_revision.id
+    first_knowledge_base_id = first_revision.knowledge_base_id
+    first_revision_content_sha256 = first_revision.content_sha256
+    first_source_revision_sha256 = first_revision.source_revision_sha256
     tenant_id = tenant.id
     agent.max_call_duration_seconds = 30
     await db.commit()
@@ -316,10 +463,24 @@ async def test_endpoint_issues_durable_preconnect_browser_call_without_sip(
     provider_creates = 0
     lock_order: list[str] = []
     original_runtime_loader = agents_endpoint._livekit_browser_runtime
+    original_call_locker = agents_endpoint._lock_livekit_browser_call
+    original_knowledge_validator = agents_endpoint._validate_livekit_browser_knowledge
 
     async def tracked_runtime_loader(*args, **kwargs):
-        lock_order.append("row-lock" if kwargs.get("for_update") else "read-only")
-        return await original_runtime_loader(*args, **kwargs)
+        result = await original_runtime_loader(*args, **kwargs)
+        lock_order.append("agent-profile-lock" if kwargs.get("for_update") else "read-only")
+        return result
+
+    async def tracked_call_locker(*args, **kwargs):
+        result = await original_call_locker(*args, **kwargs)
+        lock_order.append("call-lock")
+        return result
+
+    async def tracked_knowledge_validator(*args, **kwargs):
+        result = await original_knowledge_validator(*args, **kwargs)
+        if kwargs.get("for_update"):
+            lock_order.append("knowledge-lock")
+        return result
 
     async def tracked_advisory_lock(*_args, **_kwargs):
         lock_order.append("advisory-lock")
@@ -344,6 +505,12 @@ async def test_endpoint_issues_durable_preconnect_browser_call_without_sip(
     monkeypatch.setattr(LiveKitSIPProvider, "verify_worker", verify_worker)
     monkeypatch.setattr(LiveKitBrowserSessionProvider, "create_session", create_session)
     monkeypatch.setattr(agents_endpoint, "_livekit_browser_runtime", tracked_runtime_loader)
+    monkeypatch.setattr(agents_endpoint, "_lock_livekit_browser_call", tracked_call_locker)
+    monkeypatch.setattr(
+        agents_endpoint,
+        "_validate_livekit_browser_knowledge",
+        tracked_knowledge_validator,
+    )
     monkeypatch.setattr(agents_endpoint, "lock_agent_runtime_limits", tracked_advisory_lock)
     request_headers = {
         **auth_headers,
@@ -362,7 +529,9 @@ async def test_endpoint_issues_durable_preconnect_browser_call_without_sip(
     assert payload["session_id"] == payload["call_id"]
     assert payload["max_duration_seconds"] == 30
     assert provider_duration == 30
-    assert lock_order.index("advisory-lock") < lock_order.index("row-lock")
+    assert lock_order.index("advisory-lock") < lock_order.index("agent-profile-lock")
+    assert lock_order.index("agent-profile-lock") < lock_order.index("call-lock")
+    assert lock_order.index("call-lock") < lock_order.index("knowledge-lock")
     retry = await client.post(
         f"/api/v1/agents/{agent_id}/livekit/session",
         headers=request_headers,
@@ -404,6 +573,17 @@ async def test_endpoint_issues_durable_preconnect_browser_call_without_sip(
         "priority": True,
     }
     assert call.call_metadata["runtime"]["transport"] == "livekit_webrtc"
+    assert call.call_metadata["runtime"]["knowledge_serving_revision_id"] == str(first_revision_id)
+    assert call.call_metadata["runtime"]["knowledge_serving_knowledge_base_id"] == str(
+        first_knowledge_base_id
+    )
+    assert call.call_metadata["runtime"]["knowledge_serving_content_sha256"] == (
+        first_revision_content_sha256
+    )
+    assert call.call_metadata["runtime"]["knowledge_source_revision_sha256"] == (
+        first_source_revision_sha256
+    )
+    assert call.call_metadata["runtime"]["knowledge_serving_revocation_generation"] == 0
     assert call.call_metadata["reserved_max_duration_seconds"] == 30
     assert call.call_metadata["runtime"]["max_duration_seconds"] == 30
     assert call.call_metadata["livekit_dispatch_mode"] == "token"
@@ -411,7 +591,9 @@ async def test_endpoint_issues_durable_preconnect_browser_call_without_sip(
     assert "browser_session_request" not in call.call_metadata
     assert len(call.call_metadata["browser_session_request_fingerprint"]) == 64
 
-    # A later edit may tighten this call but cannot expand its immutable cap.
+    # A later agent edit may tighten this call but cannot expand its immutable
+    # cap. A later knowledge publication must not move this already-reserved
+    # call to the new corpus.
     agent = await db.get(Agent, agent_id)
     agent.max_call_duration_seconds = 7200
     agent.language = "en-US"
@@ -430,7 +612,10 @@ async def test_endpoint_issues_durable_preconnect_browser_call_without_sip(
         )
     )
     source.content = "Updated clinic knowledge served at join time."
-    await db.commit()
+    await db.flush()
+    second_revision = await _publish_current_knowledge_revision(db, agent)
+    second_revision_id = second_revision.id
+    assert second_revision_id != first_revision_id
     monkeypatch.setattr(livekit_worker, "async_session_factory", session_factory)
     (
         loaded_model,
@@ -438,6 +623,7 @@ async def test_endpoint_issues_durable_preconnect_browser_call_without_sip(
         _api_key,
         _variables,
         served_configuration,
+        knowledge_pin,
     ) = await livekit_worker._load_browser_runtime(
         tenant_id=tenant_id,
         agent_id=agent_id,
@@ -446,6 +632,14 @@ async def test_endpoint_issues_durable_preconnect_browser_call_without_sip(
         participant_identity=payload["participant_identity"],
     )
     assert loaded_model.max_call_duration_seconds == 30
+    assert knowledge_pin.revision_id == first_revision_id
+    assert knowledge_pin.content_sha256 == first_revision_content_sha256
+    assert knowledge_pin.revocation_generation == 0
+    assert served_configuration["knowledge_serving_revision_id"] == str(first_revision_id)
+    assert served_configuration["knowledge_serving_content_sha256"] == (
+        first_revision_content_sha256
+    )
+    assert served_configuration["knowledge_serving_revision_id"] != str(second_revision_id)
     assert served_configuration["language"] == "en-US"
     assert served_configuration["llm_model"] == "openai/gpt-4o"
     assert (
@@ -454,6 +648,37 @@ async def test_endpoint_issues_durable_preconnect_browser_call_without_sip(
     )
     assert served_configuration["knowledge_source_count"] == 1
     assert len(served_configuration["knowledge_sources_sha256"]) == 64
+    # Ordinary blue/green publication does not waste a valid reservation: the
+    # call keeps its immutable old release when the revocation fence is stable.
+    knowledge = await db.get(KnowledgeBase, binding.knowledge_base_id)
+    await livekit_worker._admit_reserved_knowledge_pin(
+        db,
+        model=loaded_model,
+        knowledge_pin=knowledge_pin,
+        call=await db.get(Call, UUID(payload["call_id"])),
+    )
+
+    # An explicit revocation that wins before admission changes the durable
+    # generation and blocks that same reservation even if its revision exists.
+    knowledge.serving_revocation_generation += 1
+    knowledge.serving_revision_id = None
+    knowledge.approval_status = "draft"
+    await db.commit()
+    with pytest.raises(RuntimeError, match="no longer live at connect"):
+        await livekit_worker._admit_reserved_knowledge_pin(
+            db,
+            model=loaded_model,
+            knowledge_pin=knowledge_pin,
+            call=await db.get(Call, UUID(payload["call_id"])),
+        )
+
+    # Restore the generation only to complete this test call. Production never
+    # decrements it; a new reservation would carry the new generation instead.
+    knowledge = await db.get(KnowledgeBase, binding.knowledge_base_id)
+    knowledge.serving_revocation_generation = knowledge_pin.revocation_generation
+    knowledge.serving_revision_id = second_revision_id
+    knowledge.approval_status = "approved"
+    await db.commit()
     await livekit_worker._open_browser_call(
         model=loaded_model,
         profile=loaded_profile,
@@ -461,11 +686,15 @@ async def test_endpoint_issues_durable_preconnect_browser_call_without_sip(
         room_name=payload["room_name"],
         participant_identity=payload["participant_identity"],
         served_configuration=served_configuration,
+        knowledge_pin=knowledge_pin,
     )
     db.expire_all()
     served_call = await db.get(Call, UUID(payload["call_id"]))
     assert served_call.call_metadata["agent_configuration"]["language"] == "en-US"
     assert served_call.call_metadata["served_configuration"] == served_configuration
+    assert served_call.call_metadata["runtime"]["knowledge_serving_revision_id"] == str(
+        first_revision_id
+    )
 
 
 @pytest.mark.asyncio
@@ -478,16 +707,22 @@ async def test_native_browser_session_fails_before_reservation_when_tools_are_re
 ):
     _configure_platform(monkeypatch)
     agent = await _configured_browser_agent(db, tenant)
+    await _publish_current_knowledge_revision(db, agent)
     profile = await db.scalar(
         select(AgentRuntimeProfile).where(AgentRuntimeProfile.agent_id == agent.id)
     )
+    agent.supported_languages = ["en-GB", "ar-AE", "hi-IN"]
+    agent.language_switching_enabled = True
     profile.runtime_config = {
         "voice_runtime": "inworld_realtime",
         "stt_model": "auto",
     }
     await db.commit()
 
-    async def reject_tool_call(_self, **_kwargs):
+    probe_payloads = []
+
+    async def reject_tool_call(_self, **kwargs):
+        probe_payloads.append(kwargs)
         raise InworldError("Tool calling is currently restricted on your plan.")
 
     worker_probe = AsyncMock()
@@ -507,6 +742,21 @@ async def test_native_browser_session_fails_before_reservation_when_tools_are_re
 
     assert response.status_code == 409
     assert "Tool calling is currently restricted" in response.json()["detail"]
+    production = livekit_worker._build_inworld_realtime_model(
+        model=agent,
+        profile=profile,
+        api_key="inworld-test-key-123456789",
+    )
+    production_transcription = production._opts.input_audio_transcription
+    assert probe_payloads == [
+        {
+            "model_id": profile.llm_model,
+            "voice_id": "Ashley",
+            "stt_model_id": production_transcription.model,
+            "stt_language": production_transcription.language,
+        }
+    ]
+    assert production_transcription.language is None
     worker_probe.assert_not_awaited()
     session_create.assert_not_awaited()
     reserved_call = await db.scalar(
@@ -528,6 +778,7 @@ async def test_endpoint_failure_releases_capacity_as_terminal_call(
 ):
     _configure_platform(monkeypatch)
     agent = await _configured_browser_agent(db, tenant)
+    await _publish_current_knowledge_revision(db, agent)
     agent_id = agent.id
     monkeypatch.setattr(LiveKitSIPProvider, "verify_worker", AsyncMock())
 
@@ -563,6 +814,7 @@ async def test_endpoint_cancellation_releases_committed_browser_reservation(
 ):
     _configure_platform(monkeypatch)
     agent = await _configured_browser_agent(db, tenant)
+    await _publish_current_knowledge_revision(db, agent)
     agent_id = agent.id
     monkeypatch.setattr(LiveKitSIPProvider, "verify_worker", AsyncMock())
     provider_started = asyncio.Event()
@@ -605,6 +857,7 @@ async def test_post_provider_persistence_failure_deletes_room_and_terminalizes_c
 ):
     _configure_platform(monkeypatch)
     agent = await _configured_browser_agent(db, tenant)
+    await _publish_current_knowledge_revision(db, agent)
     agent_id = agent.id
     monkeypatch.setattr(LiveKitSIPProvider, "verify_worker", AsyncMock())
 
@@ -703,6 +956,7 @@ async def test_worker_loads_draft_browser_profile_from_durable_reservation(
         api_key,
         variables,
         served_configuration,
+        knowledge_pin,
     ) = await livekit_worker._load_browser_runtime(
         tenant_id=tenant.id,
         agent_id=agent.id,
@@ -716,6 +970,7 @@ async def test_worker_loads_draft_browser_profile_from_durable_reservation(
     assert api_key.speech == "inworld-test-key-123456789"
     assert api_key.llm == "inworld-test-key-123456789"
     assert variables == {"customer_name": "Maya"}
+    assert knowledge_pin == livekit_worker._RuntimeKnowledgePin()
 
     call = await db.get(Call, call_id)
     call_metadata = dict(call.call_metadata)
@@ -743,7 +998,7 @@ async def test_worker_loads_draft_browser_profile_from_durable_reservation(
     knowledge = await db.get(KnowledgeBase, binding.knowledge_base_id)
     knowledge.approval_status = "draft"
     await db.commit()
-    with pytest.raises(RuntimeError, match="approved searchable knowledge"):
+    with pytest.raises(RuntimeError, match="published knowledge revision"):
         await livekit_worker._load_browser_runtime(
             tenant_id=tenant.id,
             agent_id=agent.id,
@@ -751,6 +1006,11 @@ async def test_worker_loads_draft_browser_profile_from_durable_reservation(
             room_name=room_name,
             participant_identity=participant_identity,
         )
+
+    # Restore the legacy approval state before exercising successful admission;
+    # the stale draft state above must never be bypassed by _open_browser_call.
+    knowledge.approval_status = "approved"
+    await db.commit()
 
     assert (
         await livekit_worker._open_browser_call(
@@ -760,6 +1020,7 @@ async def test_worker_loads_draft_browser_profile_from_durable_reservation(
             room_name=room_name,
             participant_identity=participant_identity,
             served_configuration=served_configuration,
+            knowledge_pin=knowledge_pin,
         )
         == call_id
     )
@@ -771,6 +1032,7 @@ async def test_worker_loads_draft_browser_profile_from_durable_reservation(
             room_name=room_name,
             participant_identity=participant_identity,
             served_configuration=served_configuration,
+            knowledge_pin=knowledge_pin,
         )
 
     duplicate_dispatch = create_browser_dispatch_metadata(
@@ -802,6 +1064,7 @@ async def test_worker_loads_draft_browser_profile_from_durable_reservation(
                 api_key,
                 variables,
                 served_configuration,
+                knowledge_pin,
             )
         ),
     )
@@ -940,6 +1203,7 @@ async def test_worker_browser_branch_uses_signed_identity_not_participant_metada
             livekit_worker._RuntimeApiKeys(speech="inworld-key", llm="inworld-key"),
             {"customer_name": "Maya"},
             {"version": 1, "agent_id": str(agent_id)},
+            livekit_worker._RuntimeKnowledgePin(),
         )
     )
     open_browser = AsyncMock(return_value=call_id)
@@ -995,6 +1259,13 @@ async def test_worker_browser_branch_uses_signed_identity_not_participant_metada
     open_sip.assert_not_awaited()
     assert start_options["room_options"] is expected_room_options
     assert finalize.await_count == 1
+    finalized_usage = finalize.await_args.args[2]
+    assert finalized_usage["greeting_provider_tts_request_count"] == 1
+    assert finalized_usage["greeting_tts_charge_expected"] is True
+    assert finalized_usage["external_tts_request_count"] == 1
+    assert finalized_usage["external_tts_provider_reconciliation_required"] is True
+    assert "external_tts" in finalized_usage["usage_components_expected"]
+    assert "external_tts" in finalized_usage["usage_components_reported"]
     assert delete_room.await_count == 1
     assert len(shutdown_callbacks) == 1
 
@@ -1091,6 +1362,7 @@ async def test_browser_disconnect_deletes_room_and_shuts_down_when_close_and_fin
                 livekit_worker._RuntimeApiKeys(speech="inworld-key", llm="inworld-key"),
                 {},
                 {"version": 1, "agent_id": str(agent_id)},
+                livekit_worker._RuntimeKnowledgePin(),
             )
         ),
     )
@@ -1226,6 +1498,7 @@ async def test_async_provider_failure_fails_call_deletes_browser_room_and_finali
                 ),
                 {},
                 {"version": 1, "agent_id": str(agent_id)},
+                livekit_worker._RuntimeKnowledgePin(),
             )
         ),
     )
@@ -1345,7 +1618,7 @@ async def test_worker_preopen_readiness_failure_terminalizes_call_and_deletes_ro
     monkeypatch.setattr(livekit_worker, "async_session_factory", session_factory)
     monkeypatch.setattr(livekit_worker, "delete_browser_room", delete_room)
 
-    with pytest.raises(RuntimeError, match="approved searchable knowledge"):
+    with pytest.raises(RuntimeError, match="published knowledge revision"):
         await livekit_worker.vav_inworld_session(Context())
 
     db.expire_all()

@@ -27,12 +27,19 @@ def has_searchable_content(source: KnowledgeSource) -> bool:
 
 
 def invalidate_knowledge_approval(knowledge_base: KnowledgeBase) -> bool:
-    """Return approved knowledge to review before any content change goes live."""
-    if knowledge_base.approval_status != "approved":
-        return False
-    knowledge_base.approval_status = "draft"
-    knowledge_base.published_at = None
-    return True
+    """Stage source edits without withdrawing the last approved release.
+
+    ``approval_status`` describes the mutable draft.  The immutable serving
+    pointer and its lexicon remain pinned until approval atomically publishes a
+    replacement (or an administrator explicitly revokes publication).
+    """
+    was_approved = knowledge_base.approval_status == "approved"
+    if was_approved:
+        knowledge_base.approval_status = "draft"
+        # The mutable draft is no longer published. The active release keeps
+        # its own immutable published_at timestamp on serving_revision.
+        knowledge_base.published_at = None
+    return was_approved
 
 
 def remote_creation_outcome_unknown(knowledge_base: KnowledgeBase) -> bool:

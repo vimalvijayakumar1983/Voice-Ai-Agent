@@ -1,0 +1,73 @@
+{
+  "schema_version": "vav-audio-replay-canary-v1",
+  "case_id": "al-zaabi-real-kb-qa-sip-proper-name",
+  "description": "Replay into an existing allowlisted LiveKit SIP QA fixture; this tool never dials.",
+  "target": {
+    "mode": "sip_fixture",
+    "api_base_url_env": "VAV_QA_API_BASE_URL",
+    "api_token_env": "VAV_QA_API_TOKEN",
+    "agent_id_env": "VAV_REAL_KB_QA_AGENT_ID",
+    "livekit_url_env": "VAV_QA_LIVEKIT_URL",
+    "livekit_access_token_env": "VAV_QA_SIP_FIXTURE_TOKEN",
+    "room_name_env": "VAV_QA_SIP_FIXTURE_ROOM",
+    "call_id_env": "VAV_QA_SIP_FIXTURE_CALL_ID",
+    "sip_fixture_id_env": "VAV_QA_SIP_FIXTURE_ID",
+    "variables": {}
+  },
+  "audio": {
+    "path_env": "VAV_QA_AUDIO_FIXTURE_PATH",
+    "format": "pcm_s16le",
+    "sample_rate_hz": 16000,
+    "channels": 1,
+    "frame_ms": 20
+  },
+  "expectations": {
+    "terminal_status": "completed",
+    "transcript": {
+      "utterances": [
+        {
+          "reference_text": "Who is the chairman of Al Zaabi Group?",
+          "max_word_error_rate": 0.15,
+          "required_entities": [
+            "Al Zaabi Group"
+          ]
+        }
+      ],
+      "max_extra_user_turns": 0
+    },
+    "latency": {
+      "max_participant_active_to_first_server_speaking_ms": 1500,
+      "max_turn_latency_p50_ms": 1400,
+      "max_turn_latency_p90_ms": 2000,
+      "max_turn_latency_p95_ms": 2200,
+      "max_last_speech_end_to_first_audio_ms": 2200
+    },
+    "grounding": {
+      "require_turn_diagnostics": true,
+      "min_responses_after_verified_retrieval": 1,
+      "max_unverified_answers": 0,
+      "max_knowledge_errors": 0,
+      "max_unexpected_script_turns": 0,
+      "max_transcription_clarifications": 0
+    }
+  },
+  "timing": {
+    "wait_for_remote_seconds": 30,
+    "pre_roll_seconds": 2,
+    "post_roll_seconds": 8,
+    "finalization_timeout_seconds": 60,
+    "poll_interval_seconds": 1
+  },
+  "safety": {
+    "test_only": true,
+    "allowlisted_agent_ids_env": "VAV_QA_REPLAY_ALLOWED_AGENT_IDS",
+    "allowlisted_sip_fixture_ids_env": "VAV_QA_REPLAY_ALLOWED_SIP_FIXTURE_IDS",
+    "required_agent_name_markers": [
+      "qa",
+      "test",
+      "canary"
+    ],
+    "max_fixture_duration_seconds": 45,
+    "max_fixture_bytes": 10000000
+  }
+}

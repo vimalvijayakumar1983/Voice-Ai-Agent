@@ -20,6 +20,7 @@ RUN playwright install --with-deps chromium \
 
 COPY migrations ./migrations
 COPY alembic.ini ./
+COPY scripts ./scripts
 
 RUN addgroup --system app && adduser --system --ingroup app app \
     && chown -R app:app /app

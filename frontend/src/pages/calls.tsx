@@ -487,6 +487,12 @@ export default function Calls() {
       (trace): trace is Record<string, unknown> => Boolean(trace) && typeof trace === 'object' && !Array.isArray(trace),
     ).slice(-20)
     : [];
+  const usageComponentsExpected = Array.isArray(selectedRuntime.usage_components_expected)
+    ? selectedRuntime.usage_components_expected.filter((value): value is string => typeof value === 'string')
+    : [];
+  const usageComponentsReported = Array.isArray(selectedRuntime.usage_components_reported)
+    ? selectedRuntime.usage_components_reported.filter((value): value is string => typeof value === 'string')
+    : [];
   const metadataLanguages = configuredLanguages(selectedCall);
   const transcriptLanguages = transcript
     ? transcript.turns.map((turn) => transcriptLanguage(turn)).filter(Boolean)
@@ -644,15 +650,23 @@ export default function Calls() {
                   <div><dt>Disposition</dt><dd>{selectedCall.disposition?.replace(/_/g, ' ') || 'Not reported'}</dd></div>
                   {selectedCall.cost_cents !== null ? <div><dt>Provider cost</dt><dd>{selectedCall.cost_cents} cents</dd></div> : null}
                   {selectedCall.sentiment_score !== null ? <div><dt>Sentiment score</dt><dd>{selectedCall.sentiment_score.toFixed(2)}</dd></div> : null}
-                  {typeof selectedMetadata.provider_latency_ms === 'number' ? <div><dt>Provider latency</dt><dd>{selectedMetadata.provider_latency_ms} ms</dd></div> : null}
-                  {typeof selectedRuntime.call_open_to_greeting_ms === 'number' ? <div><dt>Call open → greeting</dt><dd>{selectedRuntime.call_open_to_greeting_ms} ms</dd></div> : null}
-                  {typeof selectedRuntime.session_start_to_greeting_ms === 'number' ? <div><dt>Session start → greeting</dt><dd>{selectedRuntime.session_start_to_greeting_ms} ms</dd></div> : null}
+                  {typeof selectedMetadata.provider_latency_ms === 'number' ? <div><dt>Provider-reported latency</dt><dd>{selectedMetadata.provider_latency_ms} ms</dd></div> : null}
+                  {typeof selectedRuntime.participant_active_to_first_server_speaking_ms === 'number' ? <div><dt>Participant active → LiveKit server speaking</dt><dd>{selectedRuntime.participant_active_to_first_server_speaking_ms} ms</dd></div> : null}
+                  {typeof selectedRuntime.worker_job_entry_to_first_server_speaking_ms === 'number' ? <div><dt>Worker entry → LiveKit server speaking</dt><dd>{selectedRuntime.worker_job_entry_to_first_server_speaking_ms} ms</dd></div> : null}
+                  {typeof selectedRuntime.participant_active_to_session_ready_ms === 'number' ? <div><dt>Participant active → realtime session ready</dt><dd>{selectedRuntime.participant_active_to_session_ready_ms} ms</dd></div> : null}
+                  {typeof selectedRuntime.worker_job_entry_to_session_ready_ms === 'number' ? <div><dt>Worker entry → realtime session ready</dt><dd>{selectedRuntime.worker_job_entry_to_session_ready_ms} ms</dd></div> : null}
+                  {typeof selectedRuntime.call_open_to_greeting_ms === 'number' ? <div><dt>Runtime admission → LiveKit server speaking (legacy)</dt><dd>{selectedRuntime.call_open_to_greeting_ms} ms</dd></div> : null}
+                  {typeof selectedRuntime.session_start_to_greeting_ms === 'number' ? <div><dt>Session start → LiveKit server speaking</dt><dd>{selectedRuntime.session_start_to_greeting_ms} ms</dd></div> : null}
                   {typeof selectedRuntime.session_connection_ms === 'number' ? <div><dt>Realtime session connection</dt><dd>{selectedRuntime.session_connection_ms} ms</dd></div> : null}
-                  {typeof selectedRuntime.last_speech_end_to_first_audio_ms === 'number' ? <div><dt>Speech end → first audio</dt><dd>{selectedRuntime.last_speech_end_to_first_audio_ms} ms</dd></div> : null}
-                  {typeof selectedRuntime.turn_latency_p50_ms === 'number' ? <div><dt>Turn latency p50</dt><dd>{selectedRuntime.turn_latency_p50_ms} ms</dd></div> : null}
-                  {typeof selectedRuntime.turn_latency_p90_ms === 'number' ? <div><dt>Turn latency p90</dt><dd>{selectedRuntime.turn_latency_p90_ms} ms</dd></div> : null}
-                  {typeof selectedRuntime.turn_latency_p95_ms === 'number' ? <div><dt>Turn latency p95</dt><dd>{selectedRuntime.turn_latency_p95_ms} ms</dd></div> : null}
-                  {typeof selectedRuntime.last_transcript_to_first_audio_ms === 'number' ? <div><dt>Transcript → first audio</dt><dd>{selectedRuntime.last_transcript_to_first_audio_ms} ms</dd></div> : null}
+                  {typeof selectedRuntime.greeting_cache_status === 'string' ? <div><dt>Greeting preparation</dt><dd>{selectedRuntime.greeting_cache_status.replace(/_/g, ' ')}{typeof selectedRuntime.greeting_preparation_overlap_ms === 'number' ? ` · ${selectedRuntime.greeting_preparation_overlap_ms} ms overlapped` : ''}</dd></div> : null}
+                  {typeof selectedRuntime.last_speech_end_to_first_audio_ms === 'number' ? <div><dt>LiveKit speech end → server response start</dt><dd>{selectedRuntime.last_speech_end_to_first_audio_ms} ms</dd></div> : null}
+                  {typeof selectedRuntime.turn_latency_p50_ms === 'number' ? <div><dt>Server-observed response latency p50</dt><dd>{selectedRuntime.turn_latency_p50_ms} ms</dd></div> : null}
+                  {typeof selectedRuntime.turn_latency_p90_ms === 'number' ? <div><dt>Server-observed response latency p90</dt><dd>{selectedRuntime.turn_latency_p90_ms} ms</dd></div> : null}
+                  {typeof selectedRuntime.turn_latency_p95_ms === 'number' ? <div><dt>Server-observed response latency p95</dt><dd>{selectedRuntime.turn_latency_p95_ms} ms</dd></div> : null}
+                  {typeof selectedRuntime.turn_latency_sample_count === 'number' ? <div><dt>Latency sample size</dt><dd>{selectedRuntime.turn_latency_sample_count} completed turn{selectedRuntime.turn_latency_sample_count === 1 ? '' : 's'}</dd></div> : null}
+                  {typeof selectedRuntime.last_transcript_to_first_audio_ms === 'number' ? <div><dt>Final transcript → server response start</dt><dd>{selectedRuntime.last_transcript_to_first_audio_ms} ms</dd></div> : null}
+                  {typeof selectedRuntime.audio_latency_observation_point === 'string' ? <div><dt>Latency observation point</dt><dd>{selectedRuntime.audio_latency_observation_point.replace(/_/g, ' ')}</dd></div> : null}
+                  {typeof selectedRuntime.audio_latency_unobserved_segments === 'string' ? <div><dt>Latency not measured</dt><dd>Downstream network, browser audio rendering, and SIP/RTP arrival at the caller</dd></div> : null}
                   {typeof selectedRuntime.last_llm_first_token_ms === 'number' ? <div><dt>LLM first token</dt><dd>{selectedRuntime.last_llm_first_token_ms} ms</dd></div> : null}
                   {typeof selectedRuntime.last_llm_latency_ms === 'number' ? <div><dt>Last LLM latency</dt><dd>{selectedRuntime.last_llm_latency_ms} ms</dd></div> : null}
                   {typeof selectedRuntime.last_tts_first_byte_ms === 'number' ? <div><dt>Last TTS first byte</dt><dd>{selectedRuntime.last_tts_first_byte_ms} ms</dd></div> : null}
@@ -661,10 +675,11 @@ export default function Calls() {
                   {typeof selectedRuntime.last_knowledge_hook_ms === 'number' ? <div><dt>Knowledge hook</dt><dd>{selectedRuntime.last_knowledge_hook_ms} ms</dd></div> : null}
                   {typeof selectedRuntime.last_knowledge_tool_ms === 'number' ? <div><dt>Last knowledge search</dt><dd>{selectedRuntime.last_knowledge_tool_ms} ms</dd></div> : null}
                   {typeof selectedRuntime.last_interruption_detection_ms === 'number' ? <div><dt>Interruption detection</dt><dd>{selectedRuntime.last_interruption_detection_ms} ms</dd></div> : null}
-                  {typeof selectedRuntime.llm_tokens === 'number' ? <div><dt>LLM tokens</dt><dd>{selectedRuntime.llm_tokens}</dd></div> : null}
+                  {typeof selectedRuntime.usage_source === 'string' ? <div><dt>Runtime usage telemetry</dt><dd>{selectedRuntime.runtime_usage_components_complete === true ? 'All known runtime components observed' : 'Incomplete'} · expected {usageComponentsExpected.length ? usageComponentsExpected.join(', ') : 'not established'} · reported {usageComponentsReported.length ? usageComponentsReported.join(', ') : 'none'} · request units only, not a provider bill</dd></div> : null}
+                  {typeof selectedRuntime.usage_source === 'string' ? <div><dt>LLM tokens</dt><dd>{typeof selectedRuntime.llm_tokens === 'number' ? selectedRuntime.llm_tokens : 'Not reported'}</dd></div> : null}
                   {typeof selectedRuntime.llm_input_audio_tokens === 'number' ? <div><dt>Input audio tokens</dt><dd>{selectedRuntime.llm_input_audio_tokens}</dd></div> : null}
                   {typeof selectedRuntime.llm_output_audio_tokens === 'number' ? <div><dt>Output audio tokens</dt><dd>{selectedRuntime.llm_output_audio_tokens}</dd></div> : null}
-                  {typeof selectedRuntime.realtime_session_seconds === 'number' ? <div><dt>Realtime session</dt><dd>{selectedRuntime.realtime_session_seconds.toFixed(1)} s</dd></div> : null}
+                  {typeof selectedRuntime.usage_source === 'string' ? <div><dt>Realtime session</dt><dd>{typeof selectedRuntime.realtime_session_seconds === 'number' ? `${selectedRuntime.realtime_session_seconds.toFixed(1)} s` : 'Not reported'}</dd></div> : null}
                   {typeof selectedRuntime.barge_in_count === 'number' ? <div><dt>Barge-ins</dt><dd>{selectedRuntime.barge_in_count}</dd></div> : null}
                   {typeof selectedRuntime.stale_generation_cancel_count === 'number' ? <div><dt>Stale responses cancelled</dt><dd>{selectedRuntime.stale_generation_cancel_count}</dd></div> : null}
                   {typeof selectedRuntime.suppressed_fragment_count === 'number' ? <div><dt>Incomplete fragments suppressed</dt><dd>{selectedRuntime.suppressed_fragment_count}</dd></div> : null}
@@ -672,12 +687,30 @@ export default function Calls() {
                   {typeof selectedRuntime.knowledge_terminology_count === 'number' ? <div><dt>Recognition terms loaded</dt><dd>{selectedRuntime.knowledge_terminology_count}</dd></div> : null}
                   {typeof selectedRuntime.knowledge_terminology_total_count === 'number' ? <div><dt>Recognition terms available</dt><dd>{selectedRuntime.knowledge_terminology_total_count}</dd></div> : null}
                   {typeof selectedRuntime.knowledge_terminology_load_ms === 'number' ? <div><dt>Recognition vocabulary load</dt><dd>{selectedRuntime.knowledge_terminology_load_ms} ms</dd></div> : null}
+                  {typeof selectedRuntime.speech_lexicon_source === 'string' ? <div><dt>Speech lexicon</dt><dd>{selectedRuntime.speech_lexicon_source.replace(/_/g, ' ')}{typeof selectedRuntime.speech_lexicon_compiler_version === 'string' ? ` · ${selectedRuntime.speech_lexicon_compiler_version}` : ''}</dd></div> : null}
+                  {typeof selectedRuntime.speech_lexicon_artifact_id === 'string' ? <div><dt>Lexicon revision</dt><dd>{selectedRuntime.speech_lexicon_artifact_id.slice(0, 12)}</dd></div> : null}
+                  {typeof selectedRuntime.speech_lexicon_tier_one_coverage_pct === 'number' ? <div><dt>Critical-name coverage</dt><dd>{selectedRuntime.speech_lexicon_tier_one_coverage_pct.toFixed(1)}%</dd></div> : null}
+                  {typeof selectedRuntime.knowledge_turn_mode === 'string' ? <div><dt>Knowledge turn policy</dt><dd>{selectedRuntime.knowledge_turn_mode.replace(/_/g, ' ')}</dd></div> : null}
+                  {typeof selectedRuntime.last_single_pass_total_ms === 'number' ? <div><dt>Last single-pass orchestration</dt><dd>{selectedRuntime.last_single_pass_total_ms.toFixed(1)} ms{typeof selectedRuntime.last_single_pass_outcome === 'string' ? ` · ${selectedRuntime.last_single_pass_outcome}` : ''}</dd></div> : null}
+                  {typeof selectedRuntime.unexpected_script_count === 'number' ? <div><dt>Wrong-script repairs</dt><dd>{selectedRuntime.unexpected_script_count}</dd></div> : null}
+                  {typeof selectedRuntime.entity_resolution_search_applied_count === 'number' ? <div><dt>Safe name-search repairs</dt><dd>{selectedRuntime.entity_resolution_search_applied_count}</dd></div> : null}
                   {typeof selectedRuntime.knowledge_lookup_count === 'number' ? <div><dt>Knowledge searches</dt><dd>{selectedRuntime.knowledge_lookup_count}</dd></div> : null}
+                  {typeof selectedRuntime.last_exact_fact_total_ms === 'number' ? <div><dt>Last exact-fact path</dt><dd>{selectedRuntime.last_exact_fact_total_ms.toFixed(1)} ms</dd></div> : null}
                   {typeof selectedRuntime.knowledge_match_count === 'number' ? <div><dt>Verified knowledge matches</dt><dd>{selectedRuntime.knowledge_match_count}</dd></div> : null}
                   {typeof selectedRuntime.knowledge_no_match_count === 'number' ? <div><dt>Knowledge no-matches</dt><dd>{selectedRuntime.knowledge_no_match_count}</dd></div> : null}
                   {typeof selectedRuntime.unsupported_knowledge_response_count === 'number' ? <div><dt>Unsupported factual responses</dt><dd>{selectedRuntime.unsupported_knowledge_response_count}</dd></div> : null}
-                  {typeof selectedRuntime.stt_model === 'string' ? <div><dt>Recognition model</dt><dd>{selectedRuntime.stt_model}</dd></div> : null}
-                  {typeof selectedRuntime.stt_language === 'string' ? <div><dt>Recognition language</dt><dd>{selectedRuntime.stt_language}</dd></div> : null}
+                  {typeof selectedRuntime.recording_state === 'string' ? <div><dt>LiveKit recording state</dt><dd>{selectedRuntime.recording_state.replace(/_/g, ' ')}</dd></div> : null}
+                  {typeof selectedRuntime.recording_requested_mode === 'string' ? <div><dt>LiveKit recording request</dt><dd>{selectedRuntime.recording_requested_mode.replace(/_/g, ' ')}</dd></div> : null}
+                  {typeof selectedRuntime.recording_blocker === 'string' ? <div><dt>LiveKit recording blocker</dt><dd>{selectedRuntime.recording_blocker.replace(/_/g, ' ')}</dd></div> : null}
+                  {typeof selectedRuntime.stt_model === 'string' ? <div><dt>Recognition model (configured)</dt><dd>{selectedRuntime.stt_model}</dd></div> : null}
+                  {typeof selectedRuntime.stt_language === 'string' ? <div><dt>Recognition language (configured)</dt><dd>{selectedRuntime.stt_language}</dd></div> : null}
+                  {typeof selectedRuntime.stt_session_update_serialized_model === 'string' ? <div><dt>Serialized recognition model</dt><dd>{selectedRuntime.stt_session_update_serialized_model}</dd></div> : null}
+                  {typeof selectedRuntime.stt_session_update_serialized_language === 'string' ? <div><dt>Serialized recognition language</dt><dd>{selectedRuntime.stt_session_update_serialized_language}</dd></div> : null}
+                  {typeof selectedRuntime.stt_session_update_serialized_complete === 'boolean' ? <div><dt>VAV STT payload before send</dt><dd>{selectedRuntime.stt_session_update_serialized_complete ? 'Model and language present' : 'Required values missing'}{typeof selectedRuntime.stt_session_update_serialized_sequence === 'number' ? ` · update ${selectedRuntime.stt_session_update_serialized_sequence}` : ''}</dd></div> : null}
+                  {typeof selectedRuntime.stt_session_update_provider_acknowledgement_observed === 'boolean' ? <div><dt>Provider acknowledgement on this call</dt><dd>{selectedRuntime.stt_session_update_provider_acknowledgement_observed ? 'Observed' : 'Not captured; readiness is a separate probe'}</dd></div> : null}
+                  {typeof selectedRuntime.stt_provider_language_reported === 'boolean' ? <div><dt>Provider-reported transcript language</dt><dd>{selectedRuntime.stt_provider_language_reported && typeof selectedRuntime.stt_provider_reported_language === 'string' ? selectedRuntime.stt_provider_reported_language : 'Not reported'}</dd></div> : null}
+                  {typeof selectedRuntime.stt_session_update_serialized_prompt_chars === 'number' ? <div><dt>Serialized recognition prompt</dt><dd>{selectedRuntime.stt_session_update_serialized_prompt_chars} characters · content not retained</dd></div> : null}
+                  {typeof selectedRuntime.stt_session_update_serialized_lexicon_count === 'number' ? <div><dt>Serialized lexicon terms</dt><dd>{selectedRuntime.stt_session_update_serialized_lexicon_count}</dd></div> : null}
                   {selectedRuntime.cost_state === 'pending_provider_billing_sync' ? <div><dt>Runtime cost</dt><dd>Awaiting provider billing sync</dd></div> : null}
                 </dl>
               </section>
@@ -692,10 +725,22 @@ export default function Calls() {
                       const latency = typeof trace.speech_end_to_first_audio_ms === 'number' ? `${trace.speech_end_to_first_audio_ms} ms response` : null;
                       const words = typeof trace.transcript_words === 'number' ? `${trace.transcript_words} transcript words` : null;
                       const interrupted = trace.barge_in === true ? 'barge-in' : null;
-                      const knowledge = typeof trace.knowledge_result === 'string' ? `knowledge ${trace.knowledge_result.replace(/_/g, ' ')}` : null;
+                      const retrieval = typeof trace.retrieval_result === 'string'
+                        ? trace.retrieval_result
+                        : typeof trace.knowledge_result === 'string' ? trace.knowledge_result : null;
+                      const knowledge = retrieval ? `retrieval ${retrieval.replace(/_/g, ' ')}` : null;
                       const knowledgeLatency = typeof trace.knowledge_tool_ms === 'number' ? `${trace.knowledge_tool_ms} ms retrieval` : null;
-                      const grounding = typeof trace.grounding_outcome === 'string' ? trace.grounding_outcome.replace(/_/g, ' ') : null;
-                      return <div key={`turn-diagnostic-${turn}-${index}`}><dt>Turn {turn}</dt><dd>{[outcome, latency, words, knowledge, knowledgeLatency, grounding, interrupted].filter(Boolean).join(' · ')}</dd></div>;
+                      const responseAction = typeof trace.response_action === 'string'
+                        ? `response ${trace.response_action.replace(/_/g, ' ')}`
+                        : typeof trace.grounding_outcome === 'string' ? trace.grounding_outcome.replace(/_/g, ' ') : null;
+                      const retrievalPath = typeof trace.knowledge_retrieval_path === 'string' ? trace.knowledge_retrieval_path.replace(/_/g, ' ') : null;
+                      const exactAction = typeof trace.exact_fact_action === 'string' ? `exact fact ${trace.exact_fact_action.replace(/_/g, ' ')}` : null;
+                      const exactLatency = typeof trace.exact_fact_total_ms === 'number' ? `${trace.exact_fact_total_ms.toFixed(1)} ms exact path` : null;
+                      const scriptRepair = trace.unexpected_script === true ? 'wrong-script clarification' : null;
+                      const singlePassMode = typeof trace.inworld_turn_mode === 'string' ? trace.inworld_turn_mode.replace(/_/g, ' ') : null;
+                      const singlePassLatency = typeof trace.single_pass_total_ms === 'number' ? `${trace.single_pass_total_ms.toFixed(1)} ms single pass` : null;
+                      const singlePassOutcome = typeof trace.single_pass_outcome === 'string' ? `single pass ${trace.single_pass_outcome.replace(/_/g, ' ')}` : null;
+                      return <div key={`turn-diagnostic-${turn}-${index}`}><dt>Turn {turn}</dt><dd>{[outcome, latency, words, singlePassMode, singlePassLatency, singlePassOutcome, retrievalPath, knowledge, knowledgeLatency, exactAction, exactLatency, responseAction, scriptRepair, interrupted].filter(Boolean).join(' · ')}</dd></div>;
                     })}
                   </dl>
                 </section>
@@ -720,7 +765,8 @@ export default function Calls() {
                 ) : (
                   <p className="detail-empty">No recording is currently reported for this conversation.</p>
                 )}
-                <p className={styles.recordingPolicy}>Every audio request checks the latest explicit recording revocation for the customer. The absence of a consent record is policy-neutral; it is not treated as either permission or denial.</p>
+                {selectedRuntime.recording_state === 'blocked' ? <p className={styles.recordingPolicy}>LiveKit capture was not started. A saved operator request is not consent; call-bound affirmative consent, Egress, encrypted regional storage, retention, deletion, and audited playback must all be operational first.</p> : null}
+                <p className={styles.recordingPolicy}>Legacy provider-hosted playback checks the latest explicit recording revocation. That legacy access rule never authorizes LiveKit capture, which remains default-off and fail-closed.</p>
               </section>
 
               <section className="detail-section" aria-labelledby="call-summary-heading">

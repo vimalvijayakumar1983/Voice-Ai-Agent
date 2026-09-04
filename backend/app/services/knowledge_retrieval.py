@@ -14,7 +14,13 @@ from uuid import UUID
 from sqlalchemy import Text, case, cast, func, literal_column, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.agent import AgentKnowledgeBinding, KnowledgeBase, KnowledgeSource
+from app.models.agent import (
+    AgentKnowledgeBinding,
+    KnowledgeBase,
+    KnowledgeServingRevision,
+    KnowledgeServingRevisionSource,
+    KnowledgeSource,
+)
 
 _TOKEN = re.compile(r"[^\W_]+", re.UNICODE)
 _SPLIT = re.compile(r"(?:\r?\n){2,}|(?<=[.!?।])\s+")
@@ -851,6 +857,50 @@ def _structured_retrieval_content(value: object) -> str | None:
     return "\n\n".join(blocks).strip() if blocks else None
 
 
+def _structured_absence_is_authoritative(value: object) -> bool:
+    """Return whether omitting a fact from structured data is proven complete."""
+
+    if not isinstance(value, dict):
+        return False
+    coverage = value.get("exact_fact_coverage")
+    if not isinstance(coverage, dict):
+        # Legacy/imported structured documents predate the explicit completeness
+        # contract. Their returned facts may be valid, but absence from that list
+        # never proves absence from the approved source. Keep raw text searchable.
+        return False
+    return coverage.get("complete") is True and coverage.get("absence_authoritative") is True
+
+
+def _canonical_source_content(value: object) -> str | None:
+    """Recover approved canonical source text from compiler output when present."""
+
+    if not isinstance(value, str) or not value.strip():
+        return None
+    marker = "\n\nSOURCE CONTENT"
+    start = value.find(marker)
+    content = value[start + len(marker) :] if start >= 0 else value
+    cleaned = content.replace("<b>", "").replace("</b>", "").strip()
+    return cleaned or None
+
+
+def _source_retrieval_documents(
+    *,
+    name: str,
+    content: object,
+    structured_content: object,
+) -> list[tuple[str, str]]:
+    """Keep verified facts fast without hiding facts an AI extractor omitted."""
+
+    structured = _structured_retrieval_content(structured_content)
+    raw = _canonical_source_content(content)
+    if structured is None:
+        return [(name, raw)] if raw else []
+    documents = [(name, structured)]
+    if not _structured_absence_is_authoritative(structured_content) and raw:
+        documents.append((f"{name} · approved source text", raw))
+    return documents
+
+
 def _chunks(
     value: str,
     *,
@@ -1229,6 +1279,8 @@ async def load_agent_knowledge_terminology(
     tenant_id: UUID,
     agent_id: UUID,
     hints: Iterable[object] = (),
+    serving_revision_id: UUID | None = None,
+    knowledge_base_id: UUID | None = None,
 ) -> tuple[str, ...]:
     """Load a bounded proper-name vocabulary for one bound agent.
 
@@ -1236,6 +1288,26 @@ async def load_agent_knowledge_terminology(
     window contributes only high-confidence proper names so spoken brand names
     can be recovered without treating ordinary prose as aliases.
     """
+    # New approved revisions publish a deterministic, tier-ranked artifact.
+    # Keep the legacy metadata/content scan as a rolling-deploy and backfill
+    # fallback for approved knowledge bases created before that artifact.
+    from app.services.speech_lexicon import load_agent_speech_lexicon
+
+    speech_lexicon = await load_agent_speech_lexicon(
+        db,
+        tenant_id=tenant_id,
+        agent_id=agent_id,
+        serving_revision_id=serving_revision_id,
+        knowledge_base_id=knowledge_base_id,
+    )
+    if speech_lexicon is not None:
+        return tuple(entry.canonical for entry in speech_lexicon.entries)
+    if serving_revision_id is not None:
+        # A pinned call must never scan the mutable source workspace when its
+        # historical lexicon cannot be resolved. Keep only caller-supplied
+        # non-knowledge hints and let readiness/telemetry expose the bad pin.
+        return tuple(str(value) for value in hints if str(value or "").strip())
+
     row = (
         await db.execute(
             select(
@@ -1614,6 +1686,166 @@ async def _candidate_source_ids(
     )
 
 
+async def _retrieve_serving_revision_context(
+    db: AsyncSession,
+    *,
+    tenant_id: UUID,
+    revision: KnowledgeServingRevision,
+    query_plan: ContextualQueryPlan,
+    limit: int,
+    max_context_chars: int,
+) -> str | None:
+    """Search only an immutable release while a newer draft is being edited."""
+
+    combined_query = " ".join(query_plan.variants)
+    query_tokens = _query_tokens(combined_query)
+    exact_terms = sorted(_tokens(combined_query) - _QUERY_STOP_WORDS)[:16]
+    lower_name = func.lower(KnowledgeServingRevisionSource.name)
+    lower_location = func.lower(func.coalesce(KnowledgeServingRevisionSource.location, ""))
+    lower_content = func.lower(KnowledgeServingRevisionSource.content)
+    lower_structured = func.lower(cast(KnowledgeServingRevisionSource.structured_content, Text))
+    predicates = [
+        predicate
+        for term in exact_terms
+        for predicate in (
+            lower_name.contains(term),
+            lower_content.contains(term),
+            lower_structured.contains(term),
+        )
+    ]
+    contact_query = any(_is_contact_query(value) for value in query_plan.variants)
+    if contact_query:
+        predicates.extend(
+            [
+                *(lower_name.contains(marker) for marker in _CONTACT_QUERY_TOKENS),
+                *(lower_location.contains(marker) for marker in ("contact", "location")),
+                *(lower_content.contains(marker) for marker in _CONTACT_SOURCE_MARKERS),
+            ]
+        )
+    broad_query = any(_is_broad_query(value, _query_tokens(value)) for value in query_plan.variants)
+    if broad_query:
+        predicates.extend(
+            (
+                lower_name.contains("overview"),
+                lower_name.contains("about"),
+                lower_name.contains("profile"),
+                lower_name.contains("division"),
+            )
+        )
+
+    source_query = select(
+        KnowledgeServingRevisionSource.original_source_id,
+        KnowledgeServingRevisionSource.name,
+        KnowledgeServingRevisionSource.content,
+        KnowledgeServingRevisionSource.structured_content,
+    ).where(
+        KnowledgeServingRevisionSource.tenant_id == tenant_id,
+        KnowledgeServingRevisionSource.serving_revision_id == revision.id,
+    )
+    dialect = db.get_bind().dialect.name
+    order_by: tuple[object, ...] = (
+        KnowledgeServingRevisionSource.created_at.desc(),
+        KnowledgeServingRevisionSource.original_source_id,
+    )
+    if dialect == "postgresql" and _postgres_fts_terms(combined_query):
+        # Rank immutable release rows in PostgreSQL *before* applying the
+        # candidate limit.  The matching expression is backed by the GIN index
+        # created with migration 023, so a relevant page cannot disappear just
+        # because more than 48 pages were published after it.
+        empty_text = literal_column("''", type_=Text())
+        search_text = (
+            func.coalesce(cast(KnowledgeServingRevisionSource.name, Text), empty_text)
+            + literal_column("' '", type_=Text())
+            + func.coalesce(KnowledgeServingRevisionSource.location, empty_text)
+            + literal_column("' '", type_=Text())
+            + func.coalesce(KnowledgeServingRevisionSource.content, empty_text)
+        )
+        search_vector = func.to_tsvector(
+            literal_column("'simple'::regconfig"),
+            search_text,
+        )
+        ts_query = _postgres_ts_query(combined_query)
+        rank = func.ts_rank_cd(search_vector, ts_query)
+        source_query = source_query.where(search_vector.op("@@")(ts_query))
+        order_by = (
+            rank.desc(),
+            KnowledgeServingRevisionSource.created_at.desc(),
+            KnowledgeServingRevisionSource.original_source_id,
+        )
+        source_query = source_query.order_by(*order_by).limit(MAX_SOURCE_CANDIDATES)
+    else:
+        if predicates:
+            source_query = source_query.where(or_(*predicates))
+        # SQLite is used only for local/test execution and has no production
+        # tsvector path.  Fetch every predicate match so the in-process ranker
+        # can choose the best 48, rather than truncating by creation time first.
+        source_query = source_query.order_by(*order_by)
+    source_rows = (await db.execute(source_query)).all()
+
+    # A fuzzy name fallback stays bounded and never switches to mutable draft
+    # rows. It catches ASR spelling variants without widening tenant scope.
+    if not source_rows and query_tokens:
+        recent_rows = (
+            await db.execute(
+                select(
+                    KnowledgeServingRevisionSource.original_source_id,
+                    KnowledgeServingRevisionSource.name,
+                    KnowledgeServingRevisionSource.content,
+                    KnowledgeServingRevisionSource.structured_content,
+                )
+                .where(
+                    KnowledgeServingRevisionSource.tenant_id == tenant_id,
+                    KnowledgeServingRevisionSource.serving_revision_id == revision.id,
+                )
+                .order_by(
+                    KnowledgeServingRevisionSource.created_at.desc(),
+                    KnowledgeServingRevisionSource.original_source_id,
+                )
+                .limit(_TITLE_CANDIDATE_LIMIT)
+            )
+        ).all()
+        source_rows = [
+            row
+            for row in recent_rows
+            if any(
+                _best_fuzzy_source_match(token, _source_compounds(row.name))[0] > 0
+                for token in query_tokens
+            )
+        ]
+
+    documents: list[tuple[str, str]] = []
+    for row in source_rows:
+        documents.extend(
+            _source_retrieval_documents(
+                name=row.name,
+                content=row.content,
+                structured_content=row.structured_content,
+            )
+        )
+    if revision.knowledge_content:
+        documents.append((revision.knowledge_name, revision.knowledge_content))
+    matches = await asyncio.to_thread(
+        _rank_contextual_knowledge,
+        query_plan.variants,
+        documents,
+        limit,
+    )
+    if not matches:
+        return None
+    interpretation = ""
+    if query_plan.recovered_terms:
+        interpretation = (
+            "Contextual terminology considered: "
+            + ", ".join(query_plan.recovered_terms)
+            + ". Verify the intended term against the evidence below; ask a brief "
+            "clarifying question if it would materially change the answer.\n\n"
+        )
+    context = interpretation + "\n\n".join(
+        f"Source: {match.source}\n{match.text}" for match in matches
+    )
+    return context[:max_context_chars]
+
+
 async def retrieve_knowledge_context(
     db: AsyncSession,
     *,
@@ -1624,37 +1856,95 @@ async def retrieve_knowledge_context(
     terminology: Iterable[object] = (),
     limit: int = 6,
     max_context_chars: int = MAX_CONTEXT_CHARS,
+    serving_revision_id: UUID | None = None,
+    knowledge_base_id: UUID | None = None,
 ) -> str | None:
-    binding = await db.scalar(
-        select(AgentKnowledgeBinding).where(
-            AgentKnowledgeBinding.tenant_id == tenant_id,
-            AgentKnowledgeBinding.agent_id == agent_id,
+    """Retrieve only from the call-pinned or currently published corpus.
+
+    ``serving_revision_id`` may identify a historical release. A revision-only
+    pin is verified through the current agent binding. A call that already
+    crossed admission may also supply its immutable ``knowledge_base_id`` and
+    retain that exact tenant-owned release across a later rebind. Invalid pins
+    return no evidence instead of silently changing revisions.
+    """
+
+    if knowledge_base_id is not None and serving_revision_id is None:
+        raise ValueError("knowledge_base_id requires an explicit serving_revision_id")
+
+    revision = None
+    if serving_revision_id is not None and knowledge_base_id is not None:
+        # Admission already authenticated this immutable identity. A running
+        # call must keep its exact release when the agent is subsequently
+        # rebound, unbound, or its live pointer is explicitly revoked.
+        revision = await db.scalar(
+            select(KnowledgeServingRevision).where(
+                KnowledgeServingRevision.id == serving_revision_id,
+                KnowledgeServingRevision.tenant_id == tenant_id,
+                KnowledgeServingRevision.knowledge_base_id == knowledge_base_id,
+            )
         )
-    )
-    if binding is None:
-        return None
-    knowledge_base = await db.scalar(
-        select(KnowledgeBase).where(
+        if revision is None:
+            return None
+        knowledge_base = None
+    else:
+        binding = await db.scalar(
+            select(AgentKnowledgeBinding).where(
+                AgentKnowledgeBinding.tenant_id == tenant_id,
+                AgentKnowledgeBinding.agent_id == agent_id,
+            )
+        )
+        if binding is None:
+            return None
+        knowledge_base_query = select(KnowledgeBase).where(
             KnowledgeBase.id == binding.knowledge_base_id,
             KnowledgeBase.tenant_id == tenant_id,
             KnowledgeBase.is_active.is_(True),
-            KnowledgeBase.approval_status == "approved",
         )
-    )
-    if knowledge_base is None:
-        return None
+        if serving_revision_id is None:
+            knowledge_base_query = knowledge_base_query.where(
+                or_(
+                    KnowledgeBase.serving_revision_id.is_not(None),
+                    KnowledgeBase.approval_status == "approved",
+                )
+            )
+        knowledge_base = await db.scalar(knowledge_base_query)
+        if knowledge_base is None:
+            return None
+        effective_revision_id = serving_revision_id or knowledge_base.serving_revision_id
+        if effective_revision_id is not None:
+            revision = await db.scalar(
+                select(KnowledgeServingRevision).where(
+                    KnowledgeServingRevision.id == effective_revision_id,
+                    KnowledgeServingRevision.tenant_id == tenant_id,
+                    KnowledgeServingRevision.knowledge_base_id == knowledge_base.id,
+                )
+            )
+            if revision is None:
+                return None
+    terminology_name = revision.knowledge_name if revision is not None else knowledge_base.name
+    terminology_scope = revision.scope_label if revision is not None else knowledge_base.scope_label
+    terminology_tags = revision.tags if revision is not None else knowledge_base.tags
     query_plan = build_contextual_query_plan(
         query,
         supplied_variants=query_variants,
         terminology=(
             *terminology,
-            knowledge_base.name,
-            knowledge_base.scope_label,
-            *(knowledge_base.tags if isinstance(knowledge_base.tags, list) else []),
+            terminology_name,
+            terminology_scope,
+            *(terminology_tags if isinstance(terminology_tags, list) else []),
         ),
     )
     if not query_plan.variants:
         return None
+    if revision is not None:
+        return await _retrieve_serving_revision_context(
+            db,
+            tenant_id=tenant_id,
+            revision=revision,
+            query_plan=query_plan,
+            limit=limit,
+            max_context_chars=max_context_chars,
+        )
     combined_query = " ".join(query_plan.variants)
     candidate_ids = await _candidate_source_ids(
         db,
@@ -1700,13 +1990,15 @@ async def retrieve_knowledge_context(
         ).all()
     sources_by_id = {}
     for source_id, source_name, source_content, structured_content in source_rows:
-        retrieval_content = _structured_retrieval_content(structured_content)
-        if retrieval_content is None and isinstance(source_content, str):
-            retrieval_content = source_content.replace("<b>", "").replace("</b>", "")
-        if retrieval_content and retrieval_content.strip():
-            sources_by_id[source_id] = (source_name, retrieval_content)
+        retrieval_documents = _source_retrieval_documents(
+            name=source_name,
+            content=source_content,
+            structured_content=structured_content,
+        )
+        if retrieval_documents:
+            sources_by_id[source_id] = retrieval_documents
     documents = [
-        sources_by_id[source_id] for source_id in candidate_ids if source_id in sources_by_id
+        document for source_id in candidate_ids for document in sources_by_id.get(source_id, ())
     ]
     if knowledge_base.content:
         documents.append((knowledge_base.name, knowledge_base.content))

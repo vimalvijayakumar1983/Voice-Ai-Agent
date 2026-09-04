@@ -6,6 +6,7 @@ import asyncio
 import base64
 import binascii
 import json
+import re
 from typing import Any
 from urllib.parse import urlencode, urlsplit, urlunsplit
 from uuid import uuid4
@@ -26,10 +27,19 @@ ROUTER_PROBE_PROMPT = "Reply OK."
 ROUTER_TOOL_NAME = "vav_readiness_check"
 ROUTER_PROBE_MAX_TOKENS = 64
 REALTIME_PROBE_MAX_EVENTS = 32
+REALTIME_SINGLE_PASS_QUIET_SECONDS = 0.2
 # ``auto`` may select a reasoning model that spends a tiny completion budget
 # before producing visible text. Keep the larger bound isolated to that route.
 ROUTER_AUTO_PROBE_MAX_TOKENS = 128
 INWORLD_REALTIME_PATH = "/api/v1/realtime/session"
+
+
+def _is_exact_readiness_response(parts: list[str]) -> bool:
+    """Accept only the requested readiness sentinel, never a negated phrase."""
+
+    normalized = " ".join(" ".join(parts).split())
+    return re.fullmatch(r"READY[.!]?", normalized, flags=re.IGNORECASE) is not None
+
 
 # Realtime TTS-2 is cross-lingual. The Voice API's ``langCode`` describes the
 # native prompt/accent of a voice; it is not that voice's complete synthesis
@@ -374,15 +384,15 @@ class InworldClient:
         model_id: str,
         voice_id: str,
         stt_model_id: str,
+        stt_language: str | None,
+        single_pass: bool = False,
     ) -> None:
-        """Prove the exact native route can execute VAV's required knowledge tool.
+        """Prove the exact native response path selected by the runtime policy.
 
-        A successful ``session.updated`` only proves that Inworld accepted the
-        model, voice, and STT configuration. Some Inworld plans accept that
-        configuration but reject tool execution when the first caller turn is
-        processed. VAV's native agent requires a knowledge-search tool, so the
-        readiness probe must exercise one tiny text-only tool call before an
-        operator can start a production session.
+        Tool-loop mode executes VAV's required knowledge tool. Experimental
+        single-pass mode instead proves that provider auto-response can be
+        disabled and that one explicit, response-scoped, tool-free generation
+        completes. Both checks remain text-only and tightly bounded.
         """
 
         if not self.is_configured:
@@ -392,6 +402,11 @@ class InworldClient:
         selected_model = _probe_value(model_id, "Realtime model")
         selected_voice = _probe_value(voice_id, "voice ID")
         selected_stt = _probe_value(stt_model_id, "Realtime transcription model")
+        selected_language = (
+            None
+            if stt_language is None
+            else _probe_value(stt_language, "Realtime transcription language")
+        )
         timeout = max(1.0, min(float(self.timeout), PROBE_TIMEOUT_SECONDS))
         url = inworld_realtime_websocket_url(
             self.base_url,
@@ -417,16 +432,19 @@ class InworldClient:
                 # session configuration is accepted.
                 "output_modalities": ["text"],
                 "max_output_tokens": 16,
-                "tools": [tool],
-                "tool_choice": "required",
+                "tools": [] if single_pass else [tool],
+                "tool_choice": "none" if single_pass else "required",
                 "audio": {
                     "input": {
-                        "transcription": {"model": selected_stt},
+                        "transcription": {
+                            "model": selected_stt,
+                            "language": selected_language,
+                        },
                         "turn_detection": {
                             "type": "semantic_vad",
                             "eagerness": "medium",
-                            "create_response": True,
-                            "interrupt_response": True,
+                            "create_response": not single_pass,
+                            "interrupt_response": not single_pass,
                         },
                     },
                     "output": {
@@ -465,6 +483,42 @@ class InworldClient:
                         raise InworldError(
                             "Inworld Realtime readiness probe did not accept the selected route."
                         )
+                    if single_pass:
+                        effective = configured.get("session")
+                        effective_audio = (
+                            effective.get("audio") if isinstance(effective, dict) else None
+                        )
+                        effective_input = (
+                            effective_audio.get("input")
+                            if isinstance(effective_audio, dict)
+                            else None
+                        )
+                        effective_transcription = (
+                            effective_input.get("transcription")
+                            if isinstance(effective_input, dict)
+                            else None
+                        )
+                        effective_turn_detection = (
+                            effective_input.get("turn_detection")
+                            if isinstance(effective_input, dict)
+                            else None
+                        )
+                        if not (
+                            isinstance(effective, dict)
+                            and effective.get("tool_choice") == "none"
+                            and effective.get("tools") == []
+                            and isinstance(effective_transcription, dict)
+                            and effective_transcription.get("model") == selected_stt
+                            and effective_transcription.get("language") == selected_language
+                            and isinstance(effective_turn_detection, dict)
+                            and effective_turn_detection.get("create_response") is False
+                            and effective_turn_detection.get("interrupt_response") is False
+                        ):
+                            raise InworldError(
+                                "Inworld Realtime did not echo the required single-pass "
+                                "session configuration.",
+                                status_code=422,
+                            )
                     await websocket.send_json(
                         {
                             "type": "conversation.item.create",
@@ -475,20 +529,99 @@ class InworldClient:
                                     {
                                         "type": "input_text",
                                         "text": (
-                                            f"Call {ROUTER_TOOL_NAME} now. Do not reply with text."
+                                            "Reply READY only. Do not call tools."
+                                            if single_pass
+                                            else f"Call {ROUTER_TOOL_NAME} now. "
+                                            "Do not reply with text."
                                         ),
                                     }
                                 ],
                             },
                         }
                     )
-                    await websocket.send_json({"type": "response.create"})
+                    if single_pass:
+                        quiet_deadline = (
+                            asyncio.get_running_loop().time() + REALTIME_SINGLE_PASS_QUIET_SECONDS
+                        )
+                        while True:
+                            remaining = quiet_deadline - asyncio.get_running_loop().time()
+                            if remaining <= 0:
+                                break
+                            try:
+                                unexpected = await asyncio.wait_for(
+                                    websocket.receive_json(),
+                                    remaining,
+                                )
+                            except TimeoutError:
+                                break
+                            unexpected_type = unexpected.get("type")
+                            if unexpected_type == "error":
+                                raise InworldError(
+                                    _payload_error_message(unexpected),
+                                    status_code=422,
+                                )
+                            if unexpected_type in {
+                                "response.created",
+                                "response.done",
+                                "response.function_call_arguments.done",
+                                "response.output_text.delta",
+                                "response.output_text.done",
+                            }:
+                                raise InworldError(
+                                    "Inworld Realtime generated an automatic response while "
+                                    "single-pass auto-response was disabled.",
+                                    status_code=422,
+                                )
+                    client_event_id = f"vav_readiness_{uuid4().hex}"
+                    response_create: dict[str, Any] = {"type": "response.create"}
+                    if single_pass:
+                        response_create["event_id"] = client_event_id
+                        response_create["response"] = {
+                            "instructions": "Reply with READY only. Do not call tools.",
+                            "tools": [],
+                            "tool_choice": "none",
+                            "metadata": {"client_event_id": client_event_id},
+                        }
+                    await websocket.send_json(response_create)
+                    correlated_response_id: str | None = None
+                    response_text_parts: list[str] = []
                     for _ in range(REALTIME_PROBE_MAX_EVENTS):
                         event = await asyncio.wait_for(websocket.receive_json(), timeout)
                         event_type = event.get("type")
                         if event_type == "error":
                             raise InworldError(_payload_error_message(event), status_code=422)
+                        if event_type == "response.created" and single_pass:
+                            response = event.get("response")
+                            metadata = (
+                                response.get("metadata") if isinstance(response, dict) else None
+                            )
+                            if not (
+                                isinstance(metadata, dict)
+                                and metadata.get("client_event_id") == client_event_id
+                                and isinstance(response.get("id"), str)
+                                and response["id"]
+                            ):
+                                raise InworldError(
+                                    "Inworld Realtime did not preserve the LiveKit response "
+                                    "correlation metadata.",
+                                    status_code=422,
+                                )
+                            correlated_response_id = response["id"]
+                            continue
+                        if single_pass and event_type in {
+                            "response.output_text.delta",
+                            "response.output_text.done",
+                        }:
+                            text = event.get("delta") or event.get("text")
+                            if isinstance(text, str) and text:
+                                response_text_parts.append(text)
+                            continue
                         if event_type == "response.function_call_arguments.done":
+                            if single_pass:
+                                raise InworldError(
+                                    "Inworld Realtime ignored the single-pass tool lockout.",
+                                    status_code=422,
+                                )
                             if event.get("name") != ROUTER_TOOL_NAME:
                                 raise InworldError(
                                     "Inworld Realtime called an unexpected readiness tool."
@@ -501,6 +634,59 @@ class InworldClient:
                                 raise InworldError(
                                     _payload_error_message(response), status_code=422
                                 )
+                            if single_pass:
+                                if not isinstance(response, dict):
+                                    raise InworldError(
+                                        "Inworld Realtime returned an invalid manual response.",
+                                        status_code=422,
+                                    )
+                                if correlated_response_id is None:
+                                    raise InworldError(
+                                        "Inworld Realtime completed before the correlated "
+                                        "manual response was created.",
+                                        status_code=422,
+                                    )
+                                if response.get("id") != correlated_response_id:
+                                    raise InworldError(
+                                        "Inworld Realtime completed a different response than "
+                                        "the LiveKit-correlated request.",
+                                        status_code=422,
+                                    )
+                                output = (
+                                    response.get("output", []) if isinstance(response, dict) else []
+                                )
+                                if any(
+                                    isinstance(item, dict) and item.get("type") == "function_call"
+                                    for item in output
+                                ):
+                                    raise InworldError(
+                                        "Inworld Realtime ignored the single-pass tool lockout.",
+                                        status_code=422,
+                                    )
+                                if status != "completed":
+                                    raise InworldError(
+                                        "Inworld Realtime did not complete the manual "
+                                        "single-pass response.",
+                                        status_code=422,
+                                    )
+                                final_text_parts: list[str] = []
+                                for item in output:
+                                    if not isinstance(item, dict):
+                                        continue
+                                    for part in item.get("content", []):
+                                        if not isinstance(part, dict):
+                                            continue
+                                        text = part.get("text") or part.get("transcript")
+                                        if isinstance(text, str) and text:
+                                            final_text_parts.append(text)
+                                readiness_text = final_text_parts or response_text_parts
+                                if not _is_exact_readiness_response(readiness_text):
+                                    raise InworldError(
+                                        "Inworld Realtime manual response returned no verifiable "
+                                        "text output.",
+                                        status_code=422,
+                                    )
+                                return
                             raise InworldError(
                                 "Inworld Realtime completed without executing the required tool."
                             )
