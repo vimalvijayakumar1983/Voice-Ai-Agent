@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from uuid import uuid4
 
 from app.schemas.call import CallResponse
-from app.services.call_metadata import public_call_metadata
+from app.services.call_metadata import public_call_metadata, public_transport_identity_ref
 
 
 def test_call_response_projects_only_safe_agent_configuration_metadata():
@@ -173,6 +173,25 @@ def test_public_call_metadata_exposes_realtime_quality_and_usage_metrics():
             ],
         },
     }
+
+
+def test_public_call_metadata_hashes_livekit_room_for_safe_replay_correlation():
+    projected = public_call_metadata(
+        {
+            "agent_configuration": {"language": "en-GB"},
+            "channel": "phone",
+            "livekit_room": "private-livekit-room-123",
+        }
+    )
+
+    assert projected == {
+        "channel": "phone",
+        "language": "en-GB",
+        "livekit_room_ref": public_transport_identity_ref(
+            "livekit_room", "private-livekit-room-123"
+        ),
+    }
+    assert "private-livekit-room-123" not in str(projected)
 
 
 def test_public_call_metadata_preserves_serialization_diagnostics_and_unknown_usage():

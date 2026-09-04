@@ -19,6 +19,7 @@ from app.services.audio_replay_canary import (
     run_live_audio_replay,
     word_error_rate,
 )
+from app.services.call_metadata import public_transport_identity_ref
 
 
 def _manifest_payload(*, mode: str = "browser_session") -> dict:
@@ -371,6 +372,30 @@ async def test_browser_replay_uses_governed_session_and_returns_redacted_report(
     assert not api.closed
 
 
+@pytest.mark.asyncio
+async def test_browser_replay_accepts_legacy_public_room_projection(tmp_path):
+    manifest = _manifest()
+    environ, agent_id = _environment(tmp_path)
+    call_id = uuid4()
+
+    class PublicBrowserAPI(_FakeAPI):
+        async def get_call(self, call_id: UUID) -> dict:
+            call = await super().get_call(call_id)
+            call["call_metadata"] = {"runtime": call["call_metadata"]["runtime"]}
+            return call
+
+    publisher = _FakePublisher()
+    report = await run_live_audio_replay(
+        manifest,
+        environ=environ,
+        api=PublicBrowserAPI(agent_id=agent_id, call_id=call_id),
+        publisher=publisher,
+    )
+
+    assert report.passed
+    assert publisher.arguments["room_name"] == f"vav-browser-{call_id}"
+
+
 class _FakeSIPAPI(_FakeAPI):
     async def issue_browser_session(self, *, agent_id: UUID, variables: dict) -> dict:
         raise AssertionError("SIP fixture replay must not issue or originate a call")
@@ -382,6 +407,16 @@ class _FakeSIPAPI(_FakeAPI):
         # room is a separate, canonical transport identity in call metadata.
         call["provider_call_sid"] = "sip-call-id-full-123"
         call["call_metadata"]["livekit_room"] = "qa-sip-room"
+        return call
+
+
+class _PublicSIPAPI(_FakeSIPAPI):
+    async def get_call(self, call_id: UUID) -> dict:
+        call = await super().get_call(call_id)
+        call["call_metadata"].pop("livekit_room")
+        call["call_metadata"]["livekit_room_ref"] = public_transport_identity_ref(
+            "livekit_room", "qa-sip-room"
+        )
         return call
 
 
@@ -401,6 +436,49 @@ async def test_sip_replay_only_joins_precreated_allowlisted_fixture(tmp_path):
     assert report.passed
     assert publisher.arguments["room_name"] == "qa-sip-room"
     assert publisher.arguments["access_token"] == "private-livekit-token"
+
+
+@pytest.mark.asyncio
+async def test_sip_replay_accepts_public_hashed_room_projection(tmp_path):
+    manifest = _manifest(mode="sip_fixture")
+    environ, agent_id = _environment(tmp_path, mode="sip_fixture")
+    call_id = UUID(environ["TEST_CALL_ID"])
+    publisher = _FakePublisher()
+
+    report = await run_live_audio_replay(
+        manifest,
+        environ=environ,
+        api=_PublicSIPAPI(agent_id=agent_id, call_id=call_id),
+        publisher=publisher,
+    )
+
+    assert report.passed
+
+
+@pytest.mark.asyncio
+async def test_replay_rejects_conflicting_raw_and_hashed_room_identities(tmp_path):
+    manifest = _manifest()
+    environ, agent_id = _environment(tmp_path)
+    call_id = uuid4()
+
+    class ConflictingRoomAPI(_FakeAPI):
+        async def get_call(self, call_id: UUID) -> dict:
+            call = await super().get_call(call_id)
+            call["call_metadata"]["livekit_room"] = "qa-different-room"
+            call["call_metadata"]["livekit_room_ref"] = public_transport_identity_ref(
+                "livekit_room", f"vav-browser-{call_id}"
+            )
+            return call
+
+    publisher = _FakePublisher()
+    with pytest.raises(ReplayExecutionError, match="explicit test room"):
+        await run_live_audio_replay(
+            manifest,
+            environ=environ,
+            api=ConflictingRoomAPI(agent_id=agent_id, call_id=call_id),
+            publisher=publisher,
+        )
+    assert publisher.arguments is None
 
 
 @pytest.mark.asyncio

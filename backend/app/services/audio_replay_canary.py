@@ -29,6 +29,8 @@ import httpx
 from livekit import rtc
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from app.services.call_metadata import public_transport_identity_ref
+
 TERMINAL_CALL_STATUSES = {
     "completed",
     "failed",
@@ -1055,10 +1057,25 @@ def _validate_call_target(
     if not isinstance(call_metadata, Mapping):
         raise ReplayExecutionError("VAV call is missing its canonical LiveKit room metadata")
     provider_room = str(call_metadata.get("livekit_room") or "").strip()
-    if not provider_room:
-        raise ReplayExecutionError("VAV call is missing its canonical LiveKit room metadata")
-    if provider_room != room_name:
+    provider_room_ref = str(call_metadata.get("livekit_room_ref") or "").strip()
+    expected_room_ref = public_transport_identity_ref("livekit_room", room_name)
+    if provider_room and provider_room != room_name:
         raise ReplayExecutionError("VAV call room does not match the explicit test room")
+    if provider_room_ref and provider_room_ref != expected_room_ref:
+        raise ReplayExecutionError("VAV call room does not match the explicit test room")
+    room_matches = bool(provider_room or provider_room_ref)
+    if (
+        not room_matches
+        and expected_provider == "livekit_webrtc"
+        and str(call.get("provider_call_sid") or "").strip() == room_name
+    ):
+        # Rolling-deploy compatibility: browser calls historically exposed the
+        # canonical room in provider_call_sid while public metadata deliberately
+        # redacted livekit_room.  SIP cannot use this fallback because that
+        # field contains the provider's SIP Call-ID instead of the room.
+        room_matches = True
+    if not room_matches:
+        raise ReplayExecutionError("VAV call is missing its canonical LiveKit room metadata")
     if str(call.get("status") or "") in TERMINAL_CALL_STATUSES:
         raise ReplayExecutionError("VAV test call is already terminal")
 

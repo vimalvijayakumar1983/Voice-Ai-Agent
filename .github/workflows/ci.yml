@@ -19,7 +19,11 @@ concurrency:
 jobs:
   backend:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # The full Postgres-backed suite has grown past 1,000 tests. Shared GitHub
+    # runners occasionally need more than 30 minutes even though local runs are
+    # much faster; keep the release gate authoritative instead of cancelling a
+    # healthy suite midway through pytest.
+    timeout-minutes: 45
     services:
       postgres:
         image: postgres:16-alpine

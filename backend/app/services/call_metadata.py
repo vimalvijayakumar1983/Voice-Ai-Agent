@@ -1,6 +1,18 @@
 """Safe per-call configuration snapshots and their API projection."""
 
+import hashlib
 from typing import Any
+
+
+def public_transport_identity_ref(label: str, value: object) -> str | None:
+    """Return a stable, non-reversible reference for a private transport ID."""
+
+    normalized_label = str(label or "").strip().casefold()
+    normalized_value = str(value or "").strip()
+    if not normalized_label or not normalized_value:
+        return None
+    digest = hashlib.sha256(f"{normalized_label}:{normalized_value}".encode()).hexdigest()
+    return f"{normalized_label}:sha256:{digest}"
 
 
 def agent_configuration_snapshot(agent: Any) -> dict[str, Any]:
@@ -30,6 +42,12 @@ def public_call_metadata(value: Any) -> dict[str, Any] | None:
     channel = value.get("channel")
     if channel in {"browser", "chat", "phone"}:
         result["channel"] = channel
+    livekit_room_ref = public_transport_identity_ref("livekit_room", value.get("livekit_room"))
+    if livekit_room_ref is not None:
+        # The raw room name is a private provider locator.  A replay harness
+        # still needs to prove that the API call row belongs to the exact room
+        # whose scoped token it received, so expose only a deterministic hash.
+        result["livekit_room_ref"] = livekit_room_ref
     revision_id = snapshot.get("provider_revision_id")
     if isinstance(revision_id, str) and revision_id:
         result["provider_revision_id"] = revision_id
