@@ -342,6 +342,8 @@ def deterministic_grounded_reply(evidence: str | None) -> str | None:
 
     if len(facts) == 1:
         subject, predicate, value = facts[0]
+        if envelope.facts[0].fact_type == "founding":
+            return f"According to an approved source, {subject} was established in {value}."
         return f"The {predicate} for {subject} is {value}."
     details = "; ".join(
         f"{predicate} for {subject} is {value}" for subject, predicate, value in facts[:4]

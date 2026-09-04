@@ -62,6 +62,7 @@ class ExactFactType(StrEnum):
     HOURS = "hours"
     LEADERSHIP = "leadership"
     SERVICES = "services"
+    FOUNDING = "founding"
 
 
 class ExactFactResponseAction(StrEnum):
@@ -279,6 +280,7 @@ _INTENT_QUERY_TOKENS = {
         "times",
         "timing",
         "timings",
+        "working",
     },
     ExactFactType.LEADERSHIP: {
         "board",
@@ -317,6 +319,21 @@ _INTENT_QUERY_TOKENS = {
         "specializes",
         "treatment",
         "treatments",
+    },
+    ExactFactType.FOUNDING: {
+        "began",
+        "begin",
+        "established",
+        "establishment",
+        "formed",
+        "formation",
+        "founded",
+        "founding",
+        "incorporated",
+        "inception",
+        "launched",
+        "started",
+        "year",
     },
 }
 _ALL_INTENT_TOKENS = set().union(*_INTENT_QUERY_TOKENS.values())
@@ -368,6 +385,20 @@ _INTENT_PATTERNS: tuple[tuple[ExactFactType, tuple[re.Pattern[str], ...]], ...] 
                 r".{0,80}\b(?:care|procedure|product|solution)\b"
             ),
             re.compile(r"\bwhat\s+(?:do|does)\b.*\bdo\b"),
+        ),
+    ),
+    (
+        ExactFactType.FOUNDING,
+        (
+            re.compile(r"\b(?:founding|inception|establishment|formation)\s+(?:date|year)\b"),
+            re.compile(
+                r"\b(?:when|what\s+year|which\s+year)\b.{0,100}\b"
+                r"(?:began|begin|established|formed|founded|incorporated|launched|started)\b"
+            ),
+            re.compile(
+                r"\b(?:was|is)\b.{0,100}\b"
+                r"(?:established|formed|founded|incorporated|launched|started)\s+(?:in|on)\b"
+            ),
         ),
     ),
 )
@@ -424,7 +455,37 @@ _FACT_TYPE_TERMS: dict[ExactFactType, tuple[str, ...]] = {
         "specialty",
         "capability",
     ),
+    ExactFactType.FOUNDING: (
+        "established in",
+        "establishment date",
+        "establishment year",
+        "formation date",
+        "formation year",
+        "founded in",
+        "founding date",
+        "founding year",
+        "incorporated in",
+        "incorporation date",
+        "inception date",
+        "inception year",
+        "launched in",
+        "started in",
+    ),
 }
+_FOUNDING_YEAR_RE = re.compile(r"(?:18|19|20)\d{2}")
+_FOUNDING_PREDICATES = frozenset(
+    {
+        "establishment year",
+        "formation year",
+        "founding year",
+        "incorporation year",
+        "inception year",
+        "year established",
+        "year formed",
+        "year founded",
+        "year incorporated",
+    }
+)
 
 _LEADERSHIP_ROLE_PATTERN = (
     r"(?:board\s+member|ceo|cfo|chairman|chairperson|chairwoman|chief\s+executive(?:\s+officer)?|"
@@ -523,6 +584,43 @@ def _subject_is_grounded(subject: str, evidence: str) -> bool:
     return bool(normalized_subject and normalized_subject in normalized_evidence)
 
 
+def _founding_relationship_is_grounded(*, subject: str, value: str, evidence: str) -> bool:
+    """Prove a bounded organization -> founding-year clause in the quoted evidence."""
+
+    if _FOUNDING_YEAR_RE.fullmatch(_normalized(value)) is None:
+        return False
+    normalized_subject = _grounding_normalized(subject)
+    subject_pattern = re.escape(normalized_subject)
+    year_pattern = re.escape(_normalized(value))
+    # Split raw punctuation first. Grounding normalization intentionally drops
+    # punctuation, which would otherwise let a different company's statement
+    # in the next sentence appear to support this subject.
+    for raw_clause in re.split(r"[.!?;\n]+", str(evidence or "")):
+        clause = _grounding_normalized(raw_clause)
+        if not clause:
+            continue
+        patterns = (
+            # "Acme was established/founded/incorporated in 2003."
+            rf"\b{subject_pattern}\b\s+(?:was|is)\s+(?:officially\s+)?"
+            rf"(?:established|formed|founded|incorporated|launched)\s+"
+            rf"(?:in\s+)?(?:the\s+year\s+)?{year_pattern}\b",
+            # "Acme's inception year is 2003" and the production wording
+            # "Acme has operated since its inception in 2003."
+            rf"\b{subject_pattern}\b(?:\s+s)?\s+"
+            rf"(?:has\s+operated\s+since\s+)?(?:its\s+)?"
+            rf"(?:establishment|formation|founding|incorporation|inception)"
+            rf"(?:\s+(?:date|year))?\s+(?:was\s+|is\s+)?(?:in\s+)?{year_pattern}\b",
+            # Active voice is accepted only for the organization's own
+            # operations, never an object it founded or launched.
+            rf"\b{subject_pattern}\b\s+"
+            rf"(?:began|commenced|started)\s+(?:its\s+)?operations?\s+"
+            rf"(?:in\s+)?{year_pattern}\b",
+        )
+        if any(re.search(pattern, clause) for pattern in patterns):
+            return True
+    return False
+
+
 def _explicit_fact_type(fact: Mapping[str, Any]) -> ExactFactType | None:
     for key in ("fact_type", "category", "kind"):
         try:
@@ -536,15 +634,26 @@ def classify_structured_fact(fact: Mapping[str, Any]) -> ExactFactType | None:
     """Map a compiler fact to one supported exact-fact type."""
 
     explicit = _explicit_fact_type(fact)
-    if explicit is not None:
-        return explicit
     predicate = _normalized(fact.get("predicate"))
     value = _normalized(fact.get("value"))
+    if explicit == ExactFactType.FOUNDING:
+        # An AI-produced category is only a hint. A controlled founding
+        # predicate plus a bounded year/date value is required before this
+        # high-consequence fact can bypass generative retrieval.
+        return (
+            ExactFactType.FOUNDING
+            if predicate in _FOUNDING_PREDICATES and _FOUNDING_YEAR_RE.fullmatch(value) is not None
+            else None
+        )
+    if explicit is not None:
+        return explicit
     searchable = f"{predicate} {value}"
     if "fax" not in predicate and any(
         term in searchable for term in _FACT_TYPE_TERMS[ExactFactType.PHONE]
     ):
         return ExactFactType.PHONE
+    if predicate in _FOUNDING_PREDICATES and _FOUNDING_YEAR_RE.fullmatch(value) is not None:
+        return ExactFactType.FOUNDING
     for fact_type in (
         ExactFactType.ADDRESS,
         ExactFactType.HOURS,
@@ -553,6 +662,10 @@ def classify_structured_fact(fact: Mapping[str, Any]) -> ExactFactType | None:
     ):
         if any(term in searchable for term in _FACT_TYPE_TERMS[fact_type]):
             return fact_type
+    # Unknown predicates stay on the general grounded-retrieval path. Subject
+    # and value appearing in the same evidence excerpt does not prove the
+    # predicate-to-value relationship, and compiler-proposed search phrases
+    # are not caller-facing authority by themselves.
     return None
 
 
@@ -769,6 +882,13 @@ def build_exact_fact_index(
             ):
                 truncation_reasons.add("invalid_structured_fact")
                 continue
+            if fact_type == ExactFactType.FOUNDING and not _founding_relationship_is_grounded(
+                subject=subject,
+                value=value,
+                evidence=evidence,
+            ):
+                truncation_reasons.add("invalid_structured_fact")
+                continue
             aliases = _deduplicated_text(
                 (
                     *_list_values(raw_fact.get("aliases")),
@@ -833,7 +953,6 @@ def _fact_tokens(fact: ExactFact) -> set[str]:
                 fact.subject,
                 fact.predicate,
                 fact.value,
-                *fact.search_phrases,
                 *fact.aliases,
             )
         )
@@ -878,22 +997,21 @@ def _leadership_claim_tokens(query: str) -> set[str]:
 
 
 def _direct_alias_match(query: str, fact: ExactFact) -> bool:
+    """Match governed entity aliases, never compiler-proposed question text.
+
+    Search phrases remain useful ranking vocabulary after the query already has
+    a recognized Tier-1 intent. They must not manufacture an intent or bypass
+    entity checks: those phrases are model-generated and are not independently
+    proven by their supporting source.
+    """
+
     normalized_query = _normalized(query)
     if not normalized_query:
         return False
-    aliases = (*fact.aliases, *fact.search_phrases)
     return any(
         len(normalized_alias) >= 4
-        and (
-            normalized_query == normalized_alias
-            or normalized_alias in normalized_query
-            or (
-                len(normalized_query) >= 12
-                and len(_tokens(normalized_query)) >= 2
-                and normalized_query in normalized_alias
-            )
-        )
-        for alias in aliases
+        and (normalized_query == normalized_alias or normalized_alias in normalized_query)
+        for alias in fact.aliases
         if (normalized_alias := _normalized(alias))
     )
 
@@ -913,6 +1031,10 @@ def _fact_score(
         if claimed_name and not claimed_name <= fact_tokens:
             return None
     direct_alias = _direct_alias_match(query, fact)
+    if fact.fact_type == ExactFactType.FOUNDING and requested:
+        identity_tokens = _tokens(" ".join((fact.subject, *fact.aliases)))
+        if not requested <= identity_tokens and not direct_alias:
+            return None
     if requested and not requested <= fact_tokens and not direct_alias:
         return None
     score = 100 if direct_alias else 0
@@ -1070,10 +1192,12 @@ def resolve_exact_fact(
         for intent in classify_exact_fact_intents(candidate_query):
             if intent not in intents:
                 intents.append(intent)
-    # A partial exact-fact index is not a trustworthy refusal boundary.  Let
-    # the broader approved-knowledge path handle the turn until the corpus is
-    # rebuilt within the declared safety limits.
-    if index.index_truncated:
+    # Most exact-fact families fail closed on any partial corpus. A founding
+    # match is the narrow exception: it has an exact predicate/year grammar and
+    # a clause-level relationship proof, and its spoken rendering is always
+    # explicitly source-qualified. A miss still falls back to broad retrieval.
+    source_qualified_founding = bool(intents) and set(intents) == {ExactFactType.FOUNDING}
+    if index.index_truncated and not source_qualified_founding:
         return _resolution(
             action=ExactFactResponseAction.FALLBACK,
             intents=tuple(intents),
@@ -1103,7 +1227,11 @@ def resolve_exact_fact(
         return _resolution(
             action=ExactFactResponseAction.FALLBACK,
             intents=intent_tuple,
-            reason="no_exact_fact_match_use_approved_retrieval",
+            reason=(
+                "exact_fact_index_truncated"
+                if index.index_truncated
+                else "no_exact_fact_match_use_approved_retrieval"
+            ),
             max_evidence_chars=max_evidence_chars,
         )
 
@@ -1120,7 +1248,11 @@ def resolve_exact_fact(
         return _resolution(
             action=ExactFactResponseAction.FALLBACK,
             intents=intent_tuple,
-            reason="generic_query_requires_complete_exact_fact_coverage",
+            reason=(
+                "exact_fact_index_truncated"
+                if index.index_truncated
+                else "generic_query_requires_complete_exact_fact_coverage"
+            ),
             max_evidence_chars=max_evidence_chars,
         )
 
@@ -1162,7 +1294,13 @@ def resolve_exact_fact(
         action=ExactFactResponseAction.ANSWER,
         intents=intent_tuple,
         facts=selected,
-        reason="verified_exact_fact" if len(selected) == 1 else "verified_exact_facts",
+        reason=(
+            "source_qualified_founding_fact"
+            if ExactFactType.FOUNDING in intent_tuple
+            else "verified_exact_fact"
+            if len(selected) == 1
+            else "verified_exact_facts"
+        ),
         max_evidence_chars=max_evidence_chars,
     )
 

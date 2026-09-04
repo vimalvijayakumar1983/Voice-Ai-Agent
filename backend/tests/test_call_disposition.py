@@ -198,3 +198,74 @@ def test_grounding_guard_downgrades_knowledge_tool_errors_but_not_correct_refusa
     assert details["confidence"] == 0.5
     assert details["grounding"]["no_match_correctly_refused"] == 2
     assert "knowledge retrieval error" in details["evidence"][-1]
+
+
+def test_grounding_guard_downgrades_interrupted_answer_without_forging_verification():
+    analysis = normalize_call_analysis(
+        {
+            "summary": "The assistant began answering before the call ended.",
+            "disposition": "information_provided",
+            "resolution": "resolved",
+            "confidence": 0.91,
+        },
+        profile="receptionist",
+    )
+    grounding = summarize_runtime_grounding(
+        {
+            "runtime": {
+                "ignored_interrupted_assistant_item_count": 1,
+                "turn_diagnostics": [
+                    {
+                        "outcome": "answered",
+                        "knowledge_result": "verified",
+                    }
+                ],
+            }
+        }
+    )
+
+    guarded = apply_grounding_quality_guard(analysis, grounding=grounding)
+
+    details = guarded["disposition_details"]
+    assert grounding["answered_without_grounding"] == 1
+    assert grounding["response_after_verified_retrieval"] == 0
+    assert details["resolution"] == "partially_resolved"
+    assert details["needs_review"] is True
+    assert details["confidence"] == 0.5
+    assert "no completed grounding verdict" in details["evidence"][-1]
+
+
+def test_completed_grounded_answer_is_not_downgraded_after_an_earlier_barge_in():
+    analysis = normalize_call_analysis(
+        {
+            "summary": "The caller received a verified answer after changing the question.",
+            "disposition": "information_provided",
+            "resolution": "resolved",
+            "confidence": 0.91,
+        },
+        profile="receptionist",
+    )
+    grounding = summarize_runtime_grounding(
+        {
+            "runtime": {
+                # This counter is useful operational telemetry, but a normal
+                # barge-in is not itself evidence that the final turn failed.
+                "ignored_interrupted_assistant_item_count": 1,
+                "turn_diagnostics": [
+                    {
+                        "outcome": "answered",
+                        "knowledge_result": "verified",
+                        "grounding_outcome": "response_after_verified_retrieval",
+                    }
+                ],
+            }
+        }
+    )
+
+    guarded = apply_grounding_quality_guard(analysis, grounding=grounding)
+
+    details = guarded["disposition_details"]
+    assert grounding["answered_without_grounding"] == 0
+    assert details["resolution"] == "resolved"
+    assert details["needs_review"] is False
+    assert details["confidence"] == 0.91

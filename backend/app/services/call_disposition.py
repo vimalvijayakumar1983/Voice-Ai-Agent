@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-CLASSIFIER_VERSION = "vav-call-outcome-v3"
+CLASSIFIER_VERSION = "vav-call-outcome-v4"
 
 ANALYSIS_SOURCES = frozenset({"provider_analytics", "vav_ai", "rules", "unavailable"})
 
@@ -18,6 +18,11 @@ GROUNDING_OUTCOMES = frozenset(
         "no_match_clarification",
         "no_match_unverified_response",
         "knowledge_error_response",
+    }
+)
+GROUNDING_QUALITY_FLAGS = frozenset(
+    {
+        "answered_without_grounding",
     }
 )
 
@@ -326,7 +331,7 @@ def normalize_call_analysis(payload: object, *, profile: str) -> dict[str, Any]:
 
 def summarize_runtime_grounding(call_metadata: object) -> dict[str, int]:
     """Count content-free grounding outcomes captured by the realtime runtime."""
-    counts = {outcome: 0 for outcome in sorted(GROUNDING_OUTCOMES)}
+    counts = {outcome: 0 for outcome in sorted(GROUNDING_OUTCOMES | GROUNDING_QUALITY_FLAGS)}
     if not isinstance(call_metadata, dict):
         return counts
     runtime = call_metadata.get("runtime")
@@ -341,6 +346,13 @@ def summarize_runtime_grounding(call_metadata: object) -> dict[str, int]:
         outcome = trace.get("grounding_outcome")
         if outcome in counts:
             counts[outcome] += 1
+        knowledge_result = trace.get("retrieval_result", trace.get("knowledge_result"))
+        if (
+            trace.get("outcome") == "answered"
+            and knowledge_result in {"verified", "no_match", "error"}
+            and outcome not in GROUNDING_OUTCOMES
+        ):
+            counts["answered_without_grounding"] += 1
     return counts
 
 
@@ -354,12 +366,14 @@ def apply_grounding_quality_guard(
     if not isinstance(details, dict):
         return analysis
     safe_counts = {
-        outcome: max(0, int(grounding.get(outcome, 0))) for outcome in sorted(GROUNDING_OUTCOMES)
+        outcome: max(0, int(grounding.get(outcome, 0)))
+        for outcome in sorted(GROUNDING_OUTCOMES | GROUNDING_QUALITY_FLAGS)
     }
     details["grounding"] = safe_counts
     unsupported_count = safe_counts["no_match_unverified_response"]
     knowledge_error_count = safe_counts["knowledge_error_response"]
-    grounding_issue_count = unsupported_count + knowledge_error_count
+    unlinked_answer_count = safe_counts["answered_without_grounding"]
+    grounding_issue_count = unsupported_count + knowledge_error_count + unlinked_answer_count
     if grounding_issue_count <= 0:
         return analysis
 
@@ -381,6 +395,10 @@ def apply_grounding_quality_guard(
     if knowledge_error_count:
         warning_parts.append(
             f"{knowledge_error_count} response(s) followed a knowledge retrieval error"
+        )
+    if unlinked_answer_count:
+        warning_parts.append(
+            f"{unlinked_answer_count} answered turn(s) had no completed grounding verdict"
         )
     warning = "; ".join(warning_parts) + "."
     details["evidence"] = [*evidence[:2], warning]

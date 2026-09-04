@@ -387,6 +387,426 @@ def test_intent_classification_and_combined_contact_answer_are_deterministic():
     }
 
 
+def test_founding_fact_on_partial_corpus_is_source_qualified_and_positive_only():
+    partial_index = build_exact_fact_index(
+        (
+            ExactFactSource(
+                source_id="management-page",
+                source_name="Management",
+                structured_content={
+                    "schema_version": "compiler-v8",
+                    "facts": [
+                        {
+                            "subject": "Al Zaabi Group",
+                            "predicate": "inception year",
+                            "value": "2003",
+                            "evidence": "Al Zaabi Group has operated since its inception in 2003.",
+                            "search_phrases": [
+                                "When was Al Zaabi Group established?",
+                                "When was Al Zaabi Group founded?",
+                            ],
+                        }
+                    ],
+                    "exact_fact_coverage": {
+                        "complete": True,
+                        "absence_authoritative": True,
+                    },
+                },
+            ),
+            ExactFactSource(
+                source_id="legacy-page",
+                source_name="Legacy page without compiler output",
+                structured_content=None,
+            ),
+        )
+    )
+
+    partial_match = resolve_exact_fact(
+        partial_index,
+        query="When was Al Zaabi Group established?",
+    )
+    complete_index = build_exact_fact_index(
+        (
+            ExactFactSource(
+                source_id="management-page",
+                source_name="Management",
+                structured_content={
+                    "schema_version": "compiler-v8",
+                    "facts": [
+                        {
+                            "subject": "Al Zaabi Group",
+                            "predicate": "inception year",
+                            "value": "2003",
+                            "evidence": "Al Zaabi Group has operated since its inception in 2003.",
+                            "search_phrases": [
+                                "When was Al Zaabi Group established?",
+                            ],
+                        }
+                    ],
+                    "exact_fact_coverage": {
+                        "complete": True,
+                        "absence_authoritative": True,
+                    },
+                },
+            ),
+            ExactFactSource(
+                source_id="other-complete-page",
+                source_name="Other compiled page",
+                structured_content={
+                    "schema_version": "compiler-v8",
+                    "facts": [],
+                    "exact_fact_coverage": {
+                        "complete": True,
+                        "absence_authoritative": True,
+                    },
+                },
+            ),
+        )
+    )
+    matched = resolve_exact_fact(
+        complete_index,
+        query="When was Al Zaabi Group established?",
+    )
+
+    assert partial_index.index_truncated is True
+    assert partial_index.truncation_reasons == ("incomplete_structured_coverage",)
+    assert partial_match.response_action == ExactFactResponseAction.ANSWER
+    assert partial_match.reason == "source_qualified_founding_fact"
+    assert matched.response_action == ExactFactResponseAction.ANSWER
+    assert matched.reason == "source_qualified_founding_fact"
+    assert matched.intents == (ExactFactType.FOUNDING,)
+    assert matched.evidence[0].value == "2003"
+
+
+def test_founding_classification_rejects_program_dates_and_invalid_conflicts():
+    programme = ExactFactSource(
+        source_id="programme-page",
+        source_name="Programme",
+        structured_content={
+            "schema_version": "compiler-v8",
+            "facts": [
+                {
+                    "subject": "Acme Group",
+                    "predicate": "programme description",
+                    "value": "The scholarship programme started in 2020",
+                    "evidence": ("Acme Group offers The scholarship programme started in 2020."),
+                    "search_phrases": ["When was Acme Group established?"],
+                }
+            ],
+        },
+    )
+    invalid_conflict = ExactFactSource(
+        source_id="conflict-page",
+        source_name="Conflicting legacy page",
+        structured_content={
+            "schema_version": "compiler-v8",
+            "facts": [
+                {
+                    "subject": "Al Zaabi Group",
+                    "predicate": "inception year",
+                    "value": "1999",
+                    "evidence": "This excerpt does not ground the entity or date.",
+                }
+            ],
+            "exact_fact_coverage": {
+                "complete": True,
+                "absence_authoritative": True,
+            },
+        },
+    )
+    valid = ExactFactSource(
+        source_id="management-page",
+        source_name="Management",
+        structured_content={
+            "schema_version": "compiler-v8",
+            "facts": [
+                {
+                    "subject": "Al Zaabi Group",
+                    "predicate": "inception year",
+                    "value": "2003",
+                    "evidence": "Al Zaabi Group has operated since its inception in 2003.",
+                }
+            ],
+            "exact_fact_coverage": {
+                "complete": True,
+                "absence_authoritative": True,
+            },
+        },
+    )
+
+    programme_result = resolve_exact_fact(
+        build_exact_fact_index((programme,)),
+        query="When was Acme Group established?",
+    )
+    conflict_result = resolve_exact_fact(
+        build_exact_fact_index((valid, invalid_conflict)),
+        query="When was Al Zaabi Group established?",
+    )
+
+    assert programme_result.response_action == ExactFactResponseAction.FALLBACK
+    assert programme_result.evidence == ()
+    assert conflict_result.response_action == ExactFactResponseAction.ANSWER
+    assert conflict_result.reason == "source_qualified_founding_fact"
+    assert conflict_result.evidence[0].value == "2003"
+
+
+@pytest.mark.parametrize(
+    ("predicate", "value", "evidence"),
+    (
+        (
+            "inception year",
+            "scholarship programme began in 2020",
+            "Acme Group scholarship programme began in 2020.",
+        ),
+        (
+            "inception year",
+            "2020",
+            "Acme Group scholarship programme began in 2020.",
+        ),
+        (
+            "programme inception year",
+            "2020",
+            "Acme Group programme inception year is 2020.",
+        ),
+    ),
+)
+def test_founding_fact_rejects_prose_values_subentities_and_non_allowlisted_predicates(
+    predicate,
+    value,
+    evidence,
+):
+    index = build_exact_fact_index(
+        (
+            ExactFactSource(
+                source_id="programme-page",
+                source_name="Programme",
+                structured_content={
+                    "schema_version": "compiler-v8",
+                    "facts": [
+                        {
+                            "subject": "Acme Group",
+                            "predicate": predicate,
+                            "value": value,
+                            "evidence": evidence,
+                            "search_phrases": ["When was Acme Group established?"],
+                        }
+                    ],
+                },
+            ),
+        )
+    )
+
+    result = resolve_exact_fact(index, query="When was Acme Group established?")
+
+    assert result.response_action == ExactFactResponseAction.FALLBACK
+    assert result.evidence == ()
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    (
+        "Al Zaabi Group founded a scholarship programme in 2020.",
+        "Al Zaabi Group launched a new product in 2020.",
+        "Al Zaabi Group provides services. Beta Holdings was founded in 2020.",
+    ),
+)
+def test_founding_relationship_rejects_active_objects_and_cross_sentence_dates(evidence):
+    index = build_exact_fact_index(
+        (
+            ExactFactSource(
+                source_id="misattributed-page",
+                source_name="Misattributed date",
+                structured_content={
+                    "schema_version": "compiler-v8",
+                    "facts": [
+                        {
+                            "subject": "Al Zaabi Group",
+                            "predicate": "inception year",
+                            "value": "2020",
+                            "evidence": evidence,
+                        }
+                    ],
+                },
+            ),
+        )
+    )
+
+    result = resolve_exact_fact(index, query="When was Al Zaabi Group established?")
+
+    assert result.response_action == ExactFactResponseAction.FALLBACK
+    assert result.evidence == ()
+
+
+def test_generated_search_phrase_cannot_redirect_founding_fact_to_another_company():
+    index = build_exact_fact_index(
+        (
+            ExactFactSource(
+                source_id="management-page",
+                source_name="Management",
+                structured_content={
+                    "schema_version": "compiler-v8",
+                    "facts": [
+                        {
+                            "subject": "Al Zaabi Group",
+                            "predicate": "inception year",
+                            "value": "2003",
+                            "evidence": (
+                                "Al Zaabi Group has operated since its inception in 2003."
+                            ),
+                            "search_phrases": ["When was Another Company established?"],
+                        }
+                    ],
+                    "exact_fact_coverage": {
+                        "complete": True,
+                        "absence_authoritative": True,
+                    },
+                },
+            ),
+        )
+    )
+
+    result = resolve_exact_fact(index, query="When was Another Company established?")
+
+    assert result.response_action == ExactFactResponseAction.FALLBACK
+    assert result.evidence == ()
+
+
+def test_governed_hours_paraphrase_does_not_depend_on_generated_search_phrases():
+    index = build_exact_fact_index(
+        (
+            ExactFactSource(
+                source_id="hours-page",
+                source_name="Hours",
+                structured_content={
+                    "schema_version": "compiler-v8",
+                    "facts": [
+                        {
+                            "subject": "Al Zaabi Group",
+                            "predicate": "business hours",
+                            "value": "Monday to Friday, 8:30 AM to 5:30 PM",
+                            "evidence": (
+                                "Al Zaabi Group business hours are Monday to Friday, "
+                                "8:30 AM to 5:30 PM."
+                            ),
+                            # This untrusted retrieval hint names the wrong
+                            # entity. It must not be needed for the valid
+                            # paraphrase or redirect a different-company query.
+                            "search_phrases": [
+                                "What are Another Company's working timings?",
+                            ],
+                        }
+                    ],
+                    "exact_fact_coverage": {
+                        "complete": True,
+                        "absence_authoritative": True,
+                    },
+                },
+            ),
+        )
+    )
+
+    matched = resolve_exact_fact(
+        index,
+        query="What are Al Zaabi Group's working timings?",
+    )
+    redirected = resolve_exact_fact(
+        index,
+        query="What are Another Company's working timings?",
+    )
+
+    assert matched.response_action == ExactFactResponseAction.ANSWER
+    assert matched.intents == (ExactFactType.HOURS,)
+    assert matched.evidence[0].value == "Monday to Friday, 8:30 AM to 5:30 PM"
+    assert redirected.response_action == ExactFactResponseAction.FALLBACK
+    assert redirected.evidence == ()
+
+
+def test_unknown_predicate_never_enters_exact_answer_lane():
+    index = build_exact_fact_index(
+        (
+            ExactFactSource(
+                source_id="profile-page",
+                source_name="Company profile",
+                structured_content={
+                    "schema_version": "compiler-v8",
+                    "facts": [
+                        {
+                            "subject": "Al Zaabi Group",
+                            "predicate": "corporate principle",
+                            "value": "Strive for Excellence",
+                            "evidence": (
+                                "Al Zaabi Group's corporate principle is Strive for Excellence."
+                            ),
+                            "search_phrases": [
+                                "What is Al Zaabi Group's corporate principle?",
+                            ],
+                        }
+                    ],
+                },
+            ),
+        )
+    )
+
+    direct_phrase = resolve_exact_fact(
+        index,
+        query="What is Al Zaabi Group's corporate principle?",
+    )
+    ambiguous_short_query = resolve_exact_fact(
+        index,
+        query="What is Al Zaabi Group?",
+    )
+
+    assert direct_phrase.response_action == ExactFactResponseAction.FALLBACK
+    assert direct_phrase.evidence == ()
+    assert ambiguous_short_query.response_action == ExactFactResponseAction.FALLBACK
+    assert ambiguous_short_query.evidence == ()
+
+
+def test_search_phrase_cannot_invent_an_intent_or_bypass_dynamic_fact_policy():
+    index = build_exact_fact_index(
+        (
+            ExactFactSource(
+                source_id="profile-page",
+                source_name="Company profile",
+                structured_content={
+                    "schema_version": "compiler-v8",
+                    "facts": [
+                        {
+                            "subject": "Al Zaabi Group",
+                            "predicate": "primary telephone",
+                            "value": "+971 2 665 9998",
+                            "evidence": ("Al Zaabi Group primary telephone is +971 2 665 9998."),
+                            "search_phrases": [
+                                "What is Al Zaabi Group's phone number?",
+                            ],
+                        },
+                        {
+                            "subject": "Al Zaabi Group",
+                            "predicate": "current stock availability",
+                            "value": "Available",
+                            "evidence": "Al Zaabi Group current stock availability is Available.",
+                            "search_phrases": [
+                                "What is current Al Zaabi Group stock availability?",
+                            ],
+                        },
+                    ],
+                },
+            ),
+        )
+    )
+
+    underspecified = resolve_exact_fact(index, query="What is Al Zaabi Group?")
+    dynamic = resolve_exact_fact(
+        index,
+        query="What is current Al Zaabi Group stock availability?",
+    )
+
+    assert underspecified.response_action == ExactFactResponseAction.FALLBACK
+    assert underspecified.intents == ()
+    assert dynamic.response_action == ExactFactResponseAction.FALLBACK
+    assert dynamic.intents == ()
+
+
 def test_partial_multi_intent_match_uses_approved_retrieval_instead_of_false_ambiguity():
     index = build_exact_fact_index(
         (

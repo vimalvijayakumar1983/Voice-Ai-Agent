@@ -446,6 +446,28 @@ class _GreetingFlight:
         self._candidate_bytes = next_bytes
         self._candidate_duration_seconds = next_duration
 
+    async def _consume_provider_stream(self, stream: Any) -> None:
+        iterator = stream.__aiter__()
+        deadline = self._loop.time() + self._synthesis_total_timeout_seconds
+        while True:
+            remaining = deadline - self._loop.time()
+            if remaining <= 0:
+                raise TimeoutError("Greeting TTS exceeded its total timeout")
+            try:
+                audio = await asyncio.wait_for(
+                    anext(iterator),
+                    timeout=min(self._synthesis_idle_timeout_seconds, remaining),
+                )
+            except StopAsyncIteration:
+                break
+            except TimeoutError as exc:
+                raise TimeoutError("Greeting TTS stream stalled") from exc
+            frozen = FrozenAudioFrame.from_frame(audio.frame)
+            if self._first_frame_at_monotonic is None:
+                self._first_frame_at_monotonic = time.monotonic()
+            self._consider_for_cache(frozen)
+            await self._broadcast(frozen)
+
     async def _produce(self) -> None:
         error: BaseException | None = None
         try:
@@ -453,27 +475,24 @@ class _GreetingFlight:
             # provider, not when a task is merely scheduled. A pre-start
             # cancellation is therefore correctly reported as zero requests.
             self._on_provider_request()
-            async with self._tts.synthesize(self._text) as stream:
-                iterator = stream.__aiter__()
-                deadline = self._loop.time() + self._synthesis_total_timeout_seconds
-                while True:
-                    remaining = deadline - self._loop.time()
-                    if remaining <= 0:
-                        raise TimeoutError("Greeting TTS exceeded its total timeout")
-                    try:
-                        audio = await asyncio.wait_for(
-                            anext(iterator),
-                            timeout=min(self._synthesis_idle_timeout_seconds, remaining),
-                        )
-                    except StopAsyncIteration:
-                        break
-                    except TimeoutError as exc:
-                        raise TimeoutError("Greeting TTS stream stalled") from exc
-                    frozen = FrozenAudioFrame.from_frame(audio.frame)
-                    if self._first_frame_at_monotonic is None:
-                        self._first_frame_at_monotonic = time.monotonic()
-                    self._consider_for_cache(frozen)
-                    await self._broadcast(frozen)
+            capabilities = getattr(self._tts, "capabilities", None)
+            stream_factory = getattr(self._tts, "stream", None)
+            if getattr(capabilities, "streaming", False) is True and callable(stream_factory):
+                # Inworld's streaming API uses its pooled WebSocket transport.
+                # Preparing the already-required greeting on that path opens
+                # the connection while the realtime session is starting, so a
+                # later deterministic ``session.say`` can reuse it instead of
+                # paying another cold connection setup. This does not add a
+                # provider request; it changes only the transport used by the
+                # existing greeting synthesis.
+                async with stream_factory() as stream:
+                    stream.push_text(self._text)
+                    stream.end_input()
+                    await self._consume_provider_stream(stream)
+            else:
+                # Retain compatibility with non-streaming TTS implementations.
+                async with self._tts.synthesize(self._text) as stream:
+                    await self._consume_provider_stream(stream)
         except BaseException as exc:
             error = exc
 

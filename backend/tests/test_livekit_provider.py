@@ -39,6 +39,7 @@ from app.models.agent import (
 )
 from app.models.call import Call
 from app.models.campaign import ProviderCallbackOutbox
+from app.services.call_disposition import summarize_runtime_grounding
 from app.services.knowledge_serving import (
     KnowledgeServingError,
     knowledge_admission_is_durable,
@@ -1946,6 +1947,66 @@ def test_late_interrupted_assistant_item_cannot_consume_newer_grounding_verdict(
     )
     assert trace["grounding_response_item_id"] == "current-response"
     assert trace["grounding_outcome"] == "no_match_correctly_refused"
+
+
+def test_meaningful_barge_in_supersedes_old_trace_before_grounded_replacement():
+    runtime_metrics = {"barge_in_count": 0}
+    telemetry = _LiveKitRuntimeTelemetry(
+        runtime_metrics=runtime_metrics,
+        end_to_end_samples=[],
+        opened_at=1.0,
+    )
+    telemetry.on_final_transcript("Tell me about the company")
+    telemetry.record_knowledge_lookup(elapsed_ms=10, result="verified")
+    first_trace = telemetry.current_turn_trace
+    telemetry.on_agent_state(new_state="speaking")
+    assert first_trace is not None
+    assert first_trace["outcome"] == "answered"
+
+    telemetry.on_user_state(old_state="listening", new_state="speaking", agent_state="speaking")
+    telemetry.on_user_state(old_state="speaking", new_state="listening", agent_state="listening")
+    telemetry.on_final_transcript("Just give me the phone number")
+    telemetry.commit_suspended_interruption()
+    assert first_trace["outcome"] == "superseded_by_caller"
+
+    telemetry.record_knowledge_lookup(elapsed_ms=8, result="verified")
+    telemetry.on_agent_state(new_state="speaking")
+    telemetry.on_assistant_content("The phone number is +971 2 665 9998.")
+
+    grounding = summarize_runtime_grounding(
+        {"runtime": {"turn_diagnostics": telemetry.turn_diagnostics}}
+    )
+    assert grounding["answered_without_grounding"] == 0
+    assert grounding["response_after_verified_retrieval"] == 1
+
+
+def test_barge_in_pause_resume_preserves_the_original_suspended_trace():
+    telemetry = _LiveKitRuntimeTelemetry(
+        runtime_metrics={"barge_in_count": 0},
+        end_to_end_samples=[],
+        opened_at=1.0,
+    )
+    telemetry.on_final_transcript("Tell me about the company")
+    telemetry.record_knowledge_lookup(elapsed_ms=10, result="verified")
+    original_trace = telemetry.current_turn_trace
+    telemetry.on_agent_state(new_state="speaking")
+
+    telemetry.on_user_state(old_state="listening", new_state="speaking", agent_state="speaking")
+    telemetry.on_user_state(old_state="speaking", new_state="listening", agent_state="listening")
+    # A VAD pause/resume occurs before one meaningful final transcript.
+    telemetry.on_user_state(old_state="listening", new_state="speaking", agent_state="listening")
+    telemetry.on_user_state(old_state="speaking", new_state="listening", agent_state="listening")
+    telemetry.on_final_transcript("Just give me the phone number")
+    telemetry.commit_suspended_interruption()
+
+    assert original_trace is not None
+    assert original_trace["outcome"] == "superseded_by_caller"
+    assert (
+        summarize_runtime_grounding({"runtime": {"turn_diagnostics": telemetry.turn_diagnostics}})[
+            "answered_without_grounding"
+        ]
+        == 0
+    )
 
 
 def test_runtime_date_context_uses_agent_timezone_and_falls_back_safely():

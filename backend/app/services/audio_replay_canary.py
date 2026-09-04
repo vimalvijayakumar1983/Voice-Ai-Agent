@@ -42,6 +42,9 @@ TERMINAL_CALL_STATUSES = {
 _ENV_NAME = re.compile(r"^[A-Z][A-Z0-9_]{2,127}$")
 _SAFE_CASE_ID = re.compile(r"^[a-z0-9][a-z0-9._-]{2,127}$")
 _SAFE_FIXTURE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{2,127}$")
+_AGENT_STATE_ATTRIBUTE = "lk.agent.state"
+_AGENT_RESPONSE_COMPLETE_STATES = {"listening"}
+_RESPONSE_QUIESCENCE_GRACE_SECONDS = 0.25
 
 
 class AudioReplayCanaryError(RuntimeError):
@@ -192,7 +195,7 @@ class ReplayExpectations(_StrictModel):
 class ReplayTiming(_StrictModel):
     wait_for_remote_seconds: float = Field(30, ge=1, le=120)
     pre_roll_seconds: float = Field(1.5, ge=0, le=30)
-    post_roll_seconds: float = Field(8, ge=0, le=60)
+    post_roll_seconds: float = Field(8, gt=0, le=60)
     finalization_timeout_seconds: float = Field(60, ge=5, le=300)
     poll_interval_seconds: float = Field(1, ge=0.1, le=10)
 
@@ -271,6 +274,138 @@ class LiveKitPublishReceipt:
     frame_count: int
     published_audio_seconds: float
     final_room_transcript_segments: int
+
+
+@dataclass
+class _AgentResponseQuiescence:
+    """Observe one complete post-fixture agent response without retaining audio."""
+
+    agent_identity: str | None = None
+    agent_state: str | None = None
+    armed: bool = False
+    caller_final_observed: bool = False
+    agent_final_observed: bool = False
+    response_started: bool = False
+    agent_listening: asyncio.Event = field(default_factory=asyncio.Event)
+    response_completed: asyncio.Event = field(default_factory=asyncio.Event)
+
+    @staticmethod
+    def _is_agent(participant: Any) -> bool:
+        return getattr(participant, "kind", None) == rtc.ParticipantKind.PARTICIPANT_KIND_AGENT
+
+    def _select_agent(self, participant: Any) -> bool:
+        if not self._is_agent(participant):
+            return False
+        identity = str(getattr(participant, "identity", "") or "")
+        if not identity:
+            return False
+        if self.agent_identity is None:
+            self.agent_identity = identity
+        return identity == self.agent_identity
+
+    def observe_participant(self, participant: Any) -> bool:
+        """Select the first remote agent and observe its current readiness."""
+
+        if not self._select_agent(participant):
+            return False
+        attributes = getattr(participant, "attributes", {})
+        if isinstance(attributes, Mapping) and _AGENT_STATE_ATTRIBUTE in attributes:
+            self.observe_state(attributes[_AGENT_STATE_ATTRIBUTE])
+        return True
+
+    def observe_attributes(self, changed_attributes: Any, participant: Any) -> None:
+        """Observe state updates only from the selected remote agent."""
+
+        # Do not read participant.attributes here: the callback's changed map
+        # is the ordered edge, while the participant snapshot may still hold
+        # the previous state.
+        if not self._select_agent(participant) or not isinstance(changed_attributes, Mapping):
+            return
+        if _AGENT_STATE_ATTRIBUTE in changed_attributes:
+            self.observe_state(changed_attributes[_AGENT_STATE_ATTRIBUTE])
+
+    def arm(self, participants: Sequence[Any]) -> None:
+        """Start correlating a response immediately before caller audio begins."""
+
+        self.caller_final_observed = False
+        self.agent_final_observed = False
+        self.response_started = False
+        self.response_completed.clear()
+        self.armed = True
+        for participant in participants:
+            self._select_agent(participant)
+
+    def observe_transcription(self, segments: Sequence[Any], participant: Any) -> None:
+        """Use final caller/agent transcripts when state edges are coalesced."""
+
+        if not self.armed or not any(
+            bool(getattr(segment, "final", False)) for segment in segments
+        ):
+            return
+        if self._is_agent(participant):
+            if not self._select_agent(participant):
+                return
+            # A delayed greeting can finish after the replay is armed. It is
+            # not causally eligible until LiveKit has emitted the caller's
+            # final transcript for this fixture.
+            if not self.caller_final_observed:
+                return
+            self.agent_final_observed = True
+        else:
+            self.caller_final_observed = True
+            # Discard every pre-caller greeting edge. The response must begin
+            # or finalize after this explicit caller boundary.
+            self.agent_final_observed = False
+            self.response_started = False
+            self.response_completed.clear()
+        if self.agent_final_observed and self.caller_final_observed:
+            self.response_started = True
+            self.response_completed.set()
+
+    def observe_state(self, value: Any) -> None:
+        state = str(value or "").strip().casefold()
+        if not state:
+            return
+        self.agent_state = state
+        if state in _AGENT_RESPONSE_COMPLETE_STATES:
+            self.agent_listening.set()
+        else:
+            self.agent_listening.clear()
+        if not self.armed or not self.caller_final_observed:
+            return
+        if state == "speaking":
+            self.response_started = True
+        elif self.response_started and state in _AGENT_RESPONSE_COMPLETE_STATES:
+            self.response_completed.set()
+
+    async def wait_until_listening(self, timeout_seconds: float) -> None:
+        """Do not let a greeting be mistaken for the fixture's response."""
+
+        if self.agent_state in _AGENT_RESPONSE_COMPLETE_STATES:
+            return
+        try:
+            await asyncio.wait_for(self.agent_listening.wait(), timeout=timeout_seconds)
+        except TimeoutError as exc:
+            raise ReplayExecutionError(
+                "LiveKit QA agent did not become ready for caller audio"
+            ) from exc
+
+    async def wait(self, timeout_seconds: float) -> None:
+        """Wait for speaking -> listening, failing rather than truncating an answer."""
+
+        if timeout_seconds <= 0:
+            raise ReplayExecutionError(
+                "LiveKit QA replay requires post-roll time to observe a complete response"
+            )
+        try:
+            await asyncio.wait_for(self.response_completed.wait(), timeout=timeout_seconds)
+        except TimeoutError as exc:
+            if self.response_started:
+                message = "LiveKit QA agent did not finish its response before post-roll timeout"
+            else:
+                message = "LiveKit QA agent did not start a response before post-roll timeout"
+            raise ReplayExecutionError(message) from exc
+        await asyncio.sleep(_RESPONSE_QUIESCENCE_GRACE_SECONDS)
 
 
 @dataclass(frozen=True)
@@ -593,21 +728,29 @@ class LiveKitAudioPublisher:
     ) -> LiveKitPublishReceipt:
         room = rtc.Room()
         remote_ready = asyncio.Event()
+        response_quiescence = _AgentResponseQuiescence()
         final_segments = 0
 
         @room.on("participant_connected")
         def _participant_connected(participant: Any) -> None:
-            if getattr(participant, "kind", None) == rtc.ParticipantKind.PARTICIPANT_KIND_AGENT:
+            if response_quiescence.observe_participant(participant):
                 remote_ready.set()
+
+        @room.on("participant_attributes_changed")
+        def _participant_attributes_changed(
+            changed_attributes: dict[str, str], participant: Any
+        ) -> None:
+            response_quiescence.observe_attributes(changed_attributes, participant)
 
         @room.on("transcription_received")
         def _transcription_received(
             segments: Sequence[Any],
-            _participant: Any,
+            participant: Any,
             _publication: Any,
         ) -> None:
             nonlocal final_segments
             final_segments += sum(bool(getattr(segment, "final", False)) for segment in segments)
+            response_quiescence.observe_transcription(segments, participant)
 
         source: rtc.AudioSource | None = None
         try:
@@ -619,6 +762,8 @@ class LiveKitAudioPublisher:
                 for participant in room.remote_participants.values()
             ):
                 remote_ready.set()
+            for participant in room.remote_participants.values():
+                response_quiescence.observe_participant(participant)
             try:
                 await asyncio.wait_for(
                     remote_ready.wait(),
@@ -637,6 +782,8 @@ class LiveKitAudioPublisher:
             options.source = rtc.TrackSource.SOURCE_MICROPHONE
             await room.local_participant.publish_track(track, options)
             await asyncio.sleep(timing.pre_roll_seconds)
+            await response_quiescence.wait_until_listening(timing.wait_for_remote_seconds)
+            response_quiescence.arm(list(room.remote_participants.values()))
 
             samples_per_channel = audio.sample_rate_hz * audio.frame_ms // 1_000
             frame_bytes = samples_per_channel * audio.channels * 2
@@ -659,7 +806,7 @@ class LiveKitAudioPublisher:
                 if remaining > 0:
                     await asyncio.sleep(remaining)
             await source.wait_for_playout()
-            await asyncio.sleep(timing.post_roll_seconds)
+            await response_quiescence.wait(timing.post_roll_seconds)
             return LiveKitPublishReceipt(
                 room_name=room_name,
                 frame_count=frame_count,

@@ -1510,8 +1510,12 @@ class _LiveKitRuntimeTelemetry:
             # A new caller turn invalidates any not-yet-observed assistant
             # content from the previous turn. A late provider event must never
             # drive the new turn's grounding verdict.
-            self.suspended_grounding_trace = self.pending_grounding_trace
-            self.suspended_grounding_not_before = self.pending_grounding_not_before
+            # Endpointing may briefly alternate speaking/listening before one
+            # final transcript. Preserve the original interrupted answer when
+            # a later speech edge has no newer pending trace to replace it.
+            if self.pending_grounding_trace is not None:
+                self.suspended_grounding_trace = self.pending_grounding_trace
+                self.suspended_grounding_not_before = self.pending_grounding_not_before
             self.pending_grounding_trace = None
             self.pending_grounding_not_before = None
             if self.current_turn_trace is not None:
@@ -1549,6 +1553,23 @@ class _LiveKitRuntimeTelemetry:
         self.runtime_metrics["passive_backchannel_suppressed_count"] = (
             int(self.runtime_metrics.get("passive_backchannel_suppressed_count", 0)) + 1
         )
+
+    def commit_suspended_interruption(self) -> None:
+        """Mark an audible prior answer as superseded by meaningful caller speech.
+
+        Agent-speaking telemetry closes a trace at first audio, before the
+        provider later emits the completed or interrupted assistant item. A
+        real barge-in must therefore update that exact suspended trace; leaving
+        it as ``answered`` would make disposition mistake an expected
+        interruption for an ungrounded completed answer. Passive acknowledgments
+        restore the trace earlier and never call this method.
+        """
+
+        trace = self.suspended_grounding_trace
+        if trace is not None and "grounding_outcome" not in trace:
+            trace["outcome"] = "superseded_by_caller"
+        self.suspended_grounding_trace = None
+        self.suspended_grounding_not_before = None
 
     def on_final_transcript(self, value: str = "") -> None:
         now = time.monotonic()
@@ -4844,6 +4865,7 @@ async def vav_inworld_session(ctx: JobContext) -> None:
                             unexpected_scripts=script_assessment.unexpected_scripts,
                             unexpected_ratio=script_assessment.unexpected_ratio,
                         )
+                        telemetry.commit_suspended_interruption()
                         _cancel_stale_generation()
                         if script_clarification_task is not None:
                             script_clarification_task.cancel()
@@ -4881,6 +4903,8 @@ async def vav_inworld_session(ctx: JobContext) -> None:
                     telemetry=telemetry,
                 ):
                     return
+                if transcript:
+                    telemetry.commit_suspended_interruption()
                 if (
                     native_barge_in
                     and not (

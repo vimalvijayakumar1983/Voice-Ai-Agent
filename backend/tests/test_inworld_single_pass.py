@@ -276,6 +276,25 @@ def test_no_match_and_compiler_exact_facts_have_deterministic_grounded_replies()
         deterministic_grounded_reply(evidence) == "The phone for Al Zaabi Group is +971 2 665 9998."
     )
 
+    founding_evidence = encode_exact_fact_evidence(
+        response_action="answer",
+        facts=(
+            ExactFactWireFact(
+                evidence_id="exact:founding:1",
+                fact_type="founding",
+                subject="Al Zaabi Group",
+                predicate="inception year",
+                value="2003",
+                source_name="Approved profile",
+            ),
+        ),
+        max_chars=800,
+    )
+    assert founding_evidence is not None
+    assert deterministic_grounded_reply(founding_evidence) == (
+        "According to an approved source, Al Zaabi Group was established in 2003."
+    )
+
 
 def test_exact_fact_json_does_not_treat_source_delimiters_as_control_syntax():
     evidence = encode_exact_fact_evidence(

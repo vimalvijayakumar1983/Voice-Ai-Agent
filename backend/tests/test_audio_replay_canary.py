@@ -1,16 +1,19 @@
 import json
 import wave
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
 from pydantic import ValidationError
 
+from app.services import audio_replay_canary
 from app.services.audio_replay_canary import (
     AudioReplayManifest,
     LiveKitPublishReceipt,
     ReplayExecutionError,
     ReplayManifestError,
+    _AgentResponseQuiescence,
     evaluate_audio_replay,
     load_audio_fixture,
     load_audio_replay_manifest,
@@ -91,7 +94,7 @@ def _manifest_payload(*, mode: str = "browser_session") -> dict:
         "timing": {
             "wait_for_remote_seconds": 1,
             "pre_roll_seconds": 0,
-            "post_roll_seconds": 0,
+            "post_roll_seconds": 0.1,
             "finalization_timeout_seconds": 5,
             "poll_interval_seconds": 0.1,
         },
@@ -214,6 +217,141 @@ def test_load_audio_fixture_supports_bounded_wav_and_pcm(tmp_path):
 def test_word_error_rate_is_case_and_punctuation_insensitive():
     assert word_error_rate("Al Zaabi Group?", "al zaabi group") == 0
     assert word_error_rate("Al Zaabi Group", "Al Big Group") == pytest.approx(1 / 3)
+
+
+def _remote_participant(
+    identity: str,
+    *,
+    agent: bool = True,
+    state: str | None = None,
+) -> SimpleNamespace:
+    attributes = {} if state is None else {"lk.agent.state": state}
+    return SimpleNamespace(
+        identity=identity,
+        kind=(
+            audio_replay_canary.rtc.ParticipantKind.PARTICIPANT_KIND_AGENT
+            if agent
+            else audio_replay_canary.rtc.ParticipantKind.PARTICIPANT_KIND_STANDARD
+        ),
+        attributes=attributes,
+    )
+
+
+@pytest.mark.asyncio
+async def test_response_quiescence_waits_for_post_fixture_speaking_then_listening(monkeypatch):
+    monkeypatch.setattr(audio_replay_canary, "_RESPONSE_QUIESCENCE_GRACE_SECONDS", 0)
+    observer = _AgentResponseQuiescence()
+    agent = _remote_participant("qa-agent", state="listening")
+
+    # Greeting state transitions happen before the caller fixture and must not
+    # satisfy its response gate.
+    observer.observe_participant(agent)
+    observer.observe_attributes({"lk.agent.state": "speaking"}, agent)
+    observer.observe_attributes({"lk.agent.state": "listening"}, agent)
+    await observer.wait_until_listening(0.1)
+    observer.arm([agent])
+    assert not observer.response_started
+    assert not observer.response_completed.is_set()
+
+    observer.observe_transcription(
+        [SimpleNamespace(final=True)],
+        _remote_participant("caller", agent=False),
+    )
+    observer.observe_attributes({"lk.agent.state": "thinking"}, agent)
+    observer.observe_attributes({"lk.agent.state": "speaking"}, agent)
+    assert observer.response_started
+    assert not observer.response_completed.is_set()
+    observer.observe_attributes({"lk.agent.state": "listening"}, agent)
+
+    await observer.wait(0.1)
+    assert observer.response_completed.is_set()
+
+
+@pytest.mark.asyncio
+async def test_response_quiescence_preserves_response_completed_during_fixture(monkeypatch):
+    monkeypatch.setattr(audio_replay_canary, "_RESPONSE_QUIESCENCE_GRACE_SECONDS", 0)
+    observer = _AgentResponseQuiescence()
+    agent = _remote_participant("qa-agent", state="listening")
+
+    observer.observe_participant(agent)
+    observer.arm([agent])
+    observer.observe_transcription(
+        [SimpleNamespace(final=True)],
+        _remote_participant("caller", agent=False),
+    )
+    # The response can complete while trailing silence is still being
+    # published. Waiting later must observe, not discard, these edges.
+    observer.observe_attributes({"lk.agent.state": "speaking"}, agent)
+    assert observer.response_started
+    observer.observe_attributes({"lk.agent.state": "listening"}, agent)
+
+    await observer.wait(0.1)
+
+
+@pytest.mark.asyncio
+async def test_response_quiescence_uses_final_transcripts_when_speaking_edge_is_coalesced(
+    monkeypatch,
+):
+    monkeypatch.setattr(audio_replay_canary, "_RESPONSE_QUIESCENCE_GRACE_SECONDS", 0)
+    observer = _AgentResponseQuiescence()
+    agent = _remote_participant("qa-agent", state="listening")
+    caller = _remote_participant("caller", agent=False)
+    final_segment = SimpleNamespace(final=True)
+
+    observer.observe_participant(agent)
+    observer.arm([agent])
+    observer.observe_transcription([final_segment], caller)
+    observer.observe_transcription([final_segment], agent)
+
+    await observer.wait(0.1)
+    assert observer.response_started
+    assert observer.response_completed.is_set()
+
+
+@pytest.mark.asyncio
+async def test_response_quiescence_discards_late_greeting_until_caller_final(monkeypatch):
+    monkeypatch.setattr(audio_replay_canary, "_RESPONSE_QUIESCENCE_GRACE_SECONDS", 0)
+    observer = _AgentResponseQuiescence()
+    agent = _remote_participant("qa-agent", state="listening")
+    caller = _remote_participant("caller", agent=False)
+    final_segment = SimpleNamespace(final=True)
+
+    observer.observe_participant(agent)
+    observer.arm([agent])
+    # A delayed greeting starts and finishes after arm, before the caller's
+    # final transcript. Neither its state edges nor transcript can satisfy the
+    # fixture response gate.
+    observer.observe_attributes({"lk.agent.state": "speaking"}, agent)
+    observer.observe_transcription([final_segment], agent)
+    observer.observe_attributes({"lk.agent.state": "listening"}, agent)
+    assert not observer.response_started
+    assert not observer.response_completed.is_set()
+
+    observer.observe_transcription([final_segment], caller)
+    assert not observer.response_completed.is_set()
+    observer.observe_transcription([final_segment], agent)
+
+    await observer.wait(0.1)
+
+
+@pytest.mark.asyncio
+async def test_response_quiescence_ignores_other_participants_and_fails_closed():
+    observer = _AgentResponseQuiescence()
+    agent = _remote_participant("qa-agent", state="listening")
+    caller = _remote_participant("caller", agent=False, state="speaking")
+    other_agent = _remote_participant("other-agent", state="speaking")
+    observer.observe_participant(agent)
+    observer.arm([agent, caller, other_agent])
+
+    observer.observe_attributes({"lk.agent.state": "speaking"}, caller)
+    observer.observe_attributes({"lk.agent.state": "speaking"}, other_agent)
+    with pytest.raises(ReplayExecutionError, match="did not start a response"):
+        await observer.wait(0.01)
+
+    observer.observe_transcription([SimpleNamespace(final=True)], caller)
+    observer.observe_attributes({"lk.agent.state": "speaking"}, agent)
+    with pytest.raises(ReplayExecutionError, match="did not finish its response"):
+        await observer.wait(0.01)
 
 
 def test_evaluator_passes_and_never_serializes_transcript_or_private_trace(tmp_path):

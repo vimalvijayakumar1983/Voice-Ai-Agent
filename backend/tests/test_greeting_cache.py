@@ -86,6 +86,54 @@ class _TTS:
         )
 
 
+class _PushStream(_Stream):
+    def __init__(self, frames: list[rtc.AudioFrame], pushed: list[str], ended: list[int]):
+        super().__init__(frames)
+        self.pushed = pushed
+        self.ended = ended
+
+    def push_text(self, text: str) -> None:
+        self.pushed.append(text)
+
+    def end_input(self) -> None:
+        self.ended[0] += 1
+
+
+class _StreamingTTS:
+    capabilities = SimpleNamespace(streaming=True)
+
+    def __init__(self, frames: list[rtc.AudioFrame]):
+        self.frames = frames
+        self.stream_calls = 0
+        self.synthesize_calls = 0
+        self.pushed: list[str] = []
+        self.ended = [0]
+
+    def stream(self):
+        self.stream_calls += 1
+        return _PushStream(self.frames, self.pushed, self.ended)
+
+    def synthesize(self, _text: str):
+        self.synthesize_calls += 1
+        raise AssertionError("streaming-capable greeting TTS must not use chunked synthesis")
+
+
+class _StalledPushStream(_PushStream):
+    async def _iterate(self):
+        await asyncio.Event().wait()
+        if False:  # pragma: no cover - makes this an async generator
+            yield None
+
+
+class _StalledStreamingTTS(_StreamingTTS):
+    def __init__(self):
+        super().__init__([])
+
+    def stream(self):
+        self.stream_calls += 1
+        return _StalledPushStream([], self.pushed, self.ended)
+
+
 class _StalledStream(_Stream):
     async def _iterate(self):
         await asyncio.Event().wait()
@@ -298,6 +346,55 @@ async def test_preparation_starts_before_consumer_and_caches_static_audio():
     assert len(cached_frames) == 2
     assert cached_frames[0] is not frames[0]
     assert engine.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_streaming_capable_tts_prepares_greeting_on_reusable_stream_transport():
+    engine = _StreamingTTS([_frame(1), _frame(2)])
+    cache = GreetingAudioCache(max_entries=2, max_bytes=10_000)
+    prepared = prepare_greeting_audio(
+        tts_engine=engine,
+        text="Welcome",
+        cache_key="streaming-key",
+        cache=cache,
+    )
+
+    frames = [frame async for frame in prepared.frames()]
+
+    assert len(frames) == 2
+    assert engine.stream_calls == 1
+    assert engine.synthesize_calls == 0
+    assert engine.pushed == ["Welcome"]
+    assert engine.ended == [1]
+    assert prepared.provider_request_count == 1
+    assert prepared.cache_status == "miss_cached"
+    assert cache.get("streaming-key") is not None
+
+
+@pytest.mark.asyncio
+async def test_stalled_streaming_greeting_evicts_singleflight_without_chunked_fallback():
+    engine = _StalledStreamingTTS()
+    cache = GreetingAudioCache(max_entries=2, max_bytes=10_000)
+    prepared = prepare_greeting_audio(
+        tts_engine=engine,
+        text="Welcome",
+        cache_key="stalled-streaming-key",
+        cache=cache,
+        synthesis_total_timeout_seconds=0.1,
+        synthesis_idle_timeout_seconds=0.02,
+    )
+
+    with pytest.raises(TimeoutError, match="stalled"):
+        _ = [frame async for frame in prepared.frames()]
+
+    assert engine.stream_calls == 1
+    assert engine.synthesize_calls == 0
+    assert engine.pushed == ["Welcome"]
+    assert engine.ended == [1]
+    assert prepared.provider_request_count == 1
+    assert prepared.cache_status == "failed"
+    assert cache.inflight_count == 0
+    assert cache.get("stalled-streaming-key") is None
 
 
 @pytest.mark.asyncio

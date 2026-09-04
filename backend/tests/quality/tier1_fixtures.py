@@ -104,6 +104,17 @@ def tier1_exact_fact_index() -> ExactFactIndex:
                                 "What does Al Zaabi Group do?",
                             ],
                         },
+                        {
+                            "subject": "Al Zaabi Group",
+                            "predicate": "inception year",
+                            "value": "2003",
+                            "evidence": "Al Zaabi Group has operated since its inception in 2003.",
+                            "search_phrases": [
+                                "When was Al Zaabi Group established?",
+                                "When was Al Zaabi Group founded?",
+                                "What is Al Zaabi Group's inception year?",
+                            ],
+                        },
                     ],
                 },
             ),
@@ -151,6 +162,7 @@ def tier1_quality_cases(index: ExactFactIndex):
         index,
         "Healthcare, Trading, Contracting, Automotive and Transport",
     )
+    founding_id = _evidence_id(index, "2003")
     return (
         Tier1QualityCase(
             case_id="phone_paraphrases",
@@ -195,6 +207,17 @@ def tier1_quality_cases(index: ExactFactIndex):
             expected_action=ExactFactResponseAction.ANSWER,
             expected_intents=(ExactFactType.SERVICES,),
             expected_evidence_ids=(services_id,),
+        ),
+        Tier1QualityCase(
+            case_id="founding_paraphrases",
+            query="When was Al Zaabi Group established?",
+            paraphrases=(
+                "When was Al Zaabi Group founded?",
+                "What is Al Zaabi Group's inception year?",
+            ),
+            expected_action=ExactFactResponseAction.ANSWER,
+            expected_intents=(ExactFactType.FOUNDING,),
+            expected_evidence_ids=(founding_id,),
         ),
         Tier1QualityCase(
             case_id="proper_name",
