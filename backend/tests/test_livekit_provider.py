@@ -1949,6 +1949,60 @@ def test_late_interrupted_assistant_item_cannot_consume_newer_grounding_verdict(
     assert trace["grounding_outcome"] == "no_match_correctly_refused"
 
 
+def test_verified_retrieval_is_linked_at_first_audio_when_completion_event_is_late():
+    runtime_metrics = {"barge_in_count": 0}
+    telemetry = _LiveKitRuntimeTelemetry(
+        runtime_metrics=runtime_metrics,
+        end_to_end_samples=[],
+        opened_at=1.0,
+    )
+    telemetry.on_final_transcript("When was the group established?")
+    telemetry.record_knowledge_lookup(
+        elapsed_ms=30,
+        result="verified",
+        details={
+            "knowledge_retrieval_path": "exact_fact",
+            "exact_fact_action": "answer",
+        },
+    )
+
+    telemetry.on_agent_state(new_state="speaking")
+
+    trace = runtime_metrics["turn_diagnostics"][0]
+    assert trace["grounding_outcome"] == "response_after_verified_retrieval"
+    assert trace["response_action"] == "response_started_after_verified_retrieval"
+    assert trace["grounding_response_observation"] == "audio_started"
+    grounding = summarize_runtime_grounding({"runtime": runtime_metrics})
+    assert grounding["response_after_verified_retrieval"] == 1
+    assert grounding["answered_without_grounding"] == 0
+
+
+def test_interruption_removes_provisional_first_audio_grounding_link():
+    runtime_metrics = {"barge_in_count": 0}
+    telemetry = _LiveKitRuntimeTelemetry(
+        runtime_metrics=runtime_metrics,
+        end_to_end_samples=[],
+        opened_at=1.0,
+    )
+    telemetry.on_final_transcript("When was the group established?")
+    telemetry.record_knowledge_lookup(elapsed_ms=30, result="verified")
+    telemetry.on_agent_state(new_state="speaking")
+    trace = runtime_metrics["turn_diagnostics"][0]
+
+    telemetry.on_assistant_content(
+        "According to the approved source, the group was established in 2003.",
+        interrupted=True,
+    )
+
+    assert trace["outcome"] == "superseded_by_caller"
+    assert "grounding_outcome" not in trace
+    assert "response_action" not in trace
+    assert "grounding_response_observation" not in trace
+    grounding = summarize_runtime_grounding({"runtime": runtime_metrics})
+    assert grounding["response_after_verified_retrieval"] == 0
+    assert grounding["answered_without_grounding"] == 0
+
+
 def test_meaningful_barge_in_supersedes_old_trace_before_grounded_replacement():
     runtime_metrics = {"barge_in_count": 0}
     telemetry = _LiveKitRuntimeTelemetry(

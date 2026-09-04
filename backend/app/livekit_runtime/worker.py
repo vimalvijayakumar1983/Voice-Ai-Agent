@@ -1453,6 +1453,15 @@ class _LiveKitRuntimeTelemetry:
         if trace is None:
             return
         if interrupted:
+            # LiveKit can publish the assistant item after audible playback was
+            # interrupted.  A provisional link created at first audio must not
+            # survive that stronger observation or make disposition report the
+            # abandoned turn as grounded and resolved.
+            if trace.get("grounding_response_observation") == "audio_started":
+                trace.pop("grounding_outcome", None)
+                trace.pop("response_action", None)
+                trace.pop("grounding_response_observation", None)
+                trace["outcome"] = "superseded_by_caller"
             self.runtime_metrics["ignored_interrupted_assistant_item_count"] = (
                 int(self.runtime_metrics.get("ignored_interrupted_assistant_item_count", 0)) + 1
             )
@@ -1497,6 +1506,7 @@ class _LiveKitRuntimeTelemetry:
             return
         trace["grounding_outcome"] = outcome
         trace["response_action"] = response_action
+        trace["grounding_response_observation"] = "assistant_item_completed"
         if item_id:
             trace["grounding_response_item_id"] = str(item_id)[:128]
         self.pending_grounding_trace = None
@@ -1568,8 +1578,13 @@ class _LiveKitRuntimeTelemetry:
         """
 
         trace = self.suspended_grounding_trace
-        if trace is not None and "grounding_outcome" not in trace:
-            trace["outcome"] = "superseded_by_caller"
+        if trace is not None:
+            if trace.get("grounding_response_observation") == "audio_started":
+                trace.pop("grounding_outcome", None)
+                trace.pop("response_action", None)
+                trace.pop("grounding_response_observation", None)
+            if "grounding_outcome" not in trace:
+                trace["outcome"] = "superseded_by_caller"
         self.suspended_grounding_trace = None
         self.suspended_grounding_not_before = None
 
@@ -1645,6 +1660,18 @@ class _LiveKitRuntimeTelemetry:
                     self.end_to_end_samples, 0.95
                 )
             self.last_user_speech_end_at = None
+        trace = self.pending_grounding_trace
+        if trace is not None:
+            knowledge_result = trace.get("retrieval_result", trace.get("knowledge_result"))
+            if knowledge_result == "verified" and "grounding_outcome" not in trace:
+                # This label deliberately proves only ordering: audible output
+                # began after verified retrieval.  It does not claim semantic
+                # entailment.  The later assistant-item event upgrades the
+                # observation to completed; interruption removes this
+                # provisional link before disposition is calculated.
+                trace["grounding_outcome"] = "response_after_verified_retrieval"
+                trace["response_action"] = "response_started_after_verified_retrieval"
+                trace["grounding_response_observation"] = "audio_started"
         self._finish_trace("answered")
 
     def on_metrics(self, metrics: object) -> None:
