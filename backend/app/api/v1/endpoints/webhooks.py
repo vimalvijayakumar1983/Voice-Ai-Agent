@@ -121,6 +121,7 @@ class _TwilioVoiceCallbackAuthProof:
     agent_id: UUID | None
     campaign_id: UUID | None
     native_speech_provider: str | None
+    credential_source: str
 
 
 @dataclass(frozen=True)
@@ -132,6 +133,7 @@ class _TwilioStatusCallbackAuthProof:
     agent_id: UUID | None
     campaign_id: UUID | None
     native_speech_provider: str | None
+    credential_source: str
 
 
 def verify_smallest_signature(raw_body: bytes, signature: str) -> bool:
@@ -701,7 +703,7 @@ async def _validate_twilio_call_callback(
     request: Request,
     params: dict[str, str],
     call: Call,
-) -> None:
+) -> str:
     """Authenticate a call callback against its persisted telephony owner.
 
     Native Sarvam/ElevenLabs callbacks are always tenant-owned and never fall
@@ -732,7 +734,7 @@ async def _validate_twilio_call_callback(
                 detail="Twilio workspace callback credential is unavailable",
             )
         _validate_twilio_workspace_call_callback(request, params, call, credential)
-        return
+        return "workspace"
 
     if source == "platform":
         platform_credential = TwilioRouteCredential(
@@ -751,7 +753,7 @@ async def _validate_twilio_call_callback(
         ):
             raise HTTPException(status_code=401, detail="Invalid Twilio webhook signature")
         _validate_twilio_request(request, params, platform_credential.auth_token)
-        return
+        return "platform"
 
     # Compatibility for calls created before credential-source binding shipped.
     # AccountSid chooses exactly one authority; an unreadable tenant credential
@@ -765,12 +767,13 @@ async def _validate_twilio_call_callback(
         tenant_auth_token = str(tenant_config.get("auth_token") or "").strip()
         if incoming_account_sid == tenant_account_sid and tenant_auth_token:
             _validate_twilio_request(request, params, tenant_auth_token)
-            return
+            return "workspace"
         if incoming_account_sid == settings.twilio_account_sid.strip():
             _validate_twilio_request(request, params, settings.twilio_auth_token)
-            return
+            return "platform"
         raise HTTPException(status_code=401, detail="Invalid Twilio webhook signature")
     _validate_twilio_request(request, params, settings.twilio_auth_token)
+    return "platform"
 
 
 def _require_native_twilio_callback_identity(
@@ -993,20 +996,20 @@ async def _lock_native_twilio_voice_callback_runtime(
     return call, agent, runtime_profile, route_is_current
 
 
-async def _lock_native_twilio_status_callback(
+async def _lock_workspace_twilio_callback_graph(
     db: AsyncSession,
     *,
-    proof: _TwilioStatusCallbackAuthProof,
+    proof: _TwilioVoiceCallbackAuthProof | _TwilioStatusCallbackAuthProof,
     request: Request,
     params: dict[str, str],
 ) -> Call:
-    """Revalidate status authority without introducing Agent/Call inversion.
+    """Lock and revalidate a workspace-owned callback without Agent inversion.
 
-    Status callbacks reconcile calls that have already been dispatched, so
-    they do not need the Agent/Profile admission graph used before minting a
-    voice media capability. The shared provider boundary serializes credential
-    rotation, then the current credential and exact Call are locked in that
-    order before the signature is checked again.
+    Reconciliation of an already-dispatched call does not need the Agent/Profile
+    admission graph used before minting native voice media. The shared provider
+    boundary serializes credential rotation, then the current credential and
+    existing campaign graph (or direct Call) are locked before the signature is
+    checked again.
     """
 
     await lock_provider_runtime_boundaries(db, proof.tenant_id, "twilio")
@@ -1027,19 +1030,26 @@ async def _lock_native_twilio_status_callback(
             detail="Twilio workspace callback credential is unavailable",
         )
 
-    call = await db.scalar(
-        select(Call)
-        .where(
+    call_probe = await db.scalar(
+        select(Call).where(
             Call.id == proof.call_id,
             Call.tenant_id == proof.tenant_id,
             Call.agent_id == proof.agent_id,
-            Call.campaign_id.is_(None),
+            Call.campaign_id == proof.campaign_id,
             Call.provider == "twilio",
         )
-        .with_for_update()
-        .execution_options(populate_existing=True)
     )
-    if call is None or _native_twilio_speech_provider(call) != proof.native_speech_provider:
+    if call_probe is None:
+        raise HTTPException(status_code=409, detail="Call mapping changed during callback")
+    call, _attempt = await _lock_callback_call_graph(db, call_probe)
+    if call.provider != "twilio":
+        raise HTTPException(status_code=409, detail="Call mapping changed during callback")
+
+    metadata = call.call_metadata if isinstance(call.call_metadata, dict) else {}
+    binding = metadata.get("telephony_credential_binding")
+    binding = binding if isinstance(binding, dict) else {}
+    current_source = str(binding.get("source") or "").strip()
+    if current_source and current_source != "workspace":
         raise HTTPException(status_code=409, detail="Call mapping changed during callback")
 
     _validate_twilio_workspace_call_callback(
@@ -1852,7 +1862,7 @@ async def twilio_voice_webhook(call_id: UUID, request: Request):
         # Authenticate the complete signed URL before taking even the local
         # serialization guard. Invalid requests therefore cannot queue behind
         # a real callback and turn its lock into a cheap denial-of-service.
-        await _validate_twilio_call_callback(
+        credential_source = await _validate_twilio_call_callback(
             db,
             request,
             untrusted_params,
@@ -1864,6 +1874,7 @@ async def twilio_voice_webhook(call_id: UUID, request: Request):
             agent_id=call_probe.agent_id,
             campaign_id=call_probe.campaign_id,
             native_speech_provider=_native_twilio_speech_provider(call_probe),
+            credential_source=credential_source,
         )
 
     # PostgreSQL's caller-row lock provides the cross-replica guarantee. This
@@ -1887,7 +1898,11 @@ async def _twilio_voice_webhook_locked(
 ):
     async with async_session_factory() as db:
         route_is_current = False
-        if proof.native_speech_provider is not None and proof.campaign_id is None:
+        if (
+            proof.native_speech_provider is not None
+            and proof.campaign_id is None
+            and proof.credential_source == "workspace"
+        ):
             (
                 call,
                 agent,
@@ -1899,6 +1914,27 @@ async def _twilio_voice_webhook_locked(
                 request=request,
                 params=params,
             )
+        elif proof.credential_source == "workspace":
+            call = await _lock_workspace_twilio_callback_graph(
+                db,
+                proof=proof,
+                request=request,
+                params=params,
+            )
+            agent = await db.scalar(
+                select(Agent).where(
+                    Agent.id == call.agent_id,
+                    Agent.tenant_id == call.tenant_id,
+                )
+            )
+            runtime_profile = None
+            if agent is not None:
+                runtime_profile = await db.scalar(
+                    select(AgentRuntimeProfile).where(
+                        AgentRuntimeProfile.agent_id == agent.id,
+                        AgentRuntimeProfile.tenant_id == agent.tenant_id,
+                    )
+                )
         else:
             call_probe = await db.scalar(
                 select(Call).where(
@@ -1913,12 +1949,13 @@ async def _twilio_voice_webhook_locked(
                     content='<?xml version="1.0"?><Response><Hangup/></Response>',
                     media_type="application/xml",
                 )
-            # Legacy and campaign callbacks preserve their aggregate lock
-            # order. They cannot enter the native media lane, but are checked
-            # again so a routing-identity change between authentication and
-            # the local guard cannot authorize state mutation.
-            await _validate_twilio_call_callback(db, request, params, call_probe)
             call, _attempt = await _lock_callback_call_graph(db, call_probe)
+            # Platform-owned compatibility calls keep their established graph
+            # order and are re-authenticated against the locked Call. A change
+            # in selected authority fails closed rather than crossing tenants.
+            current_source = await _validate_twilio_call_callback(db, request, params, call)
+            if current_source != proof.credential_source:
+                raise HTTPException(status_code=409, detail="Call mapping changed during callback")
             agent = await db.scalar(
                 select(Agent).where(
                     Agent.id == call.agent_id,
@@ -2002,7 +2039,7 @@ async def twilio_status_callback(
         # Authenticate before taking the local contention lock so invalid
         # requests cannot queue behind a legitimate callback. Native callbacks
         # are authenticated again under the provider/credential boundary below.
-        await _validate_twilio_call_callback(
+        credential_source = await _validate_twilio_call_callback(
             db,
             request,
             untrusted_params,
@@ -2014,6 +2051,7 @@ async def twilio_status_callback(
             agent_id=call_probe.agent_id,
             campaign_id=call_probe.campaign_id,
             native_speech_provider=_native_twilio_speech_provider(call_probe),
+            credential_source=credential_source,
         )
 
     async with _local_provider_callback_lock(f"twilio:direct:{call_id}"):
@@ -2033,8 +2071,8 @@ async def _twilio_status_callback_locked(
     proof: _TwilioStatusCallbackAuthProof,
 ):
     async with async_session_factory() as db:
-        if proof.native_speech_provider is not None and proof.campaign_id is None:
-            call = await _lock_native_twilio_status_callback(
+        if proof.credential_source == "workspace":
+            call = await _lock_workspace_twilio_callback_graph(
                 db,
                 proof=proof,
                 request=request,
@@ -2051,11 +2089,10 @@ async def _twilio_status_callback_locked(
             )
             if call_probe is None:
                 return {"status": "not_found"}
-            # Preserve legacy/campaign lock order, but revalidate after the
-            # local guard so a changed routing identity cannot authorize a
-            # state transition.
-            await _validate_twilio_call_callback(db, request, params, call_probe)
             call, _attempt = await _lock_callback_call_graph(db, call_probe)
+            current_source = await _validate_twilio_call_callback(db, request, params, call)
+            if current_source != proof.credential_source:
+                raise HTTPException(status_code=409, detail="Call mapping changed during callback")
 
         call_sid = params.get("CallSid", "")
         call_status = params.get("CallStatus", "")

@@ -16,6 +16,7 @@ from twilio.request_validator import RequestValidator
 from app.api.v1.endpoints import webhooks
 from app.models.agent import Agent, AgentRuntimeProfile
 from app.models.call import Call
+from app.models.campaign import Campaign, CampaignContact, CampaignContactAttempt
 from app.services.provider_credentials import (
     ProviderCredentialError,
     invalidate_active_runtimes_for_credential,
@@ -136,6 +137,112 @@ async def _native_twilio_voice_call(
     db.add(call)
     await db.commit()
     return call, account_sid, auth_token
+
+
+async def _workspace_twilio_callback_call(
+    db,
+    tenant,
+    *,
+    with_campaign: bool,
+    explicit_binding: bool,
+):
+    """Seed a legacy Twilio call authenticated by the workspace credential."""
+
+    account_sid = "AC" + "8" * 32
+    auth_token = "workspace_legacy_callback_token_123456789"
+    await store_provider_config(
+        db,
+        tenant.id,
+        "twilio",
+        {
+            "account_sid": account_sid,
+            "auth_token": auth_token,
+            "default_from_number": "+15551234567",
+        },
+    )
+    route_credential = await load_workspace_twilio_route_credential(db, tenant.id)
+    assert route_credential is not None
+    agent = Agent(
+        tenant_id=tenant.id,
+        name="Workspace legacy Twilio callback",
+        system_prompt="Handle the call.",
+        voice_provider="twilio",
+        voice_id="twilio:legacy",
+    )
+    db.add(agent)
+    await db.flush()
+
+    campaign = None
+    contact = None
+    if with_campaign:
+        campaign = Campaign(
+            tenant_id=tenant.id,
+            agent_id=agent.id,
+            name="Workspace Twilio callback campaign",
+            status="running",
+            campaign_type="outbound",
+            timezone="UTC",
+            max_concurrent_calls=1,
+            retry_attempts=0,
+            total_contacts=1,
+            completed_contacts=0,
+            successful_contacts=0,
+        )
+        db.add(campaign)
+        await db.flush()
+        contact = CampaignContact(
+            tenant_id=tenant.id,
+            campaign_id=campaign.id,
+            phone_number="+15557654321",
+            status="calling",
+            attempts=1,
+        )
+        db.add(contact)
+        await db.flush()
+
+    call_sid = "CA-workspace-campaign" if with_campaign else "CA-workspace-direct"
+    call_metadata = {}
+    if explicit_binding:
+        call_metadata["telephony_credential_binding"] = {
+            "provider": "twilio",
+            "source": "workspace",
+            "account_sid": account_sid,
+            "credential_fingerprint": twilio_callback_credential_fingerprint(route_credential),
+        }
+    call = Call(
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        campaign_id=campaign.id if campaign is not None else None,
+        direction="outbound",
+        status="ringing",
+        from_number="+15551234567",
+        to_number="+15557654321",
+        provider="twilio",
+        provider_call_sid=call_sid,
+        started_at=datetime.now(UTC),
+        call_metadata=call_metadata,
+    )
+    db.add(call)
+    await db.flush()
+
+    attempt = None
+    if campaign is not None and contact is not None:
+        contact.last_call_id = call.id
+        attempt = CampaignContactAttempt(
+            tenant_id=tenant.id,
+            campaign_id=campaign.id,
+            contact_id=contact.id,
+            call_id=call.id,
+            attempt_number=1,
+            idempotency_key=f"workspace-callback-{call.id}",
+            provider="twilio",
+            provider_call_sid=call_sid,
+            state="accepted",
+            accepted_at=datetime.now(UTC),
+        )
+        db.add(attempt)
+    await db.commit()
+    return call, account_sid, auth_token, campaign, contact, attempt
 
 
 async def _post_signed_twilio_voice(
@@ -1467,6 +1574,254 @@ async def test_native_status_callback_rotation_before_locked_revalidation_cannot
     assert stored_call.call_metadata == original_metadata
     assert stored_profile.enabled is False
     assert stored_profile.status == "draft"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("callback_kind", "with_campaign", "explicit_binding"),
+    [
+        ("status", False, True),
+        ("status", True, False),
+        ("voice", False, True),
+    ],
+    ids=[
+        "workspace-direct-status",
+        "source-less-workspace-campaign-status",
+        "workspace-direct-voice",
+    ],
+)
+async def test_workspace_owned_callback_rejects_rotation_between_probe_and_locked_revalidation(
+    client,
+    tenant,
+    db,
+    monkeypatch,
+    callback_kind,
+    with_campaign,
+    explicit_binding,
+):
+    """The selected workspace authority is carried across both auth phases."""
+
+    (
+        call,
+        account_sid,
+        old_auth_token,
+        campaign,
+        contact,
+        attempt,
+    ) = await _workspace_twilio_callback_call(
+        db,
+        tenant,
+        with_campaign=with_campaign,
+        explicit_binding=explicit_binding,
+    )
+    call_id = call.id
+    campaign_id = campaign.id if campaign is not None else None
+    contact_id = contact.id if contact is not None else None
+    attempt_id = attempt.id if attempt is not None else None
+    original_metadata = dict(call.call_metadata)
+    original_local_lock = webhooks._local_provider_callback_lock
+    rotated = False
+
+    @asynccontextmanager
+    async def rotate_before_locked_revalidation(identity):
+        nonlocal rotated
+        async with session_factory() as rotation_db:
+            invalidated = await invalidate_active_runtimes_for_credential(
+                rotation_db,
+                tenant.id,
+                "twilio",
+            )
+            assert invalidated == []
+            await store_provider_config(
+                rotation_db,
+                tenant.id,
+                "twilio",
+                {
+                    "account_sid": account_sid,
+                    "auth_token": "rotated_workspace_callback_token_987654321",
+                    "default_from_number": "+15551234567",
+                },
+            )
+            await rotation_db.commit()
+        rotated = True
+        async with original_local_lock(identity):
+            yield
+
+    async def forbidden_persist_effects(*_args, **_kwargs):
+        raise AssertionError("stale callback must not persist provider effects")
+
+    monkeypatch.setattr(
+        webhooks,
+        "_local_provider_callback_lock",
+        rotate_before_locked_revalidation,
+    )
+    monkeypatch.setattr(webhooks, "_persist_webhook_effects", forbidden_persist_effects)
+    payload = {
+        "AccountSid": account_sid,
+        "CallSid": call.provider_call_sid,
+        "CallStatus": "completed",
+        "CallDuration": "99",
+        "RecordingUrl": "https://recordings.example/stale-workspace-credential",
+    }
+    if callback_kind == "status":
+        response = await _post_signed_twilio_status(
+            client,
+            monkeypatch,
+            call,
+            payload,
+            auth_token=old_auth_token,
+        )
+    else:
+        response = await _post_signed_twilio_voice(
+            client,
+            monkeypatch,
+            call,
+            payload,
+            auth_token=old_auth_token,
+        )
+
+    assert rotated is True
+    assert response.status_code == 401
+    db.expire_all()
+    stored_call = await db.get(Call, call_id)
+    assert stored_call.status == "ringing"
+    assert stored_call.ended_at is None
+    assert stored_call.duration_seconds is None
+    assert stored_call.provider_recording_url is None
+    assert stored_call.call_metadata == original_metadata
+    if campaign_id is not None and contact_id is not None and attempt_id is not None:
+        stored_campaign = await db.get(Campaign, campaign_id)
+        stored_contact = await db.get(CampaignContact, contact_id)
+        stored_attempt = await db.get(CampaignContactAttempt, attempt_id)
+        assert stored_campaign.status == "running"
+        assert stored_contact.status == "calling"
+        assert stored_attempt.state == "accepted"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("with_campaign", "explicit_binding"),
+    [(False, True), (True, False)],
+    ids=["workspace-direct", "source-less-workspace-campaign"],
+)
+async def test_postgres_workspace_status_rotation_boundary_prevents_stale_mutation(
+    client,
+    tenant,
+    db,
+    monkeypatch,
+    with_campaign,
+    explicit_binding,
+):
+    """A committed rotation wins before direct and campaign status mutation."""
+
+    if test_engine.dialect.name != "postgresql":
+        pytest.skip("Requires PostgreSQL advisory-lock semantics")
+
+    (
+        call,
+        account_sid,
+        old_auth_token,
+        _campaign,
+        _contact,
+        _attempt,
+    ) = await _workspace_twilio_callback_call(
+        db,
+        tenant,
+        with_campaign=with_campaign,
+        explicit_binding=explicit_binding,
+    )
+    call_id = call.id
+    original_metadata = dict(call.call_metadata)
+    postgres_sessions = async_sessionmaker(test_engine, expire_on_commit=False)
+    rotation_holds_boundary = asyncio.Event()
+    release_rotation = asyncio.Event()
+    callback_requested_boundary = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    rotation_task: asyncio.Task | None = None
+    callback_task: asyncio.Task | None = None
+    listener_installed = False
+
+    async def rotate_while_holding_boundary() -> None:
+        async with postgres_sessions() as rotation_db, rotation_db.begin():
+            await lock_provider_runtime_boundaries(rotation_db, tenant.id, "twilio")
+            await store_provider_config(
+                rotation_db,
+                tenant.id,
+                "twilio",
+                {
+                    "account_sid": account_sid,
+                    "auth_token": "postgres_workspace_rotation_token_987654321",
+                    "default_from_number": "+15551234567",
+                },
+            )
+            rotation_holds_boundary.set()
+            await release_rotation.wait()
+
+    def observe_callback_boundary_request(
+        _connection,
+        _cursor,
+        statement,
+        parameters,
+        _context,
+        _executemany,
+    ) -> None:
+        normalized = str(statement).upper()
+        values = str(parameters)
+        if "PG_ADVISORY_XACT_LOCK" in normalized and "runtime-provider:" in values:
+            loop.call_soon_threadsafe(callback_requested_boundary.set)
+
+    try:
+        rotation_task = asyncio.create_task(rotate_while_holding_boundary())
+        await asyncio.wait_for(rotation_holds_boundary.wait(), timeout=5)
+        event.listen(
+            test_engine.sync_engine,
+            "before_cursor_execute",
+            observe_callback_boundary_request,
+        )
+        listener_installed = True
+        callback_task = asyncio.create_task(
+            _post_signed_twilio_status(
+                client,
+                monkeypatch,
+                call,
+                {
+                    "AccountSid": account_sid,
+                    "CallSid": call.provider_call_sid,
+                    "CallStatus": "completed",
+                    "CallDuration": "99",
+                },
+                auth_token=old_auth_token,
+            )
+        )
+        await asyncio.wait_for(callback_requested_boundary.wait(), timeout=5)
+        assert not callback_task.done()
+
+        release_rotation.set()
+        assert rotation_task is not None
+        await asyncio.wait_for(rotation_task, timeout=5)
+        response = await asyncio.wait_for(callback_task, timeout=5)
+    finally:
+        release_rotation.set()
+        if listener_installed:
+            event.remove(
+                test_engine.sync_engine,
+                "before_cursor_execute",
+                observe_callback_boundary_request,
+            )
+        for task in (callback_task, rotation_task):
+            if task is not None and not task.done():
+                task.cancel()
+        pending = [task for task in (callback_task, rotation_task) if task is not None]
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    assert response.status_code == 401
+    db.expire_all()
+    stored_call = await db.get(Call, call_id)
+    assert stored_call.status == "ringing"
+    assert stored_call.ended_at is None
+    assert stored_call.duration_seconds is None
+    assert stored_call.call_metadata == original_metadata
 
 
 @pytest.mark.asyncio
