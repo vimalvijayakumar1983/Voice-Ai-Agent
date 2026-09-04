@@ -80,6 +80,7 @@ from app.services.knowledge_retrieval import (
 )
 from app.services.knowledge_serving import (
     KnowledgeServingError,
+    admit_inbound_livekit_knowledge_call,
     knowledge_admission_is_durable,
     load_agent_serving_revision_identity,
     load_durably_admitted_serving_revision,
@@ -709,6 +710,7 @@ class _RuntimeKnowledgePin:
     content_sha256: str | None = None
     source_revision_sha256: str | None = None
     speech_lexicon_artifact_id: UUID | None = None
+    speech_lexicon_content_sha256: str | None = None
     revocation_generation: int | None = None
 
     @classmethod
@@ -720,12 +722,20 @@ class _RuntimeKnowledgePin:
     ) -> _RuntimeKnowledgePin:
         if revision is None:
             return cls()
+        manifest = revision.manifest if isinstance(revision.manifest, dict) else {}
+        lexicon_manifest = manifest.get("speech_lexicon")
+        lexicon_content_sha256 = (
+            str(lexicon_manifest.get("content_sha256") or "")
+            if isinstance(lexicon_manifest, dict)
+            else ""
+        )
         return cls(
             revision_id=revision.id,
             knowledge_base_id=revision.knowledge_base_id,
             content_sha256=revision.content_sha256,
             source_revision_sha256=revision.source_revision_sha256,
             speech_lexicon_artifact_id=revision.speech_lexicon_artifact_id,
+            speech_lexicon_content_sha256=lexicon_content_sha256 or None,
             revocation_generation=revocation_generation,
         )
 
@@ -740,6 +750,10 @@ class _RuntimeKnowledgePin:
         }
         if self.revocation_generation is not None:
             metadata["knowledge_serving_revocation_generation"] = self.revocation_generation
+        if self.speech_lexicon_artifact_id is not None:
+            metadata["speech_lexicon_artifact_id"] = str(self.speech_lexicon_artifact_id)
+        if self.speech_lexicon_content_sha256 is not None:
+            metadata["speech_lexicon_content_sha256"] = self.speech_lexicon_content_sha256
         return metadata
 
 
@@ -786,6 +800,27 @@ class BrowserReservationAlreadyClaimedError(RuntimeError):
 
 class OutboundReservationAlreadyClaimedError(RuntimeError):
     """A duplicate LiveKit job attempted to speak for an active outbound call."""
+
+
+class InboundReservationAlreadyClaimedError(RuntimeError):
+    """A duplicate LiveKit job attempted to claim an existing inbound SIP call."""
+
+
+class InboundReservationRejectedError(RuntimeError):
+    """A durable answered inbound attempt failed a runtime-limit gate."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        tenant_id: UUID,
+        agent_id: UUID,
+        call_id: UUID,
+    ) -> None:
+        super().__init__(message)
+        self.tenant_id = tenant_id
+        self.agent_id = agent_id
+        self.call_id = call_id
 
 
 def _worker_http_port(raw_value: str | None) -> int | None:
@@ -2359,6 +2394,7 @@ async def _resolve_runtime_knowledge_pin(
             tenant_id=model.tenant_id,
             knowledge_base_id=requested_knowledge_base_id,
             serving_revision_id=requested_revision_id,
+            include_sources=True,
         )
         current_revocation_generation = None
     else:
@@ -2367,6 +2403,7 @@ async def _resolve_runtime_knowledge_pin(
             tenant_id=model.tenant_id,
             agent_id=model.id,
             serving_revision_id=requested_revision_id,
+            include_sources=True,
         )
     if requested_revision_id is not None and revision is None:
         raise RuntimeError("The call's pinned knowledge revision is unavailable")
@@ -2798,12 +2835,17 @@ async def _load_browser_runtime(
         )
 
 
-async def _resolve_inbound_runtime(
+async def _resolve_inbound_route(
     *,
     inbound_trunk_id: str,
     called_number: str,
-) -> tuple[AgentModel, AgentRuntimeProfile, _RuntimeApiKeys, _RuntimeKnowledgePin]:
-    """Resolve inbound calls from operator-owned route data, never dispatch metadata."""
+) -> tuple[AgentModel, AgentRuntimeProfile]:
+    """Resolve only the tenant and agent from operator-owned route data.
+
+    Keep knowledge and provider credential loading out of this boundary.  An
+    active SIP participant may already be billable, so the caller must be able
+    to persist a tenant-owned attempt immediately after this identity is known.
+    """
     trunk_id = str(inbound_trunk_id or "").strip()
     did = str(called_number or "").strip()
     if not trunk_id or not did:
@@ -2849,7 +2891,43 @@ async def _resolve_inbound_runtime(
         matches = [row for row in rows if did in (row[1].assigned_numbers or [])]
         if len(matches) != 1:
             raise RuntimeError("Inbound LiveKit DID does not resolve to exactly one active agent")
-        model, profile = matches[0]
+        return matches[0]
+
+
+async def _load_inbound_runtime(
+    *,
+    tenant_id: UUID,
+    agent_id: UUID,
+) -> tuple[AgentModel, AgentRuntimeProfile, _RuntimeApiKeys, _RuntimeKnowledgePin]:
+    """Load mutable runtime dependencies after the inbound attempt is durable."""
+
+    async with async_session_factory() as db:
+        row = (
+            await db.execute(
+                select(AgentModel, AgentRuntimeProfile)
+                .join(
+                    AgentRuntimeProfile,
+                    (AgentRuntimeProfile.agent_id == AgentModel.id)
+                    & (AgentRuntimeProfile.tenant_id == AgentModel.tenant_id),
+                )
+                .where(
+                    AgentModel.id == agent_id,
+                    AgentModel.tenant_id == tenant_id,
+                    AgentModel.is_active.is_(True),
+                    AgentModel.voice_provider == "inworld",
+                    AgentModel.voice_id.like("inworld:%"),
+                    AgentRuntimeProfile.tenant_id == tenant_id,
+                    AgentRuntimeProfile.enabled.is_(True),
+                    AgentRuntimeProfile.status == "active",
+                    AgentRuntimeProfile.telephony_provider == "livekit_sip",
+                    AgentRuntimeProfile.primary_speech_provider == "inworld",
+                    AgentRuntimeProfile.llm_provider.in_(("inworld", "openai")),
+                )
+            )
+        ).one_or_none()
+        if row is None:
+            raise RuntimeError("Inbound LiveKit agent became unavailable during setup")
+        model, profile = row
         knowledge_pin, _revision = await _resolve_runtime_knowledge_pin(db, model=model)
         if knowledge_pin.revision_id is None or knowledge_pin.revocation_generation is None:
             raise RuntimeError(
@@ -2863,11 +2941,26 @@ async def _resolve_inbound_runtime(
         return model, profile, api_keys, knowledge_pin
 
 
+async def _resolve_inbound_runtime(
+    *,
+    inbound_trunk_id: str,
+    called_number: str,
+) -> tuple[AgentModel, AgentRuntimeProfile, _RuntimeApiKeys, _RuntimeKnowledgePin]:
+    """Compatibility wrapper for callers that do not own the worker lifecycle."""
+
+    model, profile = await _resolve_inbound_route(
+        inbound_trunk_id=inbound_trunk_id,
+        called_number=called_number,
+    )
+    return await _load_inbound_runtime(tenant_id=model.tenant_id, agent_id=model.id)
+
+
 async def _enforce_inbound_limits(
     db,
     *,
     model: AgentModel,
     profile: AgentRuntimeProfile,
+    current_reservation_included: bool = False,
 ) -> None:
     """Atomically reserve inbound capacity before the durable call row is inserted."""
     now = datetime.now(UTC)
@@ -2902,14 +2995,182 @@ async def _enforce_inbound_limits(
         agent_id=model.id,
         month_start=month_start,
         max_call_duration_seconds=model.max_call_duration_seconds,
-        include_prospective_call=True,
+        include_prospective_call=not current_reservation_included,
     )
-    if int(daily_calls or 0) >= profile.daily_call_limit:
+    limit_offset = 1 if current_reservation_included else 0
+    if int(daily_calls or 0) >= profile.daily_call_limit + limit_offset:
         raise RuntimeError("Inbound LiveKit daily call limit has been reached")
-    if int(active_calls or 0) >= profile.max_concurrent_calls:
+    if int(active_calls or 0) >= profile.max_concurrent_calls + limit_offset:
         raise RuntimeError("Inbound LiveKit concurrent call limit has been reached")
     if monthly_budget.total_cents > profile.monthly_budget_cents:
         raise RuntimeError("Inbound LiveKit monthly call budget has been reached")
+
+
+def _inbound_provider_call_sid(attributes: dict[str, str], room_name: str) -> str:
+    """Return the stable provider identity used to deduplicate worker jobs."""
+
+    return str(
+        attributes.get("sip.callIDFull") or attributes.get("sip.callID") or room_name
+    ).strip()
+
+
+async def _reserve_inbound_call(
+    *,
+    model: AgentModel,
+    profile: AgentRuntimeProfile,
+    room_name: str,
+    attributes: dict[str, str],
+) -> UUID:
+    """Persist an answered, pending-billing SIP attempt before runtime loading."""
+
+    provider_call_sid = _inbound_provider_call_sid(attributes, room_name)
+    if not provider_call_sid:
+        raise RuntimeError("Inbound LiveKit call has no stable provider identity")
+    caller = attributes.get("sip.phoneNumber") or "unknown"
+    trunk_number = (
+        attributes.get("sip.trunkPhoneNumber") or (profile.assigned_numbers or ["unknown"])[0]
+    )
+    async with async_session_factory() as db:
+        # The same per-agent boundary serializes deduplication, capacity, daily
+        # limits, and budget reservation across worker replicas.
+        await lock_agent_runtime_limits(
+            db,
+            tenant_id=model.tenant_id,
+            agent_id=model.id,
+        )
+        existing = await db.scalar(
+            select(Call).where(Call.provider_call_sid == provider_call_sid).with_for_update()
+        )
+        if existing is not None:
+            if (
+                existing.tenant_id == model.tenant_id
+                and existing.agent_id == model.id
+                and existing.direction == "inbound"
+                and existing.provider == "livekit_sip"
+            ):
+                raise InboundReservationAlreadyClaimedError(
+                    "Inbound LiveKit call reservation was already claimed"
+                )
+            raise RuntimeError("Inbound LiveKit provider identity is already assigned")
+
+        answered_at = datetime.now(UTC)
+        call = Call(
+            tenant_id=model.tenant_id,
+            agent_id=model.id,
+            direction="inbound",
+            status="in_progress",
+            from_number=caller,
+            to_number=trunk_number,
+            provider="livekit_sip",
+            provider_call_sid=provider_call_sid,
+            started_at=answered_at,
+            answered_at=answered_at,
+            call_metadata={
+                "agent_configuration": agent_configuration_snapshot(model),
+                "conversation_type": "telephonyInbound",
+                "channel": "phone",
+                "speech_provider": "inworld",
+                "livekit_room": room_name,
+                "sip_trunk_id": attributes.get("sip.trunkID"),
+                "runtime": {
+                    "transport": "livekit_sip",
+                    "speech_provider": "inworld",
+                    "voice_runtime": _inworld_voice_runtime(profile),
+                    "llm_provider": profile.llm_provider,
+                    "llm_model": profile.llm_model,
+                    "stt_model": _inworld_stt_model(model=model, profile=profile),
+                    "stt_model_configured": configured_inworld_stt_model(profile=profile),
+                    "stt_language": _effective_stt_language(model=model, profile=profile),
+                    "stt_language_configured": profile.stt_language,
+                    "tts_model": "inworld-tts-2",
+                    "tts_delivery_mode": _inworld_delivery_mode(profile),
+                    "media_stream_started": False,
+                    "runtime_setup_state": "reserved_before_dependency_load",
+                    "cost_state": "pending_provider_billing_sync",
+                    "duration_source": "livekit_answered_runtime_clock",
+                    **recording_runtime_metadata(profile, transport="livekit_sip"),
+                },
+            },
+        )
+        db.add(call)
+        await db.flush()
+        try:
+            await _enforce_inbound_limits(
+                db,
+                model=model,
+                profile=profile,
+                current_reservation_included=True,
+            )
+        except RuntimeError as exc:
+            # Commit the answered attempt before surfacing the policy failure.
+            # The worker's cancellation-shielded outer cleanup owns terminal
+            # state, terminal outbox creation, and provider room teardown.
+            await db.commit()
+            raise InboundReservationRejectedError(
+                str(exc),
+                tenant_id=model.tenant_id,
+                agent_id=model.id,
+                call_id=call.id,
+            ) from exc
+        await db.commit()
+        return call.id
+
+
+async def _admit_inbound_call(
+    *,
+    model: AgentModel,
+    call_id: UUID,
+    room_name: str,
+    knowledge_pin: _RuntimeKnowledgePin,
+) -> None:
+    """Attach and atomically admit the immutable release for a reserved call."""
+
+    if knowledge_pin.revision_id is None or knowledge_pin.revocation_generation is None:
+        raise RuntimeError("Inbound LiveKit knowledge reservation identity is incomplete")
+    async with async_session_factory() as db:
+        call = await db.scalar(
+            select(Call)
+            .where(
+                Call.id == call_id,
+                Call.tenant_id == model.tenant_id,
+                Call.agent_id == model.id,
+                Call.direction == "inbound",
+                Call.provider == "livekit_sip",
+                Call.status == "in_progress",
+            )
+            .with_for_update()
+        )
+        if call is None:
+            raise RuntimeError("Inbound LiveKit call reservation is unavailable")
+        metadata = dict(call.call_metadata or {})
+        if metadata.get("livekit_room") != room_name:
+            raise RuntimeError("Inbound LiveKit room does not match its call reservation")
+        runtime = dict(metadata.get("runtime") or {})
+        call.call_metadata = {
+            **metadata,
+            "runtime": {
+                **runtime,
+                **knowledge_pin.runtime_metadata(),
+                "runtime_setup_state": "knowledge_reserved",
+            },
+        }
+        await db.flush()
+        admitted = await admit_inbound_livekit_knowledge_call(
+            db,
+            tenant_id=model.tenant_id,
+            agent_id=model.id,
+            call_id=call.id,
+        )
+        admitted_metadata = dict(admitted.call_metadata or {})
+        admitted_runtime = dict(admitted_metadata.get("runtime") or {})
+        admitted.call_metadata = {
+            **admitted_metadata,
+            "runtime": {
+                **admitted_runtime,
+                "runtime_setup_state": "knowledge_admitted",
+            },
+        }
+        await db.commit()
 
 
 async def _open_call(
@@ -3004,6 +3265,7 @@ async def _open_call(
                     "stt_language_configured": profile.stt_language,
                     "tts_model": "inworld-tts-2",
                     "tts_delivery_mode": _inworld_delivery_mode(profile),
+                    "media_stream_started": False,
                     **recording_runtime_metadata(profile, transport="livekit_sip"),
                     **knowledge_pin.runtime_metadata(),
                 },
@@ -3054,6 +3316,7 @@ async def _open_call(
                     "stt_language_configured": profile.stt_language,
                     "tts_model": "inworld-tts-2",
                     "tts_delivery_mode": _inworld_delivery_mode(profile),
+                    "media_stream_started": False,
                     **recording_runtime_metadata(profile, transport="livekit_sip"),
                     **knowledge_pin.runtime_metadata(),
                 },
@@ -3136,6 +3399,7 @@ async def _open_browser_call(
                 "stt_language_configured": profile.stt_language,
                 "tts_model": "inworld-tts-2",
                 "tts_delivery_mode": _inworld_delivery_mode(profile),
+                "media_stream_started": False,
                 **recording_runtime_metadata(profile, transport="livekit_webrtc"),
                 "max_duration_seconds": model.max_call_duration_seconds,
                 **knowledge_pin.runtime_metadata(),
@@ -3152,6 +3416,7 @@ async def _fail_browser_reservation(
     call_id: UUID,
     room_name: str,
     failure: BaseException,
+    knowledge_pin: _RuntimeKnowledgePin = _RuntimeKnowledgePin(),
 ) -> bool:
     """Release a browser reservation when the worker fails before session startup."""
     async with async_session_factory() as db:
@@ -3180,11 +3445,16 @@ async def _fail_browser_reservation(
                 0,
                 int((ended_at - call.answered_at).total_seconds()),
             )
+        runtime = dict(metadata.get("runtime") or {})
         call.call_metadata = {
             **metadata,
             "lifecycle_error": "livekit_browser_preopen_failure",
             "runtime_failure_type": type(failure).__name__,
             "automatic_redial_disabled": True,
+            "runtime": {
+                **runtime,
+                **knowledge_pin.runtime_metadata(),
+            },
         }
         await db.commit()
         return True
@@ -3197,6 +3467,7 @@ async def _abort_browser_preopen_despite_cancellation(
     call_id: UUID,
     room_name: str,
     failure: BaseException,
+    knowledge_pin: _RuntimeKnowledgePin = _RuntimeKnowledgePin(),
 ) -> None:
     """Terminalize and remove a failed browser job without masking its error."""
 
@@ -3208,6 +3479,7 @@ async def _abort_browser_preopen_despite_cancellation(
                 call_id=call_id,
                 room_name=room_name,
                 failure=failure,
+                knowledge_pin=knowledge_pin,
             ),
             timeout_seconds=CALL_FINALIZE_TIMEOUT_SECONDS,
             timeout_event="livekit_browser_preopen_terminalization_timed_out",
@@ -3245,6 +3517,157 @@ async def _abort_browser_preopen_despite_cancellation(
         except asyncio.CancelledError:
             # Preserve cancellation after both durable and provider resources
             # have had a chance to be released by the independent task.
+            continue
+
+
+async def _fail_inbound_preopen_call(
+    *,
+    tenant_id: UUID,
+    agent_id: UUID,
+    call_id: UUID,
+    room_name: str,
+    failure: BaseException,
+    knowledge_pin: _RuntimeKnowledgePin = _RuntimeKnowledgePin(),
+) -> bool:
+    """Terminalize only the tenant-owned inbound attempt reserved by this job."""
+
+    outbox_ids: tuple[UUID, ...] = ()
+    async with async_session_factory() as db:
+        call = await db.scalar(
+            select(Call)
+            .where(
+                Call.id == call_id,
+                Call.tenant_id == tenant_id,
+                Call.agent_id == agent_id,
+                Call.direction == "inbound",
+                Call.provider == "livekit_sip",
+            )
+            .with_for_update()
+        )
+        if call is None or call.status in TERMINAL_CALL_STATUSES:
+            return False
+        metadata = call.call_metadata if isinstance(call.call_metadata, dict) else {}
+        if metadata.get("livekit_room") != room_name:
+            return False
+        ended_at = datetime.now(UTC)
+        answered_at = call.answered_at or call.started_at or ended_at
+        if answered_at.tzinfo is None:
+            answered_at = answered_at.replace(tzinfo=UTC)
+        call.started_at = call.started_at or answered_at
+        call.answered_at = call.answered_at or answered_at
+        call.ended_at = ended_at
+        call.duration_seconds = max(
+            call.duration_seconds or 0,
+            round((ended_at - answered_at).total_seconds()),
+            1,
+        )
+        call.status = "failed"
+        runtime_value = metadata.get("runtime")
+        runtime = runtime_value if isinstance(runtime_value, dict) else {}
+        limit_rejection = isinstance(failure, InboundReservationRejectedError)
+        call.call_metadata = {
+            **metadata,
+            "lifecycle_error": (
+                "livekit_inbound_limit_rejection"
+                if limit_rejection
+                else "livekit_inbound_preopen_failure"
+            ),
+            "runtime_failure_type": type(failure).__name__,
+            "automatic_redial_disabled": True,
+            "runtime": {
+                **runtime,
+                **knowledge_pin.runtime_metadata(),
+                "runtime_setup_state": (
+                    "rejected_before_dependency_load"
+                    if limit_rejection
+                    else "failed_before_session_start"
+                ),
+                "cost_state": "pending_provider_billing_sync",
+                "duration_source": runtime.get("duration_source")
+                or "minimum_answered_runtime_start_failure",
+            },
+        }
+        outbox_ids = await persist_provider_callback_actions(
+            db,
+            call_id=call.id,
+            tenant_id=call.tenant_id,
+            campaign_id=call.campaign_id,
+            process_completed_call=True,
+            process_revision=f"livekit:failed:{ended_at.isoformat()}",
+            process_event_type="call.completed",
+            continue_campaign=False,
+        )
+        await db.commit()
+    if outbox_ids:
+        from app.tasks.campaign_tasks import dispatch_provider_callback_outbox
+
+        for outbox_id in outbox_ids:
+            try:
+                dispatch_provider_callback_outbox.delay(str(outbox_id))
+            except Exception:
+                logger.warning(
+                    "livekit_inbound_preopen_outbox_kick_failed",
+                    extra={"outbox_id": str(outbox_id), "call_id": str(call_id)},
+                )
+    return True
+
+
+async def _abort_inbound_preopen_despite_cancellation(
+    *,
+    tenant_id: UUID,
+    agent_id: UUID,
+    call_id: UUID,
+    room_name: str,
+    failure: BaseException,
+    knowledge_pin: _RuntimeKnowledgePin = _RuntimeKnowledgePin(),
+) -> None:
+    """Durably fail and hang up one answered inbound attempt."""
+
+    async def cleanup() -> None:
+        cleanup_context = {
+            "call_id": str(call_id),
+            "room_ref": _safe_log_identifier("room", room_name),
+        }
+        terminalized = await _run_bounded_cleanup(
+            _fail_inbound_preopen_call(
+                tenant_id=tenant_id,
+                agent_id=agent_id,
+                call_id=call_id,
+                room_name=room_name,
+                failure=failure,
+                knowledge_pin=knowledge_pin,
+            ),
+            timeout_seconds=CALL_FINALIZE_TIMEOUT_SECONDS,
+            timeout_event="livekit_inbound_preopen_terminalization_timed_out",
+            failure_event="livekit_inbound_preopen_terminalization_failed",
+            context=cleanup_context,
+        )
+        if terminalized is not True:
+            logger.warning("livekit_inbound_preopen_cleanup_not_owned", extra=cleanup_context)
+            return
+        removed = await _run_bounded_cleanup(
+            delete_browser_room(
+                url=settings.livekit_url,
+                api_key=settings.livekit_api_key,
+                api_secret=settings.livekit_api_secret,
+                room_name=room_name,
+            ),
+            timeout_seconds=ROOM_DELETE_TIMEOUT_SECONDS,
+            timeout_event="livekit_inbound_preopen_room_cleanup_timed_out",
+            failure_event="livekit_inbound_preopen_room_cleanup_failed",
+            context=cleanup_context,
+        )
+        if removed is not True:
+            logger.warning(
+                "livekit_inbound_preopen_room_cleanup_unconfirmed",
+                extra=cleanup_context,
+            )
+
+    cleanup_task = asyncio.create_task(cleanup())
+    while not cleanup_task.done():
+        try:
+            await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError:
             continue
 
 
@@ -3383,10 +3806,21 @@ async def _finish_call(
         ended_at = datetime.now(UTC)
         call.ended_at = ended_at
         call.status = "failed" if failure is not None else "completed"
-        if call.answered_at:
-            call.duration_seconds = max(0, int((ended_at - call.answered_at).total_seconds()))
         runtime = dict((call.call_metadata or {}).get("runtime") or {})
         runtime.update(usage)
+        failed_before_media = failure is not None and runtime.get("media_stream_started") is False
+        if call.answered_at:
+            answered_at = call.answered_at
+            if answered_at.tzinfo is None:
+                answered_at = answered_at.replace(tzinfo=UTC)
+            call.duration_seconds = max(
+                call.duration_seconds or 0,
+                int((ended_at - answered_at).total_seconds()),
+                1 if failed_before_media and call.provider == "livekit_sip" else 0,
+            )
+        if failed_before_media:
+            runtime["cost_state"] = "pending_provider_billing_sync"
+            runtime["runtime_setup_state"] = "failed_before_session_start"
         metadata = {**(call.call_metadata or {}), "runtime": runtime}
         if failure is not None:
             metadata.update(
@@ -3442,6 +3876,9 @@ async def vav_inworld_session(ctx: JobContext) -> None:
     variables: ProviderVariables = {}
     sip_direction: str | None = None
     inbound_route_context: dict[str, str] | None = None
+    inbound_reserved_call_id: UUID | None = None
+    inbound_route_tenant_id: UUID | None = None
+    inbound_route_agent_id: UUID | None = None
     knowledge_pin = _RuntimeKnowledgePin()
     try:
         await ctx.connect()
@@ -3512,21 +3949,46 @@ async def vav_inworld_session(ctx: JobContext) -> None:
                 )
                 dispatched_call_id = dispatch.call_id
             else:
-                model, profile, api_keys, knowledge_pin = await _resolve_inbound_runtime(
+                model, profile = await _resolve_inbound_route(
                     inbound_trunk_id=inbound_trunk_id,
                     called_number=called_number,
                 )
+                inbound_route_tenant_id = model.tenant_id
+                inbound_route_agent_id = model.id
+                inbound_reserved_call_id = await _reserve_inbound_call(
+                    model=model,
+                    profile=profile,
+                    room_name=ctx.room.name,
+                    attributes=attributes,
+                )
+                model, profile, api_keys, knowledge_pin = await _load_inbound_runtime(
+                    tenant_id=model.tenant_id,
+                    agent_id=model.id,
+                )
+                await _admit_inbound_call(
+                    model=model,
+                    call_id=inbound_reserved_call_id,
+                    room_name=ctx.room.name,
+                    knowledge_pin=knowledge_pin,
+                )
                 dispatched_call_id = None
-            call_id = await _open_call(
-                model=model,
-                profile=profile,
-                room_name=ctx.room.name,
-                attributes=attributes,
-                dispatched_call_id=dispatched_call_id,
-                variables=variables,
-                knowledge_pin=knowledge_pin,
-            )
+            if sip_direction == "outbound":
+                call_id = await _open_call(
+                    model=model,
+                    profile=profile,
+                    room_name=ctx.room.name,
+                    attributes=attributes,
+                    dispatched_call_id=dispatched_call_id,
+                    variables=variables,
+                    knowledge_pin=knowledge_pin,
+                )
+            else:
+                call_id = inbound_reserved_call_id
     except BaseException as exc:
+        if isinstance(exc, InboundReservationRejectedError):
+            inbound_reserved_call_id = exc.call_id
+            inbound_route_tenant_id = exc.tenant_id
+            inbound_route_agent_id = exc.agent_id
         if (
             browser_session
             and not isinstance(exc, BrowserReservationAlreadyClaimedError)
@@ -3540,13 +4002,37 @@ async def vav_inworld_session(ctx: JobContext) -> None:
                 call_id=dispatch.call_id,
                 room_name=ctx.room.name,
                 failure=exc,
+                knowledge_pin=knowledge_pin,
             )
-        elif sip_direction == "inbound":
+        elif (
+            sip_direction == "inbound"
+            and inbound_reserved_call_id is not None
+            and inbound_route_tenant_id is not None
+            and inbound_route_agent_id is not None
+            and not isinstance(exc, InboundReservationAlreadyClaimedError)
+        ):
+            await _abort_inbound_preopen_despite_cancellation(
+                tenant_id=inbound_route_tenant_id,
+                agent_id=inbound_route_agent_id,
+                call_id=inbound_reserved_call_id,
+                room_name=ctx.room.name,
+                failure=exc,
+                knowledge_pin=knowledge_pin,
+            )
+        elif sip_direction == "inbound" and not isinstance(
+            exc, InboundReservationAlreadyClaimedError
+        ):
             logger.error(
                 "livekit_inbound_preopen_failed",
                 extra={
                     **(inbound_route_context or {}),
                     "failure_type": type(exc).__name__,
+                    "participant_was_active": True,
+                    "billing_state": (
+                        "tenant_attempt_terminalized"
+                        if inbound_route_tenant_id is not None
+                        else "unattributed_provider_reconciliation_required"
+                    ),
                 },
             )
         elif (
@@ -4455,6 +4941,7 @@ async def vav_inworld_session(ctx: JobContext) -> None:
             agent=runtime_agent,
             room_options=production_room_options(),
         )
+        usage_totals["media_stream_started"] = True
         telemetry.mark_session_ready()
         session_ready_at = time.monotonic()
         preparation_overlap_end = min(

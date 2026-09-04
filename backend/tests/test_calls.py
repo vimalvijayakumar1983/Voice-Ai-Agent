@@ -12,19 +12,446 @@ from httpx import AsyncClient
 from sqlalchemy import func, select
 
 from app.api.v1.endpoints import calls as calls_endpoint
-from app.models.agent import Agent, AgentKnowledgeBinding
+from app.models.agent import Agent, AgentKnowledgeBinding, AgentRuntimeProfile
 from app.models.audit import AuditEvent
 from app.models.call import Call
 from app.models.compliance import DncEntry
+from app.services.knowledge_serving import (
+    KNOWLEDGE_ADMISSION_STATE,
+    knowledge_admission_is_durable,
+)
 from app.services.phone_numbers import normalize_e164, tenant_phone_dnc_lock
+from app.services.provider_credentials import store_provider_config
+from app.services.twilio_route_security import (
+    load_workspace_twilio_route_credential,
+    mark_twilio_route_verified,
+)
 from app.tasks import call_tasks
 from tests.conftest import test_session_factory as session_factory
+from tests.knowledge_test_utils import publish_test_knowledge
+
+TEST_TWILIO_ACCOUNT_SID = "AC" + "5" * 32
+TEST_TWILIO_AUTH_TOKEN = "workspace-native-outbound-token"
+
+
+async def _mark_verified_twilio_route(db, tenant_id, profile: AgentRuntimeProfile) -> None:
+    await store_provider_config(
+        db,
+        tenant_id,
+        "twilio",
+        {
+            "account_sid": TEST_TWILIO_ACCOUNT_SID,
+            "auth_token": TEST_TWILIO_AUTH_TOKEN,
+            "default_from_number": profile.assigned_numbers[0],
+        },
+    )
+    credential = await load_workspace_twilio_route_credential(db, tenant_id)
+    assert credential is not None
+    mark_twilio_route_verified(
+        profile,
+        credential,
+        expected_voice_url=(
+            f"{calls_endpoint.settings.base_url.rstrip('/')}/api/v1/webhooks/twilio/voice/inbound"
+        ),
+    )
 
 
 def test_e164_normalization_handles_common_import_formats():
     assert normalize_e164("+971 (50) 123-4567") == "+971501234567"
     assert normalize_e164("00971 50 123 4567") == "+971501234567"
     assert normalize_e164("0501234567") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("voice_provider", "voice_id"),
+    [("sarvam", "sarvam:ishita"), ("elevenlabs", "elevenlabs:voice-1")],
+)
+async def test_native_outbound_call_is_immutably_admitted_before_provider_io(
+    client,
+    auth_headers,
+    tenant,
+    db,
+    monkeypatch,
+    voice_provider,
+    voice_id,
+):
+    agent = Agent(
+        tenant_id=tenant.id,
+        name=f"{voice_provider} immutable outbound",
+        system_prompt="Answer from approved evidence only.",
+        voice_provider=voice_provider,
+        voice_id=voice_id,
+        language="en",
+        supported_languages=["en"],
+    )
+    db.add(agent)
+    await db.flush()
+    from_number = "+15550100002"
+    profile = AgentRuntimeProfile(
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        enabled=True,
+        status="active",
+        telephony_provider="twilio",
+        primary_speech_provider=voice_provider,
+        llm_provider="openai",
+        llm_model="gpt-4o-mini",
+        stt_language="en",
+        assigned_numbers=[from_number],
+        max_concurrent_calls=3,
+        daily_call_limit=100,
+        monthly_budget_cents=10000,
+    )
+    db.add(profile)
+    await _mark_verified_twilio_route(db, tenant.id, profile)
+    knowledge, revision = await publish_test_knowledge(
+        db,
+        tenant_id=tenant.id,
+        agent=agent,
+        label=f"{voice_provider} outbound",
+    )
+    await db.commit()
+
+    observed = {}
+
+    async def make_call(_request):
+        async with session_factory() as inspect_db:
+            admitted = await inspect_db.scalar(
+                select(Call).where(
+                    Call.agent_id == agent.id,
+                    Call.to_number == "+15550100001",
+                )
+            )
+            assert admitted is not None
+            observed["metadata"] = admitted.call_metadata
+            observed["status"] = admitted.status
+        return SimpleNamespace(provider_call_sid=f"CA-{voice_provider}-outbound")
+
+    provider_credentials = []
+
+    def provider_factory(**kwargs):
+        provider_credentials.append(kwargs)
+        return SimpleNamespace(make_call=make_call)
+
+    monkeypatch.setattr(
+        calls_endpoint,
+        "get_telephony_provider",
+        provider_factory,
+    )
+    monkeypatch.setattr(call_tasks.reconcile_call_dispatch, "apply_async", Mock())
+    monkeypatch.setattr(call_tasks.reconcile_direct_call_terminal, "apply_async", Mock())
+
+    response = await client.post(
+        "/api/v1/calls",
+        headers={
+            **auth_headers,
+            "Idempotency-Key": f"native-{voice_provider}-immutable-outbound-0001",
+        },
+        json={
+            "agent_id": str(agent.id),
+            "to_number": "+15550100001",
+            "from_number": from_number,
+        },
+    )
+
+    assert response.status_code == 201
+    assert observed["status"] == "dispatching"
+    assert knowledge_admission_is_durable(observed["metadata"])
+    runtime = observed["metadata"]["runtime"]
+    assert runtime["knowledge_admission_state"] == KNOWLEDGE_ADMISSION_STATE
+    assert runtime["knowledge_serving_revision_id"] == str(revision.id)
+    assert runtime["knowledge_serving_knowledge_base_id"] == str(knowledge.id)
+    assert runtime["knowledge_serving_content_sha256"] == revision.content_sha256
+    assert runtime["knowledge_source_revision_sha256"] == revision.source_revision_sha256
+    assert runtime["knowledge_serving_revocation_generation"] == 0
+    assert runtime["media_stream_started"] is False
+    callback_binding = observed["metadata"]["telephony_credential_binding"]
+    assert callback_binding["source"] == "workspace"
+    assert callback_binding["account_sid"] == TEST_TWILIO_ACCOUNT_SID
+    assert len(callback_binding["credential_fingerprint"]) == 64
+    assert TEST_TWILIO_AUTH_TOKEN not in str(callback_binding)
+    assert provider_credentials == [
+        {
+            "account_sid": TEST_TWILIO_ACCOUNT_SID,
+            "auth_token": TEST_TWILIO_AUTH_TOKEN,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_native_outbound_call_without_immutable_knowledge_fails_before_provider_io(
+    client,
+    auth_headers,
+    tenant,
+    db,
+    monkeypatch,
+):
+    agent = Agent(
+        tenant_id=tenant.id,
+        name="Unpublished native outbound",
+        system_prompt="Never serve mutable knowledge.",
+        voice_provider="sarvam",
+        voice_id="sarvam:ishita",
+    )
+    db.add(agent)
+    await db.flush()
+    profile = AgentRuntimeProfile(
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        enabled=True,
+        status="active",
+        telephony_provider="twilio",
+        primary_speech_provider="sarvam",
+        assigned_numbers=["+15550100002"],
+    )
+    db.add(profile)
+    await _mark_verified_twilio_route(db, tenant.id, profile)
+    await db.commit()
+    provider_call = AsyncMock()
+    monkeypatch.setattr(
+        calls_endpoint,
+        "get_telephony_provider",
+        lambda **_kwargs: SimpleNamespace(make_call=provider_call),
+    )
+
+    response = await client.post(
+        "/api/v1/calls",
+        headers={**auth_headers, "Idempotency-Key": "native-missing-release-0001"},
+        json={
+            "agent_id": str(agent.id),
+            "to_number": "+15550100001",
+            "from_number": "+15550100002",
+        },
+    )
+
+    assert response.status_code == 409
+    assert "Approve and publish" in response.json()["detail"]
+    provider_call.assert_not_awaited()
+    assert await db.scalar(select(func.count()).select_from(Call)) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("voice_provider", "voice_id"),
+    [("sarvam", "sarvam:ishita"), ("elevenlabs", "elevenlabs:voice-1")],
+)
+async def test_native_outbound_never_inherits_platform_twilio_credentials(
+    client,
+    auth_headers,
+    tenant,
+    db,
+    monkeypatch,
+    voice_provider,
+    voice_id,
+):
+    monkeypatch.setattr(calls_endpoint.settings, "twilio_account_sid", "AC" + "9" * 32)
+    monkeypatch.setattr(
+        calls_endpoint.settings,
+        "twilio_auth_token",
+        "platform_twilio_token_must_not_be_used",
+    )
+    monkeypatch.setattr(
+        calls_endpoint.settings,
+        "twilio_default_from_number",
+        "+15550100002",
+    )
+    provider_call = AsyncMock()
+    monkeypatch.setattr(
+        calls_endpoint,
+        "get_telephony_provider",
+        lambda **_kwargs: SimpleNamespace(make_call=provider_call),
+    )
+    agent = Agent(
+        tenant_id=tenant.id,
+        name=f"{voice_provider} platform credential isolation",
+        system_prompt="Use tenant-owned telephony only.",
+        voice_provider=voice_provider,
+        voice_id=voice_id,
+    )
+    db.add(agent)
+    await db.flush()
+    db.add(
+        AgentRuntimeProfile(
+            tenant_id=tenant.id,
+            agent_id=agent.id,
+            enabled=True,
+            status="active",
+            telephony_provider="twilio",
+            primary_speech_provider=voice_provider,
+            assigned_numbers=["+15550100002"],
+        )
+    )
+    await db.commit()
+
+    response = await client.post(
+        "/api/v1/calls",
+        headers={
+            **auth_headers,
+            "Idempotency-Key": f"native-{voice_provider}-no-platform-twilio-0001",
+        },
+        json={
+            "agent_id": str(agent.id),
+            "to_number": "+15550100001",
+            "from_number": "+15550100002",
+        },
+    )
+
+    assert response.status_code == 409
+    assert "workspace's own Twilio" in response.json()["detail"]
+    provider_call.assert_not_awaited()
+    assert await db.scalar(select(func.count()).select_from(Call)) == 0
+
+
+@pytest.mark.asyncio
+async def test_terminal_unknown_call_does_not_consume_native_outbound_concurrency(
+    client,
+    auth_headers,
+    tenant,
+    db,
+    monkeypatch,
+):
+    agent = Agent(
+        tenant_id=tenant.id,
+        name="Released watchdog slot",
+        system_prompt="Answer from approved evidence only.",
+        voice_provider="sarvam",
+        voice_id="sarvam:ishita",
+        language="en",
+        supported_languages=["en"],
+    )
+    db.add(agent)
+    await db.flush()
+    from_number = "+15550100002"
+    profile = AgentRuntimeProfile(
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        enabled=True,
+        status="active",
+        telephony_provider="twilio",
+        primary_speech_provider="sarvam",
+        llm_provider="openai",
+        llm_model="gpt-4o-mini",
+        stt_language="en",
+        assigned_numbers=[from_number],
+        max_concurrent_calls=1,
+        daily_call_limit=100,
+        monthly_budget_cents=10000,
+    )
+    db.add(profile)
+    await _mark_verified_twilio_route(db, tenant.id, profile)
+    await publish_test_knowledge(
+        db,
+        tenant_id=tenant.id,
+        agent=agent,
+        label="Released watchdog slot",
+    )
+    db.add(
+        Call(
+            tenant_id=tenant.id,
+            agent_id=agent.id,
+            direction="outbound",
+            status="terminal_unknown",
+            from_number=from_number,
+            to_number="+15550100003",
+            provider="twilio",
+            provider_call_sid="CA-terminal-unknown-released-slot",
+            started_at=datetime.now(UTC),
+            ended_at=datetime.now(UTC),
+        )
+    )
+    await db.commit()
+
+    provider_call = AsyncMock(
+        return_value=SimpleNamespace(provider_call_sid="CA-after-terminal-unknown")
+    )
+    monkeypatch.setattr(
+        calls_endpoint,
+        "get_telephony_provider",
+        lambda **_kwargs: SimpleNamespace(make_call=provider_call),
+    )
+    monkeypatch.setattr(call_tasks.reconcile_call_dispatch, "apply_async", Mock())
+    monkeypatch.setattr(call_tasks.reconcile_direct_call_terminal, "apply_async", Mock())
+
+    response = await client.post(
+        "/api/v1/calls",
+        headers={
+            **auth_headers,
+            "Idempotency-Key": "terminal-unknown-released-slot-0001",
+        },
+        json={
+            "agent_id": str(agent.id),
+            "to_number": "+15550100001",
+            "from_number": from_number,
+        },
+    )
+
+    assert response.status_code == 201
+    provider_call.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_native_outbound_call_with_corrupt_lexicon_release_fails_before_provider_io(
+    client,
+    auth_headers,
+    tenant,
+    db,
+    monkeypatch,
+):
+    agent = Agent(
+        tenant_id=tenant.id,
+        name="Corrupt release outbound",
+        system_prompt="Never serve an unverifiable release.",
+        voice_provider="sarvam",
+        voice_id="sarvam:ishita",
+        language="en",
+        supported_languages=["en"],
+    )
+    db.add(agent)
+    await db.flush()
+    profile = AgentRuntimeProfile(
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        enabled=True,
+        status="active",
+        telephony_provider="twilio",
+        primary_speech_provider="sarvam",
+        assigned_numbers=["+15550100002"],
+    )
+    db.add(profile)
+    await _mark_verified_twilio_route(db, tenant.id, profile)
+    _knowledge, revision = await publish_test_knowledge(
+        db,
+        tenant_id=tenant.id,
+        agent=agent,
+        label="Corrupt release",
+    )
+    revision.manifest = {
+        key: value for key, value in revision.manifest.items() if key != "speech_lexicon"
+    }
+    await db.commit()
+
+    provider_call = AsyncMock(return_value="must-not-be-called")
+    monkeypatch.setattr(
+        calls_endpoint,
+        "get_telephony_provider",
+        lambda **_kwargs: SimpleNamespace(make_call=provider_call),
+    )
+
+    response = await client.post(
+        "/api/v1/calls",
+        headers={**auth_headers, "Idempotency-Key": "native-corrupt-release-0001"},
+        json={
+            "agent_id": str(agent.id),
+            "to_number": "+15550100001",
+            "from_number": "+15550100002",
+        },
+    )
+
+    assert response.status_code == 409
+    assert "integrity validation" in response.json()["detail"]
+    provider_call.assert_not_awaited()
+    assert await db.scalar(select(func.count()).select_from(Call)) == 0
 
 
 @pytest.mark.asyncio

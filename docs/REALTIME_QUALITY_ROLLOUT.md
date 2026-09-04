@@ -14,9 +14,16 @@ has deployed or **Test readiness** is green.
 - Editing a source returns the draft to review but does not alter the active
   release. Explicit approval revocation is the only normal action that clears
   the serving pointers.
-- Browser, inbound SIP, and outbound SIP calls resolve a serving revision when
-  the call is reserved. The revision ID and hashes remain fixed for that call,
-  even if another release is approved while it is running.
+- Browser, LiveKit SIP, and VAV-native Twilio calls resolve a serving revision
+  when the call is reserved. The revision ID and hashes remain fixed for that
+  call, even if another release is approved while it is running.
+- Each native Twilio call grants exactly one durable media-session claim. A
+  duplicate WebSocket must fail closed without terminalizing the winning
+  session or writing its metrics.
+- A tenant Twilio DID is routable only after VAV proves that the tenant-owned
+  account owns it and that Twilio sends voice requests directly by `POST` to
+  the current VAV inbound URL. Shared platform credentials are not routing
+  authority for tenant-owned Sarvam or ElevenLabs agents.
 - An invalid, foreign, or unbound call pin fails closed. It must never fall
   forward to mutable content or the newest release.
 - `single_pass_experimental` is enabled per agent. VAV does not randomly split
@@ -39,6 +46,8 @@ Before deployment, from `backend`, require:
 python -m pytest tests/test_tier1_quality.py tests/test_exact_fact_retrieval.py tests/test_speech_lexicon.py tests/test_knowledge_serving.py -q
 python -m pytest tests/test_inworld_single_pass.py tests/test_greeting_cache.py tests/test_audio_replay_canary.py -q
 python -m pytest tests/test_inworld_provider.py tests/test_livekit_provider.py tests/test_livekit_browser_session.py tests/test_call_metadata.py -q
+python -m pytest tests/test_native_realtime_knowledge.py tests/test_native_twilio_inbound_limits.py tests/test_native_knowledge_admission_postgres.py tests/test_calls.py tests/test_workspace_provider_credentials.py -q
+python -m pytest tests/test_twilio_route_security.py tests/test_twilio_route_security_postgres.py tests/test_twilio_webhooks.py tests/test_realtime_session_finalization.py tests/test_cost_reporting.py -q
 ruff check app tests scripts migrations
 alembic heads
 ```
@@ -104,15 +113,40 @@ window is not the desired steady state.
 9. Before deploying the exact-`024` application or worker, verify every
    production-bound knowledge base has both immutable pointers and a readable
    serving revision with searchable revision sources. This includes every base
-   bound to an active Inworld agent or assigned production route. An inactive,
-   pending-review, or non-searchable base must be deliberately removed from
-   production routing or repaired and approved; it must not be counted as
-   successfully backfilled.
-10. Only after that verification succeeds, deploy the same full release SHA to
-    API, Celery, frontend, and `livekit-agent`. Its readiness probe requires
-    exactly `20260904_024`, closing the compatibility window after all new-call
-    paths can obtain immutable pins.
-11. Complete the QA gates below for the canary tenant before promoting traffic.
+   bound to an active Inworld, Sarvam, or ElevenLabs agent, and every base whose
+   agent owns an assigned production route. An inactive, pending-review, or
+   non-searchable base must be deliberately removed from production routing or
+   repaired and approved; it must not be counted as successfully backfilled.
+10. Before replacing the compatibility bridge, pause native Twilio outbound
+    dispatch and move every Sarvam/ElevenLabs production DID to the approved
+    maintenance TwiML route. The bridge cannot stamp immutable pins on those
+    calls. Drain its existing native Twilio calls, respecting the largest
+    configured call-duration limit, and require this PostgreSQL check to return
+    zero rows:
+
+    ```sql
+    SELECT id, direction, status, started_at
+    FROM calls
+    WHERE provider = 'twilio'
+      AND status NOT IN (
+            'completed', 'failed', 'busy', 'no_answer', 'canceled', 'cancelled'
+          )
+      AND COALESCE(
+            metadata->'runtime'->>'speech_provider',
+            metadata->>'speech_provider'
+          ) IN ('sarvam', 'elevenlabs');
+    ```
+
+    Do not waive this gate by adopting mutable legacy knowledge. Retain the
+    maintenance route until the exact-`024` API is healthy and one canary for
+    each enabled native provider has produced a durable call pin.
+11. Only after the knowledge verification and native-call drain both succeed,
+    deploy the same full release SHA to API, Celery, frontend, and
+    `livekit-agent`. Its readiness probe requires exactly `20260904_024`,
+    closing the compatibility window after all new-call paths can obtain
+    immutable pins. Restore each production DID and outbound dispatch only
+    after its canary passes.
+12. Complete the QA gates below for the canary tenant before promoting traffic.
 
 The serving-revision backfill can create a missing lexicon itself, but running
 the lexicon job first makes each artifact class independently observable and
@@ -148,13 +182,87 @@ audit and in-flight calls while the knowledge base exists. The explicit
 permanent-delete operation is a separate data-erasure boundary and cannot run
 until every call pinned to that knowledge base is terminal.
 
-For outbound SIP, confirm the reservation also contains
+For LiveKit SIP and VAV-native Twilio outbound calls, confirm the reservation also contains
 `knowledge_admission_state=admitted_before_dispatch` and
-`knowledge_admitted_at` before the LiveKit provider request begins. That
+`knowledge_admitted_at` before the telephony provider request begins. That
 durable boundary prevents a later revoke or rebind from turning an already
 dialed/answered call into silence; the call continues only on its admitted
-immutable release. Browser and inbound calls admit when the verified
+immutable release. Browser and inbound LiveKit SIP calls admit when the verified
 participant joins and therefore remain fail-closed to an earlier revoke.
+Inbound Sarvam/ElevenLabs calls instead persist
+`knowledge_admission_state=admitted_before_media_stream` before VAV returns
+Twilio's streaming TwiML. A duplicate signed `CallSid` may reuse that media URL
+only when its provider, direction, numbers, agent, transport, speech provider,
+and inbound admission marker all match the original reservation.
+The same transaction reserves the agent's daily-call, concurrent-call, and
+monthly-budget capacity before inserting an active call. Limit exhaustion,
+missing knowledge, or a corrupt release must create at most one terminal audit
+row per `CallSid` and return the controlled unavailable-and-hang-up TwiML; none
+may escape as a provider-visible HTTP 500. The local per-agent guard gives
+single-process SQLite environments the same distinct-`CallSid` limit behavior;
+PostgreSQL's transaction advisory lock remains the production cross-replica
+authority.
+
+Readiness checks the release and retained lexicon identity without loading
+compiled source bodies; aggregate source checks keep the operation bounded for
+large websites. If an authenticated Twilio media stream cannot load its pinned
+runtime configuration, VAV row-locks and terminalizes only that nonterminal
+inbound reservation so it cannot consume capacity indefinitely. Delayed voice
+or nonterminal status callbacks cannot reopen `terminal_unknown`; only a
+definitive provider outcome may reconcile it. A rejected inbound call is marked
+answered with a one-second minimum estimate and
+`cost_state=pending_provider_billing_sync` until the provider callback supplies
+the exact billable duration.
+
+LiveKit SIP inbound follows the same accounting principle. The worker first
+persists an answered, pending-reconciliation Call reservation and only then
+loads credentials and immutable knowledge. A dependency, capacity, revocation,
+or session-start failure terminalizes that exact reservation, emits the normal
+completion outbox action, and removes the LiveKit room under cancellation
+shielding. A duplicate SIP job cannot fail or delete the legitimate owner.
+
+Greeting prewarm may make a paid TTS request before `session.start()` succeeds.
+When that occurs, cost reporting includes the observed direct TTS characters
+and keeps provider reconciliation pending, while it does not invent STT or LLM
+usage. `media_stream_started=false` means the conversational speech pipeline
+never opened; it does not mean a separately evidenced prewarm request was free.
+
+## Provider and route readiness
+
+**Test readiness** is a paid, rate-limited production-boundary test, not a
+credential-presence check. Before Sarvam or ElevenLabs activation it must prove:
+
+- ownership and direct-POST configuration of every assigned Twilio DID;
+- the selected primary TTS voice;
+- the exact Sarvam Saaras realtime STT language and WebSocket handshake;
+- Sarvam emergency TTS when ElevenLabs is primary; and
+- the selected OpenAI model's required tool-calling contract.
+
+Each result is reported separately and bounded so one stalled provider cannot
+hold the request indefinitely. An absent workspace speech/LLM credential may
+use the explicitly configured platform key; an existing but unreadable
+workspace credential always fails closed and must never fall through to that
+key.
+
+Saving, rotating, or deleting Twilio, LiveKit SIP, Sarvam, ElevenLabs, Inworld,
+or OpenAI credentials returns every dependent active profile to draft. Re-run
+**Test readiness** and explicitly activate each affected agent. Provider
+boundary locks, agent-runtime locks, and credential-row locks are acquired in
+that order so rotation cannot race activation.
+
+After this release, every existing tenant-owned Twilio profile lacks the new
+route proof until it is re-verified. Do not bulk-edit database status fields or
+blindly deactivate routes with a migration. For each production agent, confirm
+the number's Twilio Voice Configuration uses the exact current VAV URL and
+`POST`, run **Test readiness**, then activate it. Changing the credential,
+assigned DID set, public `BASE_URL`, callback URL, or method invalidates the
+proof and requires the same process.
+
+Outbound calls persist whether their callback authority is tenant-owned or the
+explicit legacy platform account, along with a non-reversible credential
+fingerprint. Voice and status callbacks accept only that bound account and
+credential; a missing or unreadable tenant credential cannot be replaced by a
+platform signature.
 
 ## Two-tier quality gates
 

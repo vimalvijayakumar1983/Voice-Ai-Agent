@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
+import json
 from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlsplit
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from sqlalchemy import or_, select, text
+from sqlalchemy import func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
@@ -31,6 +34,8 @@ from app.models.provider_credential import ProviderCredential
 from app.providers.elevenlabs import ElevenLabsClient, ElevenLabsError
 from app.providers.inworld import INWORLD_TTS_MODEL, InworldClient, InworldError
 from app.providers.openai import OpenAIProviderClient, OpenAIProviderError
+from app.providers.sarvam import SarvamAIClient, SarvamAIError
+from app.realtime.sarvam_stream import SarvamStreamError, SarvamSTTStream
 from app.schemas.runtime import (
     ApiKeyCredentialRequest,
     RuntimeProfileResponse,
@@ -47,27 +52,54 @@ from app.services.integration_security import (
     IntegrationConfigUnavailableError,
     decrypt_integration_config,
 )
+from app.services.knowledge_serving import (
+    KnowledgeServingError,
+    knowledge_call_reservation_metadata,
+    load_durably_admitted_serving_revision,
+    validate_call_speech_lexicon_reservation,
+)
 from app.services.provider_credentials import (
     ProviderCredentialError,
     get_provider_credential,
+    invalidate_active_runtimes_for_credential,
     load_provider_config,
     lock_provider_cleanup_boundary,
+    lock_provider_runtime_boundaries,
     store_provider_config,
 )
 from app.services.rate_limit import enforce_rate_limit
 from app.services.realtime_speech_config import (
     inworld_stt_wire_language,
     resolve_inworld_stt_model,
+    sarvam_stt_wire_language,
 )
 from app.services.recording_policy import (
     DIAGNOSTIC_RECORDING_OFF,
     diagnostic_recording_mode,
+)
+from app.services.twilio_route_security import (
+    TwilioRouteVerificationError,
+    active_twilio_route_conflicts,
+    load_workspace_twilio_route_credential,
+    lock_twilio_route_claims,
+    mark_twilio_route_verified,
+    twilio_route_verification_fingerprint,
+    twilio_route_verification_is_current,
+    verify_twilio_route_ownership,
 )
 from app.telephony.livekit_provider import LiveKitSIPError, LiveKitSIPProvider
 
 router = APIRouter(prefix="/runtime", tags=["Realtime Runtime"])
 
 _SMALLEST_CLEANUP_PROVIDER = "smallest"
+_TWILIO_REVERIFICATION_BLOCKER = (
+    "Verify this workspace's Twilio credentials and assigned numbers before activation."
+)
+_NATIVE_LIVE_PROBE_TIMEOUT_SECONDS = 12.0
+
+
+def _twilio_inbound_voice_url() -> str:
+    return f"{settings.base_url.rstrip('/')}/api/v1/webhooks/twilio/voice/inbound"
 
 
 async def _has_pending_smallest_cleanup(db: AsyncSession, tenant_id: UUID) -> bool:
@@ -106,6 +138,238 @@ def _api_key_configured(config: dict | None, platform_key: str) -> bool:
     if config is not None:
         return bool(str(config.get("api_key") or "").strip())
     return bool(str(platform_key or "").strip())
+
+
+async def _live_api_key(
+    db: AsyncSession,
+    tenant_id: UUID,
+    provider: str,
+    platform_key: str,
+) -> tuple[str, bool]:
+    """Resolve a live-probe key without bypassing an unreadable workspace secret."""
+
+    try:
+        config = await load_provider_config(db, tenant_id, provider)
+    except ProviderCredentialError:
+        return "", True
+    if config is not None:
+        return str(config.get("api_key") or "").strip(), False
+    return str(platform_key or "").strip(), False
+
+
+async def _sarvam_stt_readiness_probe(*, api_key: str, language_code: str) -> None:
+    """Prove the same bounded Saaras WebSocket handshake used by paid calls."""
+
+    async with SarvamSTTStream(
+        api_key=api_key,
+        base_url=settings.sarvam_base_url,
+        language_code=language_code,
+    ):
+        return
+
+
+async def _bounded_native_live_probe(operation: Any) -> Exception | None:
+    """Return a probe failure while preserving request cancellation semantics."""
+
+    try:
+        await asyncio.wait_for(operation, timeout=_NATIVE_LIVE_PROBE_TIMEOUT_SECONDS)
+    except Exception as exc:
+        return exc
+    return None
+
+
+def _native_live_probe_failure(
+    *,
+    label: str,
+    error: Exception,
+    provider_errors: tuple[type[Exception], ...],
+) -> str:
+    if isinstance(error, TimeoutError):
+        return f"{label} timed out after {_NATIVE_LIVE_PROBE_TIMEOUT_SECONDS:g} seconds."
+    if isinstance(error, provider_errors):
+        return f"{label} failed: {error}"
+    return f"{label} failed unexpectedly."
+
+
+async def _native_speech_live_readiness(
+    db: AsyncSession,
+    agent: Agent,
+    profile: AgentRuntimeProfile | None,
+    blockers: list[str],
+    checks: dict[str, bool],
+) -> tuple[list[str], dict[str, bool]]:
+    """Prove every paid provider boundary in Sarvam and ElevenLabs calls."""
+
+    provider = agent.voice_provider
+    checks["tts_provider_live"] = False
+    checks["stt_provider_live"] = False
+    checks["llm_provider_live"] = False
+    if provider == "elevenlabs":
+        checks["fallback_tts_provider_live"] = False
+
+    if profile is None or not checks.get("provider_compatibility"):
+        blockers.append(
+            "Native speech providers cannot be tested until the runtime provider route matches."
+        )
+        return blockers, checks
+
+    sarvam_key, sarvam_unreadable = await _live_api_key(
+        db,
+        agent.tenant_id,
+        "sarvam",
+        settings.sarvam_api_key,
+    )
+    elevenlabs_key = ""
+    elevenlabs_unreadable = False
+    if provider == "elevenlabs":
+        elevenlabs_key, elevenlabs_unreadable = await _live_api_key(
+            db,
+            agent.tenant_id,
+            "elevenlabs",
+            settings.elevenlabs_api_key,
+        )
+    openai_key, openai_unreadable = await _live_api_key(
+        db,
+        agent.tenant_id,
+        "openai",
+        settings.openai_api_key,
+    )
+
+    probes: dict[str, tuple[Any, str, tuple[type[Exception], ...]]] = {}
+    if provider == "sarvam":
+        if sarvam_unreadable:
+            blockers.append(
+                "Sarvam live TTS synthesis cannot run because the workspace credential "
+                "is unreadable."
+            )
+        elif not sarvam_key:
+            blockers.append(
+                "Sarvam live TTS synthesis cannot be tested until its API key is configured."
+            )
+        elif checks.get("voice_selection"):
+            probes["tts_provider_live"] = (
+                SarvamAIClient(api_key=sarvam_key).synthesize_voice_preview(
+                    speaker=agent.voice_id.removeprefix("sarvam:"),
+                    language=agent.language,
+                    pace=agent.speech_rate,
+                ),
+                "Sarvam live TTS synthesis",
+                (SarvamAIError,),
+            )
+        else:
+            blockers.append(
+                "Sarvam live TTS synthesis cannot be tested until a Sarvam voice is selected."
+            )
+    else:
+        if elevenlabs_unreadable:
+            blockers.append(
+                "ElevenLabs live TTS synthesis cannot run because the workspace credential "
+                "is unreadable."
+            )
+        elif not elevenlabs_key:
+            blockers.append(
+                "ElevenLabs live TTS synthesis cannot be tested until its API key is configured."
+            )
+        elif checks.get("voice_selection"):
+            probes["tts_provider_live"] = (
+                ElevenLabsClient(api_key=elevenlabs_key).synthesize_voice_preview(
+                    voice_id=agent.voice_id.removeprefix("elevenlabs:"),
+                    language=agent.language,
+                    speed=agent.speech_rate,
+                ),
+                "ElevenLabs live TTS synthesis",
+                (ElevenLabsError,),
+            )
+        else:
+            blockers.append(
+                "ElevenLabs live TTS synthesis cannot be tested until an ElevenLabs voice "
+                "is selected."
+            )
+
+        if sarvam_unreadable:
+            blockers.append(
+                "Sarvam emergency TTS synthesis cannot run because the workspace credential "
+                "is unreadable."
+            )
+        elif not sarvam_key:
+            blockers.append(
+                "Sarvam emergency TTS synthesis cannot be tested until its API key is configured."
+            )
+        else:
+            probes["fallback_tts_provider_live"] = (
+                SarvamAIClient(api_key=sarvam_key).synthesize_voice_preview(
+                    speaker="ishita",
+                    language=agent.language,
+                    pace=agent.speech_rate,
+                ),
+                "Sarvam emergency TTS synthesis",
+                (SarvamAIError,),
+            )
+
+    if sarvam_unreadable:
+        blockers.append(
+            "Sarvam Saaras realtime STT validation cannot run because the workspace "
+            "credential is unreadable."
+        )
+    elif not sarvam_key:
+        blockers.append(
+            "Sarvam Saaras realtime STT validation cannot be tested until its API key is "
+            "configured."
+        )
+    else:
+        try:
+            stt_language = sarvam_stt_wire_language(model=agent, profile=profile)
+        except SarvamAIError as exc:
+            blockers.append(f"Sarvam Saaras realtime STT configuration is invalid: {exc}")
+        else:
+            probes["stt_provider_live"] = (
+                _sarvam_stt_readiness_probe(
+                    api_key=sarvam_key,
+                    language_code=stt_language,
+                ),
+                "Sarvam Saaras realtime STT validation",
+                (SarvamStreamError,),
+            )
+
+    if openai_unreadable:
+        blockers.append(
+            "OpenAI live tool-calling validation cannot run because the workspace credential "
+            "is unreadable."
+        )
+    elif not openai_key:
+        blockers.append(
+            "OpenAI live tool-calling validation cannot be tested until its API key is configured."
+        )
+    elif profile.llm_provider != "openai":
+        blockers.append(
+            "OpenAI live tool-calling validation requires the OpenAI LLM runtime route."
+        )
+    else:
+        probes["llm_provider_live"] = (
+            OpenAIProviderClient(api_key=openai_key).tool_readiness_probe(
+                model_id=profile.llm_model
+            ),
+            "OpenAI live tool-calling check",
+            (OpenAIProviderError,),
+        )
+
+    if not probes:
+        return blockers, checks
+    names = list(probes)
+    results = await asyncio.gather(*(_bounded_native_live_probe(probes[name][0]) for name in names))
+    for name, error in zip(names, results, strict=True):
+        if error is None:
+            checks[name] = True
+            continue
+        _operation, label, provider_errors = probes[name]
+        blockers.append(
+            _native_live_probe_failure(
+                label=label,
+                error=error,
+                provider_errors=provider_errors,
+            )
+        )
+    return blockers, checks
 
 
 def _diagnostic_recording_mode(profile: AgentRuntimeProfile | None) -> str:
@@ -250,6 +514,181 @@ async def _agent(db: AsyncSession, tenant_id: UUID, agent_id: UUID) -> Agent:
     return agent
 
 
+async def _lock_runtime_mutation(
+    db: AsyncSession,
+    tenant_id: UUID,
+    agent_id: UUID,
+    *,
+    create_profile: bool = False,
+) -> tuple[Agent, AgentRuntimeProfile | None]:
+    """Serialize every runtime configuration state transition for one agent."""
+    if db.get_bind().dialect.name == "postgresql":
+        await db.execute(
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:route_key, 0))"),
+            {"route_key": f"agent-runtime:{tenant_id}:{agent_id}"},
+        )
+    agent = await db.scalar(
+        select(Agent)
+        .where(Agent.id == agent_id, Agent.tenant_id == tenant_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if agent is None:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    profile = await db.scalar(
+        select(AgentRuntimeProfile)
+        .where(
+            AgentRuntimeProfile.agent_id == agent_id,
+            AgentRuntimeProfile.tenant_id == tenant_id,
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if profile is None and create_profile:
+        profile = AgentRuntimeProfile(tenant_id=tenant_id, agent_id=agent_id)
+        db.add(profile)
+        await db.flush()
+    return agent, profile
+
+
+def _activation_configuration_fingerprint(
+    agent: Agent,
+    profile: AgentRuntimeProfile,
+    *,
+    dependency_fingerprints: dict[str, str],
+) -> str:
+    runtime_config = profile.runtime_config if isinstance(profile.runtime_config, dict) else {}
+    runtime_config = {
+        key: value for key, value in runtime_config.items() if key != "twilio_route_verification"
+    }
+    payload = {
+        "agent": {
+            "is_active": agent.is_active,
+            "voice_provider": agent.voice_provider,
+            "voice_id": agent.voice_id,
+            "language": agent.language,
+            "supported_languages": agent.supported_languages,
+        },
+        "profile": {
+            "enabled": profile.enabled,
+            "status": profile.status,
+            "telephony_provider": profile.telephony_provider,
+            "primary_speech_provider": profile.primary_speech_provider,
+            "fallback_speech_provider": profile.fallback_speech_provider,
+            "llm_provider": profile.llm_provider,
+            "llm_model": profile.llm_model,
+            "stt_language": profile.stt_language,
+            "max_concurrent_calls": profile.max_concurrent_calls,
+            "daily_call_limit": profile.daily_call_limit,
+            "monthly_budget_cents": profile.monthly_budget_cents,
+            "assigned_numbers": profile.assigned_numbers,
+            "runtime_config": runtime_config,
+        },
+        "dependency_fingerprints": dependency_fingerprints,
+    }
+    return hashlib.sha256(
+        json.dumps(payload, default=str, separators=(",", ":"), sort_keys=True).encode()
+    ).hexdigest()
+
+
+def _runtime_dependency_providers(profile: AgentRuntimeProfile) -> set[str]:
+    providers = {
+        profile.primary_speech_provider,
+        profile.llm_provider,
+        profile.telephony_provider,
+    }
+    if profile.fallback_speech_provider:
+        providers.add(profile.fallback_speech_provider)
+    if profile.primary_speech_provider == "elevenlabs":
+        providers.add("sarvam")
+    return providers.intersection(
+        {"sarvam", "elevenlabs", "inworld", "openai", "twilio", "livekit_sip"}
+    )
+
+
+def _config_fingerprint(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(value, default=str, separators=(",", ":"), sort_keys=True).encode()
+    ).hexdigest()
+
+
+async def _activation_dependency_fingerprints(
+    db: AsyncSession,
+    agent: Agent,
+    profile: AgentRuntimeProfile,
+    *,
+    for_update: bool = False,
+) -> dict[str, str]:
+    fingerprints: dict[str, str] = {}
+    for provider in sorted(_runtime_dependency_providers(profile)):
+        try:
+            config = await load_provider_config(
+                db,
+                agent.tenant_id,
+                provider,
+                for_update=for_update,
+            )
+        except ProviderCredentialError:
+            effective_config: dict[str, Any] = {"state": "unreadable"}
+        else:
+            if config is not None:
+                effective_config = {"source": "workspace", "config": config}
+            elif provider in {"twilio", "livekit_sip"}:
+                effective_config = {"source": "none", "config": {}}
+            else:
+                effective_config = {
+                    "source": "platform",
+                    "config": _platform_credential_config(provider),
+                }
+        fingerprints[provider] = _config_fingerprint(effective_config)
+    if profile.telephony_provider == "livekit_sip":
+        fingerprints["livekit_environment"] = _config_fingerprint(
+            {
+                "url": settings.livekit_url,
+                "api_key": settings.livekit_api_key,
+                "api_secret": settings.livekit_api_secret,
+                "agent_name": settings.livekit_agent_name,
+                "worker_health_url": settings.livekit_worker_health_url,
+            }
+        )
+    return fingerprints
+
+
+async def _activation_snapshot_fingerprint(
+    db: AsyncSession,
+    agent: Agent,
+    profile: AgentRuntimeProfile,
+    *,
+    lock_credential: bool = False,
+) -> str:
+    dependency_fingerprints = await _activation_dependency_fingerprints(
+        db,
+        agent,
+        profile,
+        for_update=lock_credential,
+    )
+    if profile.telephony_provider == "twilio":
+        try:
+            credential = await load_workspace_twilio_route_credential(
+                db,
+                agent.tenant_id,
+                for_update=lock_credential,
+            )
+        except ProviderCredentialError:
+            credential = None
+        if credential is not None:
+            dependency_fingerprints["twilio_route"] = twilio_route_verification_fingerprint(
+                credential,
+                list(profile.assigned_numbers or []),
+                expected_voice_url=_twilio_inbound_voice_url(),
+            )
+    return _activation_configuration_fingerprint(
+        agent,
+        profile,
+        dependency_fingerprints=dependency_fingerprints,
+    )
+
+
 async def _profile(
     db: AsyncSession,
     tenant_id: UUID,
@@ -274,10 +713,28 @@ async def _number_route_conflicts(
     db: AsyncSession,
     agent: Agent,
     profile: AgentRuntimeProfile | None,
+    *,
+    verify_legacy_twilio_claims: bool = False,
 ) -> list[Agent]:
     """Return active agents that already own one of this profile's phone routes."""
     if profile is None or not profile.assigned_numbers:
         return []
+
+    if profile.telephony_provider == "twilio":
+        try:
+            credential = await load_workspace_twilio_route_credential(db, agent.tenant_id)
+        except ProviderCredentialError:
+            return []
+        if credential is None:
+            return []
+        return await active_twilio_route_conflicts(
+            db,
+            agent_id=agent.id,
+            account_sid=credential.account_sid,
+            assigned_numbers=list(profile.assigned_numbers),
+            expected_voice_url=_twilio_inbound_voice_url(),
+            verify_legacy_claims=verify_legacy_twilio_claims,
+        )
 
     rows = (
         await db.execute(
@@ -310,7 +767,25 @@ async def _lock_number_routes(
     agent: Agent,
     profile: AgentRuntimeProfile,
 ) -> None:
-    """Serialize activation for the same tenant/provider/number on PostgreSQL."""
+    """Serialize activation for the route's real ownership boundary."""
+    if profile.telephony_provider == "twilio":
+        try:
+            credential = await load_workspace_twilio_route_credential(
+                db,
+                agent.tenant_id,
+                for_update=True,
+            )
+        except ProviderCredentialError:
+            return
+        if credential is None:
+            return
+        await lock_twilio_route_claims(
+            db,
+            credential=credential,
+            assigned_numbers=list(profile.assigned_numbers or []),
+        )
+        return
+
     bind = db.get_bind()
     if bind.dialect.name != "postgresql":
         return
@@ -326,21 +801,28 @@ async def runtime_readiness(
     db: AsyncSession,
     agent: Agent,
     profile: AgentRuntimeProfile | None,
+    *,
+    verify_legacy_twilio_claims: bool = False,
 ) -> tuple[list[str], dict[str, bool]]:
     try:
         sarvam_config = await load_provider_config(db, agent.tenant_id, "sarvam")
     except ProviderCredentialError:
         sarvam_config = None
-    sarvam_ready = bool(
-        (sarvam_config and sarvam_config.get("api_key")) or settings.sarvam_api_key.strip()
+        sarvam_config_unreadable = True
+    else:
+        sarvam_config_unreadable = False
+    sarvam_ready = not sarvam_config_unreadable and _api_key_configured(
+        sarvam_config, settings.sarvam_api_key
     )
     try:
         elevenlabs_config = await load_provider_config(db, agent.tenant_id, "elevenlabs")
     except ProviderCredentialError:
         elevenlabs_config = None
-    elevenlabs_ready = bool(
-        (elevenlabs_config and elevenlabs_config.get("api_key"))
-        or settings.elevenlabs_api_key.strip()
+        elevenlabs_config_unreadable = True
+    else:
+        elevenlabs_config_unreadable = False
+    elevenlabs_ready = not elevenlabs_config_unreadable and _api_key_configured(
+        elevenlabs_config, settings.elevenlabs_api_key
     )
     try:
         inworld_config = await load_provider_config(db, agent.tenant_id, "inworld")
@@ -369,11 +851,14 @@ async def runtime_readiness(
             AgentKnowledgeBinding.tenant_id == agent.tenant_id,
         )
     )
-    # The production Inworld lane is intended for governed customer-facing
-    # agents, so all new calls require an immutable, published serving release.
-    # Mutable approval-only rows remain readable only by already-persisted calls
-    # during the bounded migration window.
-    immutable_knowledge_required = bool(profile and profile.primary_speech_provider == "inworld")
+    # Every VAV-owned realtime lane retrieves from the local knowledge engine,
+    # regardless of which speech provider renders the call. New Sarvam,
+    # ElevenLabs, and Inworld sessions all require the same immutable release;
+    # mutable approval-only rows remain a bounded compatibility concern only
+    # for already-persisted legacy jobs.
+    immutable_knowledge_required = bool(
+        profile and profile.primary_speech_provider in {"sarvam", "elevenlabs", "inworld"}
+    )
     knowledge_ready = not immutable_knowledge_required
     if knowledge_binding is not None:
         approval_clause = (
@@ -384,35 +869,83 @@ async def runtime_readiness(
                 KnowledgeBase.approval_status == "approved",
             )
         )
-        bound_knowledge = await db.scalar(
-            select(KnowledgeBase).where(
-                KnowledgeBase.id == knowledge_binding.knowledge_base_id,
-                KnowledgeBase.tenant_id == agent.tenant_id,
-                KnowledgeBase.is_active.is_(True),
-                approval_clause,
+        bound_knowledge = (
+            await db.execute(
+                select(
+                    KnowledgeBase.id,
+                    KnowledgeBase.serving_revision_id,
+                    KnowledgeBase.serving_revocation_generation,
+                ).where(
+                    KnowledgeBase.id == knowledge_binding.knowledge_base_id,
+                    KnowledgeBase.tenant_id == agent.tenant_id,
+                    KnowledgeBase.is_active.is_(True),
+                    approval_clause,
+                )
             )
-        )
+        ).one_or_none()
         if bound_knowledge is None:
             knowledge_ready = False
         else:
-            if bound_knowledge.serving_revision_id is not None:
-                source_contents = (
-                    await db.scalars(
-                        select(KnowledgeServingRevisionSource.content).where(
-                            KnowledgeServingRevisionSource.serving_revision_id
-                            == bound_knowledge.serving_revision_id,
-                            KnowledgeServingRevisionSource.tenant_id == agent.tenant_id,
-                        )
-                    )
-                ).all()
-                knowledge_ready = bool(source_contents) and all(
-                    bool(str(content or "").strip()) for content in source_contents
+            knowledge_base_id, serving_revision_id, revocation_generation = bound_knowledge
+            if serving_revision_id is not None:
+                serving_revision = await load_durably_admitted_serving_revision(
+                    db,
+                    tenant_id=agent.tenant_id,
+                    knowledge_base_id=knowledge_base_id,
+                    serving_revision_id=serving_revision_id,
+                    include_sources=False,
                 )
+                try:
+                    if serving_revision is None:
+                        raise KnowledgeServingError("Knowledge serving revision is unavailable")
+                    reservation = knowledge_call_reservation_metadata(
+                        serving_revision,
+                        revocation_generation,
+                    )
+                    await validate_call_speech_lexicon_reservation(
+                        db,
+                        tenant_id=agent.tenant_id,
+                        knowledge_base_id=knowledge_base_id,
+                        revision=serving_revision,
+                        metadata={"runtime": reservation},
+                    )
+                except KnowledgeServingError:
+                    knowledge_ready = False
+                else:
+                    source_groups = (
+                        await db.execute(
+                            select(
+                                KnowledgeServingRevisionSource.knowledge_base_id,
+                                func.count(KnowledgeServingRevisionSource.id),
+                            )
+                            .where(
+                                KnowledgeServingRevisionSource.serving_revision_id
+                                == serving_revision_id,
+                                KnowledgeServingRevisionSource.tenant_id == agent.tenant_id,
+                            )
+                            .group_by(KnowledgeServingRevisionSource.knowledge_base_id)
+                        )
+                    ).all()
+                    # Published source snapshots are immutable and carry
+                    # non-null content hashes. Requiring one ownership group
+                    # with the exact published count proves the complete
+                    # release is retained and prevents a mis-owned row from
+                    # entering retrieval, without de-TOASTing every potentially
+                    # multi-megabyte body on readiness.
+                    knowledge_ready = (
+                        serving_revision.source_count > 0
+                        and len(source_groups) == 1
+                        and source_groups[0].knowledge_base_id == knowledge_base_id
+                        and int(source_groups[0][1] or 0) == serving_revision.source_count
+                    )
             else:
+                # Preserve Python's Unicode-aware ``strip`` semantics for the
+                # bounded legacy compatibility path. Current VAV providers use
+                # immutable releases above and never load their source bodies.
                 source_states = (
                     await db.execute(
                         select(KnowledgeSource.status, KnowledgeSource.content).where(
-                            KnowledgeSource.knowledge_base_id == bound_knowledge.id,
+                            KnowledgeSource.knowledge_base_id == knowledge_base_id,
                             KnowledgeSource.tenant_id == agent.tenant_id,
                         )
                     )
@@ -423,7 +956,12 @@ async def runtime_readiness(
                     for status, content in source_states
                 )
 
-    number_route_conflicts = await _number_route_conflicts(db, agent, profile)
+    number_route_conflicts = await _number_route_conflicts(
+        db,
+        agent,
+        profile,
+        verify_legacy_twilio_claims=verify_legacy_twilio_claims,
+    )
 
     vav_speech_agent = agent.voice_provider in {"sarvam", "elevenlabs", "inworld"}
     tts_ready = {
@@ -476,9 +1014,26 @@ async def runtime_readiness(
     recording_checks, recording_labels = _diagnostic_recording_readiness(profile)
     checks.update(recording_checks)
     if profile and profile.telephony_provider == "twilio":
+        # A self-service DID route must prove ownership with this workspace's
+        # own account credential. Shared platform credentials are never a
+        # tenant-routing authority.
         checks["telephony_credential"] = bool(
-            (twilio_config and twilio_config.get("account_sid") and twilio_config.get("auth_token"))
-            or (settings.twilio_account_sid and settings.twilio_auth_token)
+            twilio_config and twilio_config.get("account_sid") and twilio_config.get("auth_token")
+        )
+        try:
+            route_credential = await load_workspace_twilio_route_credential(
+                db,
+                agent.tenant_id,
+            )
+        except ProviderCredentialError:
+            route_credential = None
+        checks["twilio_route_verification_current"] = bool(
+            route_credential
+            and twilio_route_verification_is_current(
+                profile,
+                route_credential,
+                expected_voice_url=_twilio_inbound_voice_url(),
+            )
         )
     elif profile and profile.telephony_provider == "livekit_sip":
         try:
@@ -524,11 +1079,16 @@ async def runtime_readiness(
         ),
         "llm_credential": "Add a valid API key for the selected LLM route.",
         "public_runtime_url": "Configure BASE_URL as the public HTTPS API origin.",
-        "telephony_credential": "Add credentials for the selected telephony provider in Settings.",
+        "telephony_credential": (
+            "Add this workspace's own Twilio account SID and auth token in Settings."
+            if profile and profile.telephony_provider == "twilio"
+            else "Add credentials for the selected telephony provider in Settings."
+        ),
         "number_assigned": "Assign at least one E.164 phone number to the runtime.",
         "number_route_unique": (
             "Move the assigned phone number from its other active agent before activation."
         ),
+        "twilio_route_verification_current": _TWILIO_REVERIFICATION_BLOCKER,
         "knowledge_retrieval": (
             (
                 "Approve and publish the bound knowledge base so it has an immutable "
@@ -562,9 +1122,23 @@ async def live_runtime_readiness(
     db: AsyncSession,
     agent: Agent,
     profile: AgentRuntimeProfile | None,
+    *,
+    persist_twilio_verification: bool = True,
 ) -> tuple[list[str], dict[str, bool]]:
     """Run normal gates plus explicit, tightly bounded live provider probes."""
     blockers, checks = await runtime_readiness(db, agent, profile)
+    if profile and profile.telephony_provider == "twilio":
+        live_conflicts = await _number_route_conflicts(
+            db,
+            agent,
+            profile,
+            verify_legacy_twilio_claims=True,
+        )
+        if live_conflicts and checks.get("number_route_unique", True):
+            checks["number_route_unique"] = False
+            blockers.append(
+                "Move the assigned phone number from its other active agent before activation."
+            )
     if profile and profile.telephony_provider == "livekit_sip":
         checks["sip_route_live"] = False
         checks["livekit_worker_live"] = False
@@ -625,7 +1199,58 @@ async def live_runtime_readiness(
                 checks["livekit_worker_live"] = True
         else:
             blockers.append("LiveKit worker cannot be tested until its configuration gates pass.")
-    if agent.voice_provider not in {"elevenlabs", "inworld"}:
+    if profile and profile.telephony_provider == "twilio" and "telephony_credential" in checks:
+        checks["twilio_route_live"] = False
+        if all(
+            checks.get(name)
+            for name in (
+                "telephony_credential",
+                "number_assigned",
+                "number_route_unique",
+            )
+        ):
+            try:
+                credential = await load_workspace_twilio_route_credential(
+                    db,
+                    agent.tenant_id,
+                )
+                if credential is None:
+                    raise TwilioRouteVerificationError(
+                        "Twilio workspace credentials are unavailable"
+                    )
+                await verify_twilio_route_ownership(
+                    credential=credential,
+                    assigned_numbers=list(profile.assigned_numbers or []),
+                    expected_voice_url=_twilio_inbound_voice_url(),
+                )
+            except (ProviderCredentialError, TwilioRouteVerificationError) as exc:
+                blockers.append(f"Twilio inbound route validation failed: {exc}")
+            else:
+                if persist_twilio_verification:
+                    mark_twilio_route_verified(
+                        profile,
+                        credential,
+                        expected_voice_url=_twilio_inbound_voice_url(),
+                    )
+                checks["twilio_route_live"] = True
+                checks["twilio_route_verification_current"] = True
+                blockers = [
+                    blocker for blocker in blockers if blocker != _TWILIO_REVERIFICATION_BLOCKER
+                ]
+        else:
+            blockers.append(
+                "Twilio inbound route cannot be tested until its credential, number, and "
+                "uniqueness gates pass."
+            )
+    if agent.voice_provider in {"sarvam", "elevenlabs"}:
+        return await _native_speech_live_readiness(
+            db,
+            agent,
+            profile,
+            blockers,
+            checks,
+        )
+    if agent.voice_provider != "inworld":
         return blockers, checks
 
     checks["tts_provider_live"] = False
@@ -653,19 +1278,6 @@ async def live_runtime_readiness(
     api_key = str(
         ((config or {}).get("api_key") or "") if config is not None else platform_key
     ).strip()
-    if provider == "elevenlabs":
-        try:
-            await ElevenLabsClient(api_key=api_key).synthesize_voice_preview(
-                voice_id=agent.voice_id.removeprefix("elevenlabs:"),
-                language=agent.language,
-                speed=agent.speech_rate,
-            )
-        except ElevenLabsError as exc:
-            blockers.append(f"ElevenLabs live synthesis failed: {exc}")
-            return blockers, checks
-        checks["tts_provider_live"] = True
-        return blockers, checks
-
     inworld = InworldClient(api_key=api_key)
     runtime_config = profile.runtime_config if isinstance(profile.runtime_config, dict) else {}
     voice_runtime = str(runtime_config.get("voice_runtime") or "pipeline")
@@ -859,8 +1471,12 @@ async def update_runtime_profile(
     current_user: CurrentUser = Depends(require_role("owner", "admin")),
     db: AsyncSession = Depends(get_db),
 ):
-    agent = await _agent(db, current_user.tenant_id, agent_id)
-    profile = await _profile(db, current_user.tenant_id, agent_id, create=True)
+    agent, profile = await _lock_runtime_mutation(
+        db,
+        current_user.tenant_id,
+        agent_id,
+        create_profile=True,
+    )
     assert profile is not None
     payload = data.model_dump(
         exclude={
@@ -952,7 +1568,76 @@ async def test_runtime_profile(
     agent = await _agent(db, current_user.tenant_id, agent_id)
     profile = await _profile(db, current_user.tenant_id, agent_id, create=True)
     assert profile is not None
-    blockers, checks = await live_runtime_readiness(db, agent, profile)
+    probe_profile_fingerprint = _activation_configuration_fingerprint(
+        agent,
+        profile,
+        dependency_fingerprints={},
+    )
+    probe_fingerprint = await _activation_snapshot_fingerprint(db, agent, profile)
+    await db.commit()
+    blockers, checks = await live_runtime_readiness(
+        db,
+        agent,
+        profile,
+        persist_twilio_verification=False,
+    )
+    await db.commit()
+    # Runtime admission and credential mutation share the global lock order:
+    # provider boundary -> agent runtime -> credential rows.
+    await lock_provider_runtime_boundaries(
+        db,
+        current_user.tenant_id,
+        _runtime_dependency_providers(profile),
+    )
+    agent, profile = await _lock_runtime_mutation(
+        db,
+        current_user.tenant_id,
+        agent_id,
+        create_profile=True,
+    )
+    assert profile is not None
+    if (
+        _activation_configuration_fingerprint(
+            agent,
+            profile,
+            dependency_fingerprints={},
+        )
+        != probe_profile_fingerprint
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Runtime configuration changed during readiness verification. "
+                "Run the readiness test again."
+            ),
+        )
+    current_fingerprint = await _activation_snapshot_fingerprint(
+        db,
+        agent,
+        profile,
+        lock_credential=True,
+    )
+    if current_fingerprint != probe_fingerprint:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Runtime configuration changed during readiness verification. "
+                "Run the readiness test again."
+            ),
+        )
+    if profile.telephony_provider == "twilio" and checks.get("twilio_route_live"):
+        credential = await load_workspace_twilio_route_credential(
+            db,
+            agent.tenant_id,
+            for_update=True,
+        )
+        if credential is None:
+            raise HTTPException(status_code=409, detail="Twilio workspace credential changed")
+        mark_twilio_route_verified(
+            profile,
+            credential,
+            expected_voice_url=_twilio_inbound_voice_url(),
+        )
     tested_at = datetime.now(UTC)
     profile.last_tested_at = tested_at
     if blockers:
@@ -960,7 +1645,9 @@ async def test_runtime_profile(
         # Transient provider/API failures must be visible, but an ordinary test
         # must never silently remove an active inbound route. Activation still
         # fails closed, and administrators can deactivate explicitly.
-        if not profile.enabled:
+        if profile.enabled:
+            profile.status = "active"
+        else:
             profile.status = "blocked"
     else:
         # Testing an already-active runtime is observational; it must not demote
@@ -1010,8 +1697,64 @@ async def activate_runtime_profile(
     agent = await _agent(db, current_user.tenant_id, agent_id)
     profile = await _profile(db, current_user.tenant_id, agent_id, create=True)
     assert profile is not None
-    await _lock_number_routes(db, agent, profile)
-    blockers, _checks = await live_runtime_readiness(db, agent, profile)
+    probe_profile_fingerprint = _activation_configuration_fingerprint(
+        agent,
+        profile,
+        dependency_fingerprints={},
+    )
+    probe_fingerprint = await _activation_snapshot_fingerprint(db, agent, profile)
+    # Release ordinary ORM read state before bounded provider I/O. The final
+    # transition reacquires a shared mutation lock and rejects any change made
+    # while the probe was in flight.
+    await db.commit()
+    blockers, _checks = await live_runtime_readiness(
+        db,
+        agent,
+        profile,
+        persist_twilio_verification=False,
+    )
+    await db.commit()
+    await lock_provider_runtime_boundaries(
+        db,
+        current_user.tenant_id,
+        _runtime_dependency_providers(profile),
+    )
+    agent, profile = await _lock_runtime_mutation(
+        db,
+        current_user.tenant_id,
+        agent_id,
+        create_profile=True,
+    )
+    assert profile is not None
+    if (
+        _activation_configuration_fingerprint(
+            agent,
+            profile,
+            dependency_fingerprints={},
+        )
+        != probe_profile_fingerprint
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Runtime configuration changed during readiness verification. "
+                "Review the latest configuration and activate again."
+            ),
+        )
+    current_fingerprint = await _activation_snapshot_fingerprint(
+        db,
+        agent,
+        profile,
+        lock_credential=True,
+    )
+    if current_fingerprint != probe_fingerprint:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Runtime configuration changed during readiness verification. "
+                "Review the latest configuration and activate again."
+            ),
+        )
     if blockers:
         profile.enabled = False
         profile.status = "blocked"
@@ -1035,6 +1778,29 @@ async def activate_runtime_profile(
         raise HTTPException(
             status_code=409,
             detail={"message": "Runtime is not ready", "blockers": blockers},
+        )
+    if profile.telephony_provider == "twilio":
+        credential = await load_workspace_twilio_route_credential(
+            db,
+            agent.tenant_id,
+            for_update=True,
+        )
+        if credential is None:
+            raise HTTPException(status_code=409, detail="Twilio workspace credential changed")
+        mark_twilio_route_verified(
+            profile,
+            credential,
+            expected_voice_url=_twilio_inbound_voice_url(),
+        )
+    await _lock_number_routes(db, agent, profile)
+    final_blockers, _final_checks = await runtime_readiness(db, agent, profile)
+    if final_blockers:
+        profile.enabled = False
+        profile.status = "blocked"
+        await db.commit()
+        raise HTTPException(
+            status_code=409,
+            detail={"message": "Runtime is not ready", "blockers": final_blockers},
         )
     profile.enabled = True
     profile.status = "active"
@@ -1060,8 +1826,12 @@ async def deactivate_runtime_profile(
     current_user: CurrentUser = Depends(require_role("owner", "admin")),
     db: AsyncSession = Depends(get_db),
 ):
-    agent = await _agent(db, current_user.tenant_id, agent_id)
-    profile = await _profile(db, current_user.tenant_id, agent_id, create=True)
+    agent, profile = await _lock_runtime_mutation(
+        db,
+        current_user.tenant_id,
+        agent_id,
+        create_profile=True,
+    )
     assert profile is not None
     profile.enabled = False
     profile.status = "inactive"
@@ -1165,22 +1935,6 @@ async def save_api_key_credential(
 ):
     if provider not in {"smallest", "sarvam", "elevenlabs", "inworld", "openai"}:
         raise HTTPException(status_code=404, detail="Unsupported API-key provider")
-    if provider == _SMALLEST_CLEANUP_PROVIDER:
-        await lock_provider_cleanup_boundary(db, current_user.tenant_id, _SMALLEST_CLEANUP_PROVIDER)
-        existing = await get_provider_credential(
-            db,
-            current_user.tenant_id,
-            provider,
-            for_update=True,
-        )
-        if (
-            existing is not None
-            and existing.is_active
-            and await _has_pending_smallest_cleanup(db, current_user.tenant_id)
-        ):
-            raise _smallest_cleanup_credential_conflict()
-    else:
-        existing = await get_provider_credential(db, current_user.tenant_id, provider)
     if provider == "elevenlabs":
         try:
             await ElevenLabsClient(api_key=data.api_key).validate_connection()
@@ -1201,6 +1955,26 @@ async def save_api_key_credential(
                 status_code=status_code,
                 detail=f"Inworld API key validation failed: {exc}",
             ) from exc
+    await lock_provider_runtime_boundaries(db, current_user.tenant_id, provider)
+    if provider == _SMALLEST_CLEANUP_PROVIDER:
+        await lock_provider_cleanup_boundary(
+            db,
+            current_user.tenant_id,
+            _SMALLEST_CLEANUP_PROVIDER,
+        )
+    existing = await get_provider_credential(db, current_user.tenant_id, provider)
+    if (
+        provider == _SMALLEST_CLEANUP_PROVIDER
+        and existing is not None
+        and existing.is_active
+        and await _has_pending_smallest_cleanup(db, current_user.tenant_id)
+    ):
+        raise _smallest_cleanup_credential_conflict()
+    invalidated_agent_ids = await invalidate_active_runtimes_for_credential(
+        db,
+        current_user.tenant_id,
+        provider,
+    )
     try:
         credential = await store_provider_config(
             db, current_user.tenant_id, provider, data.model_dump()
@@ -1214,7 +1988,10 @@ async def save_api_key_credential(
         action=("provider_credential.rotated" if existing else "provider_credential.created"),
         resource_type="provider_credential",
         resource_id=str(credential.id),
-        details={"provider": provider},
+        details={
+            "provider": provider,
+            "reverification_required_agent_ids": invalidated_agent_ids,
+        },
     )
     return await _workspace_credential_status(db, current_user.tenant_id, provider)
 
@@ -1225,6 +2002,12 @@ async def save_twilio_credential(
     current_user: CurrentUser = Depends(require_role("owner", "admin")),
     db: AsyncSession = Depends(get_db),
 ):
+    await lock_provider_runtime_boundaries(db, current_user.tenant_id, "twilio")
+    invalidated_agent_ids = await invalidate_active_runtimes_for_credential(
+        db,
+        current_user.tenant_id,
+        "twilio",
+    )
     existing = await get_provider_credential(db, current_user.tenant_id, "twilio")
     try:
         credential = await store_provider_config(
@@ -1242,7 +2025,10 @@ async def save_twilio_credential(
         action=("provider_credential.rotated" if existing else "provider_credential.created"),
         resource_type="provider_credential",
         resource_id=str(credential.id),
-        details={"provider": "twilio"},
+        details={
+            "provider": "twilio",
+            "reverification_required_agent_ids": invalidated_agent_ids,
+        },
     )
     return await _workspace_credential_status(db, current_user.tenant_id, "twilio")
 
@@ -1255,15 +2041,31 @@ async def delete_workspace_credential(
 ):
     if provider not in {"smallest", "sarvam", "elevenlabs", "inworld", "openai", "twilio"}:
         raise HTTPException(status_code=404, detail="Unsupported credential provider")
+    await lock_provider_runtime_boundaries(db, current_user.tenant_id, provider)
     if provider == _SMALLEST_CLEANUP_PROVIDER:
-        await lock_provider_cleanup_boundary(db, current_user.tenant_id, _SMALLEST_CLEANUP_PROVIDER)
+        await lock_provider_cleanup_boundary(
+            db,
+            current_user.tenant_id,
+            _SMALLEST_CLEANUP_PROVIDER,
+        )
         if await _has_pending_smallest_cleanup(db, current_user.tenant_id):
             raise _smallest_cleanup_credential_conflict()
-    credential = await get_provider_credential(
-        db, current_user.tenant_id, provider, for_update=True
-    )
+    credential = await get_provider_credential(db, current_user.tenant_id, provider)
     if credential:
         credential_id = str(credential.id)
+        invalidated_agent_ids = await invalidate_active_runtimes_for_credential(
+            db,
+            current_user.tenant_id,
+            provider,
+        )
+        credential = await get_provider_credential(
+            db,
+            current_user.tenant_id,
+            provider,
+            for_update=True,
+        )
+        if credential is None:
+            raise HTTPException(status_code=409, detail="Provider credential changed")
         await db.delete(credential)
         await db.flush()
         await record_audit_event(
@@ -1273,7 +2075,10 @@ async def delete_workspace_credential(
             action="provider_credential.deleted",
             resource_type="provider_credential",
             resource_id=credential_id,
-            details={"provider": provider},
+            details={
+                "provider": provider,
+                "reverification_required_agent_ids": invalidated_agent_ids,
+            },
         )
     return await _workspace_credential_status(db, current_user.tenant_id, provider)
 
@@ -1309,6 +2114,7 @@ async def save_sip_credential(
     current_user: CurrentUser = Depends(require_role("owner", "admin")),
     db: AsyncSession = Depends(get_db),
 ):
+    await lock_provider_runtime_boundaries(db, current_user.tenant_id, "livekit_sip")
     if db.get_bind().dialect.name == "postgresql":
         for route_id in sorted((data.inbound_trunk_id, data.dispatch_rule_id)):
             await db.execute(
@@ -1341,6 +2147,11 @@ async def save_sip_credential(
                 status_code=409,
                 detail="This LiveKit trunk or dispatch rule is already assigned",
             )
+    invalidated_agent_ids = await invalidate_active_runtimes_for_credential(
+        db,
+        current_user.tenant_id,
+        "livekit_sip",
+    )
     try:
         credential = await store_provider_config(
             db, current_user.tenant_id, "livekit_sip", data.model_dump()
@@ -1354,7 +2165,10 @@ async def save_sip_credential(
         action="provider_credential.rotated",
         resource_type="provider_credential",
         resource_id=str(credential.id),
-        details={"provider": "livekit_sip"},
+        details={
+            "provider": "livekit_sip",
+            "reverification_required_agent_ids": invalidated_agent_ids,
+        },
     )
     return SipCredentialStatus(
         configured=True,
@@ -1372,11 +2186,23 @@ async def delete_sip_credential(
     current_user: CurrentUser = Depends(require_role("owner", "admin")),
     db: AsyncSession = Depends(get_db),
 ):
-    credential = await get_provider_credential(
-        db, current_user.tenant_id, "livekit_sip", for_update=True
-    )
+    await lock_provider_runtime_boundaries(db, current_user.tenant_id, "livekit_sip")
+    credential = await get_provider_credential(db, current_user.tenant_id, "livekit_sip")
     if credential:
         credential_id = str(credential.id)
+        invalidated_agent_ids = await invalidate_active_runtimes_for_credential(
+            db,
+            current_user.tenant_id,
+            "livekit_sip",
+        )
+        credential = await get_provider_credential(
+            db,
+            current_user.tenant_id,
+            "livekit_sip",
+            for_update=True,
+        )
+        if credential is None:
+            raise HTTPException(status_code=409, detail="LiveKit SIP credential changed")
         await db.delete(credential)
         await record_audit_event(
             db,
@@ -1385,6 +2211,9 @@ async def delete_sip_credential(
             action="provider_credential.deleted",
             resource_type="provider_credential",
             resource_id=credential_id,
-            details={"provider": "livekit_sip"},
+            details={
+                "provider": "livekit_sip",
+                "reverification_required_agent_ids": invalidated_agent_ids,
+            },
         )
     return SipCredentialStatus(configured=False)

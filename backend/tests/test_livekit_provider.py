@@ -1,5 +1,6 @@
 """LiveKit SIP transport tests."""
 
+import asyncio
 import json
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -9,7 +10,7 @@ from uuid import uuid4
 import httpx
 import pytest
 from livekit import api
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.livekit_runtime import inworld_realtime as inworld_realtime_adapter
 from app.livekit_runtime import worker as livekit_worker
@@ -37,8 +38,11 @@ from app.models.agent import (
     KnowledgeSource,
 )
 from app.models.call import Call
+from app.models.campaign import ProviderCallbackOutbox
 from app.services.knowledge_serving import (
+    KnowledgeServingError,
     knowledge_admission_is_durable,
+    knowledge_call_reservation_metadata,
     pre_admit_outbound_knowledge_call,
     publish_serving_revision,
 )
@@ -259,11 +263,7 @@ async def test_pre_admitted_outbound_worker_keeps_reserved_revision_after_later_
             "runtime": {
                 "transport": "livekit_sip",
                 "speech_provider": "inworld",
-                "knowledge_serving_revision_id": str(first_revision.id),
-                "knowledge_serving_knowledge_base_id": str(first_revision.knowledge_base_id),
-                "knowledge_serving_content_sha256": first_revision.content_sha256,
-                "knowledge_source_revision_sha256": first_revision.source_revision_sha256,
-                "knowledge_serving_revocation_generation": 0,
+                **knowledge_call_reservation_metadata(first_revision, 0),
             },
         },
     )
@@ -843,7 +843,7 @@ async def test_worker_logs_only_keyed_inbound_route_references(caplog, monkeypat
 
     monkeypatch.setattr(
         livekit_worker,
-        "_resolve_inbound_runtime",
+        "_resolve_inbound_route",
         AsyncMock(side_effect=RuntimeError("route unavailable")),
     )
     open_call = AsyncMock()
@@ -867,9 +867,783 @@ async def test_worker_logs_only_keyed_inbound_route_references(caplog, monkeypat
         called_number,
     )
     assert record.room_ref == livekit_worker._safe_log_identifier("room", room_name)
+    assert record.participant_was_active is True
+    assert record.billing_state == "unattributed_provider_reconciliation_required"
     assert trunk_id not in caplog.text
     assert called_number not in caplog.text
     assert room_name not in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "runtime_failure",
+    (
+        "Inbound LiveKit calls require an immutable published knowledge revision",
+        "OpenAI credential is unavailable",
+    ),
+)
+async def test_answered_inbound_dependency_failure_is_durable_and_pending_billing(
+    db,
+    tenant,
+    monkeypatch,
+    runtime_failure,
+):
+    agent = Agent(
+        tenant_id=tenant.id,
+        name="Inbound billing-truth agent",
+        system_prompt="Use approved knowledge.",
+        voice_provider="inworld",
+        voice_id="inworld:Ashley",
+        language="en-GB",
+        max_call_duration_seconds=60,
+    )
+    db.add(agent)
+    await db.flush()
+    profile = AgentRuntimeProfile(
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        enabled=True,
+        status="active",
+        telephony_provider="livekit_sip",
+        primary_speech_provider="inworld",
+        llm_provider="openai",
+        llm_model="gpt-4o-mini",
+        stt_language="en-GB",
+        assigned_numbers=["+97141234567"],
+        max_concurrent_calls=5,
+        daily_call_limit=100,
+        monthly_budget_cents=10_000,
+    )
+    db.add(profile)
+    await db.commit()
+    tenant_id = tenant.id
+    agent_id = agent.id
+    room_name = f"vav-inbound-{uuid4()}"
+    sip_call_id = f"sip-{uuid4()}"
+
+    class Room:
+        name = room_name
+
+    class Context:
+        job = SimpleNamespace(metadata="{}")
+        room = Room()
+
+        async def connect(self):
+            return None
+
+        async def wait_for_participant(self):
+            return SimpleNamespace(
+                identity="inbound-caller",
+                attributes={
+                    "sip.callDirection": "inbound",
+                    "sip.callStatus": "active",
+                    "sip.callIDFull": sip_call_id,
+                    "sip.phoneNumber": "+971501234567",
+                    "sip.trunkID": "ST_inbound",
+                    "sip.trunkPhoneNumber": "+97141234567",
+                },
+            )
+
+    async def fail_after_durable_reservation(*, tenant_id, agent_id):
+        assert tenant_id == tenant_id_expected
+        assert agent_id == agent_id_expected
+        async with session_factory() as verification_db:
+            reserved = await verification_db.scalar(
+                select(Call).where(Call.provider_call_sid == sip_call_id)
+            )
+            assert reserved is not None
+            assert reserved.status == "in_progress"
+            assert reserved.call_metadata["runtime"]["cost_state"] == (
+                "pending_provider_billing_sync"
+            )
+        raise RuntimeError(runtime_failure)
+
+    delete_room = AsyncMock(return_value=True)
+    outbox_kick = Mock()
+    tenant_id_expected = tenant_id
+    agent_id_expected = agent_id
+    monkeypatch.setattr(livekit_worker, "async_session_factory", session_factory)
+    monkeypatch.setattr(
+        livekit_worker,
+        "_resolve_inbound_route",
+        AsyncMock(return_value=(agent, profile)),
+    )
+    monkeypatch.setattr(livekit_worker, "_load_inbound_runtime", fail_after_durable_reservation)
+    monkeypatch.setattr(livekit_worker, "delete_browser_room", delete_room)
+    monkeypatch.setattr(
+        "app.tasks.campaign_tasks.dispatch_provider_callback_outbox.delay",
+        outbox_kick,
+    )
+
+    with pytest.raises(RuntimeError, match=runtime_failure):
+        await livekit_worker.vav_inworld_session(Context())
+
+    delete_room.assert_awaited_once_with(
+        url=livekit_worker.settings.livekit_url,
+        api_key=livekit_worker.settings.livekit_api_key,
+        api_secret=livekit_worker.settings.livekit_api_secret,
+        room_name=room_name,
+    )
+    db.expire_all()
+    failed_call = await db.scalar(
+        select(Call)
+        .where(Call.provider_call_sid == sip_call_id)
+        .execution_options(populate_existing=True)
+    )
+    assert failed_call is not None
+    assert failed_call.tenant_id == tenant_id
+    assert failed_call.agent_id == agent_id
+    assert failed_call.status == "failed"
+    assert failed_call.started_at is not None
+    assert failed_call.answered_at is not None
+    assert failed_call.ended_at is not None
+    assert failed_call.duration_seconds >= 1
+    assert failed_call.call_metadata["livekit_room"] == room_name
+    assert failed_call.call_metadata["lifecycle_error"] == ("livekit_inbound_preopen_failure")
+    assert failed_call.call_metadata["runtime_failure_type"] == "RuntimeError"
+    assert failed_call.call_metadata["runtime"]["runtime_setup_state"] == (
+        "failed_before_session_start"
+    )
+    assert failed_call.call_metadata["runtime"]["cost_state"] == ("pending_provider_billing_sync")
+    assert failed_call.call_metadata["runtime"]["media_stream_started"] is False
+    assert runtime_failure not in json.dumps(failed_call.call_metadata)
+    outbox = await db.scalar(
+        select(ProviderCallbackOutbox).where(ProviderCallbackOutbox.call_id == failed_call.id)
+    )
+    assert outbox is not None
+    assert outbox.action == "process_completed_call"
+    assert outbox.status == "pending"
+    outbox_kick.assert_called_once_with(str(outbox.id))
+
+
+@pytest.mark.asyncio
+async def test_answered_inbound_limit_rejection_terminalizes_and_hangs_up(
+    db,
+    tenant,
+    monkeypatch,
+):
+    agent = Agent(
+        tenant_id=tenant.id,
+        name="Capacity-bound inbound agent",
+        system_prompt="Use approved knowledge.",
+        voice_provider="inworld",
+        voice_id="inworld:Ashley",
+        language="en-GB",
+        max_call_duration_seconds=60,
+    )
+    db.add(agent)
+    await db.flush()
+    profile = AgentRuntimeProfile(
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        enabled=True,
+        status="active",
+        telephony_provider="livekit_sip",
+        primary_speech_provider="inworld",
+        llm_provider="openai",
+        llm_model="gpt-4o-mini",
+        stt_language="en-GB",
+        assigned_numbers=["+97141234567"],
+        max_concurrent_calls=1,
+        daily_call_limit=100,
+        monthly_budget_cents=10_000,
+    )
+    existing = Call(
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        direction="inbound",
+        status="in_progress",
+        from_number="+971509999999",
+        to_number="+97141234567",
+        provider="livekit_sip",
+        provider_call_sid=f"sip-existing-{uuid4()}",
+        started_at=datetime.now(UTC),
+        answered_at=datetime.now(UTC),
+    )
+    db.add_all((profile, existing))
+    await db.commit()
+    agent_id = agent.id
+    room_name = f"vav-inbound-capacity-{uuid4()}"
+    sip_call_id = f"sip-capacity-{uuid4()}"
+
+    class Room:
+        name = room_name
+
+    class Context:
+        job = SimpleNamespace(metadata="{}")
+        room = Room()
+
+        async def connect(self):
+            return None
+
+        async def wait_for_participant(self):
+            return SimpleNamespace(
+                identity="inbound-capacity-caller",
+                attributes={
+                    "sip.callDirection": "inbound",
+                    "sip.callStatus": "active",
+                    "sip.callIDFull": sip_call_id,
+                    "sip.phoneNumber": "+971501234567",
+                    "sip.trunkID": "ST_inbound",
+                    "sip.trunkPhoneNumber": "+97141234567",
+                },
+            )
+
+    load_runtime = AsyncMock()
+    delete_room = AsyncMock(return_value=True)
+    outbox_kick = Mock()
+    monkeypatch.setattr(livekit_worker, "async_session_factory", session_factory)
+    monkeypatch.setattr(
+        livekit_worker,
+        "_resolve_inbound_route",
+        AsyncMock(return_value=(agent, profile)),
+    )
+    monkeypatch.setattr(livekit_worker, "_load_inbound_runtime", load_runtime)
+    monkeypatch.setattr(livekit_worker, "delete_browser_room", delete_room)
+    monkeypatch.setattr(
+        "app.tasks.campaign_tasks.dispatch_provider_callback_outbox.delay",
+        outbox_kick,
+    )
+
+    with pytest.raises(
+        livekit_worker.InboundReservationRejectedError,
+        match="concurrent call limit",
+    ):
+        await livekit_worker.vav_inworld_session(Context())
+
+    load_runtime.assert_not_awaited()
+    delete_room.assert_awaited_once()
+    db.expire_all()
+    rejected = await db.scalar(
+        select(Call)
+        .where(Call.provider_call_sid == sip_call_id)
+        .execution_options(populate_existing=True)
+    )
+    assert rejected is not None
+    assert rejected.agent_id == agent_id
+    assert rejected.status == "failed"
+    assert rejected.duration_seconds >= 1
+    assert rejected.call_metadata["lifecycle_error"] == "livekit_inbound_limit_rejection"
+    assert rejected.call_metadata["runtime"]["runtime_setup_state"] == (
+        "rejected_before_dependency_load"
+    )
+    assert rejected.call_metadata["runtime"]["cost_state"] == ("pending_provider_billing_sync")
+    outbox = await db.scalar(
+        select(ProviderCallbackOutbox).where(ProviderCallbackOutbox.call_id == rejected.id)
+    )
+    assert outbox is not None
+    outbox_kick.assert_called_once_with(str(outbox.id))
+
+
+@pytest.mark.asyncio
+async def test_duplicate_inbound_job_cannot_fail_or_delete_legitimate_session(
+    db,
+    tenant,
+    monkeypatch,
+):
+    agent = Agent(
+        tenant_id=tenant.id,
+        name="Duplicate-safe inbound agent",
+        system_prompt="Use approved knowledge.",
+        voice_provider="inworld",
+        voice_id="inworld:Ashley",
+        language="en-GB",
+        max_call_duration_seconds=60,
+    )
+    db.add(agent)
+    await db.flush()
+    profile = AgentRuntimeProfile(
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        enabled=True,
+        status="active",
+        telephony_provider="livekit_sip",
+        primary_speech_provider="inworld",
+        llm_provider="openai",
+        llm_model="gpt-4o-mini",
+        assigned_numbers=["+97141234567"],
+    )
+    room_name = f"vav-inbound-owner-{uuid4()}"
+    sip_call_id = f"sip-owned-{uuid4()}"
+    owner = Call(
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        direction="inbound",
+        status="in_progress",
+        from_number="+971501234567",
+        to_number="+97141234567",
+        provider="livekit_sip",
+        provider_call_sid=sip_call_id,
+        started_at=datetime.now(UTC),
+        answered_at=datetime.now(UTC),
+        call_metadata={
+            "livekit_room": room_name,
+            "runtime": {"transport": "livekit_sip"},
+        },
+    )
+    db.add_all((profile, owner))
+    await db.commit()
+    owner_id = owner.id
+
+    class Room:
+        name = room_name
+
+    class Context:
+        job = SimpleNamespace(metadata="{}")
+        room = Room()
+
+        async def connect(self):
+            return None
+
+        async def wait_for_participant(self):
+            return SimpleNamespace(
+                identity="duplicate-inbound-caller",
+                attributes={
+                    "sip.callDirection": "inbound",
+                    "sip.callStatus": "active",
+                    "sip.callIDFull": sip_call_id,
+                    "sip.phoneNumber": "+971501234567",
+                    "sip.trunkID": "ST_inbound",
+                    "sip.trunkPhoneNumber": "+97141234567",
+                },
+            )
+
+    delete_room = AsyncMock(return_value=True)
+    monkeypatch.setattr(livekit_worker, "async_session_factory", session_factory)
+    monkeypatch.setattr(
+        livekit_worker,
+        "_resolve_inbound_route",
+        AsyncMock(return_value=(agent, profile)),
+    )
+    monkeypatch.setattr(livekit_worker, "delete_browser_room", delete_room)
+
+    with pytest.raises(livekit_worker.InboundReservationAlreadyClaimedError):
+        await livekit_worker.vav_inworld_session(Context())
+
+    delete_room.assert_not_awaited()
+    db.expire_all()
+    unchanged = await db.scalar(
+        select(Call).where(Call.id == owner_id).execution_options(populate_existing=True)
+    )
+    assert unchanged is not None
+    assert unchanged.status == "in_progress"
+    assert unchanged.ended_at is None
+    assert (
+        await db.scalar(
+            select(func.count()).select_from(Call).where(Call.provider_call_sid == sip_call_id)
+        )
+        == 1
+    )
+
+
+@pytest.mark.asyncio
+async def test_inbound_knowledge_revocation_after_load_fails_exact_reservation(
+    db,
+    tenant,
+    monkeypatch,
+):
+    agent = Agent(
+        tenant_id=tenant.id,
+        name="Revocation-safe inbound agent",
+        system_prompt="Use approved evidence only.",
+        voice_provider="inworld",
+        voice_id="inworld:Ashley",
+        language="en-GB",
+        max_call_duration_seconds=60,
+    )
+    knowledge = KnowledgeBase(
+        tenant_id=tenant.id,
+        name="Inbound revision",
+        approval_status="approved",
+        sync_status="ready",
+        source_count=1,
+        indexed_source_count=1,
+        is_active=True,
+    )
+    knowledge.sources.append(
+        KnowledgeSource(
+            tenant_id=tenant.id,
+            source_type="text",
+            name="Approved facts",
+            status="indexed",
+            content="The approved support number is +971 2 111 1111.",
+        )
+    )
+    db.add_all((agent, knowledge))
+    await db.flush()
+    profile = AgentRuntimeProfile(
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        enabled=True,
+        status="active",
+        telephony_provider="livekit_sip",
+        primary_speech_provider="inworld",
+        llm_provider="openai",
+        llm_model="gpt-4o-mini",
+        assigned_numbers=["+97141234567"],
+        monthly_budget_cents=10_000,
+    )
+    db.add_all(
+        (
+            profile,
+            AgentKnowledgeBinding(
+                tenant_id=tenant.id,
+                agent_id=agent.id,
+                knowledge_base_id=knowledge.id,
+            ),
+        )
+    )
+    lexicon = await publish_speech_lexicon(
+        db,
+        tenant_id=tenant.id,
+        knowledge_base=knowledge,
+    )
+    revision = await publish_serving_revision(
+        db,
+        tenant_id=tenant.id,
+        knowledge_base=knowledge,
+        speech_lexicon=lexicon,
+    )
+    await db.commit()
+    revision_id = revision.id
+    knowledge_id = knowledge.id
+    knowledge_pin = livekit_worker._RuntimeKnowledgePin.from_revision(
+        revision,
+        revocation_generation=0,
+    )
+    room_name = f"vav-inbound-revoked-{uuid4()}"
+    sip_call_id = f"sip-revoked-{uuid4()}"
+
+    class Room:
+        name = room_name
+
+    class Context:
+        job = SimpleNamespace(metadata="{}")
+        room = Room()
+
+        async def connect(self):
+            return None
+
+        async def wait_for_participant(self):
+            return SimpleNamespace(
+                identity="inbound-revoked-caller",
+                attributes={
+                    "sip.callDirection": "inbound",
+                    "sip.callStatus": "active",
+                    "sip.callIDFull": sip_call_id,
+                    "sip.phoneNumber": "+971501234567",
+                    "sip.trunkID": "ST_inbound",
+                    "sip.trunkPhoneNumber": "+97141234567",
+                },
+            )
+
+    original_admit = livekit_worker._admit_inbound_call
+
+    async def revoke_then_admit(**kwargs):
+        async with session_factory() as revocation_db:
+            current = await revocation_db.get(KnowledgeBase, knowledge_id)
+            current.serving_revocation_generation += 1
+            current.serving_revision_id = None
+            current.approval_status = "draft"
+            await revocation_db.commit()
+        await original_admit(**kwargs)
+
+    delete_room = AsyncMock(return_value=True)
+    outbox_kick = Mock()
+    monkeypatch.setattr(livekit_worker, "async_session_factory", session_factory)
+    monkeypatch.setattr(
+        livekit_worker,
+        "_resolve_inbound_route",
+        AsyncMock(return_value=(agent, profile)),
+    )
+    monkeypatch.setattr(
+        livekit_worker,
+        "_load_inbound_runtime",
+        AsyncMock(
+            return_value=(
+                agent,
+                profile,
+                livekit_worker._RuntimeApiKeys(
+                    speech="inworld-test-key",
+                    llm="openai-test-key",
+                ),
+                knowledge_pin,
+            )
+        ),
+    )
+    monkeypatch.setattr(livekit_worker, "_admit_inbound_call", revoke_then_admit)
+    monkeypatch.setattr(livekit_worker, "delete_browser_room", delete_room)
+    monkeypatch.setattr(
+        "app.tasks.campaign_tasks.dispatch_provider_callback_outbox.delay",
+        outbox_kick,
+    )
+
+    with pytest.raises(KnowledgeServingError, match="revoked before admission"):
+        await livekit_worker.vav_inworld_session(Context())
+
+    delete_room.assert_awaited_once()
+    db.expire_all()
+    failed_call = await db.scalar(
+        select(Call)
+        .where(Call.provider_call_sid == sip_call_id)
+        .execution_options(populate_existing=True)
+    )
+    assert failed_call is not None
+    assert failed_call.status == "failed"
+    assert failed_call.duration_seconds >= 1
+    assert failed_call.call_metadata["lifecycle_error"] == ("livekit_inbound_preopen_failure")
+    assert failed_call.call_metadata["runtime"]["cost_state"] == ("pending_provider_billing_sync")
+    assert failed_call.call_metadata["runtime"]["knowledge_serving_revision_id"] == str(revision_id)
+    outbox_kick.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_inbound_preopen_cleanup_survives_cancellation(monkeypatch):
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def terminalize(**_kwargs):
+        entered.set()
+        await release.wait()
+        return True
+
+    delete_room = AsyncMock(return_value=True)
+    monkeypatch.setattr(livekit_worker, "_fail_inbound_preopen_call", terminalize)
+    monkeypatch.setattr(livekit_worker, "delete_browser_room", delete_room)
+    task = asyncio.create_task(
+        livekit_worker._abort_inbound_preopen_despite_cancellation(
+            tenant_id=uuid4(),
+            agent_id=uuid4(),
+            call_id=uuid4(),
+            room_name="vav-inbound-cancelled-cleanup",
+            failure=RuntimeError("cancelled setup"),
+        )
+    )
+    await entered.wait()
+    task.cancel()
+    release.set()
+    await task
+
+    delete_room.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_inbound_session_start_failure_after_greeting_provider_request_is_billing_true(
+    client,
+    auth_headers,
+    db,
+    tenant,
+    monkeypatch,
+):
+    greeting = "Welcome to the approved support line."
+    agent = Agent(
+        tenant_id=tenant.id,
+        name="Prewarm billing agent",
+        system_prompt="Use approved knowledge.",
+        greeting_message=greeting,
+        voice_provider="inworld",
+        voice_id="inworld:Ashley",
+        language="en-GB",
+        max_call_duration_seconds=60,
+    )
+    db.add(agent)
+    await db.flush()
+    profile = AgentRuntimeProfile(
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        enabled=True,
+        status="active",
+        telephony_provider="livekit_sip",
+        primary_speech_provider="inworld",
+        llm_provider="openai",
+        llm_model="gpt-4o-mini",
+        stt_language="en-GB",
+        assigned_numbers=["+97141234567"],
+    )
+    room_name = f"vav-inbound-prewarm-{uuid4()}"
+    sip_call_id = f"sip-prewarm-{uuid4()}"
+    call = Call(
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        direction="inbound",
+        status="in_progress",
+        from_number="+971501234567",
+        to_number="+97141234567",
+        provider="livekit_sip",
+        provider_call_sid=sip_call_id,
+        started_at=datetime.now(UTC),
+        answered_at=datetime.now(UTC),
+        call_metadata={
+            "livekit_room": room_name,
+            "runtime": {
+                "transport": "livekit_sip",
+                "speech_provider": "inworld",
+                "llm_provider": "openai",
+                "llm_model": "gpt-4o-mini",
+                "tts_model": "inworld-tts-2",
+                "media_stream_started": False,
+                "runtime_setup_state": "knowledge_admitted",
+                "cost_state": "pending_provider_billing_sync",
+            },
+        },
+    )
+    db.add_all((profile, call))
+    await db.commit()
+    call_id = call.id
+
+    class Room:
+        name = room_name
+
+        def on(self, _event, _callback):
+            return None
+
+    class Context:
+        job = SimpleNamespace(metadata="{}")
+        room = Room()
+
+        async def connect(self):
+            return None
+
+        async def wait_for_participant(self):
+            return SimpleNamespace(
+                identity="inbound-prewarm-caller",
+                attributes={
+                    "sip.callDirection": "inbound",
+                    "sip.callStatus": "active",
+                    "sip.callIDFull": sip_call_id,
+                    "sip.phoneNumber": "+971501234567",
+                    "sip.trunkID": "ST_inbound",
+                    "sip.trunkPhoneNumber": "+97141234567",
+                },
+            )
+
+        def add_shutdown_callback(self, _callback):
+            return None
+
+        def shutdown(self, reason=""):
+            return None
+
+    class PreparedGreeting:
+        cache_status = "miss_cached"
+        provider_request_count = 1
+        started_at_monotonic = 1.0
+        first_frame_at_monotonic = 1.01
+        completed_at_monotonic = 1.02
+        failed_before_playout = False
+
+        def __init__(self):
+            self.closed = False
+
+        async def aclose(self):
+            self.closed = True
+
+        async def frames(self):
+            if False:
+                yield None
+
+    class FailingSession:
+        def __init__(self, **_kwargs):
+            self.start_count = 0
+            self.close_count = 0
+
+        def on(self, _event):
+            return lambda callback: callback
+
+        async def start(self, **_kwargs):
+            self.start_count += 1
+            raise RuntimeError("session start failed")
+
+        async def aclose(self):
+            self.close_count += 1
+
+    prepared = PreparedGreeting()
+    session_holder = {}
+
+    def build_session(**kwargs):
+        session_holder["options"] = kwargs
+        session_holder["session"] = FailingSession(**kwargs)
+        return session_holder["session"]
+
+    monkeypatch.setattr(livekit_worker, "async_session_factory", session_factory)
+    monkeypatch.setattr(
+        livekit_worker,
+        "_resolve_inbound_route",
+        AsyncMock(return_value=(agent, profile)),
+    )
+    monkeypatch.setattr(
+        livekit_worker,
+        "_reserve_inbound_call",
+        AsyncMock(return_value=call_id),
+    )
+    monkeypatch.setattr(
+        livekit_worker,
+        "_load_inbound_runtime",
+        AsyncMock(
+            return_value=(
+                agent,
+                profile,
+                livekit_worker._RuntimeApiKeys(
+                    speech="inworld-test-key",
+                    llm="openai-test-key",
+                ),
+                livekit_worker._RuntimeKnowledgePin(),
+            )
+        ),
+    )
+    monkeypatch.setattr(livekit_worker, "_admit_inbound_call", AsyncMock())
+    monkeypatch.setattr(livekit_worker.inworld, "STT", lambda **_kwargs: object())
+    monkeypatch.setattr(livekit_worker.inworld, "TTS", lambda **_kwargs: object())
+    monkeypatch.setattr(livekit_worker.openai, "LLM", lambda **_kwargs: object())
+    monkeypatch.setattr(livekit_worker.inference, "TurnDetector", lambda **_kwargs: object())
+    monkeypatch.setattr(livekit_worker, "AgentSession", build_session)
+    monkeypatch.setattr(livekit_worker, "prepare_greeting_audio", lambda **_kwargs: prepared)
+    monkeypatch.setattr(livekit_worker, "production_room_options", lambda: object())
+    outbox_kick = Mock()
+    monkeypatch.setattr(
+        "app.tasks.campaign_tasks.dispatch_provider_callback_outbox.delay",
+        outbox_kick,
+    )
+
+    with pytest.raises(RuntimeError, match="session start failed"):
+        await livekit_worker.vav_inworld_session(Context())
+
+    assert prepared.closed is True
+    assert session_holder["session"].start_count == 1
+    assert session_holder["session"].close_count == 1
+    db.expire_all()
+    failed_call = await db.scalar(
+        select(Call).where(Call.id == call_id).execution_options(populate_existing=True)
+    )
+    assert failed_call is not None
+    assert failed_call.status == "failed"
+    runtime = failed_call.call_metadata["runtime"]
+    assert runtime["media_stream_started"] is False
+    assert runtime["external_tts_request_count"] == 1
+    assert runtime["external_tts_characters"] == len(greeting)
+    assert runtime["external_tts_sources"] == ["greeting_preparation"]
+    assert runtime["external_tts_provider_reconciliation_required"] is True
+    assert runtime["llm_input_tokens"] is None
+    assert runtime["llm_output_tokens"] is None
+    assert runtime["stt_audio_seconds"] is None
+    assert failed_call.call_metadata["runtime_failure_type"] == "RuntimeError"
+    outbox_kick.assert_called_once()
+
+    response = await client.get("/api/v1/billing/cost-report?days=30", headers=auth_headers)
+
+    assert response.status_code == 200
+    row = next(item for item in response.json()["calls"] if item["call_id"] == str(call_id))
+    services = {component["service"] for component in row["components"]}
+    providers = {component["provider"] for component in row["components"]}
+    assert "TTS 2" in services
+    assert "Speech to text" not in services
+    assert "OpenAI" not in providers
+    assert "Inworld Router" not in providers
+    tts = next(component for component in row["components"] if component["service"] == "TTS 2")
+    assert tts["quantity"] == pytest.approx(len(greeting) / 1000)
+    assert "direct prewarm characters only" in tts["basis"]
+    assert row["cost_state"] == "pending_provider_billing_sync"
+    assert "External TTS provider invoice reconciliation" in row["missing_cost_inputs"]
+    assert "Provider invoice reconciliation" in row["missing_cost_inputs"]
 
 
 @pytest.mark.asyncio

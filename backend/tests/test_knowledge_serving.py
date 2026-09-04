@@ -12,10 +12,12 @@ from app.services.knowledge_retrieval import (
     retrieve_knowledge_context,
 )
 from app.services.knowledge_serving import (
+    INBOUND_KNOWLEDGE_ADMISSION_STATE,
     KnowledgeServingError,
     backfill_approved_serving_revisions,
     backfill_approved_serving_revisions_batch,
     knowledge_admission_is_durable,
+    knowledge_call_reservation_metadata,
     load_agent_serving_revision,
     parse_serving_revision_id,
     pre_admit_outbound_knowledge_call,
@@ -23,6 +25,8 @@ from app.services.knowledge_serving import (
     serving_knowledge_base_id_from_call_metadata,
     serving_revision_id_from_call_metadata,
     serving_revocation_generation_from_call_metadata,
+    speech_lexicon_artifact_id_from_call_metadata,
+    speech_lexicon_content_sha256_from_call_metadata,
 )
 from app.services.knowledge_sources import invalidate_knowledge_approval
 from app.services.speech_lexicon import load_agent_speech_lexicon, publish_speech_lexicon
@@ -204,11 +208,7 @@ async def test_delete_waits_for_admitted_call_to_become_terminal(
             "runtime": {
                 "transport": "livekit_sip",
                 "speech_provider": "inworld",
-                "knowledge_serving_revision_id": str(revision.id),
-                "knowledge_serving_knowledge_base_id": str(knowledge.id),
-                "knowledge_serving_content_sha256": revision.content_sha256,
-                "knowledge_source_revision_sha256": revision.source_revision_sha256,
-                "knowledge_serving_revocation_generation": 0,
+                **knowledge_call_reservation_metadata(revision, 0),
             }
         },
     )
@@ -691,6 +691,8 @@ async def test_pending_draft_keeps_last_approved_revision_live_and_swap_is_atomi
 def test_call_metadata_revision_pin_is_strictly_parsed():
     revision_id = uuid4()
     knowledge_base_id = uuid4()
+    speech_lexicon_artifact_id = uuid4()
+    speech_lexicon_content_sha256 = "a" * 64
     assert parse_serving_revision_id(revision_id) == revision_id
     assert (
         serving_revision_id_from_call_metadata(
@@ -726,17 +728,60 @@ def test_call_metadata_revision_pin_is_strictly_parsed():
             serving_revocation_generation_from_call_metadata(
                 {"runtime": {"knowledge_serving_revocation_generation": invalid_generation}}
             )
+    assert (
+        speech_lexicon_artifact_id_from_call_metadata(
+            {"runtime": {"speech_lexicon_artifact_id": str(speech_lexicon_artifact_id)}}
+        )
+        == speech_lexicon_artifact_id
+    )
+    assert speech_lexicon_artifact_id_from_call_metadata({"runtime": {}}) is None
+    with pytest.raises(KnowledgeServingError, match="invalid"):
+        speech_lexicon_artifact_id_from_call_metadata(
+            {"runtime": {"speech_lexicon_artifact_id": "not-a-uuid"}}
+        )
+    assert (
+        speech_lexicon_content_sha256_from_call_metadata(
+            {"runtime": {"speech_lexicon_content_sha256": speech_lexicon_content_sha256}}
+        )
+        == speech_lexicon_content_sha256
+    )
+    assert speech_lexicon_content_sha256_from_call_metadata({"runtime": {}}) is None
+    with pytest.raises(KnowledgeServingError, match="invalid"):
+        speech_lexicon_content_sha256_from_call_metadata(
+            {"runtime": {"speech_lexicon_content_sha256": "not-a-sha256"}}
+        )
 
     admitted_metadata = {
         "runtime": {
             "knowledge_serving_revision_id": str(revision_id),
             "knowledge_serving_knowledge_base_id": str(knowledge_base_id),
             "knowledge_serving_revocation_generation": 7,
+            "speech_lexicon_artifact_id": str(speech_lexicon_artifact_id),
+            "speech_lexicon_content_sha256": speech_lexicon_content_sha256,
             "knowledge_admission_state": "admitted_before_dispatch",
             "knowledge_admitted_at": "2026-09-04T12:00:00+00:00",
         }
     }
     assert knowledge_admission_is_durable(admitted_metadata)
+    legacy_inworld_metadata = {
+        "runtime": {
+            key: value
+            for key, value in admitted_metadata["runtime"].items()
+            if key
+            not in {
+                "speech_lexicon_artifact_id",
+                "speech_lexicon_content_sha256",
+            }
+        }
+    }
+    assert knowledge_admission_is_durable(legacy_inworld_metadata)
+    inbound_admitted_metadata = {
+        "runtime": {
+            **admitted_metadata["runtime"],
+            "knowledge_admission_state": INBOUND_KNOWLEDGE_ADMISSION_STATE,
+        }
+    }
+    assert knowledge_admission_is_durable(inbound_admitted_metadata)
     assert not knowledge_admission_is_durable({"runtime": {}})
     for invalid_marker in (
         {"knowledge_admission_state": "admitted_before_dispatch"},

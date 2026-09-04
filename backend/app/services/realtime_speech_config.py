@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.providers.sarvam import sarvam_language_code
+
 INWORLD_STT_FIRST_PARTY = "inworld/inworld-stt-1"
 INWORLD_STT_FAST_ACCURATE = "assemblyai/u3-rt-pro"
 INWORLD_STT_WIDE_MULTILINGUAL = "soniox/stt-rt-v4"
@@ -69,6 +71,24 @@ def resolved_stt_script_languages(*, model: Any, profile: Any) -> tuple[str, ...
     if effective.casefold() != "auto":
         return (effective,)
     return configured_stt_languages(model=model, profile=profile)
+
+
+def sarvam_stt_wire_language(*, model: Any, profile: Any) -> str:
+    """Return the exact language sent to Sarvam by native Twilio sessions.
+
+    Keep readiness and the paid media path on one resolver.  Sarvam represents
+    automatic language identification with the literal ``auto`` value; pinned
+    languages use the provider's regional codes (for example, ``en-IN``).
+    """
+
+    configured = (
+        "auto"
+        if getattr(model, "language_switching_enabled", False)
+        else str(getattr(profile, "stt_language", "") or "auto").strip()
+    )
+    if configured.casefold() == "auto":
+        return "auto"
+    return sarvam_language_code(configured)
 
 
 def configured_inworld_stt_model(*, profile: Any) -> str:

@@ -357,10 +357,12 @@ def _call_components(
     transcript: CallTranscript | None,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     minutes = Decimal(str(max(call.duration_seconds or 0, 0))) / Decimal("60")
-    if minutes <= 0:
-        return [], []
     runtime = _runtime_metadata(call)
     speech = _speech_provider(call, agent)
+    media_stream_started = not (
+        runtime.get("transport") == "twilio_fallback_twiml"
+        or runtime.get("media_stream_started") is False
+    )
     components: list[dict[str, Any]] = []
     missing: list[str] = []
 
@@ -380,17 +382,18 @@ def _call_components(
             )
         else:
             missing.append("Twilio destination rate")
-        components.append(
-            _component(
-                "Twilio",
-                "Media Streams",
-                minutes,
-                "minutes",
-                TWILIO_MEDIA_STREAM_USD_PER_MINUTE,
-                TWILIO_UAE_SOURCE,
-                "VAV realtime audio stream",
+        if media_stream_started:
+            components.append(
+                _component(
+                    "Twilio",
+                    "Media Streams",
+                    minutes,
+                    "minutes",
+                    TWILIO_MEDIA_STREAM_USD_PER_MINUTE,
+                    TWILIO_UAE_SOURCE,
+                    "VAV realtime audio stream",
+                )
             )
-        )
 
     if call.provider == "livekit_sip":
         components.append(
@@ -462,7 +465,69 @@ def _call_components(
         else:
             missing.append("Smallest.ai region/plan rate")
 
-    if speech in {"sarvam", "elevenlabs", "inworld"}:
+    if speech in {"sarvam", "elevenlabs", "inworld"} and not media_stream_started:
+        # Greeting preparation starts before AgentSession connects. A cache miss
+        # can therefore incur a real provider TTS request even when session.start
+        # fails and no STT or LLM request exists. Price only that observed unit;
+        # never infer the rest of the speech pipeline from connected duration.
+        external_tts_characters = runtime.get("external_tts_characters")
+        external_tts_pending = runtime.get("external_tts_provider_reconciliation_required") is True
+        if external_tts_pending:
+            missing.append("External TTS provider invoice reconciliation")
+        if (
+            isinstance(external_tts_characters, (int, float))
+            and not isinstance(external_tts_characters, bool)
+            and external_tts_characters > 0
+        ):
+            thousands = Decimal(str(external_tts_characters)) / Decimal("1000")
+            if speech == "inworld":
+                tts_model = str(runtime.get("tts_model") or "inworld-tts-2")
+                flash = "flash" in tts_model.lower()
+                components.append(
+                    _component(
+                        "Inworld",
+                        "TTS 2 Flash" if flash else "TTS 2",
+                        thousands,
+                        "1,000 characters",
+                        INWORLD_TTS2_FLASH_USD_PER_1K_CHARACTERS
+                        if flash
+                        else INWORLD_TTS2_USD_PER_1K_CHARACTERS,
+                        INWORLD_SOURCE,
+                        "VAV-observed direct prewarm characters only; conservative public "
+                        "on-demand list rate",
+                    )
+                )
+            elif speech == "elevenlabs":
+                components.append(
+                    _component(
+                        "ElevenLabs",
+                        "Flash / Turbo text to speech",
+                        thousands,
+                        "1,000 characters",
+                        ELEVENLABS_FLASH_USD_PER_1K_CHARACTERS,
+                        ELEVENLABS_SOURCE,
+                        "VAV-observed direct prewarm characters only",
+                    )
+                )
+            else:
+                sarvam_usd_per_1k = (
+                    SARVAM_TTS_INR_PER_10K_CHARACTERS / Decimal("10") * INR_AED / USD_AED
+                )
+                components.append(
+                    _component(
+                        "Sarvam",
+                        "Bulbul v3 text to speech",
+                        thousands,
+                        "1,000 characters",
+                        sarvam_usd_per_1k,
+                        SARVAM_SOURCE,
+                        "VAV-observed direct prewarm characters only",
+                    )
+                )
+        elif external_tts_pending:
+            missing.append("Direct prewarm TTS characters")
+
+    if speech in {"sarvam", "elevenlabs", "inworld"} and media_stream_started:
         inworld_speech = speech == "inworld"
         stt_usd_per_hour = (
             INWORLD_STT_USD_PER_HOUR
@@ -696,9 +761,15 @@ async def build_cost_report(
         call_metadata = call.call_metadata if isinstance(call.call_metadata, dict) else {}
         runtime_value = call_metadata.get("runtime")
         runtime = runtime_value if isinstance(runtime_value, dict) else {}
+        runtime_provider_reconciliation_pending = (
+            runtime.get("cost_state") == "pending_provider_billing_sync"
+        )
         provider_reconciliation_pending = (
             runtime.get("external_tts_provider_reconciliation_required") is True
+            or runtime_provider_reconciliation_pending
         )
+        if runtime_provider_reconciliation_pending:
+            missing.append("Provider invoice reconciliation")
         if estimated > 0:
             primary_cost = estimated
             cost_state = (
@@ -708,7 +779,11 @@ async def build_cost_report(
             )
         elif ledger > 0:
             primary_cost = ledger
-            cost_state = "recorded_ledger_estimate"
+            cost_state = (
+                "pending_provider_billing_sync"
+                if provider_reconciliation_pending
+                else "recorded_ledger_estimate"
+            )
             components.append(
                 _component(
                     "VAV ledger",
@@ -720,6 +795,9 @@ async def build_cost_report(
                     "Legacy application estimate; provider allocation unavailable",
                 )
             )
+        elif provider_reconciliation_pending:
+            primary_cost = Decimal("0")
+            cost_state = "pending_provider_billing_sync"
         elif minutes == 0:
             primary_cost = Decimal("0")
             cost_state = "zero_duration"

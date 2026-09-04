@@ -19,26 +19,30 @@ from app.models.agent import (
     AgentKnowledgeBinding,
     AgentRuntimeProfile,
     KnowledgeBase,
+    KnowledgeServingRevisionSource,
     KnowledgeSource,
 )
 from app.models.audit import AuditEvent
 from app.models.call import Call
 from app.models.tenant import Tenant
 from app.models.user import User
+from app.providers.elevenlabs import ElevenLabsClient
 from app.providers.inworld import (
     InworldClient,
     InworldError,
     inworld_realtime_websocket_url,
 )
-from app.providers.openai import OpenAIProviderClient
+from app.providers.openai import OpenAIProviderClient, OpenAIProviderError
+from app.providers.sarvam import SarvamAIClient, SarvamAIError
 from app.realtime.auth import create_media_token, verify_media_token
-from app.realtime.sarvam_stream import is_speech_start, parse_transcript_event
+from app.realtime.sarvam_stream import SarvamStreamError, is_speech_start, parse_transcript_event
 from app.schemas.runtime import RuntimeProfileUpdate
 from app.services.knowledge_retrieval import rank_knowledge
 from app.services.knowledge_serving import publish_serving_revision
-from app.services.provider_credentials import ProviderCredentialError
+from app.services.provider_credentials import ProviderCredentialError, store_provider_config
 from app.services.speech_lexicon import publish_speech_lexicon
 from app.telephony.livekit_provider import LiveKitSIPError, LiveKitSIPProvider, LiveKitSIPResult
+from tests.knowledge_test_utils import publish_test_knowledge
 
 
 def test_media_token_is_call_scoped_and_expires():
@@ -1196,6 +1200,758 @@ async def test_live_readiness_never_falls_back_when_workspace_inworld_key_is_unr
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("provider", "expected_stt", "expected_tts"),
+    [("sarvam", False, False), ("elevenlabs", True, False)],
+)
+async def test_static_native_readiness_fails_closed_for_unreadable_workspace_key(
+    tenant,
+    db,
+    monkeypatch,
+    provider,
+    expected_stt,
+    expected_tts,
+):
+    from app.api.v1.endpoints import runtime as runtime_endpoint
+
+    agent = Agent(
+        tenant_id=tenant.id,
+        name=f"Fail-closed {provider} concierge",
+        system_prompt="Use approved knowledge.",
+        voice_provider=provider,
+        voice_id=("sarvam:ishita" if provider == "sarvam" else "elevenlabs:voice-1"),
+    )
+    profile = AgentRuntimeProfile(
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        telephony_provider="twilio",
+        primary_speech_provider=provider,
+        llm_provider="openai",
+        llm_model="gpt-4o-mini",
+    )
+    monkeypatch.setattr(settings, "sarvam_api_key", "platform-sarvam-key")
+    monkeypatch.setattr(settings, "elevenlabs_api_key", "platform-elevenlabs-key")
+    monkeypatch.setattr(settings, "openai_api_key", "platform-openai-key")
+
+    async def provider_config(_db, _tenant_id, requested_provider):
+        if requested_provider == provider:
+            raise ProviderCredentialError("cannot decrypt")
+        return None
+
+    monkeypatch.setattr(runtime_endpoint, "load_provider_config", provider_config)
+    _blockers, checks = await runtime_endpoint.runtime_readiness(db, agent, profile)
+
+    assert checks["stt_credential"] is expected_stt
+    assert checks["tts_credential"] is expected_tts
+    assert checks["llm_credential"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["sarvam", "elevenlabs"])
+async def test_static_native_readiness_uses_platform_key_only_when_workspace_key_absent(
+    tenant,
+    db,
+    monkeypatch,
+    provider,
+):
+    from app.api.v1.endpoints import runtime as runtime_endpoint
+
+    agent = Agent(
+        tenant_id=tenant.id,
+        name=f"Platform {provider} concierge",
+        system_prompt="Use approved knowledge.",
+        voice_provider=provider,
+        voice_id=("sarvam:ishita" if provider == "sarvam" else "elevenlabs:voice-1"),
+    )
+    profile = AgentRuntimeProfile(
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        telephony_provider="twilio",
+        primary_speech_provider=provider,
+        llm_provider="openai",
+        llm_model="gpt-4o-mini",
+    )
+    monkeypatch.setattr(settings, "sarvam_api_key", "platform-sarvam-key")
+    monkeypatch.setattr(settings, "elevenlabs_api_key", "platform-elevenlabs-key")
+    monkeypatch.setattr(settings, "openai_api_key", "platform-openai-key")
+
+    async def no_workspace_config(*_args):
+        return None
+
+    monkeypatch.setattr(runtime_endpoint, "load_provider_config", no_workspace_config)
+    _blockers, checks = await runtime_endpoint.runtime_readiness(db, agent, profile)
+
+    assert checks["stt_credential"] is True
+    assert checks["tts_credential"] is True
+    assert checks["llm_credential"] is True
+
+
+@pytest.mark.asyncio
+async def test_sarvam_live_readiness_proves_tts_exact_stt_route_and_openai(
+    tenant,
+    db,
+    monkeypatch,
+):
+    from app.api.v1.endpoints import runtime as runtime_endpoint
+
+    agent = Agent(
+        tenant_id=tenant.id,
+        name="Sarvam live probe concierge",
+        system_prompt="Use approved knowledge.",
+        voice_provider="sarvam",
+        voice_id="sarvam:ishita",
+        language="en",
+        supported_languages=["en"],
+        language_switching_enabled=False,
+    )
+    profile = AgentRuntimeProfile(
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        telephony_provider="twilio",
+        primary_speech_provider="sarvam",
+        llm_provider="openai",
+        llm_model="gpt-4o-mini",
+        stt_language="en",
+    )
+    observed: dict[str, object] = {}
+
+    async def static_readiness(*_args):
+        return [], {
+            "provider_compatibility": True,
+            "tts_credential": True,
+            "voice_selection": True,
+            "llm_credential": True,
+        }
+
+    async def no_workspace_config(*_args):
+        return None
+
+    async def tts_probe(self, **kwargs):
+        observed["tts"] = {"api_key": self.api_key, **kwargs}
+
+    async def stt_probe(**kwargs):
+        observed["stt"] = kwargs
+
+    async def tool_probe(self, **kwargs):
+        observed["llm"] = {"api_key": self.api_key, **kwargs}
+
+    monkeypatch.setattr(settings, "sarvam_api_key", "platform-sarvam-key")
+    monkeypatch.setattr(settings, "openai_api_key", "platform-openai-key")
+    monkeypatch.setattr(runtime_endpoint, "runtime_readiness", static_readiness)
+    monkeypatch.setattr(runtime_endpoint, "load_provider_config", no_workspace_config)
+    monkeypatch.setattr(SarvamAIClient, "synthesize_voice_preview", tts_probe)
+    monkeypatch.setattr(runtime_endpoint, "_sarvam_stt_readiness_probe", stt_probe)
+    monkeypatch.setattr(OpenAIProviderClient, "tool_readiness_probe", tool_probe)
+
+    blockers, checks = await runtime_endpoint.live_runtime_readiness(db, agent, profile)
+
+    assert blockers == []
+    assert checks["tts_provider_live"] is True
+    assert checks["stt_provider_live"] is True
+    assert checks["llm_provider_live"] is True
+    assert observed == {
+        "tts": {
+            "api_key": "platform-sarvam-key",
+            "speaker": "ishita",
+            "language": "en",
+            "pace": agent.speech_rate,
+        },
+        "stt": {"api_key": "platform-sarvam-key", "language_code": "en-IN"},
+        "llm": {"api_key": "platform-openai-key", "model_id": "gpt-4o-mini"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_sarvam_stt_readiness_handshake_uses_the_production_endpoint(
+    monkeypatch,
+):
+    from app.api.v1.endpoints import runtime as runtime_endpoint
+
+    observed: dict[str, object] = {}
+
+    class ProbeStream:
+        def __init__(self, **kwargs):
+            observed["configuration"] = kwargs
+
+        async def __aenter__(self):
+            observed["entered"] = True
+            return self
+
+        async def __aexit__(self, _exc_type, _exc, _traceback):
+            observed["closed"] = True
+
+    monkeypatch.setattr(settings, "sarvam_base_url", "https://sarvam.example.test")
+    monkeypatch.setattr(runtime_endpoint, "SarvamSTTStream", ProbeStream)
+
+    await runtime_endpoint._sarvam_stt_readiness_probe(
+        api_key="workspace-sarvam-key",
+        language_code="en-IN",
+    )
+
+    assert observed == {
+        "configuration": {
+            "api_key": "workspace-sarvam-key",
+            "base_url": "https://sarvam.example.test",
+            "language_code": "en-IN",
+        },
+        "entered": True,
+        "closed": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_elevenlabs_live_readiness_proves_primary_and_emergency_speech_and_openai(
+    tenant,
+    db,
+    monkeypatch,
+):
+    from app.api.v1.endpoints import runtime as runtime_endpoint
+
+    agent = Agent(
+        tenant_id=tenant.id,
+        name="ElevenLabs live probe concierge",
+        system_prompt="Use approved knowledge.",
+        voice_provider="elevenlabs",
+        voice_id="elevenlabs:voice-1",
+        language="en",
+        supported_languages=["en"],
+        language_switching_enabled=False,
+    )
+    profile = AgentRuntimeProfile(
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        telephony_provider="twilio",
+        primary_speech_provider="elevenlabs",
+        llm_provider="openai",
+        llm_model="gpt-4o-mini",
+        stt_language="en",
+    )
+    observed: dict[str, object] = {}
+
+    async def static_readiness(*_args):
+        return [], {
+            "provider_compatibility": True,
+            "tts_credential": True,
+            "voice_selection": True,
+            "llm_credential": True,
+        }
+
+    async def provider_config(_db, _tenant_id, provider):
+        return {"api_key": f"workspace-{provider}-key"}
+
+    async def eleven_tts_probe(self, **kwargs):
+        observed["primary_tts"] = {"api_key": self.api_key, **kwargs}
+
+    async def sarvam_tts_probe(self, **kwargs):
+        observed["fallback_tts"] = {"api_key": self.api_key, **kwargs}
+
+    async def stt_probe(**kwargs):
+        observed["stt"] = kwargs
+
+    async def tool_probe(self, **kwargs):
+        observed["llm"] = {"api_key": self.api_key, **kwargs}
+
+    monkeypatch.setattr(runtime_endpoint, "runtime_readiness", static_readiness)
+    monkeypatch.setattr(runtime_endpoint, "load_provider_config", provider_config)
+    monkeypatch.setattr(ElevenLabsClient, "synthesize_voice_preview", eleven_tts_probe)
+    monkeypatch.setattr(SarvamAIClient, "synthesize_voice_preview", sarvam_tts_probe)
+    monkeypatch.setattr(runtime_endpoint, "_sarvam_stt_readiness_probe", stt_probe)
+    monkeypatch.setattr(OpenAIProviderClient, "tool_readiness_probe", tool_probe)
+
+    blockers, checks = await runtime_endpoint.live_runtime_readiness(db, agent, profile)
+
+    assert blockers == []
+    assert checks["tts_provider_live"] is True
+    assert checks["fallback_tts_provider_live"] is True
+    assert checks["stt_provider_live"] is True
+    assert checks["llm_provider_live"] is True
+    assert observed == {
+        "primary_tts": {
+            "api_key": "workspace-elevenlabs-key",
+            "voice_id": "voice-1",
+            "language": "en",
+            "speed": agent.speech_rate,
+        },
+        "fallback_tts": {
+            "api_key": "workspace-sarvam-key",
+            "speaker": "ishita",
+            "language": "en",
+            "pace": agent.speech_rate,
+        },
+        "stt": {"api_key": "workspace-sarvam-key", "language_code": "en-IN"},
+        "llm": {"api_key": "workspace-openai-key", "model_id": "gpt-4o-mini"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_native_live_readiness_reports_all_component_failures_independently(
+    tenant,
+    db,
+    monkeypatch,
+):
+    from app.api.v1.endpoints import runtime as runtime_endpoint
+
+    agent = Agent(
+        tenant_id=tenant.id,
+        name="Failing native probes",
+        system_prompt="Use approved knowledge.",
+        voice_provider="sarvam",
+        voice_id="sarvam:ishita",
+        language="en",
+        language_switching_enabled=False,
+    )
+    profile = AgentRuntimeProfile(
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        telephony_provider="twilio",
+        primary_speech_provider="sarvam",
+        llm_provider="openai",
+        llm_model="gpt-4o-mini",
+        stt_language="en",
+    )
+
+    async def static_readiness(*_args):
+        return [], {
+            "provider_compatibility": True,
+            "tts_credential": True,
+            "voice_selection": True,
+            "llm_credential": True,
+        }
+
+    async def provider_config(_db, _tenant_id, provider):
+        return {"api_key": f"workspace-{provider}-key"}
+
+    async def tts_failure(*_args, **_kwargs):
+        raise SarvamAIError("TTS authentication rejected")
+
+    async def stt_failure(**_kwargs):
+        raise SarvamStreamError("STT handshake rejected")
+
+    async def llm_failure(*_args, **_kwargs):
+        raise OpenAIProviderError("model cannot call tools")
+
+    monkeypatch.setattr(runtime_endpoint, "runtime_readiness", static_readiness)
+    monkeypatch.setattr(runtime_endpoint, "load_provider_config", provider_config)
+    monkeypatch.setattr(SarvamAIClient, "synthesize_voice_preview", tts_failure)
+    monkeypatch.setattr(runtime_endpoint, "_sarvam_stt_readiness_probe", stt_failure)
+    monkeypatch.setattr(OpenAIProviderClient, "tool_readiness_probe", llm_failure)
+
+    blockers, checks = await runtime_endpoint.live_runtime_readiness(db, agent, profile)
+
+    assert checks["tts_provider_live"] is False
+    assert checks["stt_provider_live"] is False
+    assert checks["llm_provider_live"] is False
+    assert blockers == [
+        "Sarvam live TTS synthesis failed: TTS authentication rejected",
+        "Sarvam Saaras realtime STT validation failed: STT handshake rejected",
+        "OpenAI live tool-calling check failed: model cannot call tools",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_native_live_readiness_bounds_a_stalled_provider_without_false_green(
+    tenant,
+    db,
+    monkeypatch,
+):
+    from app.api.v1.endpoints import runtime as runtime_endpoint
+
+    agent = Agent(
+        tenant_id=tenant.id,
+        name="Timed native probes",
+        system_prompt="Use approved knowledge.",
+        voice_provider="sarvam",
+        voice_id="sarvam:ishita",
+        language="en",
+        language_switching_enabled=False,
+    )
+    profile = AgentRuntimeProfile(
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        telephony_provider="twilio",
+        primary_speech_provider="sarvam",
+        llm_provider="openai",
+        llm_model="gpt-4o-mini",
+        stt_language="en",
+    )
+
+    async def static_readiness(*_args):
+        return [], {
+            "provider_compatibility": True,
+            "tts_credential": True,
+            "voice_selection": True,
+            "llm_credential": True,
+        }
+
+    async def provider_config(_db, _tenant_id, provider):
+        return {"api_key": f"workspace-{provider}-key"}
+
+    async def stalled_stt(**_kwargs):
+        await runtime_endpoint.asyncio.sleep(1)
+
+    monkeypatch.setattr(runtime_endpoint, "_NATIVE_LIVE_PROBE_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(runtime_endpoint, "runtime_readiness", static_readiness)
+    monkeypatch.setattr(runtime_endpoint, "load_provider_config", provider_config)
+    monkeypatch.setattr(
+        SarvamAIClient,
+        "synthesize_voice_preview",
+        AsyncMock(return_value=b"RIFFaudio"),
+    )
+    monkeypatch.setattr(runtime_endpoint, "_sarvam_stt_readiness_probe", stalled_stt)
+    monkeypatch.setattr(OpenAIProviderClient, "tool_readiness_probe", AsyncMock())
+
+    blockers, checks = await runtime_endpoint.live_runtime_readiness(db, agent, profile)
+
+    assert checks["tts_provider_live"] is True
+    assert checks["stt_provider_live"] is False
+    assert checks["llm_provider_live"] is True
+    assert blockers == ["Sarvam Saaras realtime STT validation timed out after 0.01 seconds."]
+
+
+@pytest.mark.asyncio
+async def test_native_live_readiness_does_not_use_platform_sarvam_after_decrypt_failure(
+    tenant,
+    db,
+    monkeypatch,
+):
+    from app.api.v1.endpoints import runtime as runtime_endpoint
+
+    agent = Agent(
+        tenant_id=tenant.id,
+        name="Unreadable Sarvam live probes",
+        system_prompt="Use approved knowledge.",
+        voice_provider="sarvam",
+        voice_id="sarvam:ishita",
+        language="en",
+        language_switching_enabled=False,
+    )
+    profile = AgentRuntimeProfile(
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        telephony_provider="twilio",
+        primary_speech_provider="sarvam",
+        llm_provider="openai",
+        llm_model="gpt-4o-mini",
+        stt_language="en",
+    )
+
+    async def static_readiness(*_args):
+        return [], {
+            "provider_compatibility": True,
+            "tts_credential": True,
+            "voice_selection": True,
+            "llm_credential": True,
+        }
+
+    async def provider_config(_db, _tenant_id, provider):
+        if provider == "sarvam":
+            raise ProviderCredentialError("cannot decrypt")
+        return {"api_key": f"workspace-{provider}-key"}
+
+    tts_probe = AsyncMock()
+    stt_probe = AsyncMock()
+    llm_probe = AsyncMock()
+    monkeypatch.setattr(settings, "sarvam_api_key", "must-not-be-used")
+    monkeypatch.setattr(runtime_endpoint, "runtime_readiness", static_readiness)
+    monkeypatch.setattr(runtime_endpoint, "load_provider_config", provider_config)
+    monkeypatch.setattr(SarvamAIClient, "synthesize_voice_preview", tts_probe)
+    monkeypatch.setattr(runtime_endpoint, "_sarvam_stt_readiness_probe", stt_probe)
+    monkeypatch.setattr(OpenAIProviderClient, "tool_readiness_probe", llm_probe)
+
+    blockers, checks = await runtime_endpoint.live_runtime_readiness(db, agent, profile)
+
+    assert checks["tts_provider_live"] is False
+    assert checks["stt_provider_live"] is False
+    assert checks["llm_provider_live"] is True
+    assert blockers == [
+        "Sarvam live TTS synthesis cannot run because the workspace credential is unreadable.",
+        "Sarvam Saaras realtime STT validation cannot run because the workspace credential "
+        "is unreadable.",
+    ]
+    tts_probe.assert_not_awaited()
+    stt_probe.assert_not_awaited()
+    llm_probe.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_elevenlabs_live_readiness_does_not_use_platform_key_after_decrypt_failure(
+    tenant,
+    db,
+    monkeypatch,
+):
+    from app.api.v1.endpoints import runtime as runtime_endpoint
+
+    agent = Agent(
+        tenant_id=tenant.id,
+        name="Unreadable ElevenLabs live probe",
+        system_prompt="Use approved knowledge.",
+        voice_provider="elevenlabs",
+        voice_id="elevenlabs:voice-1",
+        language="en",
+        language_switching_enabled=False,
+    )
+    profile = AgentRuntimeProfile(
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        telephony_provider="twilio",
+        primary_speech_provider="elevenlabs",
+        llm_provider="openai",
+        llm_model="gpt-4o-mini",
+        stt_language="en",
+    )
+
+    async def static_readiness(*_args):
+        return [], {
+            "provider_compatibility": True,
+            "tts_credential": True,
+            "voice_selection": True,
+            "llm_credential": True,
+        }
+
+    async def provider_config(_db, _tenant_id, provider):
+        if provider == "elevenlabs":
+            raise ProviderCredentialError("cannot decrypt")
+        return {"api_key": f"workspace-{provider}-key"}
+
+    eleven_tts_probe = AsyncMock()
+    sarvam_tts_probe = AsyncMock()
+    stt_probe = AsyncMock()
+    llm_probe = AsyncMock()
+    monkeypatch.setattr(settings, "elevenlabs_api_key", "must-not-be-used")
+    monkeypatch.setattr(runtime_endpoint, "runtime_readiness", static_readiness)
+    monkeypatch.setattr(runtime_endpoint, "load_provider_config", provider_config)
+    monkeypatch.setattr(ElevenLabsClient, "synthesize_voice_preview", eleven_tts_probe)
+    monkeypatch.setattr(SarvamAIClient, "synthesize_voice_preview", sarvam_tts_probe)
+    monkeypatch.setattr(runtime_endpoint, "_sarvam_stt_readiness_probe", stt_probe)
+    monkeypatch.setattr(OpenAIProviderClient, "tool_readiness_probe", llm_probe)
+
+    blockers, checks = await runtime_endpoint.live_runtime_readiness(db, agent, profile)
+
+    assert checks["tts_provider_live"] is False
+    assert checks["fallback_tts_provider_live"] is True
+    assert checks["stt_provider_live"] is True
+    assert checks["llm_provider_live"] is True
+    assert blockers == [
+        "ElevenLabs live TTS synthesis cannot run because the workspace credential is unreadable."
+    ]
+    eleven_tts_probe.assert_not_awaited()
+    sarvam_tts_probe.assert_awaited_once()
+    stt_probe.assert_awaited_once()
+    llm_probe.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_native_live_readiness_does_not_use_platform_openai_after_decrypt_failure(
+    tenant,
+    db,
+    monkeypatch,
+):
+    from app.api.v1.endpoints import runtime as runtime_endpoint
+
+    agent = Agent(
+        tenant_id=tenant.id,
+        name="Unreadable OpenAI live probe",
+        system_prompt="Use approved knowledge.",
+        voice_provider="sarvam",
+        voice_id="sarvam:ishita",
+        language="en",
+        language_switching_enabled=False,
+    )
+    profile = AgentRuntimeProfile(
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        telephony_provider="twilio",
+        primary_speech_provider="sarvam",
+        llm_provider="openai",
+        llm_model="gpt-4o-mini",
+        stt_language="en",
+    )
+
+    async def static_readiness(*_args):
+        return [], {
+            "provider_compatibility": True,
+            "tts_credential": True,
+            "voice_selection": True,
+            "llm_credential": True,
+        }
+
+    async def provider_config(_db, _tenant_id, provider):
+        if provider == "openai":
+            raise ProviderCredentialError("cannot decrypt")
+        return {"api_key": f"workspace-{provider}-key"}
+
+    llm_probe = AsyncMock()
+    monkeypatch.setattr(settings, "openai_api_key", "must-not-be-used")
+    monkeypatch.setattr(runtime_endpoint, "runtime_readiness", static_readiness)
+    monkeypatch.setattr(runtime_endpoint, "load_provider_config", provider_config)
+    monkeypatch.setattr(
+        SarvamAIClient,
+        "synthesize_voice_preview",
+        AsyncMock(return_value=b"RIFFaudio"),
+    )
+    monkeypatch.setattr(runtime_endpoint, "_sarvam_stt_readiness_probe", AsyncMock())
+    monkeypatch.setattr(OpenAIProviderClient, "tool_readiness_probe", llm_probe)
+
+    blockers, checks = await runtime_endpoint.live_runtime_readiness(db, agent, profile)
+
+    assert checks["tts_provider_live"] is True
+    assert checks["stt_provider_live"] is True
+    assert checks["llm_provider_live"] is False
+    assert blockers == [
+        "OpenAI live tool-calling validation cannot run because the workspace credential is "
+        "unreadable."
+    ]
+    llm_probe.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("voice_provider", "telephony_provider", "llm_provider", "mutated_provider", "old", "new"),
+    [
+        (
+            "sarvam",
+            "twilio",
+            "openai",
+            "openai",
+            {"api_key": "old_openai_runtime_key_123456789"},
+            {"api_key": "new_openai_runtime_key_123456789"},
+        ),
+        (
+            "inworld",
+            "livekit_sip",
+            "inworld",
+            "livekit_sip",
+            {
+                "sip_uri": "sip:old.example.ae",
+                "inbound_trunk_id": "ST_old_inbound",
+                "dispatch_rule_id": "SDR_old_dispatch",
+                "outbound_trunk_id": "ST_old_outbound",
+                "agent_name": "vav-inworld",
+            },
+            {
+                "sip_uri": "sip:new.example.ae",
+                "inbound_trunk_id": "ST_new_inbound",
+                "dispatch_rule_id": "SDR_new_dispatch",
+                "outbound_trunk_id": "ST_new_outbound",
+                "agent_name": "vav-inworld",
+            },
+        ),
+    ],
+)
+async def test_activation_rejects_provider_or_sip_mutation_during_live_probe(
+    client,
+    auth_headers,
+    tenant,
+    db,
+    monkeypatch,
+    voice_provider,
+    telephony_provider,
+    llm_provider,
+    mutated_provider,
+    old,
+    new,
+):
+    from app.api.v1.endpoints import runtime as runtime_endpoint
+
+    await store_provider_config(db, tenant.id, mutated_provider, old)
+    agent = Agent(
+        tenant_id=tenant.id,
+        name="Activation dependency race guard",
+        system_prompt="Only activate against the dependencies that were tested.",
+        voice_provider=voice_provider,
+        voice_id=f"{voice_provider}:test-voice",
+    )
+    db.add(agent)
+    await db.flush()
+    profile = AgentRuntimeProfile(
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        enabled=False,
+        status="draft",
+        telephony_provider=telephony_provider,
+        primary_speech_provider=voice_provider,
+        llm_provider=llm_provider,
+        assigned_numbers=["+15551234567"],
+    )
+    db.add(profile)
+    await db.commit()
+
+    async def mutate_during_probe(probe_db, _agent, _profile, **_kwargs):
+        await store_provider_config(probe_db, tenant.id, mutated_provider, new)
+        await probe_db.commit()
+        return [], {"provider_probe": True}
+
+    monkeypatch.setattr(runtime_endpoint, "live_runtime_readiness", mutate_during_probe)
+
+    response = await client.post(
+        f"/api/v1/runtime/agents/{agent.id}/activate",
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 409
+    assert "changed during readiness verification" in response.json()["detail"]
+    await db.refresh(profile)
+    assert profile.enabled is False
+    assert profile.status == "draft"
+
+
+@pytest.mark.asyncio
+async def test_activation_never_undoes_an_explicit_deactivate_during_live_probe(
+    client,
+    auth_headers,
+    tenant,
+    db,
+    monkeypatch,
+):
+    from app.api.v1.endpoints import runtime as runtime_endpoint
+
+    agent = Agent(
+        tenant_id=tenant.id,
+        name="Explicit deactivate race guard",
+        system_prompt="Respect administrator deactivation.",
+        voice_provider="sarvam",
+        voice_id="sarvam:ishita",
+    )
+    db.add(agent)
+    await db.flush()
+    profile = AgentRuntimeProfile(
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        enabled=True,
+        status="active",
+        telephony_provider="twilio",
+        primary_speech_provider="sarvam",
+        llm_provider="openai",
+        assigned_numbers=["+15551234567"],
+    )
+    db.add(profile)
+    await db.commit()
+
+    async def deactivate_during_probe(probe_db, _agent, _profile, **_kwargs):
+        current = await probe_db.scalar(
+            select(AgentRuntimeProfile).where(AgentRuntimeProfile.agent_id == agent.id)
+        )
+        assert current is not None
+        current.enabled = False
+        current.status = "inactive"
+        await probe_db.commit()
+        return [], {"provider_probe": True}
+
+    monkeypatch.setattr(runtime_endpoint, "live_runtime_readiness", deactivate_during_probe)
+
+    response = await client.post(
+        f"/api/v1/runtime/agents/{agent.id}/activate",
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 409
+    assert "changed during readiness verification" in response.json()["detail"]
+    await db.refresh(profile)
+    assert profile.enabled is False
+    assert profile.status == "inactive"
+
+
+@pytest.mark.asyncio
 async def test_ready_runtime_can_be_activated(
     client: AsyncClient,
     auth_headers,
@@ -1203,11 +1959,34 @@ async def test_ready_runtime_can_be_activated(
     db,
     monkeypatch,
 ):
+    from app.api.v1.endpoints import runtime as runtime_endpoint
+
+    async def verify_route(**_kwargs):
+        return None
+
+    monkeypatch.setattr(runtime_endpoint, "verify_twilio_route_ownership", verify_route)
+    monkeypatch.setattr(
+        SarvamAIClient,
+        "synthesize_voice_preview",
+        AsyncMock(return_value=b"RIFFaudio"),
+    )
+    monkeypatch.setattr(runtime_endpoint, "_sarvam_stt_readiness_probe", AsyncMock())
+    monkeypatch.setattr(OpenAIProviderClient, "tool_readiness_probe", AsyncMock())
     monkeypatch.setattr(settings, "sarvam_api_key", "sarvam-test-key-long-enough")
     monkeypatch.setattr(settings, "openai_api_key", "openai-test-key")
     monkeypatch.setattr(settings, "twilio_account_sid", "ACtest")
     monkeypatch.setattr(settings, "twilio_auth_token", "twilio-test-token")
     monkeypatch.setattr(settings, "base_url", "https://api.example.com")
+    await store_provider_config(
+        db,
+        tenant.id,
+        "twilio",
+        {
+            "account_sid": "AC" + "1" * 32,
+            "auth_token": "workspace-twilio-test-token",
+            "default_from_number": "+971501234567",
+        },
+    )
     agent = Agent(
         tenant_id=tenant.id,
         name="Active concierge",
@@ -1221,6 +2000,13 @@ async def test_ready_runtime_can_be_activated(
         last_synced_at=datetime.now(UTC),
     )
     db.add(agent)
+    await db.flush()
+    _knowledge, serving_revision = await publish_test_knowledge(
+        db,
+        tenant_id=tenant.id,
+        agent=agent,
+        label="Active clinic",
+    )
     await db.commit()
     payload = {
         "assigned_numbers": ["+971501234567"],
@@ -1245,7 +2031,7 @@ async def test_ready_runtime_can_be_activated(
     retested = await client.post(f"/api/v1/runtime/agents/{agent.id}/test", headers=auth_headers)
     active_profile = await client.get(f"/api/v1/runtime/agents/{agent.id}", headers=auth_headers)
 
-    assert configured.json()["ready"] is True
+    assert configured.json()["ready"] is False
     assert tested.json()["ready"] is True
     assert activated.status_code == 200
     assert activated.json()["enabled"] is True
@@ -1254,6 +2040,72 @@ async def test_ready_runtime_can_be_activated(
     assert retested.json()["ready"] is True
     assert active_profile.json()["enabled"] is True
     assert active_profile.json()["status"] == "active"
+
+    original_manifest = serving_revision.manifest
+    serving_revision.manifest = {
+        **original_manifest,
+        "speech_lexicon": {
+            **original_manifest["speech_lexicon"],
+            "content_sha256": "0" * 64,
+        },
+    }
+    await db.commit()
+    corrupt_release = await client.post(
+        f"/api/v1/runtime/agents/{agent.id}/test",
+        headers=auth_headers,
+    )
+    assert corrupt_release.status_code == 200
+    assert corrupt_release.json()["ready"] is False
+    assert corrupt_release.json()["checks"]["knowledge_retrieval"] is False
+
+    serving_revision.manifest = original_manifest
+    await db.commit()
+    retained_source = await db.scalar(
+        select(KnowledgeServingRevisionSource).where(
+            KnowledgeServingRevisionSource.serving_revision_id == serving_revision.id
+        )
+    )
+    assert retained_source is not None
+
+    other_knowledge = KnowledgeBase(
+        tenant_id=tenant.id,
+        name="Other same-tenant knowledge",
+        approval_status="draft",
+        sync_status="ready",
+        is_active=True,
+    )
+    db.add(other_knowledge)
+    await db.flush()
+    misowned_source = KnowledgeServingRevisionSource(
+        tenant_id=tenant.id,
+        serving_revision_id=serving_revision.id,
+        knowledge_base_id=other_knowledge.id,
+        original_source_id=uuid4(),
+        source_type="text",
+        name="Mis-owned retained source",
+        content="This content must never enter the active clinic release.",
+        content_sha256="f" * 64,
+        chunk_count=1,
+    )
+    db.add(misowned_source)
+    await db.commit()
+    misowned_release = await client.post(
+        f"/api/v1/runtime/agents/{agent.id}/test",
+        headers=auth_headers,
+    )
+    assert misowned_release.status_code == 200
+    assert misowned_release.json()["checks"]["knowledge_retrieval"] is False
+
+    await db.delete(misowned_source)
+    await db.commit()
+    await db.delete(retained_source)
+    await db.commit()
+    incomplete_release = await client.post(
+        f"/api/v1/runtime/agents/{agent.id}/test",
+        headers=auth_headers,
+    )
+    assert incomplete_release.status_code == 200
+    assert incomplete_release.json()["checks"]["knowledge_retrieval"] is False
 
     monkeypatch.setattr(settings, "sarvam_api_key", "")
     degraded = await client.post(f"/api/v1/runtime/agents/{agent.id}/test", headers=auth_headers)
@@ -1285,11 +2137,27 @@ async def test_runtime_readiness_blocks_number_owned_by_another_active_agent(
     db,
     monkeypatch,
 ):
+    from app.services import twilio_route_security
+
+    async def verify_route(**_kwargs):
+        return None
+
+    monkeypatch.setattr(twilio_route_security, "verify_twilio_route_ownership", verify_route)
     monkeypatch.setattr(settings, "sarvam_api_key", "sarvam-test-key-long-enough")
     monkeypatch.setattr(settings, "openai_api_key", "openai-test-key")
     monkeypatch.setattr(settings, "twilio_account_sid", "ACtest")
     monkeypatch.setattr(settings, "twilio_auth_token", "twilio-test-token")
     monkeypatch.setattr(settings, "base_url", "https://api.example.com")
+    await store_provider_config(
+        db,
+        tenant.id,
+        "twilio",
+        {
+            "account_sid": "AC" + "2" * 32,
+            "auth_token": "workspace-twilio-test-token",
+            "default_from_number": "+971501234567",
+        },
+    )
     active_agent = Agent(
         tenant_id=tenant.id,
         name="Existing phone owner",
@@ -1341,8 +2209,10 @@ async def test_runtime_readiness_blocks_number_owned_by_another_active_agent(
 
     assert configured.status_code == 200
     assert configured.json()["ready"] is False
-    assert any("other active agent" in blocker for blocker in configured.json()["blockers"])
     assert activated.status_code == 409
+    assert any(
+        "other active agent" in blocker for blocker in activated.json()["detail"]["blockers"]
+    )
 
 
 @pytest.mark.asyncio
@@ -1413,4 +2283,4 @@ async def test_runtime_readiness_blocks_bound_pdf_without_searchable_text(
 
     assert configured.status_code == 200
     assert configured.json()["ready"] is False
-    assert any("searchable text" in blocker for blocker in configured.json()["blockers"])
+    assert any("immutable serving revision" in blocker for blocker in configured.json()["blockers"])

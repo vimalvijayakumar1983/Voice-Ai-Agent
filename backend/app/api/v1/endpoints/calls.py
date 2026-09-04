@@ -34,11 +34,12 @@ from app.services.compliance_policy import (
 )
 from app.services.knowledge_serving import (
     KnowledgeServingError,
+    knowledge_call_reservation_metadata,
     load_agent_serving_revision_identity,
     pre_admit_outbound_knowledge_call,
 )
 from app.services.phone_numbers import is_number_on_tenant_dnc, tenant_phone_dnc_lock
-from app.services.provider_credentials import load_provider_config
+from app.services.provider_credentials import ProviderCredentialError, load_provider_config
 from app.services.realtime_speech_config import (
     configured_inworld_stt_model,
     resolve_inworld_stt_language,
@@ -46,6 +47,15 @@ from app.services.realtime_speech_config import (
 )
 from app.services.recording_policy import recording_runtime_metadata
 from app.services.recordings import RecordingError, fetch_call_recording
+from app.services.runtime_capacity import (
+    TERMINAL_CALL_STATUSES as RUNTIME_TERMINAL_CALL_STATUSES,
+)
+from app.services.twilio_route_security import (
+    TwilioRouteCredential,
+    load_workspace_twilio_route_credential,
+    twilio_callback_credential_fingerprint,
+    twilio_route_verification_is_current,
+)
 from app.services.usage_ledger import (
     lock_agent_runtime_limits,
     monthly_agent_budget_commitment,
@@ -519,25 +529,95 @@ async def initiate_outbound_call(
 
     is_smallest = agent.voice_provider == "smallest"
     is_inworld = agent.voice_provider == "inworld"
+    is_native_twilio = agent.voice_provider in {"sarvam", "elevenlabs"}
     smallest_config = (
         await load_provider_config(db, current_user.tenant_id, "smallest") if is_smallest else None
     )
-    twilio_config = (
-        await load_provider_config(db, current_user.tenant_id, "twilio")
-        if not is_smallest and not is_inworld
-        else None
-    )
+    try:
+        twilio_config = (
+            await load_provider_config(db, current_user.tenant_id, "twilio")
+            if not is_smallest and not is_inworld
+            else None
+        )
+    except ProviderCredentialError as exc:
+        if is_native_twilio:
+            raise HTTPException(
+                status_code=409,
+                detail="This workspace's Twilio credential is unavailable",
+            ) from exc
+        raise
+    native_twilio_credential = None
+    if is_native_twilio:
+        try:
+            native_twilio_credential = await load_workspace_twilio_route_credential(
+                db,
+                current_user.tenant_id,
+            )
+        except ProviderCredentialError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail="This workspace's Twilio credential is unavailable",
+            ) from exc
+        if native_twilio_credential is None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Add this workspace's own Twilio account SID and auth token before "
+                    "placing a native VAV call"
+                ),
+            )
     sip_config = (
         await load_provider_config(db, current_user.tenant_id, "livekit_sip")
         if is_inworld
         else None
     )
     twilio_default_from_number = str(
-        (twilio_config or {}).get("default_from_number") or settings.twilio_default_from_number
+        (twilio_config or {}).get("default_from_number")
+        or ("" if is_native_twilio else settings.twilio_default_from_number)
     ).strip()
+    twilio_credential_binding: dict[str, str] | None = None
+    if not is_smallest and not is_inworld:
+        if native_twilio_credential is not None:
+            twilio_credential_binding = {
+                "provider": "twilio",
+                "source": "workspace",
+                "account_sid": native_twilio_credential.account_sid,
+                "credential_fingerprint": twilio_callback_credential_fingerprint(
+                    native_twilio_credential
+                ),
+            }
+        elif twilio_config and all(
+            twilio_config.get(name) for name in ("account_sid", "auth_token")
+        ):
+            legacy_workspace_credential = TwilioRouteCredential(
+                account_sid=str(twilio_config["account_sid"]).strip(),
+                auth_token=str(twilio_config["auth_token"]).strip(),
+            )
+            twilio_credential_binding = {
+                "provider": "twilio",
+                "source": "workspace",
+                "account_sid": legacy_workspace_credential.account_sid,
+                "credential_fingerprint": twilio_callback_credential_fingerprint(
+                    legacy_workspace_credential
+                ),
+            }
+        else:
+            platform_credential = TwilioRouteCredential(
+                account_sid=settings.twilio_account_sid.strip(),
+                auth_token=settings.twilio_auth_token.strip(),
+            )
+            twilio_credential_binding = {
+                "provider": "twilio",
+                "source": "platform",
+                "account_sid": platform_credential.account_sid,
+                "credential_fingerprint": twilio_callback_credential_fingerprint(
+                    platform_credential
+                ),
+            }
     runtime_profile = None
     knowledge_serving_revision = None
     knowledge_serving_revocation_generation = None
+    knowledge_reservation_metadata: dict[str, str | int] | None = None
     if agent.voice_provider in {"sarvam", "elevenlabs", "inworld"}:
         runtime_profile = await db.scalar(
             select(AgentRuntimeProfile).where(
@@ -561,31 +641,55 @@ async def initiate_outbound_call(
                 status_code=409,
                 detail=f"Outbound dispatch requires the active {expected_telephony} runtime",
             )
+        if is_native_twilio and (
+            native_twilio_credential is None
+            or not twilio_route_verification_is_current(
+                runtime_profile,
+                native_twilio_credential,
+                expected_voice_url=(
+                    f"{settings.base_url.rstrip('/')}/api/v1/webhooks/twilio/voice/inbound"
+                ),
+            )
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Re-run runtime readiness to verify this workspace's Twilio account and "
+                    "assigned caller IDs before placing a call"
+                ),
+            )
         if is_inworld and not (sip_config or {}).get("outbound_trunk_id"):
             raise HTTPException(
                 status_code=409,
                 detail="Record a verified LiveKit outbound trunk ID before placing outbound calls",
             )
-        if is_inworld:
-            (
+        (
+            knowledge_serving_revision,
+            knowledge_serving_revocation_generation,
+        ) = await load_agent_serving_revision_identity(
+            db,
+            tenant_id=current_user.tenant_id,
+            agent_id=agent.id,
+            include_sources=False,
+        )
+        if knowledge_serving_revision is None or knowledge_serving_revocation_generation is None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Approve and publish the agent's knowledge base before placing "
+                    "a VAV realtime call"
+                ),
+            )
+        try:
+            knowledge_reservation_metadata = knowledge_call_reservation_metadata(
                 knowledge_serving_revision,
                 knowledge_serving_revocation_generation,
-            ) = await load_agent_serving_revision_identity(
-                db,
-                tenant_id=current_user.tenant_id,
-                agent_id=agent.id,
             )
-            if (
-                knowledge_serving_revision is None
-                or knowledge_serving_revocation_generation is None
-            ):
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        "Approve and publish the agent's knowledge base before placing "
-                        "an Inworld call"
-                    ),
-                )
+        except KnowledgeServingError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail="The published knowledge release failed integrity validation",
+            ) from exc
         now = datetime.now(UTC)
         day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         month_start = day_start.replace(day=1)
@@ -609,7 +713,7 @@ async def initiate_outbound_call(
             .where(
                 Call.tenant_id == current_user.tenant_id,
                 Call.agent_id == agent.id,
-                Call.status.notin_(TERMINAL_CALL_STATUSES),
+                Call.status.notin_(RUNTIME_TERMINAL_CALL_STATUSES),
             )
         )
         monthly_budget = await monthly_agent_budget_commitment(
@@ -705,63 +809,61 @@ async def initiate_outbound_call(
             "agent_configuration": agent_configuration_snapshot(agent),
             "runtime_profile_id": str(runtime_profile.id) if runtime_profile else None,
             "speech_provider": agent.voice_provider,
+            "telephony_credential_binding": twilio_credential_binding,
             "runtime": (
                 {
-                    "transport": "livekit_sip",
-                    "speech_provider": "inworld",
+                    "transport": "livekit_sip" if is_inworld else "twilio_media_streams",
+                    "speech_provider": agent.voice_provider,
                     "llm_provider": runtime_profile.llm_provider,
                     "llm_model": runtime_profile.llm_model,
-                    "stt_model": resolve_inworld_stt_model(
-                        model=agent,
-                        profile=runtime_profile,
-                    ),
-                    "stt_model_configured": configured_inworld_stt_model(profile=runtime_profile),
-                    "stt_language": resolve_inworld_stt_language(
-                        model=agent,
-                        profile=runtime_profile,
-                    ),
-                    "stt_language_configured": runtime_profile.stt_language,
-                    "tts_model": "inworld-tts-2",
-                    "tts_delivery_mode": str(
-                        (
-                            runtime_profile.runtime_config.get("tts_delivery_mode")
-                            if isinstance(runtime_profile.runtime_config, dict)
-                            else None
-                        )
-                        or "balanced"
-                    ).lower(),
-                    **recording_runtime_metadata(
-                        runtime_profile,
-                        transport="livekit_sip",
-                    ),
+                    **({} if is_inworld else {"media_stream_started": False}),
                     **(
                         {
-                            "knowledge_serving_revision_id": str(knowledge_serving_revision.id),
-                            "knowledge_serving_knowledge_base_id": str(
-                                knowledge_serving_revision.knowledge_base_id
+                            "stt_model": resolve_inworld_stt_model(
+                                model=agent,
+                                profile=runtime_profile,
                             ),
-                            "knowledge_serving_content_sha256": (
-                                knowledge_serving_revision.content_sha256
+                            "stt_model_configured": configured_inworld_stt_model(
+                                profile=runtime_profile
                             ),
-                            "knowledge_source_revision_sha256": (
-                                knowledge_serving_revision.source_revision_sha256
+                            "stt_language": resolve_inworld_stt_language(
+                                model=agent,
+                                profile=runtime_profile,
                             ),
-                            "knowledge_serving_revocation_generation": (
-                                knowledge_serving_revocation_generation
-                            ),
+                            "stt_language_configured": runtime_profile.stt_language,
+                            "tts_model": "inworld-tts-2",
+                            "tts_delivery_mode": str(
+                                (
+                                    runtime_profile.runtime_config.get("tts_delivery_mode")
+                                    if isinstance(runtime_profile.runtime_config, dict)
+                                    else None
+                                )
+                                or "balanced"
+                            ).lower(),
                         }
-                        if knowledge_serving_revision is not None
-                        else {}
+                        if is_inworld
+                        else {
+                            "stt_model": "sarvam/saaras:v3-realtime",
+                            "stt_language_configured": runtime_profile.stt_language,
+                        }
                     ),
+                    **recording_runtime_metadata(
+                        runtime_profile,
+                        transport=("livekit_sip" if is_inworld else "twilio_media_streams"),
+                    ),
+                    **knowledge_reservation_metadata,
                 }
-                if is_inworld and runtime_profile
+                if runtime_profile
+                and knowledge_serving_revision is not None
+                and knowledge_serving_revocation_generation is not None
+                and knowledge_reservation_metadata is not None
                 else {}
             ),
         },
     )
     db.add(call)
     try:
-        if is_inworld:
+        if agent.voice_provider in {"sarvam", "elevenlabs", "inworld"}:
             try:
                 call = await pre_admit_outbound_knowledge_call(
                     db,
@@ -858,6 +960,16 @@ async def initiate_outbound_call(
                 )
                 .with_for_update()
             )
+        current_native_twilio_credential = None
+        if current_agent and current_agent.voice_provider in {"sarvam", "elevenlabs"}:
+            try:
+                current_native_twilio_credential = await load_workspace_twilio_route_credential(
+                    db,
+                    current_user.tenant_id,
+                    for_update=True,
+                )
+            except ProviderCredentialError:
+                current_native_twilio_credential = None
         current_assigned_numbers = (
             current_runtime_profile.assigned_numbers if current_runtime_profile else []
         )
@@ -904,6 +1016,21 @@ async def initiate_outbound_call(
                 or current_runtime_profile.telephony_provider
                 != ("livekit_sip" if current_agent.voice_provider == "inworld" else "twilio")
                 or current_runtime_profile.primary_speech_provider != current_agent.voice_provider
+                or (
+                    current_agent.voice_provider in {"sarvam", "elevenlabs"}
+                    and (
+                        current_native_twilio_credential is None
+                        or not twilio_route_verification_is_current(
+                            current_runtime_profile,
+                            current_native_twilio_credential,
+                            expected_voice_url=(
+                                f"{settings.base_url.rstrip('/')}"
+                                "/api/v1/webhooks/twilio/voice/inbound"
+                            ),
+                        )
+                        or current_from_number not in current_assigned_numbers
+                    )
+                )
             )
         )
         if (
@@ -959,16 +1086,23 @@ async def initiate_outbound_call(
                 provider_call_sid = livekit_result.provider_call_sid
                 livekit_room_name = livekit_result.room_name
             else:
-                provider = (
-                    get_telephony_provider(
-                        account_sid=str(twilio_config.get("account_sid")).strip(),
-                        auth_token=str(twilio_config.get("auth_token")).strip(),
+                if current_agent.voice_provider in {"sarvam", "elevenlabs"}:
+                    assert current_native_twilio_credential is not None
+                    provider = get_telephony_provider(
+                        account_sid=current_native_twilio_credential.account_sid,
+                        auth_token=current_native_twilio_credential.auth_token,
                     )
-                    if twilio_config
-                    and twilio_config.get("account_sid")
-                    and twilio_config.get("auth_token")
-                    else get_telephony_provider()
-                )
+                else:
+                    provider = (
+                        get_telephony_provider(
+                            account_sid=str(twilio_config.get("account_sid")).strip(),
+                            auth_token=str(twilio_config.get("auth_token")).strip(),
+                        )
+                        if twilio_config
+                        and twilio_config.get("account_sid")
+                        and twilio_config.get("auth_token")
+                        else get_telephony_provider()
+                    )
                 webhook_url = f"{settings.base_url}/api/v1/webhooks/twilio/voice/{call.id}"
                 status_url = f"{settings.base_url}/api/v1/webhooks/twilio/status/{call.id}"
                 provider_result = await provider.make_call(

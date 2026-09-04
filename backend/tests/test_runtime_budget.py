@@ -8,14 +8,21 @@ from uuid import uuid4
 import pytest
 from sqlalchemy import func, select
 
+from app.core.config import settings
 from app.livekit_runtime import worker as livekit_worker
 from app.models.agent import Agent, AgentRuntimeProfile
 from app.models.billing import UsageRecord
 from app.models.call import Call
+from app.services.provider_credentials import store_provider_config
+from app.services.twilio_route_security import (
+    TwilioRouteCredential,
+    mark_twilio_route_verified,
+)
 from app.services.usage_ledger import (
     lock_agent_runtime_limits,
     monthly_agent_budget_commitment,
 )
+from tests.knowledge_test_utils import publish_test_knowledge
 
 
 def _month_start(now: datetime) -> datetime:
@@ -213,20 +220,40 @@ async def test_outbound_budget_guard_reserves_unprocessed_and_prospective_calls(
     )
     db.add(agent)
     await db.flush()
-    db.add(
-        AgentRuntimeProfile(
-            tenant_id=tenant.id,
-            agent_id=agent.id,
-            enabled=True,
-            status="active",
-            telephony_provider="twilio",
-            primary_speech_provider="sarvam",
-            llm_provider="openai",
-            assigned_numbers=["+97141234567"],
-            max_concurrent_calls=5,
-            daily_call_limit=100,
-            monthly_budget_cents=100,
-        )
+    profile = AgentRuntimeProfile(
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        enabled=True,
+        status="active",
+        telephony_provider="twilio",
+        primary_speech_provider="sarvam",
+        llm_provider="openai",
+        assigned_numbers=["+97141234567"],
+        max_concurrent_calls=5,
+        daily_call_limit=100,
+        monthly_budget_cents=100,
+    )
+    db.add(profile)
+    twilio_credential = TwilioRouteCredential(
+        account_sid="AC" + "7" * 32,
+        auth_token="budget-guard-twilio-auth-token",
+    )
+    await store_provider_config(
+        db,
+        tenant.id,
+        "twilio",
+        {
+            "account_sid": twilio_credential.account_sid,
+            "auth_token": twilio_credential.auth_token,
+            "default_from_number": "+97141234567",
+        },
+    )
+    mark_twilio_route_verified(
+        profile,
+        twilio_credential,
+        expected_voice_url=(
+            f"{settings.base_url.rstrip('/')}/api/v1/webhooks/twilio/voice/inbound"
+        ),
     )
     processed_call = Call(
         tenant_id=tenant.id,
@@ -252,6 +279,12 @@ async def test_outbound_budget_guard_reserves_unprocessed_and_prospective_calls(
     )
     db.add_all([processed_call, unprocessed_call])
     await db.flush()
+    await publish_test_knowledge(
+        db,
+        tenant_id=tenant.id,
+        agent=agent,
+        label="Budget concierge",
+    )
     db.add(
         UsageRecord(
             tenant_id=tenant.id,

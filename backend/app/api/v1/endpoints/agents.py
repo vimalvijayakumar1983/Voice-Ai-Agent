@@ -116,9 +116,13 @@ from app.services.call_metadata import agent_configuration_snapshot
 from app.services.integration_security import (
     IntegrationConfigUnavailableError,
     decrypt_integration_config,
-    encrypt_integration_config,
 )
-from app.services.provider_credentials import ProviderCredentialError, load_provider_config
+from app.services.provider_credentials import (
+    ProviderCredentialError,
+    invalidate_active_runtimes_for_credential,
+    load_provider_config,
+    store_provider_config,
+)
 from app.services.rate_limit import enforce_rate_limit
 from app.services.realtime_speech_config import (
     configured_inworld_stt_model,
@@ -2775,34 +2779,26 @@ async def save_sarvam_credential(
     db: AsyncSession = Depends(get_db),
 ):
     """Store a write-only tenant Sarvam key in an authenticated envelope."""
-    try:
-        encrypted = encrypt_integration_config({"api_key": data.api_key})
-    except IntegrationConfigUnavailableError as exc:
-        raise HTTPException(
-            status_code=500,
-            detail="Credential encryption is unavailable",
-        ) from exc
-
+    invalidated_agent_ids = await invalidate_active_runtimes_for_credential(
+        db,
+        current_user.tenant_id,
+        "sarvam",
+    )
     credential = await _tenant_sarvam_credential(
         db,
         current_user.tenant_id,
         for_update=True,
     )
     action = "provider_credential.rotated" if credential else "provider_credential.created"
-    if credential is None:
-        credential = ProviderCredential(
-            tenant_id=current_user.tenant_id,
-            provider="sarvam",
-            encrypted_config=encrypted,
-            encryption_version=1,
-            is_active=True,
+    try:
+        credential = await store_provider_config(
+            db,
+            current_user.tenant_id,
+            "sarvam",
+            {"api_key": data.api_key},
         )
-        db.add(credential)
-    else:
-        credential.encrypted_config = encrypted
-        credential.encryption_version = 1
-        credential.is_active = True
-    await db.flush()
+    except ProviderCredentialError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
     await record_audit_event(
         db,
         tenant_id=current_user.tenant_id,
@@ -2810,7 +2806,10 @@ async def save_sarvam_credential(
         action=action,
         resource_type="provider_credential",
         resource_id=str(credential.id),
-        details={"provider": "sarvam"},
+        details={
+            "provider": "sarvam",
+            "reverification_required_agent_ids": invalidated_agent_ids,
+        },
     )
     return ProviderCredentialStatus(
         configured=True,
@@ -2827,6 +2826,11 @@ async def delete_sarvam_credential(
     current_user: CurrentUser = Depends(require_role("owner", "admin")),
     db: AsyncSession = Depends(get_db),
 ):
+    invalidated_agent_ids = await invalidate_active_runtimes_for_credential(
+        db,
+        current_user.tenant_id,
+        "sarvam",
+    )
     credential = await _tenant_sarvam_credential(
         db,
         current_user.tenant_id,
@@ -2843,7 +2847,10 @@ async def delete_sarvam_credential(
             action="provider_credential.deleted",
             resource_type="provider_credential",
             resource_id=credential_id,
-            details={"provider": "sarvam"},
+            details={
+                "provider": "sarvam",
+                "reverification_required_agent_ids": invalidated_agent_ids,
+            },
         )
     platform = get_sarvam_client()
     return ProviderCredentialStatus(

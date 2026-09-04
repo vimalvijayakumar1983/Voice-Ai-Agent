@@ -36,10 +36,52 @@ _SERVING_METADATA_KEYS = frozenset(
     {"title", "page_title", "display_name", "url", "canonical_url", "language"}
 )
 KNOWLEDGE_ADMISSION_STATE = "admitted_before_dispatch"
+INBOUND_KNOWLEDGE_ADMISSION_STATE = "admitted_before_media_stream"
+_KNOWLEDGE_ADMISSION_STATES = frozenset(
+    {KNOWLEDGE_ADMISSION_STATE, INBOUND_KNOWLEDGE_ADMISSION_STATE}
+)
 
 
 class KnowledgeServingError(ValueError):
     """Raised when a draft cannot be published as a safe serving revision."""
+
+
+def knowledge_call_reservation_metadata(
+    revision: KnowledgeServingRevision,
+    revocation_generation: int,
+) -> dict[str, str | int]:
+    """Serialize the complete immutable identity every VAV media lane uses."""
+
+    if (
+        isinstance(revocation_generation, bool)
+        or not isinstance(revocation_generation, int)
+        or revocation_generation < 0
+    ):
+        raise KnowledgeServingError(
+            "Knowledge serving revocation generation must be a non-negative integer"
+        )
+    manifest = revision.manifest if isinstance(revision.manifest, dict) else {}
+    lexicon_manifest = manifest.get("speech_lexicon")
+    if not isinstance(lexicon_manifest, dict):
+        raise KnowledgeServingError("Knowledge serving speech lexicon manifest is missing")
+    artifact_id = str(revision.speech_lexicon_artifact_id)
+    content_sha256 = lexicon_manifest.get("content_sha256")
+    if (
+        lexicon_manifest.get("artifact_id") != artifact_id
+        or content_sha256 != revision.entity_revision_sha256
+        or not isinstance(content_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", content_sha256) is None
+    ):
+        raise KnowledgeServingError("Knowledge serving speech lexicon manifest is invalid")
+    return {
+        "knowledge_serving_revision_id": str(revision.id),
+        "knowledge_serving_knowledge_base_id": str(revision.knowledge_base_id),
+        "knowledge_serving_content_sha256": revision.content_sha256,
+        "knowledge_source_revision_sha256": revision.source_revision_sha256,
+        "knowledge_serving_revocation_generation": revocation_generation,
+        "speech_lexicon_artifact_id": artifact_id,
+        "speech_lexicon_content_sha256": content_sha256,
+    }
 
 
 def parse_serving_revision_id(value: object) -> UUID | None:
@@ -117,8 +159,51 @@ def serving_revocation_generation_from_call_metadata(value: object) -> int | Non
     return generation
 
 
+def speech_lexicon_artifact_id_from_call_metadata(value: object) -> UUID | None:
+    """Return the immutable speech-lexicon artifact reserved for a call."""
+
+    if not isinstance(value, Mapping):
+        return None
+    runtime = value.get("runtime")
+    if not isinstance(runtime, Mapping):
+        return None
+    raw_id = runtime.get("speech_lexicon_artifact_id")
+    if raw_id is None or raw_id == "":
+        return None
+    if isinstance(raw_id, UUID):
+        return raw_id
+    if not isinstance(raw_id, str):
+        raise KnowledgeServingError("Speech lexicon artifact pin must be a UUID")
+    try:
+        return UUID(raw_id)
+    except ValueError as exc:
+        raise KnowledgeServingError("Speech lexicon artifact pin is invalid") from exc
+
+
+def speech_lexicon_content_sha256_from_call_metadata(value: object) -> str | None:
+    """Return the immutable speech-lexicon content hash reserved for a call."""
+
+    if not isinstance(value, Mapping):
+        return None
+    runtime = value.get("runtime")
+    if not isinstance(runtime, Mapping):
+        return None
+    content_sha256 = runtime.get("speech_lexicon_content_sha256")
+    if content_sha256 is None or content_sha256 == "":
+        return None
+    if not isinstance(content_sha256, str) or re.fullmatch(r"[0-9a-f]{64}", content_sha256) is None:
+        raise KnowledgeServingError("Speech lexicon content hash is invalid")
+    return content_sha256
+
+
 def knowledge_admission_is_durable(value: object) -> bool:
-    """Validate and recognize a server-authored pre-dispatch admission marker."""
+    """Validate a server-authored knowledge admission marker.
+
+    The marker predates speech-lexicon reservation fields and intentionally
+    remains backward-compatible for in-flight LiveKit calls during rolling
+    deployments. Native Twilio paths validate the newer lexicon identity
+    separately before admitting or starting media.
+    """
 
     if not isinstance(value, Mapping):
         return False
@@ -129,7 +214,7 @@ def knowledge_admission_is_durable(value: object) -> bool:
     admitted_at = runtime.get("knowledge_admitted_at")
     if state is None and admitted_at is None:
         return False
-    if state != KNOWLEDGE_ADMISSION_STATE or not isinstance(admitted_at, str):
+    if state not in _KNOWLEDGE_ADMISSION_STATES or not isinstance(admitted_at, str):
         raise KnowledgeServingError("Knowledge admission marker is invalid")
     try:
         parsed_at = datetime.fromisoformat(admitted_at.replace("Z", "+00:00"))
@@ -704,6 +789,7 @@ async def load_agent_serving_revision(
         tenant_id=tenant_id,
         agent_id=agent_id,
         serving_revision_id=serving_revision_id,
+        include_sources=True,
     )
     return revision
 
@@ -714,8 +800,15 @@ async def load_agent_serving_revision_identity(
     tenant_id: UUID,
     agent_id: UUID,
     serving_revision_id: UUID | None = None,
+    include_sources: bool = False,
 ) -> tuple[KnowledgeServingRevision | None, int | None]:
-    """Resolve a revision and its revocation fence from one DB snapshot."""
+    """Resolve a revision and its revocation fence from one DB snapshot.
+
+    Call admission and native session startup need only the immutable identity
+    columns.  Keep source loading explicit so a large compiled website is not
+    transferred on the telephony answer path. LiveKit/browser callers that
+    inspect ``revision.sources`` must opt into eager loading.
+    """
 
     query = (
         select(
@@ -735,8 +828,9 @@ async def load_agent_serving_revision_identity(
             KnowledgeServingRevision.tenant_id == tenant_id,
             KnowledgeServingRevision.knowledge_base_id == KnowledgeBase.id,
         )
-        .options(selectinload(KnowledgeServingRevision.sources))
     )
+    if include_sources:
+        query = query.options(selectinload(KnowledgeServingRevision.sources))
     if serving_revision_id is None:
         query = query.where(KnowledgeBase.serving_revision_id == KnowledgeServingRevision.id)
     else:
@@ -754,66 +848,135 @@ async def load_durably_admitted_serving_revision(
     tenant_id: UUID,
     knowledge_base_id: UUID,
     serving_revision_id: UUID,
+    include_sources: bool = False,
 ) -> KnowledgeServingRevision | None:
     """Load an exact, already-admitted release without following a new binding.
 
     The caller must first validate the durable admission marker on its
     tenant/agent-bound Call row. This loader deliberately ignores later
     pointer, approval, and binding changes: those occurred after the paid call
-    crossed its pre-dispatch admission boundary.
+    crossed its pre-dispatch admission boundary. Source bodies are omitted by
+    default so identity validation remains safe on latency-sensitive paths.
     """
 
-    return await db.scalar(
-        select(KnowledgeServingRevision)
-        .where(
-            KnowledgeServingRevision.id == serving_revision_id,
-            KnowledgeServingRevision.tenant_id == tenant_id,
-            KnowledgeServingRevision.knowledge_base_id == knowledge_base_id,
-        )
-        .options(selectinload(KnowledgeServingRevision.sources))
+    query = select(KnowledgeServingRevision).where(
+        KnowledgeServingRevision.id == serving_revision_id,
+        KnowledgeServingRevision.tenant_id == tenant_id,
+        KnowledgeServingRevision.knowledge_base_id == knowledge_base_id,
     )
+    if include_sources:
+        query = query.options(selectinload(KnowledgeServingRevision.sources))
+    return await db.scalar(query)
 
 
-async def pre_admit_outbound_knowledge_call(
+async def validate_call_speech_lexicon_reservation(
+    db: AsyncSession,
+    *,
+    tenant_id: UUID,
+    knowledge_base_id: UUID,
+    revision: KnowledgeServingRevision,
+    metadata: object,
+) -> None:
+    """Validate the exact speech artifact recorded at call admission.
+
+    A revision ID alone proves which text corpus to serve, but it does not make
+    the recognition context auditable.  Require the independently persisted
+    lexicon ID and content hash to agree with the revision manifest and the
+    retained artifact row before media is admitted or resumed.
+    """
+
+    artifact_id = speech_lexicon_artifact_id_from_call_metadata(metadata)
+    content_sha256 = speech_lexicon_content_sha256_from_call_metadata(metadata)
+    if artifact_id is None or content_sha256 is None:
+        raise KnowledgeServingError("Knowledge speech lexicon reservation identity is incomplete")
+    manifest = revision.manifest if isinstance(revision.manifest, dict) else {}
+    lexicon_manifest = manifest.get("speech_lexicon")
+    if not isinstance(lexicon_manifest, dict):
+        raise KnowledgeServingError("Knowledge speech lexicon manifest is missing")
+    if (
+        revision.tenant_id != tenant_id
+        or revision.knowledge_base_id != knowledge_base_id
+        or artifact_id != revision.speech_lexicon_artifact_id
+        or content_sha256 != revision.entity_revision_sha256
+        or lexicon_manifest.get("artifact_id") != str(artifact_id)
+        or lexicon_manifest.get("content_sha256") != content_sha256
+    ):
+        raise KnowledgeServingError(
+            "Knowledge speech lexicon reservation failed integrity validation"
+        )
+    artifact_identity = (
+        await db.execute(
+            select(
+                KnowledgeSpeechLexicon.id,
+                KnowledgeSpeechLexicon.content_sha256,
+            ).where(
+                KnowledgeSpeechLexicon.id == artifact_id,
+                KnowledgeSpeechLexicon.tenant_id == tenant_id,
+                KnowledgeSpeechLexicon.knowledge_base_id == knowledge_base_id,
+            )
+        )
+    ).one_or_none()
+    if artifact_identity is None or artifact_identity.content_sha256 != content_sha256:
+        raise KnowledgeServingError(
+            "Knowledge speech lexicon artifact is unavailable or failed integrity validation"
+        )
+
+
+async def _admit_call_knowledge(
     db: AsyncSession,
     *,
     tenant_id: UUID,
     agent_id: UUID,
     call_id: UUID,
+    direction: str,
+    providers: tuple[str, ...],
+    status: str,
+    allow_legacy_livekit: bool,
+    admission_state: str,
 ) -> Call:
-    """Atomically admit one immutable release before the paid SIP side effect.
+    """Cross one provider-neutral immutable knowledge admission boundary.
 
-    Lock order matches the worker: Call -> KnowledgeBase -> binding. Ordinary
-    publication may move the live pointer without invalidating the reserved
-    immutable revision. Explicit revocation changes the generation and wins if
-    it commits before this boundary.
+    Lock order is Call -> KnowledgeBase -> binding. Ordinary publication may
+    move the live pointer without invalidating the reserved immutable revision.
+    Explicit revocation changes the generation and wins if it commits before
+    this boundary.
     """
 
+    if admission_state not in _KNOWLEDGE_ADMISSION_STATES:
+        raise KnowledgeServingError("Knowledge admission state is unsupported")
+    label = "Outbound" if direction == "outbound" else "Inbound"
+    boundary = "dispatch" if direction == "outbound" else "admission"
     call = await db.scalar(
         select(Call)
         .where(
             Call.id == call_id,
             Call.tenant_id == tenant_id,
             Call.agent_id == agent_id,
-            Call.direction == "outbound",
-            Call.provider == "livekit_sip",
-            Call.status == "dispatching",
+            Call.direction == direction,
+            Call.provider.in_(providers),
+            Call.status == status,
         )
         .with_for_update()
         .execution_options(populate_existing=True)
     )
     if call is None:
-        raise KnowledgeServingError("Outbound knowledge reservation is unavailable")
+        raise KnowledgeServingError(f"{label} knowledge reservation is unavailable")
     metadata = call.call_metadata if isinstance(call.call_metadata, dict) else {}
     revision_id = serving_revision_id_from_call_metadata(metadata)
     knowledge_base_id = serving_knowledge_base_id_from_call_metadata(metadata)
     revocation_generation = serving_revocation_generation_from_call_metadata(metadata)
     if revision_id is None:
-        # Bounded rolling-deploy compatibility for legacy approved knowledge.
-        # Such calls retain worker-time admission and are not marked durable.
-        return call
+        if allow_legacy_livekit and call.provider == "livekit_sip":
+            # Bounded rolling-deploy compatibility for LiveKit reservations
+            # created before migration 023. The LiveKit worker retains its
+            # stricter connect-time admission for these already-persisted
+            # calls. Native Twilio media calls never had such a second
+            # admission boundary, so a newly admitted Twilio call must always
+            # carry the complete immutable identity.
+            return call
+        raise KnowledgeServingError(f"{label} knowledge reservation identity is missing")
     if knowledge_base_id is None or revocation_generation is None:
-        raise KnowledgeServingError("Outbound knowledge reservation identity is incomplete")
+        raise KnowledgeServingError(f"{label} knowledge reservation identity is incomplete")
 
     discovered_binding = await db.scalar(
         select(AgentKnowledgeBinding).where(
@@ -822,9 +985,9 @@ async def pre_admit_outbound_knowledge_call(
         )
     )
     if discovered_binding is None or discovered_binding.knowledge_base_id != knowledge_base_id:
-        raise KnowledgeServingError("Outbound knowledge binding changed before dispatch")
-    knowledge = await db.scalar(
-        select(KnowledgeBase)
+        raise KnowledgeServingError(f"{label} knowledge binding changed before {boundary}")
+    knowledge_revocation_generation = await db.scalar(
+        select(KnowledgeBase.serving_revocation_generation)
         .where(
             KnowledgeBase.id == knowledge_base_id,
             KnowledgeBase.tenant_id == tenant_id,
@@ -833,8 +996,8 @@ async def pre_admit_outbound_knowledge_call(
         .with_for_update()
         .execution_options(populate_existing=True)
     )
-    if knowledge is None:
-        raise KnowledgeServingError("Outbound knowledge base was removed before dispatch")
+    if knowledge_revocation_generation is None:
+        raise KnowledgeServingError(f"{label} knowledge base was removed before {boundary}")
     binding = await db.scalar(
         select(AgentKnowledgeBinding)
         .where(
@@ -845,35 +1008,121 @@ async def pre_admit_outbound_knowledge_call(
         .execution_options(populate_existing=True)
     )
     if binding is None or binding.knowledge_base_id != knowledge_base_id:
-        raise KnowledgeServingError("Outbound knowledge binding changed during admission")
-    if knowledge.serving_revocation_generation != revocation_generation:
-        raise KnowledgeServingError("Outbound knowledge was revoked before dispatch")
+        raise KnowledgeServingError(f"{label} knowledge binding changed during admission")
+    if knowledge_revocation_generation != revocation_generation:
+        raise KnowledgeServingError(f"{label} knowledge was revoked before {boundary}")
 
     revision = await load_durably_admitted_serving_revision(
         db,
         tenant_id=tenant_id,
         knowledge_base_id=knowledge_base_id,
         serving_revision_id=revision_id,
+        include_sources=False,
     )
     if revision is None:
-        raise KnowledgeServingError("Outbound knowledge revision is unavailable")
+        raise KnowledgeServingError(f"{label} knowledge revision is unavailable")
+    await validate_call_speech_lexicon_reservation(
+        db,
+        tenant_id=tenant_id,
+        knowledge_base_id=knowledge_base_id,
+        revision=revision,
+        metadata=metadata,
+    )
     runtime = metadata.get("runtime")
     reserved_runtime = runtime if isinstance(runtime, dict) else {}
     if reserved_runtime.get("knowledge_serving_content_sha256") != revision.content_sha256 or (
         reserved_runtime.get("knowledge_source_revision_sha256") != revision.source_revision_sha256
     ):
-        raise KnowledgeServingError("Outbound knowledge reservation failed integrity validation")
+        raise KnowledgeServingError(f"{label} knowledge reservation failed integrity validation")
     admitted_at = datetime.now(UTC).isoformat()
     call.call_metadata = {
         **metadata,
         "runtime": {
             **reserved_runtime,
-            "knowledge_admission_state": KNOWLEDGE_ADMISSION_STATE,
+            "knowledge_admission_state": admission_state,
             "knowledge_admitted_at": admitted_at,
         },
     }
     await db.flush()
     return call
+
+
+async def pre_admit_outbound_knowledge_call(
+    db: AsyncSession,
+    *,
+    tenant_id: UUID,
+    agent_id: UUID,
+    call_id: UUID,
+) -> Call:
+    """Atomically admit one release before a paid telephony side effect."""
+
+    return await _admit_call_knowledge(
+        db,
+        tenant_id=tenant_id,
+        agent_id=agent_id,
+        call_id=call_id,
+        direction="outbound",
+        providers=("livekit_sip", "twilio"),
+        status="dispatching",
+        allow_legacy_livekit=True,
+        admission_state=KNOWLEDGE_ADMISSION_STATE,
+    )
+
+
+async def admit_inbound_twilio_knowledge_call(
+    db: AsyncSession,
+    *,
+    tenant_id: UUID,
+    agent_id: UUID,
+    call_id: UUID,
+) -> Call:
+    """Atomically pin knowledge before returning an inbound media stream.
+
+    Unlike the bounded LiveKit rolling-upgrade path, native Twilio media
+    sessions have no later worker admission hook. Every new inbound call must
+    therefore carry a complete immutable knowledge identity and cross the
+    revocation fence before VAV returns TwiML that can start caller audio.
+    """
+
+    return await _admit_call_knowledge(
+        db,
+        tenant_id=tenant_id,
+        agent_id=agent_id,
+        call_id=call_id,
+        direction="inbound",
+        providers=("twilio",),
+        status="in_progress",
+        allow_legacy_livekit=False,
+        admission_state=INBOUND_KNOWLEDGE_ADMISSION_STATE,
+    )
+
+
+async def admit_inbound_livekit_knowledge_call(
+    db: AsyncSession,
+    *,
+    tenant_id: UUID,
+    agent_id: UUID,
+    call_id: UUID,
+) -> Call:
+    """Atomically admit an answered LiveKit SIP call before agent startup.
+
+    The LiveKit participant can already be carrier-billable when the worker is
+    dispatched.  Its call row is therefore reserved first, then this boundary
+    validates the immutable release and records the same durable inbound
+    admission marker used by native media streams.
+    """
+
+    return await _admit_call_knowledge(
+        db,
+        tenant_id=tenant_id,
+        agent_id=agent_id,
+        call_id=call_id,
+        direction="inbound",
+        providers=("livekit_sip",),
+        status="in_progress",
+        allow_legacy_livekit=False,
+        admission_state=INBOUND_KNOWLEDGE_ADMISSION_STATE,
+    )
 
 
 async def backfill_approved_serving_revisions(
