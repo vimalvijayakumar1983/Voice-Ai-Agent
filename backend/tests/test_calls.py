@@ -5,13 +5,16 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
+from urllib.parse import parse_qs, urlsplit
 from uuid import UUID
 
 import pytest
 from httpx import AsyncClient
 from sqlalchemy import func, select
+from twilio.request_validator import RequestValidator
 
 from app.api.v1.endpoints import calls as calls_endpoint
+from app.api.v1.endpoints import webhooks
 from app.models.agent import Agent, AgentKnowledgeBinding, AgentRuntimeProfile
 from app.models.audit import AuditEvent
 from app.models.call import Call
@@ -22,6 +25,7 @@ from app.services.knowledge_serving import (
 )
 from app.services.phone_numbers import normalize_e164, tenant_phone_dnc_lock
 from app.services.provider_credentials import store_provider_config
+from app.services.twilio_callback_claim import TWILIO_CALLBACK_CLAIM_METADATA_KEY
 from app.services.twilio_route_security import (
     load_workspace_twilio_route_credential,
     mark_twilio_route_verified,
@@ -115,7 +119,7 @@ async def test_native_outbound_call_is_immutably_admitted_before_provider_io(
 
     observed = {}
 
-    async def make_call(_request):
+    async def make_call(request):
         async with session_factory() as inspect_db:
             admitted = await inspect_db.scalar(
                 select(Call).where(
@@ -126,6 +130,7 @@ async def test_native_outbound_call_is_immutably_admitted_before_provider_io(
             assert admitted is not None
             observed["metadata"] = admitted.call_metadata
             observed["status"] = admitted.status
+            observed["provider_request"] = request
         return SimpleNamespace(provider_call_sid=f"CA-{voice_provider}-outbound")
 
     provider_credentials = []
@@ -171,12 +176,129 @@ async def test_native_outbound_call_is_immutably_admitted_before_provider_io(
     assert callback_binding["account_sid"] == TEST_TWILIO_ACCOUNT_SID
     assert len(callback_binding["credential_fingerprint"]) == 64
     assert TEST_TWILIO_AUTH_TOKEN not in str(callback_binding)
+    provider_request = observed["provider_request"]
+    voice_claim = parse_qs(urlsplit(provider_request.webhook_url).query)["vav_callback_claim"]
+    status_claim = parse_qs(urlsplit(provider_request.status_callback_url).query)[
+        "vav_callback_claim"
+    ]
+    assert len(voice_claim) == 1
+    assert voice_claim == status_claim
+    assert len(voice_claim[0]) >= 40
+    assert voice_claim[0] not in str(observed["metadata"])
+    persisted_claim = observed["metadata"][TWILIO_CALLBACK_CLAIM_METADATA_KEY]
+    assert persisted_claim["version"] == 1
+    assert persisted_claim["state"] == "pending"
+    assert len(persisted_claim["sha256"]) == 64
     assert provider_credentials == [
         {
             "account_sid": TEST_TWILIO_ACCOUNT_SID,
             "auth_token": TEST_TWILIO_AUTH_TOKEN,
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_native_make_call_response_cannot_overwrite_callback_bound_sid(
+    client,
+    auth_headers,
+    tenant,
+    db,
+    monkeypatch,
+):
+    monkeypatch.setattr(calls_endpoint.settings, "base_url", "http://test")
+    agent = Agent(
+        tenant_id=tenant.id,
+        name="Callback wins provider response race",
+        system_prompt="Answer from approved evidence only.",
+        voice_provider="sarvam",
+        voice_id="sarvam:ishita",
+        language="en",
+        supported_languages=["en"],
+    )
+    db.add(agent)
+    await db.flush()
+    from_number = "+15550100002"
+    profile = AgentRuntimeProfile(
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        enabled=True,
+        status="active",
+        telephony_provider="twilio",
+        primary_speech_provider="sarvam",
+        llm_provider="openai",
+        llm_model="gpt-4o-mini",
+        stt_language="en",
+        assigned_numbers=[from_number],
+        max_concurrent_calls=3,
+        daily_call_limit=100,
+        monthly_budget_cents=10000,
+    )
+    db.add(profile)
+    await _mark_verified_twilio_route(db, tenant.id, profile)
+    await publish_test_knowledge(
+        db,
+        tenant_id=tenant.id,
+        agent=agent,
+        label="Callback response race",
+    )
+    await db.commit()
+
+    callback_sid = "CA-callback-bound-before-response"
+
+    async def make_call(request):
+        callback_url = urlsplit(request.webhook_url)
+        callback_target = callback_url.path
+        if callback_url.query:
+            callback_target = f"{callback_target}?{callback_url.query}"
+        payload = {
+            "AccountSid": TEST_TWILIO_ACCOUNT_SID,
+            "CallSid": callback_sid,
+        }
+        signature = RequestValidator(TEST_TWILIO_AUTH_TOKEN).compute_signature(
+            request.webhook_url,
+            payload,
+        )
+        callback_response = await client.post(
+            callback_target,
+            data=payload,
+            headers={"X-Twilio-Signature": signature},
+        )
+        assert callback_response.status_code == 200
+        return SimpleNamespace(provider_call_sid="CA-conflicting-late-provider-response")
+
+    monkeypatch.setattr(
+        calls_endpoint,
+        "get_telephony_provider",
+        lambda **_kwargs: SimpleNamespace(make_call=make_call),
+    )
+    monkeypatch.setattr(webhooks, "async_session_factory", session_factory)
+    monkeypatch.setattr(webhooks, "_kick_provider_outbox", lambda _ids: None)
+    monkeypatch.setattr(call_tasks.reconcile_call_dispatch, "apply_async", Mock())
+    monkeypatch.setattr(call_tasks.reconcile_direct_call_terminal, "apply_async", Mock())
+
+    response = await client.post(
+        "/api/v1/calls",
+        headers={
+            **auth_headers,
+            "Idempotency-Key": "native-callback-provider-response-race-0001",
+        },
+        json={
+            "agent_id": str(agent.id),
+            "to_number": "+15550100001",
+            "from_number": from_number,
+        },
+    )
+
+    assert response.status_code == 201
+    assert response.json()["provider_call_sid"] == callback_sid
+    assert response.json()["status"] == "in_progress"
+    db.expire_all()
+    stored = await db.get(Call, UUID(response.json()["id"]))
+    assert stored.provider_call_sid == callback_sid
+    assert stored.call_metadata["dispatch_error"] == "provider_id_conflict"
+    claim = stored.call_metadata[TWILIO_CALLBACK_CLAIM_METADATA_KEY]
+    assert claim["state"] == "bound"
+    assert claim["bound_via"] == "provider_callback"
 
 
 @pytest.mark.asyncio

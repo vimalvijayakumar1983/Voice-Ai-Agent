@@ -23,6 +23,16 @@ from app.services.knowledge_serving import (
     knowledge_call_reservation_metadata,
     pre_admit_outbound_knowledge_call,
 )
+from app.services.provider_credentials import (
+    invalidate_active_runtimes_for_credential,
+    lock_provider_runtime_boundaries,
+    store_provider_config,
+)
+from app.services.twilio_route_security import (
+    load_workspace_twilio_route_credential,
+    mark_twilio_route_verified,
+)
+from app.services.usage_ledger import lock_agent_runtime_limits
 from tests.conftest import engine
 from tests.knowledge_test_utils import publish_test_knowledge
 
@@ -241,6 +251,143 @@ async def test_postgres_explicit_revocation_serializes_before_inbound_media_admi
 
 
 @pytest.mark.asyncio
+async def test_postgres_twilio_rotation_boundary_cannot_be_overtaken_by_inbound_admission(
+    db: AsyncSession,
+    tenant,
+):
+    """A rotation owning the provider boundary must win before a later call."""
+
+    if engine.dialect.name != "postgresql":
+        pytest.skip("Requires PostgreSQL advisory-lock semantics")
+
+    number = "+15550103002"
+    original_token = "postgres_rotation_boundary_token_123456789"
+    agent = Agent(
+        tenant_id=tenant.id,
+        name="PostgreSQL credential rotation race",
+        system_prompt="Answer only from the admitted immutable release.",
+        voice_provider="sarvam",
+        voice_id="sarvam:ishita",
+        language="en",
+        supported_languages=["en"],
+    )
+    db.add(agent)
+    await db.flush()
+    await store_provider_config(
+        db,
+        tenant.id,
+        "twilio",
+        {
+            "account_sid": "AC" + "2" * 32,
+            "auth_token": original_token,
+            "default_from_number": number,
+        },
+    )
+    profile = AgentRuntimeProfile(
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        enabled=True,
+        status="active",
+        telephony_provider="twilio",
+        primary_speech_provider="sarvam",
+        llm_provider="openai",
+        llm_model="gpt-4o-mini",
+        assigned_numbers=[number],
+    )
+    db.add(profile)
+    authenticated_credential = await load_workspace_twilio_route_credential(db, tenant.id)
+    assert authenticated_credential is not None
+    mark_twilio_route_verified(
+        profile,
+        authenticated_credential,
+        expected_voice_url=(
+            f"{webhooks.settings.base_url.rstrip('/')}/api/v1/webhooks/twilio/voice/inbound"
+        ),
+    )
+    await publish_test_knowledge(
+        db,
+        tenant_id=tenant.id,
+        agent=agent,
+        label="PostgreSQL rotation boundary",
+    )
+    await db.commit()
+
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    provider_boundary_acquired = asyncio.Event()
+    release_rotation = asyncio.Event()
+    rotation_task: asyncio.Task | None = None
+    admission_task: asyncio.Task | None = None
+    call_sid = "CA-provider-boundary-rotation-race"
+
+    async def rotate_credential() -> None:
+        async with session_factory() as session, session.begin():
+            await lock_provider_runtime_boundaries(session, tenant.id, "twilio")
+            provider_boundary_acquired.set()
+            await release_rotation.wait()
+            invalidated = await invalidate_active_runtimes_for_credential(
+                session,
+                tenant.id,
+                "twilio",
+            )
+            assert invalidated == [str(agent.id)]
+            await store_provider_config(
+                session,
+                tenant.id,
+                "twilio",
+                {
+                    "account_sid": authenticated_credential.account_sid,
+                    "auth_token": "postgres_rotated_token_987654321",
+                    "default_from_number": number,
+                },
+            )
+
+    async def admit_from_stale_candidate() -> Call | None:
+        async with session_factory() as session:
+            stale_agent = await session.get(Agent, agent.id)
+            stale_profile = await session.get(AgentRuntimeProfile, profile.id)
+            assert stale_agent is not None
+            assert stale_profile is not None
+            return await webhooks._reserve_twilio_inbound_call(
+                session,
+                profile=stale_profile,
+                agent=stale_agent,
+                authenticated_route_credential=authenticated_credential,
+                call_sid=call_sid,
+                from_number="+15550103001",
+                to_number=number,
+            )
+
+    try:
+        rotation_task = asyncio.create_task(rotate_credential())
+        await asyncio.wait_for(provider_boundary_acquired.wait(), timeout=5)
+        admission_task = asyncio.create_task(admit_from_stale_candidate())
+
+        await asyncio.sleep(0.1)
+        assert not admission_task.done()
+
+        release_rotation.set()
+        await asyncio.wait_for(rotation_task, timeout=5)
+        assert await asyncio.wait_for(admission_task, timeout=5) is None
+    finally:
+        release_rotation.set()
+        for task in (rotation_task, admission_task):
+            if task is not None and not task.done():
+                task.cancel()
+        pending = [task for task in (rotation_task, admission_task) if task is not None]
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    async with session_factory() as verify_db:
+        stored_profile = await verify_db.get(AgentRuntimeProfile, profile.id)
+        assert stored_profile is not None
+        assert stored_profile.enabled is False
+        assert stored_profile.status == "draft"
+        assert (
+            await verify_db.scalar(select(Call).where(Call.provider_call_sid == call_sid)) is None
+        )
+
+
+@pytest.mark.asyncio
 async def test_postgres_inbound_replay_waits_for_terminalization_and_fails_closed(
     db: AsyncSession,
     tenant,
@@ -261,6 +408,18 @@ async def test_postgres_inbound_replay_waits_for_terminalization_and_fails_close
     )
     db.add(agent)
     await db.flush()
+    from_number = "+15550102001"
+    to_number = "+15550102002"
+    await store_provider_config(
+        db,
+        tenant.id,
+        "twilio",
+        {
+            "account_sid": "AC" + "1" * 32,
+            "auth_token": "postgres_terminal_replay_token_123456789",
+            "default_from_number": to_number,
+        },
+    )
     profile = AgentRuntimeProfile(
         tenant_id=tenant.id,
         agent_id=agent.id,
@@ -270,8 +429,18 @@ async def test_postgres_inbound_replay_waits_for_terminalization_and_fails_close
         primary_speech_provider="sarvam",
         llm_provider="openai",
         llm_model="gpt-4o-mini",
+        assigned_numbers=[to_number],
     )
     db.add(profile)
+    route_credential = await load_workspace_twilio_route_credential(db, tenant.id)
+    assert route_credential is not None
+    mark_twilio_route_verified(
+        profile,
+        route_credential,
+        expected_voice_url=(
+            f"{webhooks.settings.base_url.rstrip('/')}/api/v1/webhooks/twilio/voice/inbound"
+        ),
+    )
     _knowledge, revision = await publish_test_knowledge(
         db,
         tenant_id=tenant.id,
@@ -279,8 +448,6 @@ async def test_postgres_inbound_replay_waits_for_terminalization_and_fails_close
         label="PostgreSQL terminal replay",
     )
     call_sid = "CA-native-terminal-replay-race"
-    from_number = "+15550102001"
-    to_number = "+15550102002"
     call = Call(
         tenant_id=tenant.id,
         agent_id=agent.id,
@@ -313,7 +480,8 @@ async def test_postgres_inbound_replay_waits_for_terminalization_and_fails_close
 
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     terminal_flushed = asyncio.Event()
-    release_terminal = asyncio.Event()
+    request_terminal_capacity_lock = asyncio.Event()
+    terminal_capacity_lock_acquired = asyncio.Event()
     replay_requested_call_lock = asyncio.Event()
     loop = asyncio.get_running_loop()
     terminal_task: asyncio.Task | None = None
@@ -328,7 +496,16 @@ async def test_postgres_inbound_replay_waits_for_terminalization_and_fails_close
             stored.ended_at = datetime.now(UTC)
             await session.flush()
             terminal_flushed.set()
-            await release_terminal.wait()
+            await request_terminal_capacity_lock.wait()
+            # Terminal billing holds Call before taking the shared capacity
+            # lock. A replay that held capacity while waiting for this Call
+            # would deadlock here.
+            await lock_agent_runtime_limits(
+                session,
+                tenant_id=tenant.id,
+                agent_id=agent.id,
+            )
+            terminal_capacity_lock_acquired.set()
 
     async def replay_in_independent_transaction() -> Call | None:
         async with session_factory() as session, session.begin():
@@ -340,6 +517,7 @@ async def test_postgres_inbound_replay_waits_for_terminalization_and_fails_close
                 session,
                 profile=stored_profile,
                 agent=stored_agent,
+                authenticated_route_credential=route_credential,
                 call_sid=call_sid,
                 from_number=from_number,
                 to_number=to_number,
@@ -366,14 +544,12 @@ async def test_postgres_inbound_replay_waits_for_terminalization_and_fails_close
         replay_task = asyncio.create_task(replay_in_independent_transaction())
         await asyncio.wait_for(replay_requested_call_lock.wait(), timeout=5)
 
-        await asyncio.sleep(0.1)
-        assert not replay_task.done()
-
-        release_terminal.set()
+        request_terminal_capacity_lock.set()
+        await asyncio.wait_for(terminal_capacity_lock_acquired.wait(), timeout=5)
         await asyncio.wait_for(terminal_task, timeout=5)
         assert await asyncio.wait_for(replay_task, timeout=5) is None
     finally:
-        release_terminal.set()
+        request_terminal_capacity_lock.set()
         if listener_installed:
             event.remove(engine.sync_engine, "before_cursor_execute", observe_replay_call_lock)
         for task in (terminal_task, replay_task):

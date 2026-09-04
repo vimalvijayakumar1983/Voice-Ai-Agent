@@ -50,6 +50,12 @@ from app.services.recordings import RecordingError, fetch_call_recording
 from app.services.runtime_capacity import (
     TERMINAL_CALL_STATUSES as RUNTIME_TERMINAL_CALL_STATUSES,
 )
+from app.services.twilio_callback_claim import (
+    TWILIO_CALLBACK_CLAIM_METADATA_KEY,
+    append_twilio_callback_claim,
+    create_twilio_callback_claim,
+    mark_twilio_callback_claim_bound,
+)
 from app.services.twilio_route_security import (
     TwilioRouteCredential,
     load_workspace_twilio_route_credential,
@@ -793,6 +799,13 @@ async def initiate_outbound_call(
         str(runtime_profile.id) if runtime_profile else None,
         runtime_profile.updated_at.isoformat() if runtime_profile else None,
     )
+    twilio_callback_claim_token: str | None = None
+    twilio_callback_claim_metadata: dict[str, object] | None = None
+    if not is_smallest and not is_inworld:
+        (
+            twilio_callback_claim_token,
+            twilio_callback_claim_metadata,
+        ) = create_twilio_callback_claim()
 
     # Create call record
     call = Call(
@@ -810,6 +823,13 @@ async def initiate_outbound_call(
             "runtime_profile_id": str(runtime_profile.id) if runtime_profile else None,
             "speech_provider": agent.voice_provider,
             "telephony_credential_binding": twilio_credential_binding,
+            **(
+                {
+                    TWILIO_CALLBACK_CLAIM_METADATA_KEY: twilio_callback_claim_metadata,
+                }
+                if twilio_callback_claim_metadata is not None
+                else {}
+            ),
             "runtime": (
                 {
                     "transport": "livekit_sip" if is_inworld else "twilio_media_streams",
@@ -1103,8 +1123,15 @@ async def initiate_outbound_call(
                         and twilio_config.get("auth_token")
                         else get_telephony_provider()
                     )
-                webhook_url = f"{settings.base_url}/api/v1/webhooks/twilio/voice/{call.id}"
-                status_url = f"{settings.base_url}/api/v1/webhooks/twilio/status/{call.id}"
+                assert twilio_callback_claim_token is not None
+                webhook_url = append_twilio_callback_claim(
+                    f"{settings.base_url}/api/v1/webhooks/twilio/voice/{call.id}",
+                    twilio_callback_claim_token,
+                )
+                status_url = append_twilio_callback_claim(
+                    f"{settings.base_url}/api/v1/webhooks/twilio/status/{call.id}",
+                    twilio_callback_claim_token,
+                )
                 provider_result = await provider.make_call(
                     CallRequest(
                         to_number=data.to_number,
@@ -1149,6 +1176,10 @@ async def initiate_outbound_call(
             }
         else:
             current_call.provider_call_sid = current_call.provider_call_sid or provider_call_sid
+            current_call.call_metadata = mark_twilio_callback_claim_bound(
+                current_call.call_metadata,
+                source="provider_response",
+            )
             if current_call.status == "dispatching":
                 current_call.status = "ringing"
                 current_call.started_at = current_call.started_at or datetime.now(UTC)

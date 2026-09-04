@@ -499,48 +499,63 @@ def _media_claim_matches(config: RuntimeSessionConfig, runtime: dict) -> bool:
 
 async def _store_metrics(config: RuntimeSessionConfig, metrics: dict) -> None:
     async with async_session_factory() as db:
-        call = await db.scalar(
-            select(Call)
-            .where(Call.id == config.call_id, Call.tenant_id == config.tenant_id)
-            .with_for_update()
-            .execution_options(populate_existing=True)
-        )
-        if call is None:
-            return
-        metadata = dict(call.call_metadata or {})
-        existing_runtime = metadata.get("runtime")
-        preserved_runtime = existing_runtime if isinstance(existing_runtime, dict) else {}
-        if not _media_claim_matches(config, preserved_runtime):
-            return
-        metadata["runtime"] = {
-            **preserved_runtime,
-            "speech_provider": config.speech_provider,
-            "llm_provider": "openai",
-            "llm_model": config.llm_model,
-            "stt_language": config.stt_language,
-            "turn_count": metrics.get("turn_count", 0),
-            "llm_tokens": metrics.get("llm_tokens", 0),
-            "llm_input_tokens": metrics.get("llm_input_tokens", 0),
-            "llm_output_tokens": metrics.get("llm_output_tokens", 0),
-            "tts_characters": metrics.get("tts_characters", 0),
-            "inbound_audio_bytes": metrics.get("inbound_audio_bytes", 0),
-            "outbound_audio_bytes": metrics.get("outbound_audio_bytes", 0),
-            "barge_in_count": metrics.get("barge_in_count", 0),
-            "tts_failure_count": metrics.get("tts_failure_count", 0),
-            "tts_fallback_count": metrics.get("tts_fallback_count", 0),
-            "last_llm_latency_ms": metrics.get("last_llm_latency_ms"),
-            "last_llm_first_token_ms": metrics.get("last_llm_first_token_ms"),
-            "last_tts_first_byte_ms": metrics.get("last_tts_first_byte_ms"),
-            "last_transcript_to_first_audio_ms": metrics.get("last_transcript_to_first_audio_ms"),
-            "last_speech_end_to_first_audio_ms": metrics.get("last_speech_end_to_first_audio_ms"),
-            "turn_latency_p50_ms": metrics.get("turn_latency_p50_ms"),
-            "turn_latency_p95_ms": metrics.get("turn_latency_p95_ms"),
-            "knowledge_terminology_count": len(config.knowledge_terminology),
-            "media_stream_started": True,
-            "cost_state": "pending_provider_billing_sync",
-        }
-        call.call_metadata = metadata
-        await db.commit()
+        # SQLite ignores SELECT ... FOR UPDATE and the test/development engine
+        # shares one connection. Reuse the media-claim guard so a stale session
+        # cannot roll back or interleave with its legitimate owner's metrics.
+        # PostgreSQL continues to use the per-Call row lock below.
+        use_local_lock = db.get_bind().dialect.name == "sqlite"
+        if use_local_lock:
+            await _SQLITE_MEDIA_CLAIM_LOCK.acquire()
+        try:
+            call = await db.scalar(
+                select(Call)
+                .where(Call.id == config.call_id, Call.tenant_id == config.tenant_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+            if call is None:
+                return
+            metadata = dict(call.call_metadata or {})
+            existing_runtime = metadata.get("runtime")
+            preserved_runtime = existing_runtime if isinstance(existing_runtime, dict) else {}
+            if not _media_claim_matches(config, preserved_runtime):
+                return
+            metadata["runtime"] = {
+                **preserved_runtime,
+                "speech_provider": config.speech_provider,
+                "llm_provider": "openai",
+                "llm_model": config.llm_model,
+                "stt_language": config.stt_language,
+                "turn_count": metrics.get("turn_count", 0),
+                "llm_tokens": metrics.get("llm_tokens", 0),
+                "llm_input_tokens": metrics.get("llm_input_tokens", 0),
+                "llm_output_tokens": metrics.get("llm_output_tokens", 0),
+                "tts_characters": metrics.get("tts_characters", 0),
+                "inbound_audio_bytes": metrics.get("inbound_audio_bytes", 0),
+                "outbound_audio_bytes": metrics.get("outbound_audio_bytes", 0),
+                "barge_in_count": metrics.get("barge_in_count", 0),
+                "tts_failure_count": metrics.get("tts_failure_count", 0),
+                "tts_fallback_count": metrics.get("tts_fallback_count", 0),
+                "last_llm_latency_ms": metrics.get("last_llm_latency_ms"),
+                "last_llm_first_token_ms": metrics.get("last_llm_first_token_ms"),
+                "last_tts_first_byte_ms": metrics.get("last_tts_first_byte_ms"),
+                "last_transcript_to_first_audio_ms": metrics.get(
+                    "last_transcript_to_first_audio_ms"
+                ),
+                "last_speech_end_to_first_audio_ms": metrics.get(
+                    "last_speech_end_to_first_audio_ms"
+                ),
+                "turn_latency_p50_ms": metrics.get("turn_latency_p50_ms"),
+                "turn_latency_p95_ms": metrics.get("turn_latency_p95_ms"),
+                "knowledge_terminology_count": len(config.knowledge_terminology),
+                "media_stream_started": True,
+                "cost_state": "pending_provider_billing_sync",
+            }
+            call.call_metadata = metadata
+            await db.commit()
+        finally:
+            if use_local_lock:
+                _SQLITE_MEDIA_CLAIM_LOCK.release()
 
 
 async def fail_inbound_runtime_start(

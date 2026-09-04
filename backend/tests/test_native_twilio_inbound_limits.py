@@ -6,14 +6,18 @@ from unittest.mock import AsyncMock
 from xml.etree import ElementTree
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from twilio.request_validator import RequestValidator
 
 from app.api.v1.endpoints import webhooks
 from app.models.agent import Agent, AgentRuntimeProfile
 from app.models.billing import UsageRecord
 from app.models.call import Call
-from app.services.knowledge_serving import KnowledgeServingError
+from app.services.knowledge_serving import (
+    INBOUND_KNOWLEDGE_ADMISSION_STATE,
+    KnowledgeServingError,
+)
+from app.services.provider_credentials import store_provider_config
 from app.services.twilio_route_security import (
     load_workspace_twilio_route_credential,
     mark_twilio_route_verified,
@@ -143,6 +147,111 @@ async def _assert_single_failed_audit_call(db, *, call_sid: str, lifecycle_error
     )
     assert count == 1
     return call
+
+
+@pytest.mark.asyncio
+async def test_native_twilio_inbound_revalidation_admits_current_route(
+    client,
+    auth_headers,
+    db,
+    tenant,
+    monkeypatch,
+):
+    agent, _profile, revision, account_sid, token, number = await _configure_native_inbound_route(
+        client, auth_headers, db, tenant
+    )
+    call_sid = "CA-current-route-admission"
+
+    response = await _post_inbound(
+        client,
+        monkeypatch,
+        account_sid=account_sid,
+        auth_token=token,
+        number=number,
+        call_sid=call_sid,
+    )
+
+    assert response.status_code == 200
+    assert ElementTree.fromstring(response.text).find("./Connect/Stream") is not None
+    call = await db.scalar(select(Call).where(Call.provider_call_sid == call_sid))
+    assert call is not None
+    assert call.agent_id == agent.id
+    assert call.status == "in_progress"
+    runtime = call.call_metadata["runtime"]
+    assert runtime["knowledge_serving_revision_id"] == str(revision.id)
+    assert runtime["knowledge_admission_state"] == INBOUND_KNOWLEDGE_ADMISSION_STATE
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("race_mutation", ["deactivate", "rotate_credential"])
+async def test_native_twilio_inbound_revalidates_after_candidate_selection(
+    client,
+    auth_headers,
+    db,
+    tenant,
+    monkeypatch,
+    race_mutation,
+):
+    agent, profile, _revision, account_sid, token, number = await _configure_native_inbound_route(
+        client, auth_headers, db, tenant
+    )
+    call_sid = f"CA-stale-candidate-{race_mutation}"
+    original_reserve = webhooks._reserve_twilio_inbound_call
+    mutation_injected = False
+
+    async def mutate_after_candidate_selection(reservation_db, **kwargs):
+        nonlocal mutation_injected
+        assert kwargs["agent"].id == agent.id
+        assert kwargs["profile"].id == profile.id
+        mutation_injected = True
+        if race_mutation == "deactivate":
+            # Bypass ORM synchronization so the candidate objects passed to
+            # the reservation boundary remain deliberately stale.
+            await reservation_db.execute(
+                update(AgentRuntimeProfile)
+                .where(AgentRuntimeProfile.id == profile.id)
+                .values(enabled=False, status="inactive")
+                .execution_options(synchronize_session=False)
+            )
+        else:
+            await store_provider_config(
+                reservation_db,
+                tenant.id,
+                "twilio",
+                {
+                    "account_sid": account_sid,
+                    "auth_token": "rotated_after_signature_validation_123456789",
+                    "default_from_number": number,
+                },
+            )
+        # This commit models the concurrent mutation winning immediately after
+        # candidates/signature validation and before the admission locks.
+        await reservation_db.commit()
+        return await original_reserve(reservation_db, **kwargs)
+
+    monkeypatch.setattr(
+        webhooks,
+        "_reserve_twilio_inbound_call",
+        mutate_after_candidate_selection,
+    )
+
+    response = await _post_inbound(
+        client,
+        monkeypatch,
+        account_sid=account_sid,
+        auth_token=token,
+        number=number,
+        call_sid=call_sid,
+    )
+
+    assert mutation_injected is True
+    _assert_friendly_rejection(response)
+    assert (
+        await db.scalar(
+            select(func.count()).select_from(Call).where(Call.provider_call_sid == call_sid)
+        )
+        == 0
+    )
 
 
 @pytest.mark.asyncio

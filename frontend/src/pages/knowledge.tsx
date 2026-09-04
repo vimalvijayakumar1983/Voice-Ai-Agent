@@ -40,6 +40,10 @@ import {
   KnowledgeSource,
   VoiceAgent,
 } from '@/lib/api';
+import {
+  canBindKnowledgeAgent,
+  knowledgeBindingGuidance,
+} from '@/lib/knowledge-binding.cjs';
 import styles from '@/styles/Knowledge.module.css';
 
 type Notice = { type: 'success' | 'error' | 'info'; text: string };
@@ -939,7 +943,10 @@ function AgentBinding({ selected, agents, busy, canManage, onBind, onUnbind }: {
   const [agentId, setAgentId] = useState('');
   const boundIds = new Set(selected.agent_bindings.map((binding) => binding.agent_id));
   const available = agents.filter((agent) => !boundIds.has(agent.id));
-  return <div className={styles.bindingCard}><div className={styles.bindingHeader}><div><span className={styles.miniLabel}>Agent access</span><strong>{selected.agent_bindings.length} agents bound</strong></div><Bot size={18} /></div><div className={styles.bindingList}>{selected.agent_bindings.map((binding) => <div key={binding.id}><span className={styles.agentAvatar}><Bot size={13} /></span><span><strong>{binding.agent_name}</strong><small>{binding.sync_status === 'synced' ? 'Live knowledge retrieval' : 'Publish agent to make binding live'}</small></span>{canManage && <button type="button" className="icon-button" disabled={busy} onClick={() => onUnbind(binding.agent_id)} aria-label={`Unbind ${binding.agent_name}`}><Unlink size={14} /></button>}</div>)}{selected.agent_bindings.length === 0 && <p className={styles.bindingEmpty}>No agents can use this knowledge yet.</p>}</div>{canManage && <div className={styles.bindControl}><select aria-label="Agent to bind" value={agentId} disabled={busy || selected.approval_status !== 'approved'} onChange={(event) => setAgentId(event.target.value)}><option value="">Select an agent…</option>{available.map((agent) => <option key={agent.id} value={agent.id}>{agent.name}</option>)}</select><button type="button" className="btn btn-secondary btn-sm" disabled={busy || !agentId || selected.approval_status !== 'approved'} onClick={() => { onBind(agentId); setAgentId(''); }}><Link2 size={12} /> Bind</button></div>}</div>;
+  const selectedAgent = available.find((agent) => agent.id === agentId);
+  const eligible = available.filter((agent) => canBindKnowledgeAgent(selected, agent));
+  const guidance = knowledgeBindingGuidance(selected);
+  return <div className={styles.bindingCard}><div className={styles.bindingHeader}><div><span className={styles.miniLabel}>Agent access</span><strong>{selected.agent_bindings.length} agents bound</strong></div><Bot size={18} /></div><div className={styles.bindingList}>{selected.agent_bindings.map((binding) => <div key={binding.id}><span className={styles.agentAvatar}><Bot size={13} /></span><span><strong>{binding.agent_name}</strong><small>{binding.sync_status === 'synced' ? 'Live knowledge retrieval' : 'Publish agent to make binding live'}</small></span>{canManage && <button type="button" className="icon-button" disabled={busy} onClick={() => onUnbind(binding.agent_id)} aria-label={`Unbind ${binding.agent_name}`}><Unlink size={14} /></button>}</div>)}{selected.agent_bindings.length === 0 && <p className={styles.bindingEmpty}>No agents can use this knowledge yet.</p>}</div>{canManage && <div className={styles.bindControl}><select aria-label="Agent to bind" value={agentId} disabled={busy || eligible.length === 0} onChange={(event) => setAgentId(event.target.value)}><option value="">Select an agent…</option>{available.map((agent) => <option key={agent.id} value={agent.id} disabled={!canBindKnowledgeAgent(selected, agent)}>{agent.name}</option>)}</select><button type="button" className="btn btn-secondary btn-sm" disabled={busy || !agentId || !canBindKnowledgeAgent(selected, selectedAgent)} onClick={() => { onBind(agentId); setAgentId(''); }}><Link2 size={12} /> Bind</button>{guidance && <p className="form-hint">{guidance}</p>}</div>}</div>;
 }
 
 function StatusBadge({ status }: { status: KnowledgeBase['sync_status'] }) {

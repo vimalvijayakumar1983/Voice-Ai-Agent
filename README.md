@@ -81,6 +81,11 @@ npm run dev
 
 Deploy this isolated monorepo as six Railway services. For each GitHub service, select the production branch and set the root directory shown below in Railway's service settings:
 
+Before enabling direct Twilio traffic, complete the
+[callback-claim log-redaction rollout](docs/TWILIO_CALLBACK_CLAIM_ROLLOUT.md),
+including the Railway edge/proxy, APM, tracing, and log-drain checks that cannot
+be enforced inside the API process.
+
 | Service | Source/root | Deployment settings | Public domain |
 | --- | --- | --- | --- |
 | `api` | GitHub, `/backend` | Dockerfile; pre-deploy `alembic upgrade head`; health check `/ready` | Yes |
