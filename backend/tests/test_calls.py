@@ -10,7 +10,7 @@ from uuid import UUID
 
 import pytest
 from httpx import AsyncClient
-from sqlalchemy import func, select
+from sqlalchemy import event, func, select, text
 from twilio.request_validator import RequestValidator
 
 from app.api.v1.endpoints import calls as calls_endpoint
@@ -19,18 +19,25 @@ from app.models.agent import Agent, AgentKnowledgeBinding, AgentRuntimeProfile
 from app.models.audit import AuditEvent
 from app.models.call import Call
 from app.models.compliance import DncEntry
+from app.models.provider_credential import ProviderCredential
 from app.services.knowledge_serving import (
     KNOWLEDGE_ADMISSION_STATE,
     knowledge_admission_is_durable,
 )
 from app.services.phone_numbers import normalize_e164, tenant_phone_dnc_lock
-from app.services.provider_credentials import store_provider_config
+from app.services.provider_credentials import (
+    lock_provider_runtime_boundaries,
+    store_provider_config,
+)
 from app.services.twilio_callback_claim import TWILIO_CALLBACK_CLAIM_METADATA_KEY
 from app.services.twilio_route_security import (
+    TwilioRouteCredential,
     load_workspace_twilio_route_credential,
     mark_twilio_route_verified,
+    twilio_callback_credential_fingerprint,
 )
 from app.tasks import call_tasks
+from tests.conftest import engine as test_engine
 from tests.conftest import test_session_factory as session_factory
 from tests.knowledge_test_utils import publish_test_knowledge
 
@@ -64,6 +71,685 @@ def test_e164_normalization_handles_common_import_formats():
     assert normalize_e164("+971 (50) 123-4567") == "+971501234567"
     assert normalize_e164("00971 50 123 4567") == "+971501234567"
     assert normalize_e164("0501234567") is None
+
+
+async def _seed_generic_twilio_agent(db, tenant_id) -> Agent:
+    agent = Agent(
+        tenant_id=tenant_id,
+        name="Generic direct Twilio agent",
+        system_prompt="Place a direct Twilio call safely.",
+        voice_provider="twilio",
+    )
+    db.add(agent)
+    await db.commit()
+    return agent
+
+
+@pytest.mark.asyncio
+async def test_generic_twilio_direct_call_uses_exact_workspace_route(
+    client,
+    auth_headers,
+    tenant,
+    db,
+    monkeypatch,
+):
+    account_sid = "AC" + "1" * 32
+    auth_token = "generic-direct-workspace-auth-token"
+    from_number = "+15550110001"
+    await store_provider_config(
+        db,
+        tenant.id,
+        "twilio",
+        {
+            "account_sid": account_sid,
+            "auth_token": auth_token,
+            "default_from_number": from_number,
+        },
+    )
+    await db.commit()
+    agent = await _seed_generic_twilio_agent(db, tenant.id)
+    provider = SimpleNamespace(
+        make_call=AsyncMock(return_value=SimpleNamespace(provider_call_sid="CA-generic-direct"))
+    )
+    provider_factory = Mock(return_value=provider)
+    monkeypatch.setattr(calls_endpoint, "get_telephony_provider", provider_factory)
+    monkeypatch.setattr(call_tasks.reconcile_call_dispatch, "apply_async", Mock())
+    monkeypatch.setattr(call_tasks.reconcile_direct_call_terminal, "apply_async", Mock())
+
+    response = await client.post(
+        "/api/v1/calls",
+        headers={**auth_headers, "Idempotency-Key": "generic-twilio-exact-route-0001"},
+        json={"agent_id": str(agent.id), "to_number": "+15550110002"},
+    )
+
+    assert response.status_code == 201
+    assert response.json()["status"] == "ringing"
+    provider_factory.assert_called_once_with(account_sid=account_sid, auth_token=auth_token)
+    request = provider.make_call.await_args.args[0]
+    assert request.from_number == from_number
+    voice_claim = parse_qs(urlsplit(request.webhook_url).query)["vav_callback_claim"]
+    status_claim = parse_qs(urlsplit(request.status_callback_url).query)["vav_callback_claim"]
+    assert voice_claim == status_claim
+
+    db.expire_all()
+    stored_call = await db.get(Call, UUID(response.json()["id"]))
+    binding = stored_call.call_metadata["telephony_credential_binding"]
+    assert binding == {
+        "provider": "twilio",
+        "source": "workspace",
+        "account_sid": account_sid,
+        "credential_fingerprint": twilio_callback_credential_fingerprint(
+            TwilioRouteCredential(account_sid=account_sid, auth_token=auth_token)
+        ),
+    }
+    assert voice_claim[0] not in str(stored_call.call_metadata)
+
+
+@pytest.mark.asyncio
+async def test_generic_twilio_direct_call_uses_exact_platform_route(
+    client,
+    auth_headers,
+    tenant,
+    db,
+    monkeypatch,
+):
+    account_sid = "AC" + "7" * 32
+    auth_token = "generic-direct-platform-auth-token"
+    from_number = "+15550170001"
+    monkeypatch.setattr(calls_endpoint.settings, "twilio_account_sid", account_sid)
+    monkeypatch.setattr(calls_endpoint.settings, "twilio_auth_token", auth_token)
+    monkeypatch.setattr(calls_endpoint.settings, "twilio_default_from_number", from_number)
+    agent = await _seed_generic_twilio_agent(db, tenant.id)
+    provider = SimpleNamespace(
+        make_call=AsyncMock(return_value=SimpleNamespace(provider_call_sid="CA-generic-platform"))
+    )
+    provider_factory = Mock(return_value=provider)
+    monkeypatch.setattr(calls_endpoint, "get_telephony_provider", provider_factory)
+    monkeypatch.setattr(call_tasks.reconcile_call_dispatch, "apply_async", Mock())
+    monkeypatch.setattr(call_tasks.reconcile_direct_call_terminal, "apply_async", Mock())
+
+    response = await client.post(
+        "/api/v1/calls",
+        headers={**auth_headers, "Idempotency-Key": "generic-twilio-platform-route-0001"},
+        json={"agent_id": str(agent.id), "to_number": "+15550170002"},
+    )
+
+    assert response.status_code == 201
+    assert response.json()["status"] == "ringing"
+    provider_factory.assert_called_once_with(account_sid=account_sid, auth_token=auth_token)
+    request = provider.make_call.await_args.args[0]
+    assert request.from_number == from_number
+    voice_claim = parse_qs(urlsplit(request.webhook_url).query)["vav_callback_claim"]
+    status_claim = parse_qs(urlsplit(request.status_callback_url).query)["vav_callback_claim"]
+    assert voice_claim == status_claim
+
+    db.expire_all()
+    stored_call = await db.get(Call, UUID(response.json()["id"]))
+    binding = stored_call.call_metadata["telephony_credential_binding"]
+    assert binding == {
+        "provider": "twilio",
+        "source": "platform",
+        "account_sid": account_sid,
+        "credential_fingerprint": twilio_callback_credential_fingerprint(
+            TwilioRouteCredential(account_sid=account_sid, auth_token=auth_token)
+        ),
+    }
+    claim = stored_call.call_metadata[TWILIO_CALLBACK_CLAIM_METADATA_KEY]
+    assert claim["state"] == "bound"
+    assert claim["bound_via"] == "provider_response"
+    assert voice_claim[0] not in str(stored_call.call_metadata)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "drift",
+    [
+        "platform_to_workspace",
+        "workspace_rotate",
+        "workspace_delete",
+        "workspace_partial",
+        "workspace_default",
+    ],
+)
+async def test_generic_twilio_direct_route_drift_aborts_before_provider_io(
+    drift,
+    client,
+    auth_headers,
+    tenant,
+    db,
+    monkeypatch,
+):
+    account_sid = "AC" + "2" * 32
+    auth_token = "generic-direct-original-auth-token"
+    from_number = "+15550120001"
+    monkeypatch.setattr(calls_endpoint.settings, "twilio_account_sid", account_sid)
+    monkeypatch.setattr(calls_endpoint.settings, "twilio_auth_token", auth_token)
+    monkeypatch.setattr(calls_endpoint.settings, "twilio_default_from_number", from_number)
+    if drift != "platform_to_workspace":
+        await store_provider_config(
+            db,
+            tenant.id,
+            "twilio",
+            {
+                "account_sid": account_sid,
+                "auth_token": auth_token,
+                "default_from_number": from_number,
+            },
+        )
+        await db.commit()
+    agent = await _seed_generic_twilio_agent(db, tenant.id)
+
+    provider_factory = Mock(side_effect=AssertionError("provider I/O must not run"))
+    monkeypatch.setattr(calls_endpoint, "get_telephony_provider", provider_factory)
+    monkeypatch.setattr(call_tasks.reconcile_call_dispatch, "apply_async", Mock())
+
+    final_guard_reached = asyncio.Event()
+    release_final_guard = asyncio.Event()
+    real_dnc_lock = calls_endpoint.tenant_phone_dnc_lock
+
+    @asynccontextmanager
+    async def paused_final_guard(session, tenant_id, phone_number):
+        final_guard_reached.set()
+        await release_final_guard.wait()
+        async with real_dnc_lock(session, tenant_id, phone_number) as canonical:
+            yield canonical
+
+    monkeypatch.setattr(calls_endpoint, "tenant_phone_dnc_lock", paused_final_guard)
+    call_task = asyncio.create_task(
+        client.post(
+            "/api/v1/calls",
+            headers={
+                **auth_headers,
+                "Idempotency-Key": f"generic-twilio-route-drift-{drift}-0001",
+            },
+            json={"agent_id": str(agent.id), "to_number": "+15550120002"},
+        )
+    )
+    try:
+        await asyncio.wait_for(final_guard_reached.wait(), timeout=5)
+        async with session_factory() as mutation_db:
+            if drift == "workspace_delete":
+                credential = await mutation_db.scalar(
+                    select(ProviderCredential).where(
+                        ProviderCredential.tenant_id == tenant.id,
+                        ProviderCredential.provider == "twilio",
+                    )
+                )
+                assert credential is not None
+                await mutation_db.delete(credential)
+            else:
+                changed_config = {
+                    "account_sid": account_sid,
+                    "auth_token": auth_token,
+                    "default_from_number": from_number,
+                }
+                if drift == "workspace_rotate":
+                    changed_config["auth_token"] = "generic-direct-rotated-auth-token"
+                elif drift == "workspace_partial":
+                    changed_config.pop("auth_token")
+                elif drift == "workspace_default":
+                    changed_config["default_from_number"] = "+15550120009"
+                await store_provider_config(
+                    mutation_db,
+                    tenant.id,
+                    "twilio",
+                    changed_config,
+                )
+            await mutation_db.commit()
+        release_final_guard.set()
+        response = await asyncio.wait_for(call_task, timeout=5)
+    finally:
+        release_final_guard.set()
+        if not call_task.done():
+            call_task.cancel()
+        await asyncio.gather(call_task, return_exceptions=True)
+
+    assert response.status_code == 201
+    assert response.json()["status"] == "failed"
+    provider_factory.assert_not_called()
+    db.expire_all()
+    stored_call = await db.get(Call, UUID(response.json()["id"]))
+    assert stored_call.provider_call_sid is None
+    assert stored_call.call_metadata["dispatch_error"] == "twilio_route_changed"
+    assert stored_call.call_metadata[TWILIO_CALLBACK_CLAIM_METADATA_KEY]["state"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_generic_twilio_explicit_from_number_survives_default_only_change(
+    client,
+    auth_headers,
+    tenant,
+    db,
+    monkeypatch,
+):
+    account_sid = "AC" + "3" * 32
+    auth_token = "generic-direct-stable-route-token"
+    explicit_from_number = "+15550130001"
+    await store_provider_config(
+        db,
+        tenant.id,
+        "twilio",
+        {
+            "account_sid": account_sid,
+            "auth_token": auth_token,
+            "default_from_number": "+15550130002",
+        },
+    )
+    await db.commit()
+    agent = await _seed_generic_twilio_agent(db, tenant.id)
+    provider = SimpleNamespace(
+        make_call=AsyncMock(return_value=SimpleNamespace(provider_call_sid="CA-explicit-from"))
+    )
+    provider_factory = Mock(return_value=provider)
+    monkeypatch.setattr(calls_endpoint, "get_telephony_provider", provider_factory)
+    monkeypatch.setattr(call_tasks.reconcile_call_dispatch, "apply_async", Mock())
+    monkeypatch.setattr(call_tasks.reconcile_direct_call_terminal, "apply_async", Mock())
+
+    final_guard_reached = asyncio.Event()
+    release_final_guard = asyncio.Event()
+    real_dnc_lock = calls_endpoint.tenant_phone_dnc_lock
+
+    @asynccontextmanager
+    async def paused_final_guard(session, tenant_id, phone_number):
+        final_guard_reached.set()
+        await release_final_guard.wait()
+        async with real_dnc_lock(session, tenant_id, phone_number) as canonical:
+            yield canonical
+
+    monkeypatch.setattr(calls_endpoint, "tenant_phone_dnc_lock", paused_final_guard)
+    call_task = asyncio.create_task(
+        client.post(
+            "/api/v1/calls",
+            headers={
+                **auth_headers,
+                "Idempotency-Key": "generic-twilio-explicit-default-drift-0001",
+            },
+            json={
+                "agent_id": str(agent.id),
+                "to_number": "+15550130003",
+                "from_number": explicit_from_number,
+            },
+        )
+    )
+    try:
+        await asyncio.wait_for(final_guard_reached.wait(), timeout=5)
+        async with session_factory() as mutation_db:
+            await store_provider_config(
+                mutation_db,
+                tenant.id,
+                "twilio",
+                {
+                    "account_sid": account_sid,
+                    "auth_token": auth_token,
+                    "default_from_number": "+15550130009",
+                },
+            )
+            await mutation_db.commit()
+        release_final_guard.set()
+        response = await asyncio.wait_for(call_task, timeout=5)
+    finally:
+        release_final_guard.set()
+        if not call_task.done():
+            call_task.cancel()
+        await asyncio.gather(call_task, return_exceptions=True)
+
+    assert response.status_code == 201
+    assert response.json()["status"] == "ringing"
+    provider_factory.assert_called_once_with(account_sid=account_sid, auth_token=auth_token)
+    assert provider.make_call.await_args.args[0].from_number == explicit_from_number
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mutation", ["create", "rotate"])
+async def test_postgres_generic_twilio_credential_mutation_wins_before_final_dispatch(
+    mutation,
+    client,
+    auth_headers,
+    tenant,
+    db,
+    monkeypatch,
+):
+    if test_engine.dialect.name != "postgresql":
+        pytest.skip("Requires PostgreSQL advisory-lock semantics")
+
+    account_sid = "AC" + "4" * 32
+    original_token = "generic-direct-pg-original-token"
+    from_number = "+15550140001"
+    monkeypatch.setattr(calls_endpoint.settings, "twilio_account_sid", account_sid)
+    monkeypatch.setattr(calls_endpoint.settings, "twilio_auth_token", original_token)
+    monkeypatch.setattr(calls_endpoint.settings, "twilio_default_from_number", from_number)
+    if mutation == "rotate":
+        await store_provider_config(
+            db,
+            tenant.id,
+            "twilio",
+            {
+                "account_sid": account_sid,
+                "auth_token": original_token,
+                "default_from_number": from_number,
+            },
+        )
+        await db.commit()
+    agent = await _seed_generic_twilio_agent(db, tenant.id)
+    provider_factory = Mock(side_effect=AssertionError("provider I/O must not run"))
+    monkeypatch.setattr(calls_endpoint, "get_telephony_provider", provider_factory)
+    monkeypatch.setattr(call_tasks.reconcile_call_dispatch, "apply_async", Mock())
+
+    final_guard_reached = asyncio.Event()
+    release_final_guard = asyncio.Event()
+    provider_boundary_requested = asyncio.Event()
+    provider_boundary_acquired = asyncio.Event()
+    real_dnc_lock = calls_endpoint.tenant_phone_dnc_lock
+    real_provider_boundary = calls_endpoint.lock_provider_runtime_boundaries
+
+    @asynccontextmanager
+    async def paused_final_guard(session, tenant_id, phone_number):
+        final_guard_reached.set()
+        await release_final_guard.wait()
+        async with real_dnc_lock(session, tenant_id, phone_number) as canonical:
+            yield canonical
+
+    async def observed_provider_boundary(*args, **kwargs):
+        provider_boundary_requested.set()
+        await real_provider_boundary(*args, **kwargs)
+        provider_boundary_acquired.set()
+
+    monkeypatch.setattr(calls_endpoint, "tenant_phone_dnc_lock", paused_final_guard)
+    monkeypatch.setattr(
+        calls_endpoint,
+        "lock_provider_runtime_boundaries",
+        observed_provider_boundary,
+    )
+    call_task = asyncio.create_task(
+        client.post(
+            "/api/v1/calls",
+            headers={
+                **auth_headers,
+                "Idempotency-Key": f"generic-twilio-pg-{mutation}-race-0001",
+            },
+            json={"agent_id": str(agent.id), "to_number": "+15550140002"},
+        )
+    )
+    mutation_db = session_factory()
+    try:
+        await asyncio.wait_for(final_guard_reached.wait(), timeout=5)
+        await lock_provider_runtime_boundaries(mutation_db, tenant.id, "twilio")
+        await store_provider_config(
+            mutation_db,
+            tenant.id,
+            "twilio",
+            {
+                "account_sid": account_sid,
+                "auth_token": (
+                    original_token if mutation == "create" else "generic-direct-pg-rotated-token"
+                ),
+                "default_from_number": from_number,
+            },
+        )
+        await mutation_db.flush()
+
+        release_final_guard.set()
+        await asyncio.wait_for(provider_boundary_requested.wait(), timeout=5)
+        await asyncio.sleep(0.1)
+        assert not provider_boundary_acquired.is_set()
+        assert not call_task.done()
+        provider_factory.assert_not_called()
+        await mutation_db.commit()
+        await asyncio.wait_for(provider_boundary_acquired.wait(), timeout=5)
+        response = await asyncio.wait_for(call_task, timeout=5)
+    finally:
+        release_final_guard.set()
+        await mutation_db.rollback()
+        await mutation_db.close()
+        if not call_task.done():
+            call_task.cancel()
+        await asyncio.gather(call_task, return_exceptions=True)
+
+    assert response.status_code == 201
+    assert response.json()["status"] == "failed"
+    provider_factory.assert_not_called()
+    db.expire_all()
+    stored_call = await db.get(Call, UUID(response.json()["id"]))
+    assert stored_call.call_metadata["dispatch_error"] == "twilio_route_changed"
+    assert stored_call.provider_call_sid is None
+
+
+@pytest.mark.asyncio
+async def test_postgres_generic_twilio_final_guard_locks_agent_before_credential(
+    client,
+    auth_headers,
+    tenant,
+    db,
+    monkeypatch,
+):
+    if test_engine.dialect.name != "postgresql":
+        pytest.skip("Requires PostgreSQL row-lock semantics")
+
+    account_sid = "AC" + "5" * 32
+    auth_token = "generic-direct-pg-lock-order-token"
+    from_number = "+15550150001"
+    await store_provider_config(
+        db,
+        tenant.id,
+        "twilio",
+        {
+            "account_sid": account_sid,
+            "auth_token": auth_token,
+            "default_from_number": from_number,
+        },
+    )
+    await db.commit()
+    agent = await _seed_generic_twilio_agent(db, tenant.id)
+    agent_id = agent.id
+    provider = SimpleNamespace(
+        make_call=AsyncMock(return_value=SimpleNamespace(provider_call_sid="CA-pg-lock-order"))
+    )
+    monkeypatch.setattr(
+        calls_endpoint,
+        "get_telephony_provider",
+        Mock(return_value=provider),
+    )
+    monkeypatch.setattr(call_tasks.reconcile_call_dispatch, "apply_async", Mock())
+    monkeypatch.setattr(call_tasks.reconcile_direct_call_terminal, "apply_async", Mock())
+
+    final_guard_reached = asyncio.Event()
+    release_final_guard = asyncio.Event()
+    agent_lock_requested = asyncio.Event()
+    real_dnc_lock = calls_endpoint.tenant_phone_dnc_lock
+    loop = asyncio.get_running_loop()
+    listener_installed = False
+    blocker = session_factory()
+
+    @asynccontextmanager
+    async def paused_final_guard(session, tenant_id, phone_number):
+        final_guard_reached.set()
+        await release_final_guard.wait()
+        async with real_dnc_lock(session, tenant_id, phone_number) as canonical:
+            yield canonical
+
+    monkeypatch.setattr(calls_endpoint, "tenant_phone_dnc_lock", paused_final_guard)
+    call_task = asyncio.create_task(
+        client.post(
+            "/api/v1/calls",
+            headers={
+                **auth_headers,
+                "Idempotency-Key": "generic-twilio-pg-lock-order-0001",
+            },
+            json={"agent_id": str(agent_id), "to_number": "+15550150002"},
+        )
+    )
+    try:
+        await asyncio.wait_for(final_guard_reached.wait(), timeout=5)
+        locked_agent = await blocker.scalar(
+            select(Agent).where(Agent.id == agent_id).with_for_update()
+        )
+        assert locked_agent is not None
+
+        def observe_agent_lock(
+            _connection,
+            _cursor,
+            statement,
+            _parameters,
+            _context,
+            _executemany,
+        ):
+            normalized = " ".join(str(statement).upper().split())
+            if "FROM AGENTS" in normalized and "FOR UPDATE" in normalized:
+                loop.call_soon_threadsafe(agent_lock_requested.set)
+
+        event.listen(test_engine.sync_engine, "before_cursor_execute", observe_agent_lock)
+        listener_installed = True
+        release_final_guard.set()
+        await asyncio.wait_for(agent_lock_requested.wait(), timeout=5)
+        assert not call_task.done()
+
+        # While dispatch waits on Agent it must not own the credential row.
+        # A Credential -> Agent order would deadlock a direct native path that
+        # already owns Agent and is waiting for this row.
+        async with session_factory() as probe_db, probe_db.begin():
+            await probe_db.execute(text("SET LOCAL lock_timeout = '500ms'"))
+            credential = await probe_db.scalar(
+                select(ProviderCredential)
+                .where(
+                    ProviderCredential.tenant_id == tenant.id,
+                    ProviderCredential.provider == "twilio",
+                )
+                .with_for_update()
+            )
+            assert credential is not None
+
+        await blocker.commit()
+        response = await asyncio.wait_for(call_task, timeout=5)
+    finally:
+        release_final_guard.set()
+        if listener_installed:
+            event.remove(test_engine.sync_engine, "before_cursor_execute", observe_agent_lock)
+        await blocker.rollback()
+        await blocker.close()
+        if not call_task.done():
+            call_task.cancel()
+        await asyncio.gather(call_task, return_exceptions=True)
+
+    assert response.status_code == 201
+    assert response.json()["status"] == "ringing"
+    provider.make_call.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mutation", ["rotate", "delete"])
+async def test_native_twilio_route_drift_between_reservation_and_final_guard_aborts(
+    mutation,
+    client,
+    auth_headers,
+    tenant,
+    db,
+    monkeypatch,
+):
+    agent = Agent(
+        tenant_id=tenant.id,
+        name="Native direct Twilio route drift",
+        system_prompt="Never dial using stale telephony credentials.",
+        voice_provider="sarvam",
+        voice_id="sarvam:ishita",
+        language="en",
+        supported_languages=["en"],
+    )
+    db.add(agent)
+    await db.flush()
+    from_number = "+15550160001"
+    profile = AgentRuntimeProfile(
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        enabled=True,
+        status="active",
+        telephony_provider="twilio",
+        primary_speech_provider="sarvam",
+        llm_provider="openai",
+        llm_model="gpt-4o-mini",
+        stt_language="en",
+        assigned_numbers=[from_number],
+        max_concurrent_calls=3,
+        daily_call_limit=100,
+        monthly_budget_cents=10000,
+    )
+    db.add(profile)
+    await _mark_verified_twilio_route(db, tenant.id, profile)
+    await publish_test_knowledge(
+        db,
+        tenant_id=tenant.id,
+        agent=agent,
+        label="Native Twilio route drift",
+    )
+    await db.commit()
+
+    provider_factory = Mock(side_effect=AssertionError("provider I/O must not run"))
+    monkeypatch.setattr(calls_endpoint, "get_telephony_provider", provider_factory)
+    monkeypatch.setattr(call_tasks.reconcile_call_dispatch, "apply_async", Mock())
+    final_guard_reached = asyncio.Event()
+    release_final_guard = asyncio.Event()
+    real_dnc_lock = calls_endpoint.tenant_phone_dnc_lock
+
+    @asynccontextmanager
+    async def paused_final_guard(session, tenant_id, phone_number):
+        final_guard_reached.set()
+        await release_final_guard.wait()
+        async with real_dnc_lock(session, tenant_id, phone_number) as canonical:
+            yield canonical
+
+    monkeypatch.setattr(calls_endpoint, "tenant_phone_dnc_lock", paused_final_guard)
+    call_task = asyncio.create_task(
+        client.post(
+            "/api/v1/calls",
+            headers={
+                **auth_headers,
+                "Idempotency-Key": f"native-twilio-route-{mutation}-0001",
+            },
+            json={
+                "agent_id": str(agent.id),
+                "to_number": "+15550160002",
+                "from_number": from_number,
+            },
+        )
+    )
+    try:
+        await asyncio.wait_for(final_guard_reached.wait(), timeout=5)
+        async with session_factory() as mutation_db:
+            if mutation == "delete":
+                credential = await mutation_db.scalar(
+                    select(ProviderCredential).where(
+                        ProviderCredential.tenant_id == tenant.id,
+                        ProviderCredential.provider == "twilio",
+                    )
+                )
+                assert credential is not None
+                await mutation_db.delete(credential)
+            else:
+                await store_provider_config(
+                    mutation_db,
+                    tenant.id,
+                    "twilio",
+                    {
+                        "account_sid": TEST_TWILIO_ACCOUNT_SID,
+                        "auth_token": "workspace-native-rotated-token",
+                        "default_from_number": from_number,
+                    },
+                )
+            await mutation_db.commit()
+        release_final_guard.set()
+        response = await asyncio.wait_for(call_task, timeout=5)
+    finally:
+        release_final_guard.set()
+        if not call_task.done():
+            call_task.cancel()
+        await asyncio.gather(call_task, return_exceptions=True)
+
+    assert response.status_code == 201
+    assert response.json()["status"] == "failed"
+    provider_factory.assert_not_called()
+    db.expire_all()
+    stored_call = await db.get(Call, UUID(response.json()["id"]))
+    assert stored_call.provider_call_sid is None
+    assert stored_call.call_metadata["dispatch_error"] == "runtime_not_ready"
 
 
 @pytest.mark.asyncio
