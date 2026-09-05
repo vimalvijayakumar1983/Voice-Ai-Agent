@@ -75,6 +75,7 @@ from app.services.conversation_scope import (
     repeat_spoken,
     scope_reply,
 )
+from app.services.exact_fact_protocol import decode_exact_fact_evidence
 from app.services.exact_fact_retrieval import (
     ExactFactResponseAction,
     ExactFactType,
@@ -2083,6 +2084,7 @@ class VAVInworldAgent(Agent):
         if self._company_scope:
             self._single_pass_active_subject = self._company_scope.default_company
         self._company_epoch = 0
+        self._single_pass_search_repair = bool(single_pass)
         self._spoken_response_sequence = 0
         self._last_committed_response_sequence = 0
         self._spoken_answers: dict[tuple[str, ExactFactType], str] = {}
@@ -2372,6 +2374,7 @@ Knowledge policy:
             not context
             and company_subject
             and allow_semantic_repair
+            and self._single_pass_search_repair
             and self._company_scope.semantic_retrieval_enabled
         ):
             return await self._repair_knowledge_search(
@@ -2683,6 +2686,19 @@ Knowledge policy:
         self._spoken_response_sequence += 1
         sequence = self._spoken_response_sequence
         intents = classify_exact_fact_intents(query)
+        envelope = decode_exact_fact_evidence(evidence or "")
+        if not intents and envelope is not None and envelope.response_action == "answer":
+            # A paraphrase such as "ring your office" need not contain the
+            # word "phone". The retrieved typed fact supplies the repeat slot;
+            # the memory value still comes only from committed speech below.
+            intents = tuple(
+                dict.fromkeys(
+                    ExactFactType(fact.fact_type)
+                    for fact in envelope.facts
+                    if fact.fact_type in {kind.value for kind in ExactFactType}
+                    and company_key(fact.subject) == company_key(subject or "")
+                )
+            )
         usable = bool(
             evidence
             and evidence not in {NO_KNOWLEDGE_REQUIRED, "NO_VERIFIED_KNOWLEDGE_MATCH"}

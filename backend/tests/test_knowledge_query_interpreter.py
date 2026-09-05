@@ -154,6 +154,10 @@ async def test_real_scoped_retrieval_repairs_once_caches_and_keeps_step1(db, ten
     assert not any("Trading" in term for term in planner.call_args.kwargs["search_vocabulary"])
     await runtime.retrieve_single_pass_evidence(original)
     assert planner.await_count == 1
+    runtime.prepare_spoken_response(original, result)("+971 2 665 9998")
+    assert "6, 6, 5" in await runtime.retrieve_single_pass_evidence(
+        "Repeat the phone number slowly"
+    )
     result = await runtime.retrieve_single_pass_evidence("What is the phone number?")
     runtime.prepare_spoken_response("What is the phone number?", result)("+971 2 665 9998")
     assert "6, 6, 5" in await runtime.retrieve_single_pass_evidence("Repeat slowly")
@@ -171,6 +175,15 @@ async def test_default_off_does_not_call_extra_model(db, tenant, monkeypatch):
     planner = AsyncMock()
     monkeypatch.setattr(worker, "interpret_knowledge_question", planner)
     await runtime.retrieve_single_pass_evidence("How can I ring your office?")
+    planner.assert_not_awaited()
+
+
+async def test_tool_loop_does_not_activate_single_pass_repair(db, tenant, monkeypatch):
+    runtime = await enabled_runtime(db, tenant, monkeypatch)
+    runtime._single_pass_search_repair = False
+    planner = AsyncMock()
+    monkeypatch.setattr(worker, "interpret_knowledge_question", planner)
+    await runtime._retrieve_approved_knowledge(query="How can I ring your office?")
     planner.assert_not_awaited()
 
 
