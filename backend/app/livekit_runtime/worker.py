@@ -83,6 +83,7 @@ from app.services.conversation_scope import (
 from app.services.conversation_state import (
     LIST_CONTROLS,
     ConversationState,
+    conversation_control,
     explicit_attribute_request,
     person_reference,
 )
@@ -2514,6 +2515,10 @@ Knowledge policy:
             if self._last_spoken_answer and self._last_spoken_answer[0] == company
             else ""
         )
+        if self._conversation_state_v3:
+            # The state layer already resolves follow-ups. An old person's answer
+            # must not contaminate interpretation of a new person's question.
+            previous = ""
         cache_key = (company, query, previous)
         metrics = self._telemetry.runtime_metrics if self._telemetry else {}
         cached = self._semantic_repairs.get(cache_key)
@@ -2525,6 +2530,13 @@ Knowledge policy:
             ):
                 if trace is not None:
                     trace["knowledge_interpretation_status"] = "retry_budget_exhausted"
+                    if self._conversation_state_v3:
+                        trace["conversation_recovery_failure"] = "search_budget_exhausted"
+                if self._conversation_state_v3:
+                    return scope_reply(
+                        "I can't complete that lookup right now. "
+                        "Please contact reception to confirm that detail."
+                    )
                 return scope_reply(
                     "I couldn't find that detail with the available search. "
                     "Could you clarify the company and the specific detail you need?"
@@ -2606,6 +2618,8 @@ Knowledge policy:
         if result.plan is None:
             # A timeout/unavailable interpreter is an operational limitation,
             # not proof that the original source has no answer.
+            if self._conversation_state_v3 and trace is not None:
+                trace["conversation_recovery_failure"] = result.status
             return scope_reply("I couldn't resolve that question. Could you rephrase it briefly?")
         if result.plan.action == "clarify":
             if is_clear_pricing_request(query, company=company) or (
@@ -2927,6 +2941,11 @@ Knowledge policy:
 
     async def _retrieve_conversation_state_evidence(self, transcript: str) -> str:
         """Separate topic, company, identity and playback state on the opt-in lane."""
+        control = conversation_control(str(transcript or ""))
+        if control == "hold":
+            return scope_reply("Of course. Take your time.")
+        if control == "courtesy":
+            return NO_KNOWLEDGE_REQUIRED
         text = routing_text(str(transcript or ""))
         text = re.sub(r"^stop[—,\s-]+(?:just\s+)?(?=give|tell|what|who|list)", "", text, flags=re.I)
         normalized = _normalized_utterance(text)
@@ -2943,6 +2962,7 @@ Knowledge policy:
             "so",
             "please",
             "just",
+            "i think",
         }:
             # STT can finalize a discourse prefix before the real correction.
             # It must not replace the requested detail or trigger search repair.
@@ -3031,6 +3051,8 @@ Knowledge policy:
                     "conversation_pending_company": bool(state.pending_companies),
                 }
             )
+            if plan.action == "clarify" and state.clarification_count > 1:
+                trace["conversation_recovery_failure"] = "repeated_entity_clarification"
         if plan.action != "lookup":
             if plan.action == "selection":
                 self._switch_company(plan.company)

@@ -59,6 +59,123 @@ async def ask(runtime, question):
     return reply or evidence
 
 
+@pytest.mark.parametrize(
+    "question",
+    [
+        "One minute, please.",
+        "One minute, one minute, one minute, please.",
+        "Give me a second, please.",
+        "Just a moment please.",
+    ],
+)
+async def test_hold_does_not_search_or_change_topic(db, tenant, monkeypatch, question):
+    runtime, _ = await runtime_fixture(db, tenant, monkeypatch)
+    await ask(runtime, "What is the phone number?")
+    before = runtime._conversation_state.topic_query
+    search = AsyncMock(side_effect=AssertionError("control must not search"))
+    monkeypatch.setattr(runtime, "_retrieve_approved_knowledge", search)
+    assert "Take your time" in await ask(runtime, question)
+    assert runtime._conversation_state.topic_query == before
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "It's okay, thank you very much.",
+        "That is all, thanks for your help today.",
+    ],
+)
+async def test_natural_courtesy_bypasses_search(db, tenant, monkeypatch, question):
+    runtime, _ = await runtime_fixture(db, tenant, monkeypatch)
+    monkeypatch.setattr(
+        runtime, "_retrieve_approved_knowledge", AsyncMock(side_effect=AssertionError)
+    )
+    assert "welcome" in await ask(runtime, question)
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "Is this Cara Harbour?",
+        "Is Cara Harbour someone in this company?",
+        "I want to know more about Cara Harbour, uh, in Harbour Group.",
+    ],
+)
+async def test_natural_person_question_uses_approved_identity(db, tenant, monkeypatch, question):
+    runtime, _ = await runtime_fixture(db, tenant, monkeypatch)
+    await ask(runtime, "List all directors of Harbour Group.")
+    reply = await ask(runtime, question)
+    assert "President" in reply and "Which company" not in reply
+
+
+async def test_second_human_call_context_sequence(db, tenant, monkeypatch):
+    runtime, _ = await runtime_fixture(db, tenant, monkeypatch)
+    assert "Director" in await ask(runtime, "Who is Victor Jaykumar?")
+    reply = await ask(runtime, "What does Alice hold?")
+    assert "Managing Director" in reply and "Victor" not in reply
+    await ask(runtime, "Stop, just give me Harbour Group phone number.")
+    assert await runtime.retrieve_single_pass_evidence("Sorry.") == SUPPRESS_REPLY
+    assert "551 3831" in await ask(runtime, "I mean about Harbour Trading.")
+    assert "Which company" in await ask(runtime, "What about Sun and Moon?")
+    assert "567 8000" in await ask(runtime, "So it's Sun & Moon Cosmetic Medical Center.")
+    retrieve = AsyncMock(return_value="NO_VERIFIED_KNOWLEDGE_MATCH")
+    monkeypatch.setattr(runtime, "_retrieve_approved_knowledge", retrieve)
+    await ask(runtime, "Do they sell Botox?")
+    assert retrieve.await_args.kwargs["query"] == "Do they sell Botox?"
+
+
+def test_control_preserves_mixed_questions():
+    from app.services.conversation_state import conversation_control
+
+    for text in [
+        "Thanks, what is the phone number?",
+        "Wait, book me for tomorrow.",
+        "One minute appointments are available?",
+        "Is it okay to book?",
+    ]:
+        assert conversation_control(text) is None
+
+
+def test_company_switch_preserves_extra_attributes_and_constraints():
+    scope = KnowledgeCompanyScope(
+        companies=[KnowledgeCompany(name="A Company"), KnowledgeCompany(name="B Company")]
+    )
+    state = ConversationState(company="A Company")
+    state.plan("Give me A Company phone number and email", scope, {})
+    result = state.plan("I meant B Company", scope, {})
+    assert "email" in result.query and "phone" in result.query
+    state.plan("Give me B Company doctor phone number", scope, {})
+    result = state.plan("I meant A Company", scope, {})
+    assert "doctor" in result.query
+
+
+async def test_budget_exhaustion_still_allows_direct_facts_and_courtesy(db, tenant, monkeypatch):
+    runtime, _ = await runtime_fixture(db, tenant, monkeypatch)
+    runtime._company_scope.semantic_retrieval_enabled = True
+    runtime._semantic_attempts = {("Harbour Group", str(i), ""): 1 for i in range(8)}
+    interpreter = AsyncMock(side_effect=AssertionError("must respect existing cost cap"))
+    monkeypatch.setattr(worker, "interpret_knowledge_question", interpreter)
+    reply = await ask(runtime, "What is the moon excursion policy?")
+    assert "contact reception" in reply and "clarify" not in reply
+    assert "Take your time" in await ask(runtime, "One minute please.")
+    assert "welcome" in await ask(runtime, "It's okay, thank you very much.")
+    assert "551 3831" in await ask(runtime, "What's the phone number of Harbour Trading?")
+    assert sum(runtime._semantic_attempts.values()) == 8
+
+
+async def test_search_interpreter_does_not_receive_previous_person_answer(db, tenant, monkeypatch):
+    runtime, _ = await runtime_fixture(db, tenant, monkeypatch)
+    runtime._company_scope.semantic_retrieval_enabled = True
+    await ask(runtime, "Who is Victor Jaykumar?")
+    interpreter = AsyncMock(
+        return_value=SearchRepairResult(None, "timeout", 2000, None, None, True)
+    )
+    monkeypatch.setattr(worker, "load_provider_config", AsyncMock(return_value={"api_key": "test"}))
+    monkeypatch.setattr(worker, "interpret_knowledge_question", interpreter)
+    await ask(runtime, "What is the moon excursion policy?")
+    assert interpreter.await_args.kwargs["previous_answer"] == ""
+
+
 async def test_full_failed_call_natural_variations(db, tenant, monkeypatch):
     runtime, medical = await runtime_fixture(db, tenant, monkeypatch)
     planner = AsyncMock()

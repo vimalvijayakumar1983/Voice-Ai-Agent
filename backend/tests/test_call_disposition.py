@@ -10,6 +10,38 @@ from app.services.call_disposition import (
 )
 
 
+def test_repeated_routing_or_search_failure_requires_review_without_grounding_event():
+    analysis = normalize_call_analysis(
+        {
+            "summary": "Some questions answered.",
+            "disposition": "information_provided",
+            "resolution": "resolved",
+            "confidence": 0.9,
+        },
+        profile="receptionist",
+    )
+    grounding = summarize_runtime_grounding(
+        {
+            "runtime": {
+                "turn_diagnostics": [
+                    {
+                        "outcome": "answered",
+                        "conversation_recovery_failure": "repeated_entity_clarification",
+                    },
+                    {
+                        "outcome": "answered",
+                        "conversation_recovery_failure": "search_budget_exhausted",
+                    },
+                ]
+            }
+        }
+    )
+    result = apply_grounding_quality_guard(analysis, grounding=grounding)["disposition_details"]
+    assert result["needs_review"] is True
+    assert result["resolution"] == "partially_resolved"
+    assert result["grounding"]["conversation_recovery_failure"] == 2
+
+
 def test_receptionist_information_call_is_resolved_without_follow_up():
     result = normalize_call_analysis(
         {

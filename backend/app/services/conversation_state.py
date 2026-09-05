@@ -53,6 +53,11 @@ def person_reference(text: str) -> tuple[str, bool] | None:
     """Extract a person reference, not a caller's proposed role or company fact."""
     patterns = (
         (r"who is (.+)", True),
+        (r"what does (.+?) (?:hold|do)", True),
+        (r"is (?:this |that )?(.+?) (?:someone|working|a person) in (?:this|the) company", True),
+        (r"is (?:this|that) (.+)", True),
+        (r"(?:more |tell me more )?about (.+?)(?:,? in .+)?", True),
+        (r"with (.+)", False),
         (r"(?:what|which) (?:position|role) does (.+?) (?:hold|have)", True),
         (r"(?:tell me about|what about) (.+)", True),
         (r"(?:it is|it's|that is|that's|the name is) (.+)", False),
@@ -61,6 +66,69 @@ def person_reference(text: str) -> tuple[str, bool] | None:
         match = re.fullmatch(pattern, text.strip(" .?!"), re.I)
         if match:
             return match[1], inquiry
+    return None
+
+
+def conversation_control(text: str) -> str | None:
+    """Classify bounded conversational acts before retrieval, preserving mixed questions."""
+    words = company_key(text).split()
+    if (
+        words
+        and set(words)
+        <= {
+            "one",
+            "a",
+            "just",
+            "minute",
+            "moment",
+            "second",
+            "please",
+            "wait",
+            "hold",
+            "on",
+            "hang",
+            "give",
+            "me",
+            "for",
+        }
+        and set(words) & {"minute", "moment", "second", "wait", "hold", "hang"}
+    ):
+        return "hold"
+    if (
+        words
+        and len(words) <= 16
+        and set(words)
+        <= {
+            "it",
+            "s",
+            "is",
+            "that",
+            "all",
+            "okay",
+            "ok",
+            "fine",
+            "thank",
+            "thanks",
+            "you",
+            "very",
+            "much",
+            "so",
+            "again",
+            "and",
+            "bye",
+            "goodbye",
+            "alright",
+            "great",
+            "well",
+            "oh",
+            "for",
+            "your",
+            "help",
+            "today",
+        }
+        and set(words) & {"thank", "thanks", "goodbye", "bye"}
+    ):
+        return "courtesy"
     return None
 
 
@@ -187,8 +255,14 @@ class ConversationState:
         exact_companies = mentioned_companies(selection, scope)
         if exact_companies and re.search(r"\b(?:not|except|without)\b", selection, re.I):
             return self._clarify("Please name the company you want information about?")
-        reference = person_reference(text)
-        people = match_people(reference[0], directory) if reference and not exact_companies else ()
+        reference_text = text
+        for label in scope.companies:
+            if label.name in exact_companies:
+                reference_text = re.sub(
+                    r"\s+in\s+" + re.escape(label.name) + r"[.?!]*$", "", reference_text, flags=re.I
+                )
+        reference = person_reference(reference_text)
+        people = match_people(reference[0], directory) if reference else ()
         # A versioned lexicon may offer a spelling correction. It is usable
         # only if that exact canonical person has approved company ownership.
         if reference and not exact_companies and not people and person_hint in directory:
@@ -213,6 +287,11 @@ class ConversationState:
                     message=f"What would you like to know about {person}?",
                 )
             owners = tuple(n for n in directory[person] if n in {c.name for c in scope.companies})
+            if exact_companies:
+                # Never move an explicit company question to another person's employer.
+                owners = tuple(n for n in owners if n in exact_companies)
+                if not owners:
+                    return self._lookup(text, exact_companies[0])
             if len(owners) > 1:
                 self.pending_companies, self.pending_query = owners, f"Who is {person}?"
                 return self._clarify("Which company do you mean: " + " or ".join(owners) + "?")
@@ -255,6 +334,13 @@ class ConversationState:
             "instead",
             "centre",
             "center",
+            "so",
+            "it",
+            "s",
+            "is",
+            "yes",
+            "could",
+            "be",
         }
         if len(labels) > 1:
             common = set.intersection(*(set(company_key(c.name).split()) for c in labels))
@@ -286,6 +372,28 @@ class ConversationState:
             if query and self.company:
                 old_label = next(c for c in scope.companies if c.name == self.company)
                 query = company_request_remainder(query, old_label)
+            # Carry an attribute, not the wording of the old company's request.
+            if re.search(r"\b(?:phone|telephone|contact number)\b", query, re.I) and set(
+                company_key(query).split()
+            ) <= {
+                "what",
+                "is",
+                "the",
+                "phone",
+                "telephone",
+                "contact",
+                "number",
+                "just",
+                "give",
+                "tell",
+                "me",
+                "please",
+                "your",
+                "their",
+                "of",
+                "office",
+            }:
+                query = "What is the phone number?"
         if len(companies) > 1:
             self.pending_companies = companies
             if not selection_only:
@@ -326,7 +434,7 @@ class ConversationState:
             if self.topic_query:
                 return self._lookup(self.topic_query, self.company)
             return self._clarify("Which topic would you like me to look up?")
-        if re.fullmatch(r"(?:is|was|are|were|does|do) (?:it|they) .+", normalized):
+        if re.fullmatch(r"(?:is|was|are|were) (?:it|they) .+", normalized):
             if self.topic_query:
                 # STT may finalize "What is annual revenue?" separately from
                 # "Is it one billion?". This is a grammatical confirmation,
