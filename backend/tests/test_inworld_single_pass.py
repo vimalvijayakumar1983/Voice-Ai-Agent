@@ -297,7 +297,7 @@ def test_no_match_and_compiler_exact_facts_have_deterministic_grounded_replies()
     assert (
         deterministic_grounded_reply(
             founding_evidence,
-            query="How long has Al Zaabi Group been operating?",
+            query="How long has Al Zaabi Group been in operation?",
         )
         == "Al Zaabi Group has operated since 2003."
     )

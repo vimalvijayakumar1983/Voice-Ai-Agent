@@ -354,7 +354,14 @@ def deterministic_grounded_reply(
                 or "from what year" in normalized_query
             ) and any(
                 term in normalized_query
-                for term in ("operate", "operated", "operating", "exist", "running")
+                for term in (
+                    "operate",
+                    "operated",
+                    "operating",
+                    "operation",
+                    "exist",
+                    "running",
+                )
             )
             if duration_question:
                 return f"{subject} has operated since {value}."
