@@ -341,6 +341,30 @@ def test_no_match_and_compiler_exact_facts_have_deterministic_grounded_replies()
         "Contracting, Automotive and Transport."
     )
 
+    multi_service_evidence = encode_exact_fact_evidence(
+        response_action="answer",
+        facts=tuple(
+            ExactFactWireFact(
+                evidence_id=f"exact:services:{index}",
+                fact_type="services",
+                subject="Al Zaabi Group",
+                predicate="business segment",
+                value=value,
+                source_name="Approved company profile",
+            )
+            for index, value in enumerate(
+                ("Healthcare", "Trading", "Contracting", "Automotive"),
+                start=1,
+            )
+        ),
+        max_chars=900,
+    )
+    assert multi_service_evidence is not None
+    assert deterministic_grounded_reply(multi_service_evidence) == (
+        "Verified services and divisions for Al Zaabi Group include Healthcare, Trading, "
+        "Contracting, and Automotive."
+    )
+
 
 def test_exact_fact_json_does_not_treat_source_delimiters_as_control_syntax():
     evidence = encode_exact_fact_evidence(

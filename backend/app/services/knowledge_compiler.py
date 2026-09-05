@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 ProcessingMode = Literal["automatic", "fast", "ai_verified"]
 
-COMPILER_VERSION = "vav-knowledge-compiler-8"
+COMPILER_VERSION = "vav-knowledge-compiler-9"
 AUTOMATIC_MODEL = "gpt-5.6-luna"
 VERIFIED_MODEL = "gpt-5.6-terra"
 _MODEL_PRICES_PER_MILLION = {
@@ -31,6 +31,17 @@ _EMAIL_RE = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.I)
 _SPACE_RE = re.compile(r"\s+")
 _GROUNDING_SEPARATOR_RE = re.compile(r"[^\w]+", re.UNICODE)
 _PARAGRAPH_RE = re.compile(r"\n\s*\n+")
+_ROLE_MESSAGE_RE = re.compile(
+    r"\b(?P<role>chairman|chairperson|chairwoman|president)(?:\s+s)?\s+message\b"
+)
+_ROLE_MESSAGE_PREDICATES = {
+    "heading",
+    "message heading",
+    "message title",
+    "section heading",
+    "section title",
+    "title",
+}
 
 
 class KnowledgeCompilerError(RuntimeError):
@@ -217,6 +228,73 @@ def _validated_fact(source: str, fact: _Fact) -> dict | None:
     return {**fact.model_dump(), "evidence": evidence}
 
 
+def _project_role_heading_facts(*, entities: list[dict], facts: list[dict]) -> list[dict]:
+    """Turn an explicit role-message heading and author into a reusable role fact."""
+
+    organizations = list(
+        dict.fromkeys(
+            str(entity.get("name") or "").strip()
+            for entity in entities
+            if str(entity.get("entity_type") or "").strip().lower()
+            in {"organization", "organisation"}
+            and str(entity.get("name") or "").strip()
+        )
+    )
+    projected = list(facts)
+    seen = {
+        (
+            _grounding_normalized(str(fact.get("subject") or "")),
+            _grounding_normalized(str(fact.get("predicate") or "")),
+            _grounding_normalized(str(fact.get("value") or "")),
+        )
+        for fact in facts
+    }
+    for fact in facts:
+        if _grounding_normalized(str(fact.get("predicate") or "")) not in (
+            _ROLE_MESSAGE_PREDICATES
+        ):
+            continue
+        match = _ROLE_MESSAGE_RE.search(_grounding_normalized(str(fact.get("value") or "")))
+        if match is None:
+            continue
+        person = str(fact.get("subject") or "").strip()
+        evidence = str(fact.get("evidence") or "").strip()
+        matching_organizations = [
+            organization
+            for organization in organizations
+            if _value_is_grounded(organization, evidence)
+        ]
+        if (
+            not person
+            or not evidence
+            or len(matching_organizations) != 1
+            or not _value_is_grounded(person, evidence)
+        ):
+            continue
+        role = match.group("role")
+        key = (
+            _grounding_normalized(matching_organizations[0]),
+            role,
+            _grounding_normalized(person),
+        )
+        if key in seen:
+            continue
+        projected.append(
+            {
+                "subject": matching_organizations[0],
+                "predicate": role,
+                "value": person,
+                "evidence": evidence,
+                "search_phrases": [
+                    f"Who is the {role} of {matching_organizations[0]}?",
+                    f"Who leads {matching_organizations[0]}?",
+                ],
+            }
+        )
+        seen.add(key)
+    return projected
+
+
 def _requires_ai(text: str) -> bool:
     contacts = len(_PHONE_RE.findall(text)) + len(_EMAIL_RE.findall(text))
     non_ascii = sum(ord(character) > 127 for character in text[:20_000])
@@ -373,6 +451,10 @@ they, begin the evidence at the nearest explicit subject sentence or heading and
 the intervening source text through the value. Omit anything ambiguous. For every fact,
 provide up to eight short search_phrases expressing natural ways a caller could request
 that SAME fact.
+When a management page has an explicit role heading such as Chairman's Message or
+President's Message followed by the named author, also emit the direct organization role
+fact (organization / chairman or president / person) only when one contiguous evidence
+span contains the organization name, the role heading, and the person's name.
 Include both everyday wording and the source's terminology (for example, formed, founded,
 established and inception for an explicit inception year). Search phrases are retrieval
 hints only: never add an answer, entity, date, number or claim that is not already in the
@@ -411,6 +493,10 @@ fact. Do not produce medical advice."""
     accepted_facts = [
         validated for fact in result.facts if (validated := _validated_fact(text, fact)) is not None
     ]
+    accepted_facts = _project_role_heading_facts(
+        entities=accepted_entities,
+        facts=accepted_facts,
+    )
     usage = getattr(response, "usage", None)
     input_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
     output_tokens = int(getattr(usage, "completion_tokens", 0) or 0)

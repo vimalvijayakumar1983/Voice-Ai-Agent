@@ -205,7 +205,114 @@ def test_unstructured_or_deterministic_only_source_never_creates_refusal_boundar
         assert index.index_truncated is True
         assert "incomplete_structured_coverage" in index.truncation_reasons
         assert result.response_action == ExactFactResponseAction.FALLBACK
-        assert result.reason == "exact_fact_index_truncated"
+        assert result.reason == "no_exact_fact_match_use_approved_retrieval"
+
+
+def test_named_grounded_facts_survive_soft_legacy_coverage_gaps():
+    evidence = (
+        "Al Zaabi Group operates its businesses in five segments: Healthcare, Trading, "
+        "Contracting, Automotive and Transport."
+    )
+    management = ExactFactSource(
+        source_id="management",
+        source_name="Management – Al Zaabi Group",
+        structured_content={
+            "schema_version": "vav-knowledge-compiler-8",
+            "entities": [
+                {
+                    "name": "Al Zaabi Group",
+                    "entity_type": "organization",
+                    "evidence": "Al Zaabi Group",
+                }
+            ],
+            "facts": [
+                {
+                    "subject": "Al Zaabi Group",
+                    "predicate": "business segment",
+                    "value": value,
+                    "evidence": evidence,
+                    "search_phrases": [f"Does Al Zaabi Group operate in {value}?"],
+                }
+                for value in (
+                    "Healthcare",
+                    "Trading",
+                    "Contracting",
+                    "Automotive",
+                    "Transport",
+                )
+            ],
+            "validation": {
+                "all_evidence_source_grounded": True,
+                "facts_rejected": 0,
+            },
+        },
+    )
+    legacy = ExactFactSource(
+        source_id="legacy-page",
+        source_name="Legacy approved page",
+        structured_content=None,
+    )
+
+    result = resolve_exact_fact(
+        build_exact_fact_index((management, legacy)),
+        query="What businesses or divisions does Al Zaabi Group operate?",
+    )
+
+    assert result.response_action == ExactFactResponseAction.ANSWER
+    assert result.reason == "verified_exact_fact"
+    assert [item.value for item in result.evidence] == [
+        "Healthcare, Trading, Contracting, Automotive and Transport"
+    ]
+
+
+def test_role_message_heading_projects_a_grounded_company_leadership_fact():
+    evidence = (
+        "Chairman's Message. Al Zaabi Group continues its strides towards excellence. "
+        "T.R. Vijayakumar"
+    )
+    index = build_exact_fact_index(
+        (
+            ExactFactSource(
+                source_id="management",
+                source_name="Management – Al Zaabi Group",
+                structured_content={
+                    "schema_version": "vav-knowledge-compiler-8",
+                    "entities": [
+                        {
+                            "name": "Al Zaabi Group",
+                            "entity_type": "organization",
+                            "evidence": "Al Zaabi Group",
+                        }
+                    ],
+                    "facts": [
+                        {
+                            "subject": "T.R. Vijayakumar",
+                            "predicate": "message title",
+                            "value": "Chairman's Message",
+                            "evidence": evidence,
+                            "search_phrases": ["Who gave the Chairman's Message?"],
+                        }
+                    ],
+                    "validation": {
+                        "all_evidence_source_grounded": True,
+                        "facts_rejected": 0,
+                    },
+                },
+            ),
+            ExactFactSource(
+                source_id="legacy-page",
+                source_name="Legacy approved page",
+                structured_content=None,
+            ),
+        )
+    )
+
+    result = resolve_exact_fact(index, query="Who is the chairman of Al Zaabi Group?")
+
+    assert result.response_action == ExactFactResponseAction.ANSWER
+    assert [(item.subject, item.predicate, item.value) for item in result.evidence] == [
+        ("Al Zaabi Group", "chairman", "T.R. Vijayakumar")
+    ]
 
 
 def test_llm_claimed_complete_but_omitted_fact_never_creates_refusal_boundary():
@@ -735,6 +842,38 @@ def test_generated_search_phrase_cannot_redirect_founding_fact_to_another_compan
 
     assert result.response_action == ExactFactResponseAction.FALLBACK
     assert result.evidence == ()
+
+
+def test_operation_duration_wording_resolves_the_verified_founding_year():
+    index = build_exact_fact_index(
+        (
+            ExactFactSource(
+                source_id="management-page",
+                source_name="Management – Al Zaabi Group",
+                structured_content={
+                    "schema_version": "compiler-v8",
+                    "facts": [
+                        {
+                            "subject": "Al Zaabi Group",
+                            "predicate": "inception year",
+                            "value": "2003",
+                            "evidence": (
+                                "Al Zaabi Group has operated since its inception in 2003."
+                            ),
+                        }
+                    ],
+                },
+            ),
+        )
+    )
+
+    result = resolve_exact_fact(
+        index,
+        query="How long has Al Zaabi Group been in operation?",
+    )
+
+    assert result.response_action == ExactFactResponseAction.ANSWER
+    assert result.evidence[0].value == "2003"
 
 
 def test_governed_hours_paraphrase_does_not_depend_on_generated_search_phrases():

@@ -364,6 +364,19 @@ def deterministic_grounded_reply(
         if envelope.facts[0].fact_type == "services":
             return f"Verified services and divisions for {subject} include {value}."
         return f"The {predicate} for {subject} is {value}."
+    fact_types = {fact.fact_type for fact in envelope.facts}
+    subjects = {fact.subject for fact in envelope.facts}
+    if fact_types == {"services"} and len(subjects) == 1:
+        subject = next(iter(subjects))
+        values = list(dict.fromkeys(fact.value for fact in envelope.facts))
+        if len(values) == 1:
+            joined = values[0]
+        elif len(values) == 2:
+            joined = f"{values[0]} and {values[1]}"
+        else:
+            joined = f"{', '.join(values[:-1])}, and {values[-1]}"
+        return f"Verified services and divisions for {subject} include {joined}."
+
     details = "; ".join(
         f"{predicate} for {subject} is {value}" for subject, predicate, value in facts[:4]
     )

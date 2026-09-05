@@ -48,6 +48,20 @@ MAX_FACTS_PER_SOURCE = 200
 MAX_INDEX_FACTS = 2_048
 MAX_RESPONSE_FACTS = 5
 
+# A partial AI extraction is a soft coverage gap: every returned fact is still
+# revalidated against verbatim evidence below, so a positive, named match is
+# safe to serve while a miss must fall through to the full approved document.
+# Capacity truncation is different because it can silently discard a competing
+# exact fact and therefore remains fail-closed.
+_HARD_TRUNCATION_REASONS = frozenset(
+    {
+        "source_limit",
+        "source_coverage_mismatch",
+        "per_source_fact_limit",
+        "index_fact_limit",
+    }
+)
+
 _ELIGIBLE_SOURCE_STATUSES = ("processing", "indexed", "local_only")
 _TOKEN_RE = re.compile(r"[^\W_]+", re.UNICODE)
 _SPACE_RE = re.compile(r"\s+")
@@ -346,6 +360,7 @@ _INTENT_QUERY_TOKENS = {
         "operate",
         "operated",
         "operating",
+        "operation",
         "operations",
         "since",
         "started",
@@ -472,9 +487,13 @@ _FACT_TYPE_TERMS: dict[ExactFactType, tuple[str, ...]] = {
         "role",
     ),
     ExactFactType.SERVICES: (
+        "business segment",
+        "operates businesses",
+        "division",
         "service",
         "offering",
         "provides",
+        "sector",
         "treatment",
         "speciality",
         "specialty",
@@ -515,6 +534,19 @@ _FOUNDING_PREDICATES = frozenset(
 _LEADERSHIP_ROLE_PATTERN = (
     r"(?:board\s+member|ceo|cfo|chairman|chairperson|chairwoman|chief\s+executive(?:\s+officer)?|"
     r"chief\s+financial(?:\s+officer)?|director|founder|managing\s+director|president)"
+)
+_ROLE_MESSAGE_PREDICATES = frozenset(
+    {
+        "heading",
+        "message heading",
+        "message title",
+        "section heading",
+        "section title",
+        "title",
+    }
+)
+_ROLE_MESSAGE_RE = re.compile(
+    r"\b(?P<role>chairman|chairperson|chairwoman|president)(?:\s+s)?\s+message\b"
 )
 
 _NON_NAME_QUESTION_PREFIXES = {
@@ -605,6 +637,114 @@ def _list_values(value: object) -> tuple[object, ...]:
     if value is None:
         return ()
     return (value,)
+
+
+def _role_heading_projection(
+    structured: Mapping[str, Any],
+    fact: Mapping[str, Any],
+) -> Mapping[str, Any] | None:
+    """Project a governed role-heading fact into organization -> person form.
+
+    Management pages often encode leadership as ``Chairman's Message``
+    followed by the author's name. Generative extraction commonly preserves
+    that layout as ``person / message title / Chairman's Message``, which is
+    grounded but cannot answer a company-scoped leadership question. This
+    projection is deliberately narrow: one organization, one supported role
+    heading, and verbatim evidence containing the organization, role and person
+    are all required.
+    """
+
+    predicate = _grounding_normalized(fact.get("predicate"))
+    if predicate not in _ROLE_MESSAGE_PREDICATES:
+        return None
+    role_match = _ROLE_MESSAGE_RE.search(_grounding_normalized(fact.get("value")))
+    if role_match is None:
+        return None
+    person = _clean_text(fact.get("subject"), limit=200)
+    evidence = _clean_text(fact.get("evidence"), limit=1_500)
+    if not person or not evidence or not _value_is_grounded(person, evidence):
+        return None
+
+    organizations: list[str] = []
+    for entity in _list_values(structured.get("entities")):
+        if not isinstance(entity, Mapping):
+            continue
+        if _normalized(entity.get("entity_type")) not in {"organization", "organisation"}:
+            continue
+        name = _clean_text(entity.get("name"), limit=200)
+        if name and name not in organizations and _subject_is_grounded(name, evidence):
+            organizations.append(name)
+    if len(organizations) != 1:
+        return None
+
+    role = role_match.group("role")
+    return {
+        "subject": organizations[0],
+        "predicate": role,
+        "value": person,
+        "evidence": evidence,
+        "search_phrases": [
+            f"Who is the {role} of {organizations[0]}?",
+            f"Who leads {organizations[0]}?",
+        ],
+    }
+
+
+def _projected_fact_records(
+    structured: Mapping[str, Any],
+    fact: Mapping[str, Any],
+) -> tuple[Mapping[str, Any], ...]:
+    projected = _role_heading_projection(structured, fact)
+    return (fact, projected) if projected is not None else (fact,)
+
+
+def _service_list_projections(
+    facts: Sequence[object],
+) -> tuple[Mapping[str, Any], ...]:
+    """Collapse repeated segment facts backed by one explicit source list."""
+
+    groups: dict[tuple[str, str], list[Mapping[str, Any]]] = {}
+    for fact in facts:
+        if not isinstance(fact, Mapping):
+            continue
+        predicate = _grounding_normalized(fact.get("predicate"))
+        if predicate not in {"business segment", "division", "service division"}:
+            continue
+        subject = _clean_text(fact.get("subject"), limit=200)
+        evidence = _clean_text(fact.get("evidence"), limit=1_500)
+        value = _clean_text(fact.get("value"), limit=1_000)
+        if subject and evidence and value and _value_is_grounded(value, evidence):
+            groups.setdefault((subject, evidence), []).append(fact)
+
+    projected: list[Mapping[str, Any]] = []
+    for (subject, evidence), grouped in groups.items():
+        if len(grouped) < 2:
+            continue
+        values = list(
+            dict.fromkeys(_clean_text(fact.get("value"), limit=1_000) for fact in grouped)
+        )
+        positions = [(evidence.casefold().find(value.casefold()), value) for value in values]
+        if any(position < 0 for position, _value in positions):
+            continue
+        positions.sort(key=lambda item: item[0])
+        start = positions[0][0]
+        last_position, last_value = positions[-1]
+        list_value = evidence[start : last_position + len(last_value)].strip(" ,.;:")
+        if not list_value or not all(value.casefold() in list_value.casefold() for value in values):
+            continue
+        projected.append(
+            {
+                "subject": subject,
+                "predicate": "business divisions",
+                "value": list_value,
+                "evidence": evidence,
+                "search_phrases": [
+                    f"What businesses or divisions does {subject} operate?",
+                    f"What are the business segments of {subject}?",
+                ],
+            }
+        )
+    return tuple(projected)
 
 
 def _value_is_grounded(value: str, evidence: str) -> bool:
@@ -940,11 +1080,14 @@ def build_exact_fact_index(
             compiled_at=_isoformat(source.compiled_at),
             compiler_version=_clean_text(structured.get("schema_version"), limit=100) or None,
         )
+        projected_raw_facts: list[Mapping[str, Any]] = []
         for raw_fact in raw_facts[:MAX_FACTS_PER_SOURCE]:
+            if isinstance(raw_fact, Mapping):
+                projected_raw_facts.extend(_projected_fact_records(structured, raw_fact))
+        projected_raw_facts.extend(_service_list_projections(raw_facts[:MAX_FACTS_PER_SOURCE]))
+        for raw_fact in projected_raw_facts:
             if len(facts) >= MAX_INDEX_FACTS:
                 truncation_reasons.add("index_fact_limit")
-                continue
-            if not isinstance(raw_fact, Mapping):
                 continue
             subject = _clean_text(raw_fact.get("subject"), limit=200)
             predicate = _clean_text(raw_fact.get("predicate"), limit=100)
@@ -1272,12 +1415,13 @@ def resolve_exact_fact(
         for intent in classify_exact_fact_intents(candidate_query):
             if intent not in intents:
                 intents.append(intent)
-    # Most exact-fact families fail closed on any partial corpus. A founding
-    # match is the narrow exception: it has an exact predicate/year grammar and
-    # a clause-level relationship proof, and its spoken rendering is always
-    # explicitly source-qualified. A miss still falls back to broad retrieval.
+    # Capacity truncation can hide a competing fact and must fail closed. Soft
+    # compiler coverage gaps do not invalidate facts that individually passed
+    # the evidence boundary: named positive matches may answer, while misses
+    # still fall through to the full approved document below.
     source_qualified_founding = bool(intents) and set(intents) == {ExactFactType.FOUNDING}
-    if index.index_truncated and not source_qualified_founding:
+    hard_truncated = bool(_HARD_TRUNCATION_REASONS.intersection(index.truncation_reasons))
+    if hard_truncated and not source_qualified_founding:
         return _resolution(
             action=ExactFactResponseAction.FALLBACK,
             intents=tuple(intents),
@@ -1309,7 +1453,7 @@ def resolve_exact_fact(
             intents=intent_tuple,
             reason=(
                 "exact_fact_index_truncated"
-                if index.index_truncated
+                if hard_truncated
                 else "no_exact_fact_match_use_approved_retrieval"
             ),
             max_evidence_chars=max_evidence_chars,
@@ -1351,11 +1495,41 @@ def resolve_exact_fact(
         intent_ranked = [(score, fact) for score, fact in ranked if fact.fact_type == intent]
         top_score = intent_ranked[0][0]
         top_facts = [fact for score, fact in intent_ranked if score == top_score]
-        # Broad service questions intentionally return a short verified list.
+        # Broad service/division questions intentionally return a short,
+        # concrete verified list. Prefer one-fact-per-segment records over a
+        # count-only summary such as "five segments" when both are present.
         if intent == ExactFactType.SERVICES:
-            subjects = {_grounding_normalized(fact.subject) for fact in top_facts}
-            if len(subjects) == 1:
-                selected.extend(top_facts)
+            top_subjects = {_grounding_normalized(fact.subject) for fact in top_facts}
+            if len(top_subjects) == 1:
+                top_subject = next(iter(top_subjects))
+                same_subject = [
+                    fact
+                    for _score, fact in intent_ranked
+                    if _grounding_normalized(fact.subject) == top_subject
+                ]
+                summaries = [
+                    fact
+                    for fact in same_subject
+                    if _grounding_normalized(fact.predicate) == "business divisions"
+                ]
+                if summaries:
+                    selected.append(summaries[0])
+                    continue
+                concrete = [
+                    fact
+                    for fact in same_subject
+                    if any(
+                        marker in _grounding_normalized(fact.predicate)
+                        for marker in (
+                            "business segment",
+                            "division",
+                            "offering",
+                            "service",
+                            "treatment",
+                        )
+                    )
+                ]
+                selected.extend((concrete or top_facts)[:MAX_RESPONSE_FACTS])
                 continue
         if len(top_facts) > 1:
             ambiguous.extend(top_facts)

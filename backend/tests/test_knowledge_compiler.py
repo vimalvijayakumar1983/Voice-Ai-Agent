@@ -190,6 +190,58 @@ async def test_ai_compilation_keeps_natural_questions_with_verified_fact():
 
 
 @pytest.mark.asyncio
+async def test_ai_compilation_projects_explicit_role_message_heading():
+    evidence = (
+        "Chairman's Message\n\nA Winning Combination of Minds\n\n"
+        "Al Zaabi Group will continue its strides towards excellence.\n\n"
+        "T.R. Vijayakumar"
+    )
+    client = _FakeClient(
+        {
+            "page_type": "overview",
+            "entities": [
+                {
+                    "name": "Al Zaabi Group",
+                    "entity_type": "organization",
+                    "evidence": "Al Zaabi Group",
+                },
+                {
+                    "name": "T.R. Vijayakumar",
+                    "entity_type": "person",
+                    "evidence": "T.R. Vijayakumar",
+                },
+            ],
+            "facts": [
+                {
+                    "subject": "T.R. Vijayakumar",
+                    "predicate": "message title",
+                    "value": "Chairman's Message",
+                    "evidence": evidence,
+                    "search_phrases": ["Who gave the Chairman's Message?"],
+                }
+            ],
+        }
+    )
+
+    result = await compile_website_knowledge(
+        title="Management – Al Zaabi Group",
+        url="https://alzaabigroup.example/management",
+        text=evidence,
+        requested_mode="ai_verified",
+        api_key="test-key",
+        client=client,
+    )
+
+    assert any(
+        fact["subject"] == "Al Zaabi Group"
+        and fact["predicate"] == "chairman"
+        and fact["value"] == "T.R. Vijayakumar"
+        for fact in result.structured["facts"]
+    )
+    assert result.structured["compiler"]["version"] == "vav-knowledge-compiler-9"
+
+
+@pytest.mark.asyncio
 async def test_ai_compilation_accepts_pronoun_fact_from_same_subject_paragraph():
     text = (
         "Al Zaabi Group has grown throughout the UAE.\n\nPresident's Message\n\n"
