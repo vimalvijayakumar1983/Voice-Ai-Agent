@@ -14,11 +14,17 @@ from app.livekit_runtime.inworld_single_pass import (
 )
 from app.models.agent import KnowledgeSource
 from app.services.conversation_scope import KnowledgeCompany, KnowledgeCompanyScope
-from app.services.conversation_state import ConversationState, match_people
+from app.services.conversation_state import (
+    ConversationState,
+    explicit_attribute_request,
+    match_people,
+)
 from app.services.knowledge_collections import collection_reply, decode_collection
+from app.services.knowledge_query_interpreter import SearchRepair, SearchRepairResult
 from tests.test_conversation_routing import medical_runtime
 from tests.test_inworld_single_pass import _FakeSession
 from tests.test_knowledge_collections import fact
+from tests.test_speech_lexicon import _entry
 
 
 async def runtime_fixture(db, tenant, monkeypatch):
@@ -275,3 +281,74 @@ def test_clarification_loop_has_bounded_recovery_message():
     assert "haven't been able to resolve" in plan.message
     assert state.plan("What is A Company phone number?", scope, {}).action == "lookup"
     assert state.clarification_count == 0
+
+
+async def test_approved_lexicon_spelling_hint_resolves_owner_before_search(db, tenant, monkeypatch):
+    runtime, medical = await runtime_fixture(db, tenant, monkeypatch)
+    source = await db.scalar(select(KnowledgeSource).where(KnowledgeSource.tenant_id == tenant.id))
+    source.structured_content = {
+        "facts": [
+            *source.structured_content["facts"],
+            fact("Harbour Group", "person profile: Andrew Vijayakumar", "Director"),
+        ]
+    }
+    await db.commit()
+    runtime._speech_lexicon_entries = (
+        _entry("Andrew Vijayakumar", entry_id="andrew", entity_type="person", tier=1),
+    )
+    await ask(runtime, "What is " + medical[1] + " phone number?")
+    reply = await ask(runtime, "Who is Andrew Vijay Kumar?")
+    assert "Andrew Vijayakumar" in reply and "Director" in reply
+    assert runtime._single_pass_active_subject == "Harbour Group"
+
+
+def test_lexicon_hint_without_approved_owner_does_not_grant_company_access():
+    scope = KnowledgeCompanyScope(companies=[KnowledgeCompany(name="A Company")])
+    state = ConversationState(company="A Company")
+    plan = state.plan("Who is Unknown Person?", scope, {}, person_hint="External Person")
+    assert plan.company == "A Company" and "External Person" not in plan.query
+
+
+@pytest.mark.parametrize(
+    "query,clear",
+    [
+        ("What is annual revenue? Is it one billion?", True),
+        ("What is their cancellation policy?", True),
+        ("What is the price of it?", False),
+        ("What is the number?", False),
+        ("Who is the leader?", False),
+        ("What is that?", False),
+    ],
+)
+def test_clear_attribute_is_not_confused_with_ambiguous_reference(query, clear):
+    assert explicit_attribute_request(query, "Harbour Group") is clear
+
+
+async def test_clear_unsupported_attribute_does_not_loop_on_clarification(db, tenant, monkeypatch):
+    runtime, _ = await runtime_fixture(db, tenant, monkeypatch)
+    runtime._company_scope.semantic_retrieval_enabled = True
+    monkeypatch.setattr(worker, "load_provider_config", AsyncMock(return_value={"api_key": "test"}))
+    monkeypatch.setattr(
+        worker,
+        "interpret_knowledge_question",
+        AsyncMock(
+            return_value=SearchRepairResult(
+                SearchRepair(action="clarify", query=""), "completed", 1, 10, 5, True
+            )
+        ),
+    )
+    reply = await ask(runtime, "What is the annual revenue? Is it one billion dirhams?")
+    assert "don't have verified" in reply and "clarify" not in reply
+
+
+async def test_interpreter_timeout_is_not_called_a_missing_fact(db, tenant, monkeypatch):
+    runtime, _ = await runtime_fixture(db, tenant, monkeypatch)
+    runtime._company_scope.semantic_retrieval_enabled = True
+    monkeypatch.setattr(worker, "load_provider_config", AsyncMock(return_value={"api_key": "test"}))
+    monkeypatch.setattr(
+        worker,
+        "interpret_knowledge_question",
+        AsyncMock(return_value=SearchRepairResult(None, "timeout", 2000, None, None, True)),
+    )
+    reply = await ask(runtime, "What is the annual revenue?")
+    assert "couldn't resolve" in reply and "don't have verified" not in reply

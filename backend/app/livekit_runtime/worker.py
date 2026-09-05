@@ -79,7 +79,11 @@ from app.services.conversation_scope import (
     routing_text,
     scope_reply,
 )
-from app.services.conversation_state import ConversationState, person_reference
+from app.services.conversation_state import (
+    ConversationState,
+    explicit_attribute_request,
+    person_reference,
+)
 from app.services.exact_fact_protocol import decode_exact_fact_evidence
 from app.services.exact_fact_retrieval import (
     ExactFactResponseAction,
@@ -2599,7 +2603,9 @@ Knowledge policy:
             # not proof that the original source has no answer.
             return scope_reply("I couldn't resolve that question. Could you rephrase it briefly?")
         if result.plan.action == "clarify":
-            if is_clear_pricing_request(query, company=company):
+            if is_clear_pricing_request(query, company=company) or (
+                self._conversation_state_v3 and explicit_attribute_request(query, company)
+            ):
                 return "NO_VERIFIED_KNOWLEDGE_MATCH"
             return scope_reply("Could you clarify which detail you would like me to check?")
         rewrite = result.plan.query.strip()
@@ -2999,7 +3005,17 @@ Knowledge policy:
 
         if normalized in _BACKCHANNEL_UTTERANCES:
             return NO_KNOWLEDGE_REQUIRED
-        plan = state.plan(text, self._company_scope, self._person_company_directory or {})
+        person_hint = None
+        reference = person_reference(text)
+        if reference and self._speech_lexicon_entries:
+            resolution = resolve_canonical_entity(
+                reference[0], self._speech_lexicon_entries, expected_entity_types=("person",)
+            )
+            if resolution.safe_to_apply and resolution.entity_type == "person":
+                person_hint = resolution.canonical
+        plan = state.plan(
+            text, self._company_scope, self._person_company_directory or {}, person_hint=person_hint
+        )
         if self._telemetry:
             self._telemetry.runtime_metrics["conversation_state_version"] = "v3"
             trace = self._telemetry._trace()

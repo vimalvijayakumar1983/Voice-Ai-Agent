@@ -65,6 +65,39 @@ def match_people(reference: str, directory: dict[str, tuple[str, ...]]) -> tuple
     return tuple(matches)
 
 
+def explicit_attribute_request(question: str, company: str) -> bool:
+    """A clear attribute with no evidence is a gap, not an unclear question.
+
+    Only used after scoped retrieval failed and the optional interpreter returned
+    clarify. Never converts a provider timeout into an evidence gap.
+    """
+    clause = company_key(question.split("?", 1)[0])
+    match = re.fullmatch(r"(?:what (?:is|are)|how much (?:is|are)) (.+)", clause)
+    if not match:
+        return False
+    words = set(match[1].split()) - set(company_key(company).split())
+    if words & {"it", "this", "that", "he", "she", "thing", "detail", "something"}:
+        return False
+    words -= {"the", "a", "an", "your", "our", "its", "their", "of", "s", "company", "group"}
+    return bool(words) and not words <= {
+        "name",
+        "number",
+        "contact",
+        "leader",
+        "leadership",
+        "position",
+        "role",
+        "information",
+        "price",
+        "cost",
+        "fee",
+        "rate",
+        "current",
+        "new",
+        "old",
+    }
+
+
 @dataclass
 class ConversationState:
     company: str | None = None
@@ -101,7 +134,11 @@ class ConversationState:
         return TurnPlan("lookup", company, query=query)
 
     def plan(
-        self, text: str, scope: KnowledgeCompanyScope, directory: dict[str, tuple[str, ...]]
+        self,
+        text: str,
+        scope: KnowledgeCompanyScope,
+        directory: dict[str, tuple[str, ...]],
+        person_hint: str | None = None,
     ) -> TurnPlan:
         text = routing_text(text)
         normalized = company_key(text)
@@ -129,6 +166,10 @@ class ConversationState:
             return self._clarify("Please name the company you want information about?")
         reference = person_reference(text)
         people = match_people(reference[0], directory) if reference and not exact_companies else ()
+        # A versioned lexicon may offer a spelling correction. It is usable
+        # only if that exact canonical person has approved company ownership.
+        if reference and not exact_companies and not people and person_hint in directory:
+            people = (person_hint,)
         if self.pending_people and not people:
             people = match_people(
                 text, {n: directory[n] for n in self.pending_people if n in directory}
