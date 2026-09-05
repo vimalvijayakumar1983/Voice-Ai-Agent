@@ -72,7 +72,9 @@ from app.services.call_metadata import agent_configuration_snapshot
 from app.services.conversation_foundation import (
     FOUNDATION_FLAG,
     RequestLedger,
+    canonical_company_text,
     capability_question,
+    company_alias_scope,
     contextual_plan,
     incomplete_request,
     named_identity_request,
@@ -2161,6 +2163,8 @@ class VAVInworldAgent(Agent):
         self._foundation_enabled = (getattr(model, "agent_metadata", None) or {}).get(
             FOUNDATION_FLAG
         ) is True and self._conversation_state_v3
+        if self._foundation_enabled and self._company_scope:
+            self._company_scope = company_alias_scope(self._company_scope)
         self._request_ledger = RequestLedger()
         self._request_ids: dict[str, int] = {}
         self._recent_companies: tuple[str, ...] = ()
@@ -3075,6 +3079,7 @@ Knowledge policy:
                     self._last_spoken_answer[1], slow=natural_repeat == "repeat_slow"
                 )
             text = positive_correction(text, self._company_scope)
+            text = canonical_company_text(text, self._company_scope)
         if self._person_company_directory is None and (
             person_reference(text)
             or state.pending_people
@@ -3261,6 +3266,31 @@ Knowledge policy:
                 raise asyncio.CancelledError
             self._conversation_state = state = proposed_state
         elif self._foundation_enabled:
+            # Interpret uncertain contextual turns before retrieval, not after
+            # a wrong-company search. Share the repair budget and never chain
+            # a second model pass. Deterministic facts/choices remain fast.
+            if (
+                not foundation_plan
+                and self._company_scope.semantic_retrieval_enabled
+                and not proposed_state.pending_companies
+                and (
+                    plan.action == "clarify"
+                    or (
+                        not classify_exact_fact_intents(plan.query)
+                        and plan.action not in {"selection", "person_reference", "recall"}
+                        and re.search(
+                            r"\b(?:his|her|he|she|they|their|mean|meant|looking|referring)\b",
+                            text,
+                            re.I,
+                        )
+                    )
+                )
+            ):
+                proposed_state = replace(state)
+                plan = await self._interpret_turn_plan(text, proposed_state)
+                interpreted = True
+            if intent_sequence != self._intent_sequence:
+                raise asyncio.CancelledError
             self._conversation_state = state = proposed_state
         if self._telemetry:
             self._telemetry.runtime_metrics["conversation_state_version"] = "v3"
@@ -3494,7 +3524,7 @@ Knowledge policy:
                             "?" in content
                             or re.search(
                                 r"\b(?:please ask|couldn't verify|couldn't safely|"
-                                r"finish your question)\b",
+                                r"finish your question|repeat your question|didn't catch)\b",
                                 content,
                                 re.I,
                             )
@@ -5758,6 +5788,7 @@ async def vav_inworld_session(ctx: JobContext) -> None:
                 record_timing=telemetry.record_single_pass_timing,
                 record_error=_record_single_pass_error,
                 prepare_spoken_response=runtime_agent.prepare_spoken_response,
+                recover_untranscribed_speech=runtime_agent._foundation_enabled,
                 settle_interrupted_lists=runtime_agent._conversation_state_v3,
                 incomplete_request=runtime_agent.is_incomplete_request
                 if runtime_agent._foundation_enabled
@@ -5858,6 +5889,8 @@ async def vav_inworld_session(ctx: JobContext) -> None:
                 # Hold a pending response until transcript content distinguishes
                 # a real replacement turn from a harmless backchannel.
                 single_pass_controller.on_user_speech_started()
+            elif new_state == "listening" and single_pass_controller is not None:
+                single_pass_controller.on_user_speech_stopped()
             if (
                 native_realtime
                 and new_state == "speaking"

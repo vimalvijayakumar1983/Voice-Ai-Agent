@@ -14,6 +14,7 @@ from app.services.call_metadata import public_call_metadata
 from app.services.conversation_foundation import (
     RequestLedger,
     capability_question,
+    company_alias_scope,
     contextual_plan,
     incomplete_request,
 )
@@ -24,7 +25,146 @@ from tests.test_inworld_single_pass import _FakeSession
 async def foundation(db, tenant, monkeypatch):
     runtime, medical = await runtime_fixture(db, tenant, monkeypatch)
     runtime._foundation_enabled = True
+    runtime._company_scope = company_alias_scope(runtime._company_scope)
     return runtime, medical
+
+
+@pytest.mark.parametrize(
+    "correction",
+    [
+        "No, I am in Harbour Group. Tell me his role, not the phone number.",
+        "No, I mean Harbour Group. Tell me his role, not the phone number.",
+        "Sorry, I mean Harbour Group. Tell me his position, not the telephone number.",
+    ],
+)
+async def test_live_role_correction_variants(db, tenant, monkeypatch, correction):
+    r, _ = await foundation(db, tenant, monkeypatch)
+    await ask(r, "Who is the president of Harbour Group?")
+    await ask(r, "Does he also work for Harbour Trading?")
+    assert "President" in await ask(r, correction)
+
+
+async def test_live_short_alias_correction_sequence(db, tenant, monkeypatch):
+    r, medical = await foundation(db, tenant, monkeypatch)
+    await ask(r, "Who is the chairman?")
+    assert "567 8000" in await ask(r, "Give me the cosmetic medical center's phone number.")
+    assert "123 4000" in await ask(
+        r, "Sorry, not, uh, I'm talking about Sun & Moon Specialized Medical Center."
+    )
+    both = await ask(r, "Give me both medical centers' phone number and say which is which.")
+    assert all(name in both for name in medical)
+    assert "primary-telephone" not in both
+
+
+async def test_resolved_company_correction_never_gets_reinterpreted(db, tenant, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    r, medical = await foundation(db, tenant, monkeypatch)
+    r._company_scope.semantic_retrieval_enabled = True
+    interpreter = AsyncMock(side_effect=AssertionError("already resolved correction"))
+    monkeypatch.setattr(r, "_interpret_turn_plan", interpreter)
+    assert "567 8000" in await ask(r, "Give me the cosmetic medical center phone number.")
+    assert "123 4000" in await ask(r, f"I mean {medical[0]}.")
+    assert "123 4000" in await ask(r, f"Not the Cosmetic centre. I mean {medical[0]}.")
+    interpreter.assert_not_awaited()
+
+
+async def test_vad_without_final_does_not_silently_abandon_request(monkeypatch):
+    from app.livekit_runtime import inworld_single_pass as module
+
+    monkeypatch.setattr(module, "SPEECH_RESOLUTION_TIMEOUT_SECONDS", 0.01)
+    release = asyncio.Event()
+
+    async def retrieve(text):
+        await release.wait()
+        return "NO_VERIFIED_KNOWLEDGE_MATCH"
+
+    session = _FakeSession()
+    c = InworldSinglePassController(
+        session=session, retrieve_evidence=retrieve, recover_untranscribed_speech=True
+    )
+    task = c.on_final_transcript("Who is the chairman?")
+    c.on_user_speech_started()
+    c.on_meaningful_user_speech()
+    release.set()
+    await asyncio.sleep(0.03)
+    assert not session.say_calls
+    c.on_user_speech_stopped()
+    await task
+    assert "repeat your question" in session.say_calls[0]["text"]
+    await c.aclose()
+
+
+async def test_lost_person_reference_never_returns_another_executive(db, tenant, monkeypatch):
+    r, _ = await foundation(db, tenant, monkeypatch)
+    r._conversation_state.person = None
+    reply = await ask(r, "I mean Harbour Group. Tell me his role.")
+    assert "Whose role" in reply
+    assert "Managing Director" not in reply
+
+
+def test_derived_aliases_do_not_cross_scope_or_assign_shared_suffix():
+    from app.services.conversation_scope import (
+        KnowledgeCompany,
+        KnowledgeCompanyScope,
+        mentioned_companies,
+    )
+
+    scope = KnowledgeCompanyScope(
+        companies=[
+            KnowledgeCompany(name="North Dental Clinic"),
+            KnowledgeCompany(name="South Dental Clinic"),
+            KnowledgeCompany(name="North Cosmetic Clinic"),
+        ]
+    )
+    derived = company_alias_scope(scope)
+    assert mentioned_companies("Cosmetic Clinic", derived) == ("North Cosmetic Clinic",)
+    assert not mentioned_companies("Dental Clinic", derived)
+    assert {c.name for c in derived.companies} == {c.name for c in scope.companies}
+    from app.services.conversation_state import ConversationState
+
+    state = ConversationState(company="North Cosmetic Clinic")
+    plan = contextual_plan("Give me the Dental Clinic phone number", state, derived, {})
+    assert plan.action == "clarify"
+    assert set(state.pending_companies) == {"North Dental Clinic", "South Dental Clinic"}
+    assert "phone" in state.pending_query
+
+
+async def test_recovery_prompt_keeps_request_unresolved(db, tenant, monkeypatch):
+    from app.services.conversation_scope import scope_reply
+
+    r, _ = await foundation(db, tenant, monkeypatch)
+    q = "Who is the chairman?"
+    await r.retrieve_single_pass_evidence(q)
+    e = scope_reply("I didn't catch that interruption. Please repeat your question.")
+    r.prepare_spoken_response(q, e)(e.split(":", 1)[1])
+    assert r._request_ledger.metrics()["conversation_requests_unresolved"] == 1
+
+
+async def test_final_replacement_wins_after_provisional_interim(monkeypatch):
+    release = asyncio.Event()
+    seen = []
+
+    async def retrieve(text):
+        seen.append(text)
+        if text == "old question":
+            await release.wait()
+        return "NO_VERIFIED_KNOWLEDGE_MATCH"
+
+    session = _FakeSession()
+    c = InworldSinglePassController(
+        session=session, retrieve_evidence=retrieve, recover_untranscribed_speech=True
+    )
+    first = c.on_final_transcript("old question")
+    await asyncio.sleep(0)
+    c.on_user_speech_started()
+    c.on_meaningful_user_speech()
+    assert c.active
+    await c.on_final_transcript("new question")
+    release.set()
+    await first
+    assert len(session.say_calls) == 1
+    await c.aclose()
 
 
 async def test_verified_person_pronoun_and_field_correction(db, tenant, monkeypatch):

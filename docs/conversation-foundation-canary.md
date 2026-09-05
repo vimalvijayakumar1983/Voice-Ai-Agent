@@ -29,6 +29,29 @@ production audio acceptance passes.
 
 ## Verification
 
+### Natural correction recovery (September 5 follow-up)
+
+- The scoped directory derives unique descriptive company suffixes at call
+  startup. Shared suffixes require a choice; no new company authority is added.
+- Possessives and centre/center spelling are normalized only in search input.
+  Explicit negative company corrections are distinct from excluded detail slots.
+- An unbound person-role pronoun asks whose role; it must not retrieve an
+  arbitrary executive profile. Uncertain contextual turns use the existing
+  validated intent interpreter and shared eight-request repair budget, without
+  a second interpretation pass after retrieval.
+- A provisional interim transcript does not cancel a still-pending lookup.
+  A final replacement does. If VAD ends without transcription, after the bounded
+  grace period the agent requests a repeat and keeps the original request
+  unresolved. Continuous detected speech remains bounded to 30 seconds; no
+  stale answer is spoken over it. Recovery counters are exposed in metadata.
+- Multi-company contact speech uses human-readable phone/address labels.
+
+The expanded regressions must include the failed correction as transcribed
+(`I am in ...`), company-only follow-ups, possessive shortened clinic names,
+negative corrections with fillers, ambiguous clinic suffixes, an unbound role
+pronoun, and provisional speech without a final transcript. Synthetic audio
+still does not establish robustness to every human accent or background speaker.
+
 `backend/tests/test_conversation_foundation.py` exercises generic fictional
 companies, constraints, false claims, correction/repeat/plural requests,
 fragment continuation, cancellation, normal-turn latency, and disposition.

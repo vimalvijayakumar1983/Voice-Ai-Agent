@@ -4,6 +4,7 @@ import re
 from dataclasses import dataclass, field
 
 from app.services.conversation_scope import (
+    KnowledgeCompany,
     KnowledgeCompanyScope,
     candidate_companies,
     company_key,
@@ -17,6 +18,69 @@ ROLE_PATTERN = (
     r"chairman|chairperson|president|ceo|cfo|chief executive officer|"
     r"chief financial officer|managing director|executive director|director"
 )
+
+
+def company_alias_scope(scope: KnowledgeCompanyScope) -> KnowledgeCompanyScope:
+    """Derive unique descriptive suffixes only within the authorised directory.
+
+    No fuzzy match, external company discovery, or new authority. Shared labels
+    remain ambiguous; the canonical scope is not persisted or rewritten.
+    """
+    owners: dict[str, set[str]] = {}
+    labels: dict[str, set[str]] = {}
+    generic = set("the and company group medical center llc limited".split())
+    for company in scope.companies:
+        values = {company.name, *company.aliases}
+        words = company_key(company.name).replace("centre", "center").split()
+        for i in range(len(words) - 1):
+            suffix = words[i:]
+            if set(suffix) - generic:
+                values.add(" ".join(suffix))
+                if "medical" in suffix and "center" in suffix:
+                    values.add(" ".join(w for w in suffix if w != "medical"))
+        labels[company.name] = values
+        for value in values:
+            owners.setdefault(company_key(value), set()).add(company.name)
+    return KnowledgeCompanyScope(
+        default_company=scope.default_company,
+        semantic_retrieval_enabled=scope.semantic_retrieval_enabled,
+        companies=[
+            KnowledgeCompany(
+                name=c.name,
+                aliases=list(
+                    dict.fromkeys(
+                        [
+                            *c.aliases,
+                            *sorted(
+                                v
+                                for v in labels[c.name]
+                                if v != c.name and owners[company_key(v)] == {c.name}
+                            ),
+                        ]
+                    )
+                )[:20],
+            )
+            for c in scope.companies
+        ],
+    )
+
+
+def canonical_company_text(text: str, scope: KnowledgeCompanyScope) -> str:
+    """Expand a directory alias without deleting requested details or constraints."""
+    text = re.sub(r"[’']s\b", "", text, flags=re.I)
+    text = re.sub(r"\bcentre\b", "center", text, flags=re.I)
+    # Longest labels first in a single substitution: never replace inside an
+    # already expanded company name, or re-expand a nested alias.
+    labels = {company_key(v): c.name for c in scope.companies for v in (c.name, *c.aliases)}
+    pattern = (
+        r"\b(?:"
+        + "|".join(
+            r"\s+".join("(?:and|&)" if w == "and" else re.escape(w) for w in v.split())
+            for v in sorted(labels, key=len, reverse=True)
+        )
+        + r")\b"
+    )
+    return re.sub(pattern, lambda m: labels[company_key(m[0])], text, flags=re.I)
 
 
 def spoken_control(text: str) -> str | None:
@@ -156,14 +220,18 @@ def fragment_continues(previous: str, current: str) -> bool:
 def positive_correction(text: str, scope: KnowledgeCompanyScope) -> str:
     # Accept the explicit positive side of a correction, never the negated side.
     match = re.search(
-        r"^\s*not\b.+?(?:[.,;]\s*|\s+)(?:i mean|instead|actually)\s+(.+)$", text, re.I
+        r"^\s*((?:no|not)\b.*?)\b(?:i mean|i meant|i am talking about|"
+        r"i'm talking about|instead|actually)\s+(.+)$",
+        text,
+        re.I,
     )
     if (
         match
-        and len(mentioned_companies(match[1], scope)) == 1
-        and not re.search(r"\bnot\b", match[1], re.I)
+        and (company_key(match[1]) in {"no", "not"} or negative_company_prefix(match[1], scope))
+        and len(mentioned_companies(match[2], scope)) == 1
+        and not re.search(r"\bnot\b", match[2], re.I)
     ):
-        return "I mean " + match[1]
+        return "I mean " + match[2]
     return text
 
 
@@ -175,7 +243,22 @@ def contextual_plan(
 ) -> TurnPlan | None:
     explicit = mentioned_companies(text, scope)
     if len(explicit) > 1:
-        return None
+        state.pending_companies = explicit
+        state.pending_query = text
+        return state._clarify("Which company do you mean: " + " or ".join(explicit) + "?")
+    if not explicit:
+        suffixes: dict[str, list[str]] = {}
+        for label in scope.companies:
+            words = company_key(label.name).replace("centre", "center").split()
+            for i in range(1, len(words) - 1):
+                suffixes.setdefault(" ".join(words[i:]), []).append(label.name)
+        normalized = company_key(text).replace("centre", "center")
+        for suffix in sorted(suffixes, key=len, reverse=True):
+            choices = tuple(dict.fromkeys(suffixes[suffix]))
+            if len(choices) > 1 and re.search(r"\b" + re.escape(suffix) + r"\b", normalized):
+                state.pending_companies = choices
+                state.pending_query = re.sub(r"\b" + re.escape(suffix) + r"\b", "", normalized)
+                return state._clarify("Which company do you mean: " + " or ".join(choices) + "?")
     company = explicit[0] if explicit else state.company
     office = re.fullmatch(rf"who is (?:the )?({ROLE_PATTERN})", company_key(text))
     if office and company:
@@ -190,6 +273,9 @@ def contextual_plan(
     person = people[0] if len(people) == 1 else None
     if not people and state.person and re.search(r"\b(?:he|she|his|her|him)\b", text, re.I):
         person = state.person
+    if not person and re.search(r"\b(?:his|her|their) (?:role|position)\b", text, re.I):
+        state.pending_query = text
+        return state._clarify("Whose role would you like me to check?")
     if not person or person not in directory:
         return None
     # Canonical slot rewrites are allowed only for a closed structural vocabulary.
@@ -201,7 +287,7 @@ def contextual_plan(
             for alias in (label.name, *label.aliases):
                 remaining -= set(company_key(alias).split())
     framing = set(
-        "i was told heard think believe is that correct right really please no mean tell me "
+        "i am was told heard think believe is that correct right really please no mean tell me "
         "his her their he she the a an of at in for role position not phone telephone number "
         "chairman chairperson president ceo cfo chief executive financial officer "
         "managing director".split()

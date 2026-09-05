@@ -468,8 +468,10 @@ def deterministic_grounded_reply(
             first, second = role_values
             return f"The {first[0]} of {subject} is {first[1]}, and the {second[0]} is {second[1]}."
 
+    spoken_labels = {"phone": "phone number", "address": "address"}
     details = "; ".join(
-        f"{predicate} for {subject} is {value}" for subject, predicate, value in facts[:4]
+        f"{spoken_labels.get(fact.fact_type, fact.predicate)} for {fact.subject} is {fact.value}"
+        for fact in envelope.facts[:4]
     )
     return f"The verified details are: {details}."
 
@@ -498,6 +500,7 @@ class InworldSinglePassController:
         incomplete_request: Callable[[str], bool] | None = None,
         fragment_wait_seconds: float = 1.4,
         record_fragment_event: Callable[[str], None] | None = None,
+        recover_untranscribed_speech: bool = False,
     ) -> None:
         self._session = session
         self._retrieve_evidence = retrieve_evidence
@@ -519,6 +522,10 @@ class InworldSinglePassController:
         self._user_speech_resolved.set()
         self._preempted_for_current_utterance = False
         self._closed = False
+        self._recover_untranscribed_speech = recover_untranscribed_speech
+        self._user_speaking = False
+        self._speech_stopped = asyncio.Event()
+        self._speech_stopped.set()
 
     @property
     def sequence(self) -> int:
@@ -601,13 +608,25 @@ class InworldSinglePassController:
         """Hold pending generation until this utterance can be classified."""
 
         if not self._closed:
+            self._user_speaking = True
+            self._speech_stopped.clear()
             self._preempted_for_current_utterance = False
             self._user_speech_resolved.clear()
+
+    def on_user_speech_stopped(self) -> None:
+        """A VAD end is not a transcript; allow a bounded final-transcript grace."""
+        self._user_speaking = False
+        self._speech_stopped.set()
 
     def on_meaningful_user_speech(self) -> None:
         """Promptly cancel an abandoned answer after transcript-gated proof."""
 
         if self._closed or self._preempted_for_current_utterance:
+            return
+        if self._recover_untranscribed_speech and self._speech_handle is None:
+            # Interim text is provisional. Hold the pending lookup behind the
+            # speech gate; only a final replacement may abandon it. There is
+            # no playing audio to interrupt at this point.
             return
         self._preempted_for_current_utterance = True
         self._invalidate_active_turn()
@@ -775,8 +794,27 @@ class InworldSinglePassController:
                 # A provider transcription failure may emit neither a final nor
                 # another state transition. Never leave this task (or a later
                 # shutdown) waiting forever, and never speak stale audio.
-                outcome = SinglePassTurnOutcome.CANCELLED
-                return
+                if not self._recover_untranscribed_speech:
+                    outcome = SinglePassTurnOutcome.CANCELLED
+                    return
+                # Preserve the request, but never talk over detected speech or
+                # assume an untranscribed utterance was permission to answer it.
+                try:
+                    await asyncio.wait_for(self._speech_stopped.wait(), timeout=30.0)
+                except TimeoutError:
+                    self._fragment_event("recovery_speech_timeout")
+                    outcome = SinglePassTurnOutcome.CANCELLED
+                    return
+                try:
+                    await asyncio.wait_for(self._user_speech_resolved.wait(), timeout=1.0)
+                except TimeoutError:
+                    if self._closed or sequence != self._sequence or self._user_speaking:
+                        outcome = SinglePassTurnOutcome.CANCELLED
+                        return
+                    evidence = scope_reply(
+                        "I didn't catch that interruption. Please repeat your question."
+                    )
+                    self._fragment_event("recovery_prompt")
             if self._closed or sequence != self._sequence:
                 outcome = SinglePassTurnOutcome.STALE
                 return

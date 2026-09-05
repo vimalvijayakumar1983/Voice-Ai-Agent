@@ -219,6 +219,8 @@ def public_call_metadata(value: Any) -> dict[str, Any] | None:
             "conversation_fragments_joined",
             "conversation_fragments_expired",
             "conversation_fragments_discarded",
+            "conversation_fragments_recovery_prompt",
+            "conversation_fragments_recovery_speech_timeout",
         }
         for field in string_fields:
             if isinstance(runtime.get(field), str):
