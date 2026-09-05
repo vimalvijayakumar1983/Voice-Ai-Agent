@@ -38,6 +38,13 @@ class _FakeSpeechHandle:
         self._done = asyncio.Event()
         self._exception: BaseException | None = None
         self.interrupted = False
+        self.chat_items = []
+        self._callbacks = []
+
+    def add_done_callback(self, callback):
+        self._callbacks.append(callback)
+        if self.done():
+            callback(self)
 
     def __await__(self):
         return self._done.wait().__await__()
@@ -52,12 +59,14 @@ class _FakeSpeechHandle:
     def interrupt(self, *, force: bool = False):
         assert force is True
         self.interrupted = True
-        self._done.set()
+        self.complete()
         return self
 
     def complete(self, error: BaseException | None = None) -> None:
         self._exception = error
         self._done.set()
+        for callback in self._callbacks:
+            callback(self)
 
 
 class _FakeSession:

@@ -68,6 +68,13 @@ from app.models.agent import (
 from app.models.call import Call, CallTranscript
 from app.models.provider_credential import ProviderCredential
 from app.services.call_metadata import agent_configuration_snapshot
+from app.services.conversation_scope import (
+    KnowledgeCompanyScope,
+    company_key,
+    mentioned_companies,
+    repeat_spoken,
+    scope_reply,
+)
 from app.services.exact_fact_retrieval import (
     ExactFactResponseAction,
     ExactFactType,
@@ -1313,6 +1320,7 @@ class _LiveKitRuntimeTelemetry:
         if isinstance(details, dict):
             for key in (
                 "knowledge_retrieval_path",
+                "knowledge_company_subject",
                 "exact_fact_action",
                 "exact_fact_reason",
             ):
@@ -2068,6 +2076,15 @@ class VAVInworldAgent(Agent):
         # document retrieval.  This value is evidence-derived, never inferred
         # from a caller assertion.
         self._single_pass_active_subject: str | None = None
+        scope = getattr(model, "knowledge_company_scope", None)
+        self._company_scope = KnowledgeCompanyScope.model_validate(scope) if scope else None
+        if self._company_scope:
+            self._single_pass_active_subject = self._company_scope.default_company
+        self._company_epoch = 0
+        self._spoken_response_sequence = 0
+        self._last_committed_response_sequence = 0
+        self._spoken_answers: dict[tuple[str, ExactFactType], str] = {}
+        self._last_spoken_answer: tuple[str, str] | None = None
         self._single_pass_last_verified_evidence: str | None = None
         self._single_pass_verified_evidence_by_type: dict[ExactFactType, str] = {}
         self._single_pass_follow_up_offered = False
@@ -2199,7 +2216,14 @@ Knowledge policy:
         originating_trace = (
             self._telemetry.begin_knowledge_lookup() if self._telemetry is not None else None
         )
-        scoped_query = _scope_knowledge_query(agent_name=self._agent_name, query=query)
+        company_subject = self._single_pass_active_subject if self._company_scope else None
+        if self._company_scope and not company_subject:
+            return scope_reply("Which company are you asking about?")
+        scoped_query = (
+            f"{company_subject}. {query}"
+            if company_subject
+            else _scope_knowledge_query(agent_name=self._agent_name, query=query)
+        )
         selected_variants = tuple(dict.fromkeys((scoped_query, query, *query_variants)))
         if self._speech_lexicon_entries:
             resolution = resolve_canonical_entity(query, self._speech_lexicon_entries)
@@ -2244,15 +2268,18 @@ Knowledge policy:
                     query_variants=selected_variants,
                     serving_revision_id=self._knowledge_serving_revision_id,
                     knowledge_base_id=self._knowledge_base_id,
+                    **({"company_subject": company_subject} if company_subject else {}),
                 )
                 trace_details = _exact_fact_trace_details(exact_fact)
+                if company_subject:
+                    trace_details["knowledge_company_subject"] = company_subject
                 if exact_fact.response_action != ExactFactResponseAction.FALLBACK:
                     exact_subjects = {
                         str(item.subject or "").strip()
                         for item in exact_fact.evidence
                         if str(item.subject or "").strip()
                     }
-                    if len(exact_subjects) == 1:
+                    if len(exact_subjects) == 1 and not self._company_scope:
                         self._single_pass_active_subject = next(iter(exact_subjects))
                     exact_context = exact_fact.evidence_context
                     if (
@@ -2294,6 +2321,7 @@ Knowledge policy:
                     max_context_chars=VOICE_KNOWLEDGE_CONTEXT_CHARS,
                     serving_revision_id=self._knowledge_serving_revision_id,
                     knowledge_base_id=self._knowledge_base_id,
+                    **({"company_subject": company_subject} if company_subject else {}),
                 )
                 if context is None:
                     fallback_query = _broad_knowledge_fallback_query(
@@ -2312,6 +2340,7 @@ Knowledge policy:
                             max_context_chars=VOICE_KNOWLEDGE_CONTEXT_CHARS,
                             serving_revision_id=self._knowledge_serving_revision_id,
                             knowledge_base_id=self._knowledge_base_id,
+                            **({"company_subject": company_subject} if company_subject else {}),
                         )
         except Exception:
             if self._telemetry is not None:
@@ -2379,6 +2408,62 @@ Knowledge policy:
             return NO_KNOWLEDGE_REQUIRED
         if _is_bare_hold_utterance(text) or _is_silent_stop_utterance(text):
             return NO_KNOWLEDGE_REQUIRED
+
+        if self._company_scope:
+            correction = re.split(r"\b(?:i mean|instead i mean)\b", text, flags=re.I)
+            selection_text = correction[-1] if len(correction) > 1 else text
+            companies = mentioned_companies(selection_text, self._company_scope)
+            if len(companies) > 1:
+                self._switch_company(None)
+                return scope_reply("Which company should I answer for first?")
+            if companies:
+                self._switch_company(companies[0])
+                labels = next(c for c in self._company_scope.companies if c.name == companies[0])
+                remainder = company_key(selection_text)
+                for label in sorted([labels.name, *labels.aliases], key=len, reverse=True):
+                    remainder = re.sub(r"\b" + re.escape(company_key(label)) + r"\b", "", remainder)
+                if set(remainder.split()) <= {
+                    "no",
+                    "not",
+                    "about",
+                    "for",
+                    "the",
+                    "please",
+                    "actually",
+                }:
+                    return scope_reply(f"Okay, {companies[0]}. What would you like to know?")
+            # An unresolved company correction must not retain the previous company.
+            elif len(correction) > 1 or re.match(r"^(?:no[, ]+)?(?:about|for)\s+", text, re.I):
+                self._switch_company(None)
+                return scope_reply("Which of this agent's configured companies do you mean?")
+
+            if "repeat" in normalized.split() or "say again" in normalized:
+                subject = self._single_pass_active_subject
+                if not subject:
+                    return scope_reply("Which company are you asking about?")
+                intents = classify_exact_fact_intents(text)
+                content = next(
+                    (
+                        self._spoken_answers[(subject, intent)]
+                        for intent in intents
+                        if (subject, intent) in self._spoken_answers
+                    ),
+                    None,
+                )
+                if (
+                    not intents
+                    and self._last_spoken_answer
+                    and self._last_spoken_answer[0] == subject
+                ):
+                    content = self._last_spoken_answer[1]
+                if content:
+                    return repeat_spoken(
+                        content, slow=bool({"slow", "slowly"} & set(normalized.split()))
+                    )
+                return scope_reply(
+                    f"I haven't given that detail for {subject} yet. "
+                    "What would you like me to look up?"
+                )
 
         if _is_conversation_control_utterance(text):
             if "repeat" in normalized or "say again" in normalized:
@@ -2467,6 +2552,46 @@ Knowledge policy:
         self._single_pass_follow_up_offered = any(
             pattern in normalized for pattern in offer_patterns
         )
+
+    def _switch_company(self, subject: str | None) -> None:
+        if subject == self._single_pass_active_subject:
+            return
+        self._single_pass_active_subject = subject
+        self._company_epoch += 1
+        self._single_pass_previous_explicit_query = None
+        self._single_pass_last_verified_evidence = None
+        self._single_pass_verified_evidence_by_type.clear()
+        self._single_pass_follow_up_offered = False
+        self._last_spoken_answer = None
+        self._spoken_answers.clear()
+
+    def prepare_spoken_response(self, query: str, evidence: str | None):
+        """Capture scope at dispatch; only the handle's committed speech becomes memory."""
+        subject, epoch = self._single_pass_active_subject, self._company_epoch
+        self._spoken_response_sequence += 1
+        sequence = self._spoken_response_sequence
+        intents = classify_exact_fact_intents(query)
+        usable = bool(
+            evidence
+            and evidence not in {NO_KNOWLEDGE_REQUIRED, "NO_VERIFIED_KNOWLEDGE_MATCH"}
+            and not evidence.startswith("VAV_SCOPE_REPLY:")
+        )
+
+        def remember(content: str) -> None:
+            if (
+                not usable
+                or not subject
+                or not content
+                or epoch != self._company_epoch
+                or sequence < self._last_committed_response_sequence
+            ):
+                return
+            self._last_committed_response_sequence = sequence
+            self._last_spoken_answer = (subject, content)
+            for intent in intents:
+                self._spoken_answers[(subject, intent)] = content
+
+        return remember
 
     def should_expand_single_pass_backchannel(self, transcript: str) -> bool:
         normalized = _normalized_utterance(transcript)
@@ -4667,6 +4792,7 @@ async def vav_inworld_session(ctx: JobContext) -> None:
                 retrieve_evidence=runtime_agent.retrieve_single_pass_evidence,
                 record_timing=telemetry.record_single_pass_timing,
                 record_error=_record_single_pass_error,
+                prepare_spoken_response=runtime_agent.prepare_spoken_response,
             )
 
         def _cancel_stale_generation() -> None:

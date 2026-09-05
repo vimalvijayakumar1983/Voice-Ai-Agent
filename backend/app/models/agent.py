@@ -62,6 +62,14 @@ class Agent(TenantScopedModel):
     transfer_number: Mapped[str | None] = mapped_column(String(20))
     agent_metadata: Mapped[dict | None] = mapped_column("metadata", JSONB)
 
+    @property
+    def knowledge_company_scope(self) -> dict | None:
+        return (self.agent_metadata or {}).get("knowledge_company_scope")
+
+    @knowledge_company_scope.setter
+    def knowledge_company_scope(self, value: dict | None) -> None:
+        self.agent_metadata = {**(self.agent_metadata or {}), "knowledge_company_scope": value}
+
     # Relationships
     tenant = relationship("Tenant", back_populates="agents")
     knowledge_bases = relationship(

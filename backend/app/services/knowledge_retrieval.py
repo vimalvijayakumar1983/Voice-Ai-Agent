@@ -856,7 +856,9 @@ def _intent_content(value: str, *, phone_query: bool) -> str:
     return structured if _has_phone_evidence(structured, structured_tokens) else value
 
 
-def _structured_retrieval_content(value: object) -> str | None:
+def _structured_retrieval_content(
+    value: object, *, company_subject: str | None = None
+) -> str | None:
     """Render verified JSON facts for ranking without loading raw source prose.
 
     PostgreSQL headline extraction is useful for legacy documents, but it can
@@ -875,6 +877,11 @@ def _structured_retrieval_content(value: object) -> str | None:
         if not isinstance(fact, dict):
             continue
         subject = " ".join(str(fact.get("subject") or "").split()).strip()
+        if company_subject is not None:
+            from app.services.conversation_scope import company_key
+
+            if company_key(subject) != company_key(company_subject):
+                continue
         predicate = " ".join(str(fact.get("predicate") or "").split()).strip()
         fact_value = " ".join(str(fact.get("value") or "").split()).strip()
         evidence = " ".join(str(fact.get("evidence") or "").split()).strip()
@@ -933,10 +940,15 @@ def _source_retrieval_documents(
     name: str,
     content: object,
     structured_content: object,
+    company_subject: str | None = None,
 ) -> list[tuple[str, str]]:
     """Keep verified facts fast without hiding facts an AI extractor omitted."""
 
-    structured = _structured_retrieval_content(structured_content)
+    structured = _structured_retrieval_content(structured_content, company_subject=company_subject)
+    if company_subject is not None:
+        # A mention in a footer/title is not ownership. Unattributed raw prose
+        # must not reintroduce a subsidiary's facts through a fallback lane.
+        return [(name, structured)] if structured else []
     raw = _canonical_source_content(content)
     if structured is None:
         return [(name, raw)] if raw else []
@@ -1943,6 +1955,7 @@ async def _retrieve_serving_revision_context(
     query_plan: ContextualQueryPlan,
     limit: int,
     max_context_chars: int,
+    company_subject: str | None = None,
 ) -> str | None:
     """Search only an immutable release while a newer draft is being edited."""
 
@@ -2057,9 +2070,10 @@ async def _retrieve_serving_revision_context(
                 name=row.name,
                 content=row.content,
                 structured_content=row.structured_content,
+                company_subject=company_subject,
             )
         )
-    if revision.knowledge_content:
+    if revision.knowledge_content and company_subject is None:
         documents.append((revision.knowledge_name, revision.knowledge_content))
     matches = await asyncio.to_thread(
         _rank_contextual_knowledge,
@@ -2095,6 +2109,7 @@ async def retrieve_knowledge_context(
     max_context_chars: int = MAX_CONTEXT_CHARS,
     serving_revision_id: UUID | None = None,
     knowledge_base_id: UUID | None = None,
+    company_subject: str | None = None,
 ) -> str | None:
     """Retrieve only from the call-pinned or currently published corpus.
 
@@ -2181,6 +2196,7 @@ async def retrieve_knowledge_context(
             query_plan=query_plan,
             limit=limit,
             max_context_chars=max_context_chars,
+            company_subject=company_subject,
         )
     combined_query = " ".join(query_plan.variants)
     candidate_ids = await _candidate_source_ids(
@@ -2231,13 +2247,14 @@ async def retrieve_knowledge_context(
             name=source_name,
             content=source_content,
             structured_content=structured_content,
+            company_subject=company_subject,
         )
         if retrieval_documents:
             sources_by_id[source_id] = retrieval_documents
     documents = [
         document for source_id in candidate_ids for document in sources_by_id.get(source_id, ())
     ]
-    if knowledge_base.content:
+    if knowledge_base.content and company_subject is None:
         documents.append((knowledge_base.name, knowledge_base.content))
     matches = await asyncio.to_thread(
         _rank_contextual_knowledge,

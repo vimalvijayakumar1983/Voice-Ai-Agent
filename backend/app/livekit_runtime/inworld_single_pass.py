@@ -27,6 +27,7 @@ from typing import Any, Protocol
 from livekit.agents import AgentSession
 from openai.types.realtime.realtime_audio_input_turn_detection import SemanticVad
 
+from app.services.conversation_scope import SCOPE_REPLY_PREFIX, SPOKEN_REPEAT_PREFIX
 from app.services.exact_fact_protocol import decode_exact_fact_evidence
 
 logger = logging.getLogger(__name__)
@@ -97,6 +98,8 @@ class _SpeechHandle(Protocol):
     def exception(self) -> BaseException | None: ...
 
     def interrupt(self, *, force: bool = False) -> Any: ...
+
+    def add_done_callback(self, callback: Callable[[Any], None]) -> None: ...
 
 
 class _ManualReplySession(Protocol):
@@ -328,6 +331,10 @@ def deterministic_grounded_reply(
     and one source of tail latency for the highest-value facts.
     """
 
+    if evidence:
+        for prefix in (SCOPE_REPLY_PREFIX, SPOKEN_REPEAT_PREFIX):
+            if evidence.startswith(prefix):
+                return evidence[len(prefix) :]
     if not evidence or evidence == NO_VERIFIED_KNOWLEDGE_MATCH:
         raw_query = " ".join(str(query or "").split())
         normalized_query = raw_query.casefold()
@@ -480,12 +487,14 @@ class InworldSinglePassController:
         record_timing: TimingRecorder | None = None,
         record_error: ErrorRecorder | None = None,
         clock: Callable[[], float] = perf_counter,
+        prepare_spoken_response: Callable[[str, str | None], Callable[[str], None]] | None = None,
     ) -> None:
         self._session = session
         self._retrieve_evidence = retrieve_evidence
         self._record_timing = record_timing
         self._record_error = record_error
         self._clock = clock
+        self._prepare_spoken_response = prepare_spoken_response
         self._sequence = 0
         self._turn_task: asyncio.Task[None] | None = None
         self._speech_handle: _SpeechHandle | None = None
@@ -643,6 +652,7 @@ class InworldSinglePassController:
         evidence_chars = 0
         outcome = SinglePassTurnOutcome.FAILED
         error_type: str | None = None
+        remember_spoken = None
         try:
             retrieval_started_at = self._clock()
             evidence = await self._retrieve_evidence(transcript)
@@ -679,6 +689,8 @@ class InworldSinglePassController:
                 return
 
             generation_started_at = self._clock()
+            if self._prepare_spoken_response:
+                remember_spoken = self._prepare_spoken_response(transcript, evidence)
             deterministic_reply = deterministic_grounded_reply(evidence, query=transcript)
             if deterministic_reply is not None:
                 handle = self._session.say(
@@ -698,6 +710,22 @@ class InworldSinglePassController:
                 0.0,
                 (self._clock() - generation_started_at) * 1000,
             )
+            if remember_spoken is not None:
+
+                def commit_spoken(completed_handle: Any) -> None:
+                    if completed_handle.exception() is not None:
+                        return
+                    spoken = " ".join(
+                        str(getattr(item, "text_content", "") or "").strip()
+                        for item in getattr(completed_handle, "chat_items", [])
+                        if getattr(item, "role", None) == "assistant"
+                    ).strip()
+                    if spoken:
+                        remember_spoken(spoken)
+
+                # Done fires after committed interrupted speech, even when
+                # this controller task has already been cancelled.
+                handle.add_done_callback(commit_spoken)
             if self._closed or sequence != self._sequence:
                 if not handle.done():
                     handle.interrupt(force=True)

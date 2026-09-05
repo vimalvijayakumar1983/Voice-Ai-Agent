@@ -57,7 +57,13 @@ function createIdempotencyKey() {
   throw new Error('Secure idempotency-key generation is unavailable in this browser.');
 }
 
+export interface KnowledgeCompanyScope {
+  default_company: string | null;
+  companies: { name: string; aliases: string[] }[];
+}
+
 export interface VoiceAgent {
+  knowledge_company_scope?: KnowledgeCompanyScope | null;
   id: string;
   name: string;
   description: string | null;

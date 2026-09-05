@@ -35,6 +35,7 @@ from app.models.agent import (
     KnowledgeServingRevisionSource,
     KnowledgeSource,
 )
+from app.services.conversation_scope import company_key
 from app.services.exact_fact_protocol import ExactFactWireFact, encode_exact_fact_evidence
 
 MIN_EVIDENCE_CONTEXT_CHARS = 600
@@ -1448,10 +1449,21 @@ def resolve_exact_fact(
     query: str,
     query_variants: Iterable[str] = (),
     max_evidence_chars: int = DEFAULT_EVIDENCE_CONTEXT_CHARS,
+    company_subject: str | None = None,
 ) -> ExactFactResolution:
     """Resolve a caller query to an explicit, evidence-bearing action."""
 
     _validate_evidence_context_limit(max_evidence_chars)
+    if company_subject is not None:
+        # Filter an immutable copy; never poison the shared revision cache.
+        index = replace(
+            index,
+            facts=tuple(
+                fact
+                for fact in index.facts
+                if company_key(fact.subject) == company_key(company_subject)
+            ),
+        )
     queries = _deduplicated_text((query, *query_variants), limit=8)
     intents: list[ExactFactType] = []
     for candidate_query in queries:
@@ -1993,6 +2005,7 @@ async def retrieve_exact_fact(
     serving_revision_id: UUID | None = None,
     knowledge_base_id: UUID | None = None,
     cache: ExactFactIndexCache | None = agent_exact_fact_cache,
+    company_subject: str | None = None,
 ) -> ExactFactResolution:
     """Load an agent's approved index and resolve one deterministic Tier-1 query."""
 
@@ -2051,6 +2064,7 @@ async def retrieve_exact_fact(
         query=query,
         query_variants=queries[1:],
         max_evidence_chars=max_evidence_chars,
+        company_subject=company_subject,
     )
     resolution_ms = _elapsed_ms(resolution_started)
     return replace(

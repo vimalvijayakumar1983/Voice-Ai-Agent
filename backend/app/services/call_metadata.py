@@ -18,6 +18,7 @@ def public_transport_identity_ref(label: str, value: object) -> str | None:
 def agent_configuration_snapshot(agent: Any) -> dict[str, Any]:
     """Capture the agent language/revision serving a call at dispatch time."""
     return {
+        "knowledge_company_scope": getattr(agent, "knowledge_company_scope", None),
         "provider_revision_id": getattr(agent, "provider_revision_id", None),
         "language": getattr(agent, "language", None),
         "supported_languages": list(getattr(agent, "supported_languages", None) or []),
@@ -355,6 +356,7 @@ def public_call_metadata(value: Any) -> dict[str, Any] | None:
                     safe_trace["response_action"] = trace["response_action"]
                 for field in (
                     "knowledge_retrieval_path",
+                    "knowledge_company_subject",
                     "exact_fact_action",
                     "exact_fact_reason",
                     "entity_resolution_entry_id",
