@@ -19,6 +19,33 @@ INWORLD_STT_MODELS = frozenset(
 U3_SUPPORTED_LANGUAGES = frozenset({"en", "es", "fr", "de", "it", "pt"})
 
 
+def inworld_transcription_language_hint(*, model: Any, profile: Any) -> str:
+    """Prompt guidance for the QA U3 route, not proof of a hard language lock.
+
+    U3 uses native code switching; its streaming documentation recommends a
+    'Transcribe <language>' prompt. Preserve wire language and auto-mode policy.
+    """
+    if (getattr(model, "agent_metadata", None) or {}).get("conversation_foundation_v1") is not True:
+        return ""
+    if resolve_inworld_stt_model(model=model, profile=profile) != INWORLD_STT_FAST_ACCURATE:
+        return ""
+    language = resolve_inworld_stt_language(model=model, profile=profile).casefold().split("-")[0]
+    name = {
+        "en": "English",
+        "es": "Spanish",
+        "fr": "French",
+        "de": "German",
+        "it": "Italian",
+        "pt": "Portuguese",
+    }.get(language)
+    return (
+        f"Transcribe {name}. Transcribe verbatim with standard punctuation. "
+        "Include filler words and incomplete utterances. "
+        if name
+        else ""
+    )
+
+
 def configured_stt_languages(*, model: Any, profile: Any) -> tuple[str, ...]:
     """Return the declared language set in stable, de-duplicated order."""
 

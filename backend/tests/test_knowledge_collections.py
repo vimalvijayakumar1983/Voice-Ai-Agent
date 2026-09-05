@@ -129,6 +129,43 @@ def test_filtered_list_request_is_not_silently_answered_unfiltered():
     assert category is None and "first" in clarification
 
 
+@pytest.mark.parametrize(
+    "query",
+    [
+        "Can you give me the list of leadership team in Harbour Group?",
+        "I need a list of leadership team.",
+        "I want the management team.",
+        "I would like to see the leadership team of Harbour Group.",
+        "Please share the leadership team.",
+    ],
+)
+def test_natural_request_framing_is_not_a_collection_filter(query):
+    assert collection_request(query, "Harbour Group", natural_language=True) == ("leadership", None)
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "I need all branches in Dubai",
+        "List leadership appointed after 2024",
+        "I want the list of directors in Harbour Group based in Dubai",
+        "List directors with email addresses",
+        "List only female directors",
+        "List directors except the chairman",
+        "List leadership not based in Dubai",
+        "List all directors in",
+        "List all services for children",
+    ],
+)
+def test_natural_framing_does_not_remove_real_filters(query):
+    category, _ = collection_request(query, "Harbour Group", natural_language=True)
+    assert category is None
+
+
+def test_legacy_collection_parser_is_unchanged_until_opted_in():
+    assert collection_request("I need a list of leadership team", "Harbour Group")[0] is None
+
+
 def test_count_is_explicitly_a_published_index_count_not_a_real_world_assertion():
     built = index([fact("Harbour Group", "Director", "Alice Jones")])
     result = retrieve_collection(

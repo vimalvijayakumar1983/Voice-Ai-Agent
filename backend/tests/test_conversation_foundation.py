@@ -30,6 +30,55 @@ async def foundation(db, tenant, monkeypatch):
     return runtime, medical
 
 
+async def test_natural_list_interruption_acceptance_and_company_correction(db, tenant, monkeypatch):
+    from app.livekit_runtime.inworld_single_pass import deterministic_grounded_reply
+    from app.services.knowledge_collections import decode_collection
+
+    r, medical = await foundation(db, tenant, monkeypatch)
+    r._company_scope.semantic_retrieval_enabled = True
+    first = "Can you give me the list of leadership team in Harbour Group?"
+    evidence = await r.retrieve_single_pass_evidence(first)
+    assert decode_collection(evidence).total > 0
+    expected = deterministic_grounded_reply(evidence, query=first)
+    r.prepare_spoken_response(first, evidence)("The published leadership")
+    assert r._request_ledger.metrics()["conversation_requests_unresolved"] == 1
+    reply = await ask(r, "Okay, give me.")
+    assert "Alice" in reply and "filter" not in reply
+    assert r._request_ledger.metrics()["conversation_requests_unresolved"] == 0
+    await ask(r, "I need a list of leadership team.")
+    assert "don't have a published" in await ask(r, f"I mean {medical[0]}.")
+    assert "Alice" in await ask(r, "I mean Harbour Group.")
+    assert expected
+
+
+async def test_acceptance_keeps_genuine_filter_and_does_not_guess_choice(db, tenant, monkeypatch):
+    r, _ = await foundation(db, tenant, monkeypatch)
+    assert "filter" in await ask(r, "List all leadership in Dubai at Harbour Group.")
+    assert "filter" in await ask(r, "Okay, give me.")
+    await ask(r, "What is the phone number for Sun and Moon?")
+    assert "Which one" in await ask(r, "Okay, give me.")
+
+
+async def test_acceptance_without_request_or_after_stop_does_not_search(db, tenant, monkeypatch):
+    r, _ = await foundation(db, tenant, monkeypatch)
+    assert "What information" in await ask(r, "Okay, give me.")
+    question = "I need a list of leadership team in Harbour Group."
+    e = await r.retrieve_single_pass_evidence(question)
+    r.prepare_spoken_response(question, e)("The published leadership")
+    await r.retrieve_single_pass_evidence("Stop.")
+    assert "What information" in await ask(r, "Okay, give me.")
+
+
+async def test_past_tense_appointment_is_clarified_without_knowledge_search(
+    db, tenant, monkeypatch
+):
+    r, _ = await foundation(db, tenant, monkeypatch)
+    assert "already have a booking" in await ask(r, "And I actually booked an appointment.")
+    assert "cannot book" in await ask(r, "Don't book anything.")
+    assert r._request_ledger.metrics()["conversation_requests_unresolved"] == 0
+    assert "welcome" in await ask(r, "Thank you, that's all.")
+
+
 @pytest.mark.parametrize(
     "correction",
     [

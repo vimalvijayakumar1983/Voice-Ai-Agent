@@ -72,6 +72,7 @@ from app.services.call_metadata import agent_configuration_snapshot
 from app.services.conversation_foundation import (
     FOUNDATION_FLAG,
     RequestLedger,
+    ambiguous_appointment_statement,
     booking_decline,
     canonical_company_text,
     capability_question,
@@ -82,6 +83,7 @@ from app.services.conversation_foundation import (
     named_identity_request,
     negative_company_prefix,
     negative_detail_control,
+    pending_information_acceptance,
     person_mentions,
     plural_companies,
     positive_correction,
@@ -152,6 +154,7 @@ from app.services.realtime_speech_config import (
     INWORLD_STT_FAST_ACCURATE,
     configured_inworld_stt_model,
     inworld_stt_wire_language,
+    inworld_transcription_language_hint,
     resolve_inworld_stt_language,
     resolve_inworld_stt_model,
     resolved_stt_script_languages,
@@ -1939,7 +1942,8 @@ def _build_inworld_realtime_model(
         model=_inworld_stt_model(model=model, profile=profile),
         language=inworld_stt_wire_language(model=model, profile=profile),
         prompt=(
-            "Customer-service call. Preserve business, person, treatment, product, and "
+            inworld_transcription_language_hint(model=model, profile=profile)
+            + "Customer-service call. Preserve business, person, treatment, product, and "
             f"place names exactly. Agent scope: {str(model.name or '').strip()[:180]}."
             f"{vocabulary_instruction}"
         ),
@@ -2356,7 +2360,11 @@ Knowledge policy:
                         c for c in self._company_scope.companies if c.name == company_subject
                     )
                     category, clarification = collection_request(
-                        company_request_remainder(query, labels), company_subject
+                        query
+                        if self._foundation_enabled
+                        else company_request_remainder(query, labels),
+                        company_subject,
+                        natural_language=self._foundation_enabled,
                     )
                     if clarification:
                         return scope_reply(clarification)
@@ -3025,6 +3033,8 @@ Knowledge policy:
         state = self._conversation_state
         if self._foundation_enabled:
             excluded_detail = negative_detail_control(text)
+            accepts_pending = pending_information_acceptance(text)
+            previous_request_status = self._request_ledger.states.get(self._request_ledger.active)
             resumes = bool(
                 (state.pending_companies or state.pending_people)
                 and (
@@ -3034,6 +3044,7 @@ Knowledge policy:
                 and not re.search(r"\b(?:who|what|where|when|how|give|tell)\b", text, re.I)
             )
             resumes = resumes or bool(excluded_detail and state.topic_query)
+            resumes = resumes or accepts_pending
             resumes = resumes or bool(
                 state.requested_companies
                 and state.pending_query
@@ -3041,13 +3052,50 @@ Knowledge policy:
             )
             if booking_decline(text):
                 resumes = resumes or any(
-                    request_id == self._request_ledger.active and capability_question(question)
+                    request_id == self._request_ledger.active
+                    and (capability_question(question) or ambiguous_appointment_statement(question))
                     for question, request_id in self._request_ids.items()
                 )
             self._request_ids[str(transcript)] = self._request_ledger.begin(resumes=resumes)
             if len(self._request_ids) > 256:
                 self._request_ids.pop(next(iter(self._request_ids)))
             self._record_request_ledger()
+            if accepts_pending:
+                if state.pending_companies or state.pending_people:
+                    choices = state.pending_companies or state.pending_people
+                    return scope_reply("Which one do you mean: " + " or ".join(choices) + "?")
+                if state.requested_detail == "appointment_action":
+                    return scope_reply("I cannot book or change appointments in this call.")
+                # Reuse the accepted request verbatim, including real filters.
+                # No model pass, company change, or caller assertion becomes evidence.
+                pending = state.pending_query or state.topic_query
+                if (
+                    pending
+                    and state.company
+                    and (
+                        previous_request_status in {"pending", "clarification"}
+                        or (self._collection_playback and previous_request_status != "cancelled")
+                    )
+                ):
+                    progress = self._collection_playback
+                    offset = (
+                        progress.confirmed_offset
+                        if progress and progress.page.company == state.company
+                        else 0
+                    )
+                    return await self._retrieve_approved_knowledge(
+                        query=pending, collection_offset=offset, allow_semantic_repair=False
+                    )
+                return scope_reply("What information would you like me to provide?")
+            if ambiguous_appointment_statement(text):
+                state.topic_query = text
+                state.requested_detail = "appointment_action"
+                state.pending_query = None
+                state.requested_companies = ()
+                return scope_reply(
+                    "Are you asking me to book an appointment, "
+                    "or saying you already have a booking?"
+                )
             if excluded_detail:
                 prior_types = {
                     item.value for item in classify_exact_fact_intents(state.topic_query or "")
@@ -3371,6 +3419,14 @@ Knowledge policy:
         self._collection_playback = None
         self._collection_cursor = None
         self._single_pass_previous_explicit_query = plan.query
+        if self._foundation_enabled:
+            category, clarification = collection_request(
+                plan.query, plan.company, natural_language=True
+            )
+            if category and not clarification:
+                # Store an unfiltered list as a typed canonical request. This
+                # survives company-only corrections without orphaned prepositions.
+                state.topic_query = f"List the {category} of {plan.company}."
         self._requested_detail = classify_exact_fact_intents(plan.query)
         if (self._structured_intent_enabled or self._foundation_enabled) and not interpreted:
             state.requested_detail = (

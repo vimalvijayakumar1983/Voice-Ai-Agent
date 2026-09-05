@@ -87,10 +87,25 @@ _REQUEST_WORDS = set(
 )
 
 
-def collection_request(query: str, company: str) -> tuple[str | None, str | None]:
+def collection_request(
+    query: str, company: str, *, natural_language: bool = False
+) -> tuple[str | None, str | None]:
     # Possession identifies the owner; it is not a geographic or content filter.
     query = re.sub(r"[’']s\b", "", query)
     text = company_key(query)
+    if natural_language:
+        # Strip a request prefix, not arbitrary words inside the requested filter.
+        text = re.sub(
+            r"^(?:(?:okay|ok|yes|please) )*i (?:need|want|would like) "
+            r"(?:(?:to (?:see|know|get)|you to (?:show|give|tell)) )?",
+            "",
+            text,
+        )
+        # 'in <the selected company>' identifies ownership; 'in Dubai' still
+        # contains a real location constraint and must not become an unfiltered list.
+        text = re.sub(
+            r"\b(?:in|at|of|for) (?:the )?" + re.escape(company_key(company)) + r"\b", "", text
+        )
     text = re.sub(r"\b" + re.escape(company_key(company)) + r"\b", "", text)
     text = re.sub(r"\b(?:the )?(?:group|company|organisation|organization)\b", "", text)
     categories = [key for key, pattern in _CATEGORIES.items() if re.search(pattern, text)]
@@ -100,7 +115,8 @@ def collection_request(query: str, company: str) -> tuple[str | None, str | None
         return None, "Which list would you like first: " + " or ".join(categories) + "?"
     category = categories[0]
     remainder = re.sub(_CATEGORIES[category], "", text)
-    if set(remainder.split()) - _REQUEST_WORDS:
+    request_words = _REQUEST_WORDS | ({"share"} if natural_language else set())
+    if set(remainder.split()) - request_words:
         # Do not ignore filters, dates, or specific service names by answering
         # with an unfiltered collection. Existing descriptive retrieval handles it.
         if re.search(r"\b(?:all|every|list|how many|complete|full)\b", text):

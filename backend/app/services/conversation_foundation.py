@@ -147,6 +147,29 @@ def booking_decline(text: str) -> bool:
     )
 
 
+def pending_information_acceptance(text: str) -> bool:
+    """Accept a pending information response, never an action or a new question."""
+    return bool(
+        re.fullmatch(
+            r"(?:(?:okay|ok|yes|yeah|please) )*(?:give|tell|show|read) "
+            r"(?:me|us|it|that|the list)(?: (?:it|that|the list|please))?",
+            company_key(text),
+        )
+    )
+
+
+def ambiguous_appointment_statement(text: str) -> bool:
+    """Do not turn a past-tense booking statement into a lookup or an action."""
+    return bool(
+        re.fullmatch(
+            r"(?:and )?i (?:(?:have|actually|already|just) )*"
+            r"(?:booked|scheduled|cancelled|canceled|rescheduled) "
+            r"(?:an?|my|the) appointment",
+            company_key(text),
+        )
+    )
+
+
 def person_mentions(text: str, directory: dict[str, tuple[str, ...]]) -> tuple[str, ...]:
     words = company_key(text).split()
     starts = {company_key(name).split()[0] for name in directory if company_key(name)}
