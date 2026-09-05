@@ -67,6 +67,9 @@ def company_alias_scope(scope: KnowledgeCompanyScope) -> KnowledgeCompanyScope:
 
 def canonical_company_text(text: str, scope: KnowledgeCompanyScope) -> str:
     """Expand a directory alias without deleting requested details or constraints."""
+    # Normalize grammar only on the routing copy, never the provider transcript.
+    text = re.sub(r"\bi[’']m\b", "I am", text, flags=re.I)
+    text = re.sub(r"\b(what|who|where|that|it|he|she)[’']s\b", r"\1 is", text, flags=re.I)
     text = re.sub(r"[’']s\b", "", text, flags=re.I)
     text = re.sub(r"\bcentre\b", "center", text, flags=re.I)
     # Longest labels first in a single substitution: never replace inside an
@@ -115,6 +118,17 @@ def capability_question(text: str) -> bool:
             r"\b(?:can|could) you (?:actually )?(?:book|schedule|"
             r"make (?:an? )?(?:actual )?appointment|change (?:my |an? )?appointment)\b|"
             r"\bwhat can (?:you|this agent) do\b",
+            text,
+            re.I,
+        )
+    ) or bool(
+        # Imperative actions must not consume the knowledge interpretation budget.
+        # Informational policies ("How do I cancel...") are deliberately excluded.
+        re.search(
+            r"(?:^|[.!?]\s*|\b(?:want|need|would like) you to )"
+            r"(?:(?:no|yes|please|actually|now)[,\s]+)*"
+            r"(?:book|schedule|reschedule|cancel|change|make) "
+            r"(?:(?:me|an?|the|my|new|another|actual) )*appointments?\b",
             text,
             re.I,
         )
@@ -283,7 +297,13 @@ def contextual_plan(
             return None
     people = person_mentions(text, directory)
     person = people[0] if len(people) == 1 else None
-    if not people and state.person and re.search(r"\b(?:he|she|his|her|him)\b", text, re.I):
+    if (
+        not people
+        and state.person
+        and re.search(
+            r"\b(?:he|she|his|her|him)\b|\b(?:what|which) (?:role|position)\b", text, re.I
+        )
+    ):
         person = state.person
     if not person and re.search(r"\b(?:his|her|their) (?:role|position)\b", text, re.I):
         state.pending_query = text
@@ -299,15 +319,35 @@ def contextual_plan(
             for alias in (label.name, *label.aliases):
                 remaining -= set(company_key(alias).split())
     framing = set(
-        "i am was told heard think believe is that correct right really please no mean tell me "
+        "i am was told heard think believe is that it someone correct right really please "
+        "no mean tell me "
         "his her their he she the a an of at in for role position not phone telephone number "
+        "so example want would like to understand know do you what which who does hold holds "
+        "holding have has and works work working employed where now "
         "chairman chairperson president ceo cfo chief executive financial officer "
         "managing director".split()
     )
-    safe_slot = remaining <= framing
+    # Excluding a different output field does not negate the company or role.
+    # Positive contact requests, dates and unknown constraints must survive.
+    slot_text = re.sub(r"\bnot (?:the )?(?:phone number|telephone number)\b", "", text, flags=re.I)
+    safe_slot = remaining <= framing and not re.search(
+        r"\b(?:not|never|without|except|phone|telephone|number)\b", slot_text, re.I
+    )
     # Role correction is a new detail, not a negated company. Never drop other
     # substantive constraints such as salary, dates or contact details.
-    if safe_slot and re.search(r"\b(?:his|her|their) (?:role|position)\b", text, re.I):
+    if safe_slot and re.search(r"\b(?:role|position)\b", text, re.I):
+        # An explicit office claim remains a claim, not a generic role request.
+        if re.search(rf"\b(?:{ROLE_PATTERN})\b", slot_text, re.I):
+            return None
+        result = state._lookup(f"Who is {person}?", company)
+        state.person = person
+        state.requested_detail = "person_role"
+        return result
+    identity = re.search(r"\b(?:who is|do you know|tell me about)\b", text, re.I)
+    if safe_slot and identity and not re.search(rf"\b(?:{ROLE_PATTERN})\b", text, re.I):
+        owners = directory[person]
+        if not explicit and len(owners) == 1:
+            company = owners[0]
         result = state._lookup(f"Who is {person}?", company)
         state.person = person
         state.requested_detail = "person_role"
@@ -324,13 +364,11 @@ def contextual_plan(
         explicit and re.search(r"\b(?:is|was)\b.+\bin\b", text, re.I)
     ):
         query = re.sub(r"\b(?:he|she|him|his|her)\b", person, text, flags=re.I)
-        affiliation_words = set(company_key(text).split()) - set(company_key(person).split())
         if (
             not explicit
             and len(directory[person]) == 1
-            and "where" in affiliation_words
-            and affiliation_words
-            <= set("so is does work works working employed where he she now".split())
+            and re.search(r"\bwhere\b", text, re.I)
+            and safe_slot
         ):
             company = directory[person][0]
             query = f"Who is {person}?"
@@ -419,7 +457,11 @@ class RequestLedger:
         return self.active
 
     def complete(self, request_id: int | None, status: str) -> None:
-        if request_id in self.states and self.states[request_id] != "cancelled":
+        if request_id in self.states and self.states[request_id] not in {
+            "cancelled",
+            "answered",
+            "refused",
+        }:
             self.states[request_id] = status
 
     def metrics(self) -> dict:

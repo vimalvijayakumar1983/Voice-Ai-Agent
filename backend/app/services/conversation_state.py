@@ -198,6 +198,8 @@ class ConversationState:
     pending_companies: tuple[str, ...] = ()
     pending_query: str | None = None
     pending_people: tuple[str, ...] = ()
+    # Multiple requested companies are a set to answer, not choices to disambiguate.
+    requested_companies: tuple[str, ...] = ()
     clarification_count: int = 0
 
     def _clarify(self, message: str) -> TurnPlan:
@@ -222,6 +224,7 @@ class ConversationState:
         self.pending_companies = ()
         self.pending_query = None
         self.pending_people = ()
+        self.requested_companies = ()
         self.clarification_count = 0
         return TurnPlan("lookup", company, query=query)
 

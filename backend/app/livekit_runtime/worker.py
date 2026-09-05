@@ -3033,6 +3033,11 @@ Knowledge policy:
                 and not re.search(r"\b(?:who|what|where|when|how|give|tell)\b", text, re.I)
             )
             resumes = resumes or bool(excluded_detail and state.topic_query)
+            resumes = resumes or bool(
+                state.requested_companies
+                and state.pending_query
+                and classify_exact_fact_intents(text)
+            )
             if booking_decline(text):
                 resumes = resumes or any(
                     request_id == self._request_ledger.active and capability_question(question)
@@ -3062,6 +3067,10 @@ Knowledge policy:
             if capability_question(text) or booking_decline(text):
                 # This lane registers search_approved_knowledge only. Do not claim
                 # actions from a business prompt or from booking-related KB text.
+                state.requested_companies = ()
+                state.pending_query = None
+                state.topic_query = text
+                state.requested_detail = "appointment_action"
                 return scope_reply(
                     "I can provide information, but I cannot book or change appointments "
                     "in this call."
@@ -3130,6 +3139,44 @@ Knowledge policy:
         if self._foundation_enabled:
             companies = plural_companies(text, self._company_scope, self._recent_companies)
             typed = classify_exact_fact_intents(text)
+            # A short detail clarification completes the same multi-company frame.
+            # A new substantive question must not inherit those companies.
+            detail_only = set(company_key(text).split()) <= {
+                "the",
+                "their",
+                "phone",
+                "telephone",
+                "number",
+                "numbers",
+                "address",
+                "addresses",
+                "please",
+                "just",
+                "give",
+                "me",
+                "both",
+                "of",
+                "them",
+            }
+            if not companies and state.pending_query and detail_only:
+                companies = state.requested_companies
+            if (
+                companies
+                and not typed
+                and state.requested_detail == "phone"
+                and re.search(r"\bnumbers?\b", text, re.I)
+            ):
+                typed = (ExactFactType.PHONE,)
+            if companies:
+                state.requested_companies = companies
+                state.pending_query = text
+                if not typed:
+                    return scope_reply(
+                        "Which detail would you like for both companies: "
+                        "phone numbers or addresses?"
+                    )
+            else:
+                state.requested_companies = ()
             if (
                 companies
                 and len(typed) == 1
@@ -3176,6 +3223,9 @@ Knowledge policy:
                 evidence = encode_exact_fact_evidence(
                     response_action="answer", facts=facts, max_chars=4000
                 )
+                state.requested_detail = typed[0].value
+                state.topic_query = text
+                state.pending_query = None
                 if self._telemetry:
                     self._telemetry.record_knowledge_lookup(
                         elapsed_ms=round((time.perf_counter() - started) * 1000),
@@ -3321,9 +3371,13 @@ Knowledge policy:
         self._collection_cursor = None
         self._single_pass_previous_explicit_query = plan.query
         self._requested_detail = classify_exact_fact_intents(plan.query)
-        if self._structured_intent_enabled and not interpreted:
+        if (self._structured_intent_enabled or self._foundation_enabled) and not interpreted:
             state.requested_detail = (
-                self._requested_detail[0].value if len(self._requested_detail) == 1 else "other"
+                state.requested_detail
+                if foundation_plan and state.person
+                else self._requested_detail[0].value
+                if len(self._requested_detail) == 1
+                else "other"
             )
         return await self._retrieve_approved_knowledge(
             query=plan.query,
@@ -3367,6 +3421,17 @@ Knowledge policy:
             if trace is not None:
                 trace["conversation_intent_status"] = status
             explicit = mentioned_companies(text, self._company_scope)
+            if self._foundation_enabled:
+                # Failed interpretation is not a new accepted request. Preserve
+                # company/person/detail and retain the unparsed turn for recovery.
+                state.pending_query = text
+                if trace is not None:
+                    trace["conversation_recovery_failure"] = status
+                if state.person:
+                    return state._clarify(f"What would you like to check about {state.person}?")
+                if state.company:
+                    return state._clarify(f"Which detail would you like about {state.company}?")
+                return state._clarify("Which company is your question about?")
             if (
                 status
                 in {

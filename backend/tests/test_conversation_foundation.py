@@ -33,6 +33,8 @@ async def foundation(db, tenant, monkeypatch):
 @pytest.mark.parametrize(
     "correction",
     [
+        "No, I'm in Harbour Group. Tell me his role, not the phone number.",
+        "No, I’m in Harbour Group. Tell me his role, not the phone number.",
         "No, I am in Harbour Group. Tell me his role, not the phone number.",
         "No, I mean Harbour Group. Tell me his role, not the phone number.",
         "Sorry, I mean Harbour Group. Tell me his position, not the telephone number.",
@@ -43,6 +45,101 @@ async def test_live_role_correction_variants(db, tenant, monkeypatch, correction
     await ask(r, "Who is the president of Harbour Group?")
     await ask(r, "Does he also work for Harbour Trading?")
     assert "President" in await ask(r, correction)
+
+
+async def test_failed_human_sequence_with_semantic_routing_and_no_model_dependency(
+    db, tenant, monkeypatch
+):
+    from unittest.mock import AsyncMock
+
+    r, medical = await foundation(db, tenant, monkeypatch)
+    r._company_scope.semantic_retrieval_enabled = True
+    interpreter = AsyncMock(side_effect=AssertionError("resolved slots must not need an LLM"))
+    monkeypatch.setattr(r, "_interpret_turn_plan", interpreter)
+    # Exhaustion of the optional repair budget must not disable supported turns.
+    r._semantic_attempts = {("test", str(i), ""): 1 for i in range(8)}
+    cases = [
+        ("Who is the president of Harbour Group?", "Cara"),
+        ("Does he also work for Harbour Trading?", "don't have verified"),
+        ("No, I'm in Harbour Group. Tell me his role, not the phone number.", "President"),
+        ("I mean Cara Harbour works for Harbour Group, and what's his role?", "President"),
+        ("Not the phone number.", "President"),
+        ("So for example, what position is holding in Harbour Group?", "President"),
+        ("I want to understand, Cara Harbour is working where?", "President"),
+        ("Do you know Cara Harbour?", "President"),
+        ("Harbour Group.", "President"),
+        ("Give me the cosmetic medical center phone number.", "567 8000"),
+        ("Sorry, I'm talking about Specialized Medical Center.", "123 4000"),
+        ("Give me both centers’ numbers and say which is which.", "567 8000"),
+        ("Who is the chairman of Harbour Group?", "Dan Jones"),
+        ("Someone told me Cara Harbour is the chairman. Is it correct?", "Dan Jones"),
+        (f"No, I want you to book an appointment in {medical[0]}.", "cannot book"),
+        ("Thank you. That's all.", "welcome"),
+    ]
+    for q, expected in cases:
+        reply = await ask(r, q)
+        assert expected.casefold() in reply.casefold(), (q, reply, r._conversation_state)
+        if "both centers" in q:
+            assert "123 4000" in reply and all(c in reply for c in medical)
+    interpreter.assert_not_awaited()
+
+
+async def test_multi_company_detail_clarification_preserves_both_targets(db, tenant, monkeypatch):
+    r, medical = await foundation(db, tenant, monkeypatch)
+    await ask(r, f"What is the phone number for {medical[0]}?")
+    await ask(r, f"What is the phone number for {medical[1]}?")
+    r._conversation_state.requested_detail = None
+    assert "Which detail" in await ask(r, "Give me both centers' numbers and say which is which.")
+    assert set(r._conversation_state.requested_companies) == set(medical)
+    reply = await ask(r, "The phone number.")
+    assert "123 4000" in reply and "567 8000" in reply
+    assert r._request_ledger.metrics()["conversation_requests_unresolved"] == 0
+
+
+async def test_interpreter_timeout_preserves_slots_and_next_correction_works(
+    db, tenant, monkeypatch
+):
+    from dataclasses import replace
+    from unittest.mock import AsyncMock
+
+    from app.livekit_runtime import worker
+    from app.services.conversation_intent import IntentResult
+
+    r, _ = await foundation(db, tenant, monkeypatch)
+    await ask(r, "Who is the president of Harbour Group?")
+    before = replace(r._conversation_state)
+    monkeypatch.setattr(worker, "load_provider_config", AsyncMock(return_value={"api_key": "test"}))
+    monkeypatch.setattr(
+        worker,
+        "interpret_conversation_turn",
+        AsyncMock(return_value=IntentResult(None, "timeout", 2000, attempted=True)),
+    )
+    plan = await r._interpret_turn_plan("I meant his other responsibilities", r._conversation_state)
+    assert plan.action == "clarify" and "Cara Harbour" in plan.message
+    for field in ("company", "person", "requested_detail", "topic_query"):
+        assert getattr(r._conversation_state, field) == getattr(before, field)
+    assert "President" in await ask(r, "Tell me his role, not the phone number.")
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Book an appointment.",
+        "Please cancel my appointment.",
+        "I need you to reschedule my appointment.",
+        "No, I want you to book an appointment in North Clinic.",
+    ],
+)
+def test_imperative_appointment_requests_are_capability_gated(text):
+    assert capability_question(text)
+
+
+def test_late_partial_cannot_reopen_a_completed_request():
+    ledger = RequestLedger()
+    request = ledger.begin()
+    ledger.complete(request, "answered")
+    ledger.complete(request, "pending")
+    assert ledger.metrics()["conversation_requests_unresolved"] == 0
 
 
 async def test_live_short_alias_correction_sequence(db, tenant, monkeypatch):
