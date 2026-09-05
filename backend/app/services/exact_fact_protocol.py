@@ -138,36 +138,35 @@ def encode_exact_fact_evidence(
         )
         return rendered if len(rendered) <= max_chars else None
 
-    encoded_facts: list[dict[str, Any]] = []
-    for fact in bounded_facts:
-        selected: dict[str, Any] | None = None
-        for detail in ("full", "compact", "core"):
-            candidate = _fact_payload(fact, detail=detail)
-            if (
-                len(
-                    _serialize(
-                        action,
-                        (*encoded_facts, candidate),
-                        candidate_count=total_candidates,
-                    )
-                )
-                <= max_chars
-            ):
-                selected = candidate
-                break
-        if selected is None:
-            break
-        encoded_facts.append(selected)
+    # Preserve the number of verified answer facts before preserving quotes or
+    # provenance detail.  Otherwise a verbose first fact can consume the wire
+    # budget and silently drop the second half of a two-role correction.
+    for detail in ("full", "compact", "core"):
+        rendered = _serialize(
+            action,
+            tuple(_fact_payload(fact, detail=detail) for fact in bounded_facts),
+            candidate_count=total_candidates,
+        )
+        if len(rendered) <= max_chars:
+            return rendered
 
-    if not encoded_facts:
-        # The public caller enforces at least 600 characters, but retain a
-        # deterministic last-resort shape so future callers cannot accidentally
-        # produce malformed, sliced JSON at a smaller limit.
-        fact = facts[0]
-        minimal = _minimal_fact_payload(fact)
-        rendered = _serialize(action, (minimal,), candidate_count=total_candidates)
-        return rendered if len(rendered) <= max_chars else None
-    return _serialize(action, encoded_facts, candidate_count=total_candidates)
+    minimal_facts = tuple(_minimal_fact_payload(fact) for fact in bounded_facts)
+    rendered = _serialize(action, minimal_facts, candidate_count=total_candidates)
+    if len(rendered) <= max_chars:
+        return rendered
+
+    # The public caller enforces at least 600 characters. Retain a deterministic
+    # valid prefix at smaller future bounds, while candidate_count keeps the
+    # omitted count observable to the consumer.
+    for count in range(len(minimal_facts) - 1, 0, -1):
+        rendered = _serialize(
+            action,
+            minimal_facts[:count],
+            candidate_count=total_candidates,
+        )
+        if len(rendered) <= max_chars:
+            return rendered
+    return None
 
 
 def decode_exact_fact_evidence(value: str) -> ExactFactWireEnvelope | None:

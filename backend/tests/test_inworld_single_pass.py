@@ -357,6 +357,35 @@ def test_no_match_and_compiler_exact_facts_have_deterministic_grounded_replies()
         "Do you mean the chairman or the president of Future Example Holdings?"
     )
 
+    leadership_correction = encode_exact_fact_evidence(
+        response_action="answer",
+        facts=(
+            ExactFactWireFact(
+                evidence_id="exact:leadership:chairman:" + "c" * 48,
+                fact_type="leadership",
+                subject="Future Example Holdings",
+                predicate="chairman",
+                value="Amal Rahman",
+                quote="The chairman of Future Example Holdings is Amal Rahman.",
+                source_name="Approved leadership directory",
+            ),
+            ExactFactWireFact(
+                evidence_id="exact:leadership:president:" + "p" * 48,
+                fact_type="leadership",
+                subject="Future Example Holdings",
+                predicate="president",
+                value="David Chen",
+                quote="The president of Future Example Holdings is David Chen.",
+                source_name="Approved leadership directory",
+            ),
+        ),
+        max_chars=800,
+    )
+    assert leadership_correction is not None
+    assert deterministic_grounded_reply(leadership_correction) == (
+        "The chairman of Future Example Holdings is Amal Rahman, and the president is David Chen."
+    )
+
     services_evidence = encode_exact_fact_evidence(
         response_action="answer",
         facts=(
