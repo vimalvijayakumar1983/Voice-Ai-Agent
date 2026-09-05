@@ -165,6 +165,7 @@ from app.services.speech_lexicon import (
     SpeechLexiconEntry,
     detect_unexpected_script,
     load_agent_speech_lexicon,
+    prepare_speech_lexicon,
     resolve_canonical_entity,
     select_provider_terms,
 )
@@ -1390,6 +1391,7 @@ class _LiveKitRuntimeTelemetry:
                 if isinstance(value, str) and value:
                     trace[key] = value[:100]
             for key in (
+                "knowledge_entity_resolution_ms",
                 "exact_fact_preclassification_ms",
                 "exact_fact_binding_lookup_ms",
                 "exact_fact_revision_lookup_ms",
@@ -2147,6 +2149,8 @@ class VAVInworldAgent(Agent):
         self._agent_name = str(getattr(model, "name", "") or "")
         self._knowledge_terminology: tuple[str, ...] | None = knowledge_terminology or None
         self._speech_lexicon_entries = speech_lexicon_entries
+        self._prepared_lexicon_source = speech_lexicon_entries
+        self._prepared_lexicon = prepare_speech_lexicon(speech_lexicon_entries)
         self._knowledge_serving_revision_id = knowledge_serving_revision_id
         self._knowledge_base_id = knowledge_base_id
         self._telemetry = telemetry
@@ -2320,6 +2324,15 @@ Knowledge policy:
 """
         super().__init__(instructions=instructions)
 
+    @property
+    def _prepared_speech_lexicon(self):
+        # The publication is immutable, but a runtime may explicitly replace its
+        # loaded tuple. Never retain aliases from the previous revision.
+        if self._prepared_lexicon_source is not self._speech_lexicon_entries:
+            self._prepared_lexicon = prepare_speech_lexicon(self._speech_lexicon_entries)
+            self._prepared_lexicon_source = self._speech_lexicon_entries
+        return self._prepared_lexicon
+
     async def _retrieve_approved_knowledge(
         self,
         *,
@@ -2341,27 +2354,6 @@ Knowledge policy:
             else _scope_knowledge_query(agent_name=self._agent_name, query=query)
         )
         selected_variants = tuple(dict.fromkeys((scoped_query, query, *query_variants)))
-        if self._speech_lexicon_entries:
-            resolution = resolve_canonical_entity(query, self._speech_lexicon_entries)
-            canonical = str(resolution.canonical or "").strip()
-            applied = bool(
-                resolution.safe_to_apply
-                and canonical
-                and canonical.casefold() not in query.casefold()
-            )
-            if applied:
-                # Preserve the caller transcript verbatim.  The canonical term
-                # is an extra retrieval clue only; it never becomes evidence.
-                selected_variants = tuple(
-                    dict.fromkeys((*selected_variants, f"{query} {canonical}"))
-                )
-            if resolution.entry_id and self._telemetry is not None:
-                self._telemetry.record_entity_resolution(
-                    entry_id=resolution.entry_id,
-                    confidence=resolution.confidence,
-                    margin=resolution.margin,
-                    applied_to_search=applied,
-                )
         fallback_used = False
         trace_details: dict[str, Any] = {}
         try:
@@ -2414,6 +2406,7 @@ Knowledge policy:
                                 query_variant_count=1,
                                 fallback_used=False,
                                 details={
+                                    "knowledge_entity_resolution_ms": 0.0,
                                     "knowledge_retrieval_path": "collection",
                                     "knowledge_company_subject": company_subject,
                                     "collection_category": category,
@@ -2429,6 +2422,32 @@ Knowledge policy:
                                 originating_trace=originating_trace,
                             )
                         return context
+                # Collections use the original query and approved index, never fuzzy variants.
+                if self._speech_lexicon_entries:
+                    entity_started_at = time.perf_counter()
+                    resolution = resolve_canonical_entity(query, self._prepared_speech_lexicon)
+                    trace_details["knowledge_entity_resolution_ms"] = (
+                        time.perf_counter() - entity_started_at
+                    ) * 1000
+                    canonical = str(resolution.canonical or "").strip()
+                    applied = bool(
+                        resolution.safe_to_apply
+                        and canonical
+                        and canonical.casefold() not in query.casefold()
+                    )
+                    if applied:
+                        # Preserve the caller transcript verbatim.  The canonical term
+                        # is an extra retrieval clue only; it never becomes evidence.
+                        selected_variants = tuple(
+                            dict.fromkeys((*selected_variants, f"{query} {canonical}"))
+                        )
+                    if resolution.entry_id and self._telemetry is not None:
+                        self._telemetry.record_entity_resolution(
+                            entry_id=resolution.entry_id,
+                            confidence=resolution.confidence,
+                            margin=resolution.margin,
+                            applied_to_search=applied,
+                        )
                 if self._knowledge_terminology is None:
                     self._knowledge_terminology = await load_agent_knowledge_terminology(
                         db,
@@ -2450,7 +2469,7 @@ Knowledge policy:
                     **({"company_subject": company_subject} if company_subject else {}),
                     **({"prefer_primary_phone": True} if self._conversation_routing_v2 else {}),
                 )
-                trace_details = _exact_fact_trace_details(exact_fact)
+                trace_details.update(_exact_fact_trace_details(exact_fact))
                 if company_subject:
                     trace_details["knowledge_company_subject"] = company_subject
                 if exact_fact.response_action != ExactFactResponseAction.FALLBACK:
@@ -2842,7 +2861,7 @@ Knowledge policy:
                 return scope_reply("Which of this agent's configured companies do you mean?")
 
             elif self._speech_lexicon_entries:
-                entity = resolve_canonical_entity(selection_text, self._speech_lexicon_entries)
+                entity = resolve_canonical_entity(selection_text, self._prepared_speech_lexicon)
                 if (
                     entity.safe_to_apply
                     and entity.entity_type in {"organization", "organisation"}
@@ -2976,7 +2995,7 @@ Knowledge policy:
             if pronoun_identity_question and self._speech_lexicon_entries:
                 entity = resolve_canonical_entity(
                     previous,
-                    self._speech_lexicon_entries,
+                    self._prepared_speech_lexicon,
                     expected_entity_types=("person",),
                 )
                 if entity.entity_type == "person" and entity.canonical:
@@ -3324,7 +3343,7 @@ Knowledge policy:
         reference = person_reference(text)
         if reference and self._speech_lexicon_entries:
             resolution = resolve_canonical_entity(
-                reference[0], self._speech_lexicon_entries, expected_entity_types=("person",)
+                reference[0], self._prepared_speech_lexicon, expected_entity_types=("person",)
             )
             if resolution.safe_to_apply and resolution.entity_type == "person":
                 person_hint = resolution.canonical

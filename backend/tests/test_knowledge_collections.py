@@ -216,6 +216,7 @@ async def test_collection_telemetry_records_page_and_source_ids(db, tenant, monk
     assert trace["knowledge_retrieval_path"] == "collection"
     assert trace["collection_total"] == 8 and trace["collection_next_offset"] == 5
     assert trace["collection_coverage"] == "indexed_only"
+    assert trace["knowledge_entity_resolution_ms"] == 0
     assert len(trace["collection_evidence_ids"]) == 5
 
 
@@ -252,6 +253,21 @@ async def runtime_fixture(db, tenant, monkeypatch):
     }
     await db.commit()
     return runtime
+
+
+async def test_collection_bypasses_unused_fuzzy_resolver(db, tenant, monkeypatch):
+    from app.livekit_runtime import worker
+
+    runtime = await runtime_fixture(db, tenant, monkeypatch)
+    runtime._single_pass_active_subject = "Harbour Group"
+    runtime._speech_lexicon_entries = (object(),)
+
+    def unexpected_resolution(*args, **kwargs):
+        raise AssertionError("Collection path must not run fuzzy entity resolution")
+
+    monkeypatch.setattr(worker, "resolve_canonical_entity", unexpected_resolution)
+    page = decode_collection(await runtime._retrieve_approved_knowledge(query="List all directors"))
+    assert page.total == 8 and page.next_offset == 5
 
 
 async def test_runtime_pagination_advances_only_after_complete_speech(db, tenant, monkeypatch):

@@ -877,9 +877,103 @@ def _entity_match_score(candidate: str, alias: str, phonetic_keys: set[str]) -> 
     return score, "phonetic" if phonetic_match and score >= 0.9 else "fuzzy"
 
 
+@dataclass(frozen=True)
+class _MatchText:
+    raw: str
+    normalized: str
+    compact: str
+    latin: str
+    phonetic: str
+
+
+def _prepare_match_text(raw: str) -> _MatchText:
+    normalized = _normalized(raw)
+    compact = normalized.replace(" ", "")
+    return _MatchText(raw, normalized, compact, _latin_fold(compact), _phonetic_key(raw))
+
+
+@dataclass(frozen=True)
+class _PreparedAlias:
+    text: _MatchText
+    width: int
+    exact_pattern: re.Pattern[str]
+
+
+@dataclass(frozen=True)
+class PreparedSpeechLexicon:
+    # Owned by one runtime/call. No shared cache of tenant names or caller text.
+    entries: tuple[tuple[SpeechLexiconEntry, tuple[_PreparedAlias, ...], frozenset[str]], ...]
+
+
+def prepare_speech_lexicon(
+    entries: Iterable[SpeechLexiconEntry | dict[str, Any]],
+) -> PreparedSpeechLexicon:
+    return PreparedSpeechLexicon(
+        tuple(
+            (
+                entry,
+                tuple(
+                    _PreparedAlias(
+                        _prepare_match_text(alias),
+                        max(1, len(_TERM_TOKEN.findall(alias))),
+                        re.compile(
+                            rf"(?<![^\W_]){re.escape(_normalized(alias))}(?![^\W_])",
+                            flags=re.UNICODE,
+                        ),
+                    )
+                    for alias in (entry.canonical, *entry.aliases)
+                ),
+                frozenset(entry.phonetic_keys),
+            )
+            for entry in _coerce_entries(entries)
+        )
+    )
+
+
+def _prepared_match_score(
+    candidate: _MatchText,
+    alias: _MatchText,
+    phonetic_keys: frozenset[str],
+    edit_matcher: SequenceMatcher,
+    token_matcher: SequenceMatcher,
+    best_score: float,
+    required_score: float,
+) -> tuple[float, str]:
+    if not candidate.normalized or not alias.normalized:
+        return 0.0, "none"
+    if candidate.normalized == alias.normalized:
+        return 1.0, "exact"
+    if min(len(candidate.compact), len(alias.compact)) < 4:
+        return 0.0, "none"
+    phonetic_match = bool(candidate.phonetic and candidate.phonetic in phonetic_keys)
+    first_letter_mismatch = (
+        candidate.latin.isascii()
+        and alias.latin.isascii()
+        and candidate.latin[:1] != alias.latin[:1]
+        and not phonetic_match
+    )
+    if first_letter_mismatch and (best_score >= 0.75 or required_score > 0.75):
+        return 0.0, "none"
+    edit_matcher.set_seq1(candidate.compact)
+    token_matcher.set_seq1(candidate.normalized)
+    # quick_ratio is an upper bound, not a replacement for the original score.
+    # Prune only candidates that cannot beat this alias's current winner.
+    upper = edit_matcher.quick_ratio() * 0.7 + token_matcher.quick_ratio() * 0.3
+    if phonetic_match:
+        upper = max(upper, 0.9)
+    if upper <= best_score or upper < required_score:
+        return 0.0, "none"
+    score = edit_matcher.ratio() * 0.7 + token_matcher.ratio() * 0.3
+    if phonetic_match:
+        score = max(score, 0.9)
+    if first_letter_mismatch:
+        score = min(score, 0.75)
+    return score, "phonetic" if phonetic_match and score >= 0.9 else "fuzzy"
+
+
 def resolve_canonical_entity(
     transcript: str,
-    entries: Iterable[SpeechLexiconEntry | dict[str, Any]],
+    entries: Iterable[SpeechLexiconEntry | dict[str, Any]] | PreparedSpeechLexicon,
     *,
     expected_entity_types: Iterable[str] = (),
     minimum_confidence: float = 0.84,
@@ -894,30 +988,42 @@ def resolve_canonical_entity(
     expected = {str(value).strip().lower() for value in expected_entity_types if value}
     scores: list[tuple[float, SpeechLexiconEntry, str, str]] = []
     normalized_text = _normalized(raw_text)
-    for entry in _coerce_entries(entries):
-        aliases = (entry.canonical, *entry.aliases)
+    prepared = (
+        entries if isinstance(entries, PreparedSpeechLexicon) else prepare_speech_lexicon(entries)
+    )
+    windows_by_width: dict[int, tuple[_MatchText, ...]] = {}
+    for entry, aliases, phonetic_keys in prepared.entries:
+        # Scores below this conservative floor cannot enter the final candidate
+        # list, even after the type bonus. Never prune ties at the threshold.
+        bonus = 0.02 if expected and entry.entity_type in expected else 0.0
+        required_score = minimum_confidence - bonus - 1e-12
         best_score = 0.0
         best_match = ""
         best_reason = "none"
         for alias in aliases:
-            normalized_alias = _normalized(alias)
-            if normalized_alias and re.search(
-                rf"(?<![^\W_]){re.escape(normalized_alias)}(?![^\W_])",
-                normalized_text,
-                flags=re.UNICODE,
-            ):
-                score, reason, matched = 1.0, "exact", alias
+            if alias.text.normalized and alias.exact_pattern.search(normalized_text):
+                score, reason, matched = 1.0, "exact", alias.text.raw
             else:
                 score, reason, matched = 0.0, "none", ""
-                width = max(1, len(_TERM_TOKEN.findall(alias)))
-                for window in _candidate_windows(raw_text, width):
-                    candidate_score, candidate_reason = _entity_match_score(
+                if alias.width not in windows_by_width:
+                    windows_by_width[alias.width] = tuple(
+                        _prepare_match_text(window)
+                        for window in _candidate_windows(raw_text, alias.width)
+                    )
+                edit_matcher = SequenceMatcher(None, "", alias.text.compact)
+                token_matcher = SequenceMatcher(None, "", alias.text.normalized)
+                for window in windows_by_width[alias.width]:
+                    candidate_score, candidate_reason = _prepared_match_score(
                         window,
-                        alias,
-                        set(entry.phonetic_keys),
+                        alias.text,
+                        phonetic_keys,
+                        edit_matcher,
+                        token_matcher,
+                        score,
+                        required_score,
                     )
                     if candidate_score > score:
-                        score, reason, matched = candidate_score, candidate_reason, window
+                        score, reason, matched = candidate_score, candidate_reason, window.raw
             if score > best_score:
                 best_score, best_reason, best_match = score, reason, matched
         if expected and entry.entity_type in expected:
