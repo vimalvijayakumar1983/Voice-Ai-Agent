@@ -29,14 +29,72 @@ from app.services.campaign_lifecycle import (
     CampaignLifecycleResult,
     sync_campaign_call_lifecycle,
 )
+from app.services.knowledge_serving import (
+    INBOUND_KNOWLEDGE_ADMISSION_STATE,
+    KnowledgeServingError,
+    admit_inbound_twilio_knowledge_call,
+    knowledge_admission_is_durable,
+    knowledge_call_reservation_metadata,
+    load_agent_serving_revision_identity,
+    speech_lexicon_artifact_id_from_call_metadata,
+    speech_lexicon_content_sha256_from_call_metadata,
+)
 from app.services.provider_callback_outbox import persist_provider_callback_actions
-from app.services.provider_credentials import ProviderCredentialError, load_provider_config
+from app.services.provider_credentials import (
+    ProviderCredentialError,
+    load_provider_config,
+    lock_provider_runtime_boundaries,
+)
+from app.services.recording_policy import recording_runtime_metadata
+from app.services.runtime_capacity import (
+    TERMINAL_CALL_STATUSES as RUNTIME_TERMINAL_CALL_STATUSES,
+)
+from app.services.runtime_capacity import (
+    RuntimeCapacityError,
+    enforce_runtime_capacity,
+)
+from app.services.twilio_callback_claim import (
+    TWILIO_CALLBACK_CLAIM_METADATA_KEY,
+    TWILIO_CALLBACK_CLAIM_QUERY_PARAMETER,
+    mark_twilio_callback_claim_bound,
+    twilio_callback_claim_matches,
+)
+from app.services.twilio_route_security import (
+    TwilioRouteCredential,
+    load_workspace_twilio_route_credential,
+    twilio_callback_credential_fingerprint,
+    twilio_route_verification_is_current,
+)
+from app.services.usage_ledger import lock_agent_runtime_limits
 from app.telephony.twilio_provider import get_telephony_provider
 
 router = APIRouter(prefix="/webhooks", tags=["Webhooks"])
 logger = structlog.get_logger()
 MAX_PROVIDER_WEBHOOK_BYTES = 2 * 1024 * 1024
 MAX_PROVIDER_FORM_FIELDS = 100
+_TWILIO_STATUS_MAP = {
+    # VAV intentionally collapses Twilio's pre-answer states to ``ringing``:
+    # every accepted direct call then remains covered by the terminal watchdog.
+    "queued": "ringing",
+    "initiated": "ringing",
+    "ringing": "ringing",
+    "in-progress": "in_progress",
+    "completed": "completed",
+    "busy": "busy",
+    "no-answer": "no_answer",
+    "canceled": "failed",
+    "failed": "failed",
+}
+_TWILIO_TERMINAL_STATUSES = frozenset({"completed", "busy", "no-answer", "canceled", "failed"})
+_TWILIO_ACTIVE_STATUS_RANK = {
+    "dispatching": 0,
+    "dispatch_unknown": 0,
+    # Retain ranks for rows written by older releases.
+    "queued": 1,
+    "initiated": 1,
+    "ringing": 1,
+    "in_progress": 2,
+}
 _LOCAL_CALLBACK_LOCKS: weakref.WeakValueDictionary[str, asyncio.Lock] = (
     weakref.WeakValueDictionary()
 )
@@ -52,6 +110,32 @@ class ProviderWebhookEffects:
     process_tenant_id: str | None = None
     process_revision: str | None = None
     process_event_type: str | None = None
+
+
+@dataclass(frozen=True)
+class _TwilioVoiceCallbackAuthProof:
+    """Immutable routing identity established before callback locks."""
+
+    call_id: UUID
+    tenant_id: UUID
+    agent_id: UUID | None
+    campaign_id: UUID | None
+    native_speech_provider: str | None
+    credential_source: str
+    credential_binding_source: str | None
+
+
+@dataclass(frozen=True)
+class _TwilioStatusCallbackAuthProof:
+    """Immutable status-callback identity established before locks."""
+
+    call_id: UUID
+    tenant_id: UUID
+    agent_id: UUID | None
+    campaign_id: UUID | None
+    native_speech_provider: str | None
+    credential_source: str
+    credential_binding_source: str | None
 
 
 def verify_smallest_signature(raw_body: bytes, signature: str) -> bool:
@@ -504,6 +588,16 @@ def _twilio_validation_url(request: Request) -> str:
     return url
 
 
+def _twilio_callback_claim_from_request(request: Request) -> str | None:
+    """Return exactly one non-empty callback capability, rejecting ambiguity."""
+
+    values = request.query_params.getlist(TWILIO_CALLBACK_CLAIM_QUERY_PARAMETER)
+    if len(values) != 1:
+        return None
+    value = values[0].strip()
+    return value or None
+
+
 async def _parse_twilio_request(request: Request) -> dict[str, str]:
     cached = getattr(request.state, "twilio_params", None)
     if isinstance(cached, dict):
@@ -563,6 +657,304 @@ async def _tenant_twilio_config(db: AsyncSession, tenant_id: UUID) -> dict:
     return await load_provider_config(db, tenant_id, "twilio") or {}
 
 
+def _native_twilio_speech_provider(call: Call) -> str | None:
+    if call.provider != "twilio":
+        return None
+    metadata = call.call_metadata if isinstance(call.call_metadata, dict) else {}
+    runtime = metadata.get("runtime") if isinstance(metadata.get("runtime"), dict) else {}
+    speech_provider = str(
+        metadata.get("speech_provider") or runtime.get("speech_provider") or ""
+    ).strip()
+    return speech_provider if speech_provider in {"sarvam", "elevenlabs"} else None
+
+
+def _twilio_callback_binding_source(call: Call) -> str | None:
+    """Return an explicit credential authority, or ``None`` for legacy rows."""
+
+    metadata = call.call_metadata if isinstance(call.call_metadata, dict) else {}
+    binding = metadata.get("telephony_credential_binding")
+    binding = binding if isinstance(binding, dict) else {}
+    source = str(binding.get("source") or "").strip()
+    if not source:
+        return None
+    if source not in {"workspace", "platform"}:
+        raise HTTPException(status_code=409, detail="Unsupported Twilio credential binding")
+    return source
+
+
+def _validate_twilio_workspace_call_callback(
+    request: Request,
+    params: dict[str, str],
+    call: Call,
+    credential: TwilioRouteCredential,
+) -> None:
+    """Validate a callback against one already-resolved workspace credential."""
+
+    metadata = call.call_metadata if isinstance(call.call_metadata, dict) else {}
+    binding = metadata.get("telephony_credential_binding")
+    binding = binding if isinstance(binding, dict) else {}
+    bound_account_sid = str(binding.get("account_sid") or "").strip()
+    bound_credential_fingerprint = str(binding.get("credential_fingerprint") or "").strip()
+    incoming_account_sid = str(params.get("AccountSid") or "").strip()
+    if (
+        not incoming_account_sid
+        or not hmac.compare_digest(incoming_account_sid, credential.account_sid)
+        or (
+            bound_account_sid and not hmac.compare_digest(bound_account_sid, credential.account_sid)
+        )
+        or (
+            bound_credential_fingerprint
+            and not hmac.compare_digest(
+                bound_credential_fingerprint,
+                twilio_callback_credential_fingerprint(credential),
+            )
+        )
+    ):
+        raise HTTPException(status_code=401, detail="Invalid Twilio webhook signature")
+    _validate_twilio_request(request, params, credential.auth_token)
+
+
+def _validate_twilio_call_callback_with_locked_credential(
+    request: Request,
+    params: dict[str, str],
+    call: Call,
+    workspace_credential: TwilioRouteCredential | None,
+) -> str:
+    """Resolve and authenticate one callback while the provider boundary is held."""
+
+    source = _twilio_callback_binding_source(call)
+    if _native_twilio_speech_provider(call) is not None or source == "workspace":
+        if workspace_credential is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Twilio workspace callback credential is unavailable",
+            )
+        _validate_twilio_workspace_call_callback(
+            request,
+            params,
+            call,
+            workspace_credential,
+        )
+        return "workspace"
+
+    metadata = call.call_metadata if isinstance(call.call_metadata, dict) else {}
+    binding = metadata.get("telephony_credential_binding")
+    binding = binding if isinstance(binding, dict) else {}
+    bound_account_sid = str(binding.get("account_sid") or "").strip()
+    bound_credential_fingerprint = str(binding.get("credential_fingerprint") or "").strip()
+    incoming_account_sid = str(params.get("AccountSid") or "").strip()
+    platform_credential = TwilioRouteCredential(
+        account_sid=settings.twilio_account_sid.strip(),
+        auth_token=settings.twilio_auth_token.strip(),
+    )
+
+    if source == "platform":
+        if (
+            not incoming_account_sid
+            or incoming_account_sid != platform_credential.account_sid
+            or (bound_account_sid and bound_account_sid != incoming_account_sid)
+            or (
+                bound_credential_fingerprint
+                and bound_credential_fingerprint
+                != twilio_callback_credential_fingerprint(platform_credential)
+            )
+        ):
+            raise HTTPException(status_code=401, detail="Invalid Twilio webhook signature")
+        _validate_twilio_request(request, params, platform_credential.auth_token)
+        return "platform"
+
+    # Calls persisted before credential binding shipped remain compatible, but
+    # their authority is selected while the provider boundary is held. This
+    # makes a concurrent workspace-credential creation linearize before or
+    # after the callback rather than changing authority during mutation.
+    if incoming_account_sid:
+        if (
+            workspace_credential is not None
+            and incoming_account_sid == workspace_credential.account_sid
+        ):
+            _validate_twilio_request(request, params, workspace_credential.auth_token)
+            return "workspace"
+        if incoming_account_sid == platform_credential.account_sid:
+            _validate_twilio_request(request, params, platform_credential.auth_token)
+            return "platform"
+        raise HTTPException(status_code=401, detail="Invalid Twilio webhook signature")
+    _validate_twilio_request(request, params, platform_credential.auth_token)
+    return "platform"
+
+
+async def _validate_twilio_call_callback(
+    db: AsyncSession,
+    request: Request,
+    params: dict[str, str],
+    call: Call,
+) -> str:
+    """Authenticate a call callback against its persisted telephony owner.
+
+    Native Sarvam/ElevenLabs callbacks are always tenant-owned and never fall
+    back to the shared platform token. Older non-native calls remain compatible
+    by selecting one credential from the exact incoming AccountSid rather than
+    trying tenant and platform secrets interchangeably.
+    """
+    metadata = call.call_metadata if isinstance(call.call_metadata, dict) else {}
+    native_twilio = _native_twilio_speech_provider(call) is not None
+    binding = metadata.get("telephony_credential_binding")
+    binding = binding if isinstance(binding, dict) else {}
+    source = _twilio_callback_binding_source(call)
+    bound_account_sid = str(binding.get("account_sid") or "").strip()
+    bound_credential_fingerprint = str(binding.get("credential_fingerprint") or "").strip()
+    incoming_account_sid = str(params.get("AccountSid") or "").strip()
+
+    if native_twilio or source == "workspace":
+        try:
+            credential = await load_workspace_twilio_route_credential(db, call.tenant_id)
+        except ProviderCredentialError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="Twilio workspace callback credential is unavailable",
+            ) from exc
+        if credential is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Twilio workspace callback credential is unavailable",
+            )
+        _validate_twilio_workspace_call_callback(request, params, call, credential)
+        return "workspace"
+
+    if source == "platform":
+        platform_credential = TwilioRouteCredential(
+            account_sid=settings.twilio_account_sid.strip(),
+            auth_token=settings.twilio_auth_token.strip(),
+        )
+        if (
+            not incoming_account_sid
+            or incoming_account_sid != platform_credential.account_sid
+            or (bound_account_sid and bound_account_sid != incoming_account_sid)
+            or (
+                bound_credential_fingerprint
+                and bound_credential_fingerprint
+                != twilio_callback_credential_fingerprint(platform_credential)
+            )
+        ):
+            raise HTTPException(status_code=401, detail="Invalid Twilio webhook signature")
+        _validate_twilio_request(request, params, platform_credential.auth_token)
+        return "platform"
+
+    # Compatibility for calls created before credential-source binding shipped.
+    # AccountSid chooses exactly one authority; an unreadable tenant credential
+    # is never silently substituted for a matching platform identity.
+    if incoming_account_sid:
+        try:
+            tenant_config = await _tenant_twilio_config(db, call.tenant_id)
+        except ProviderCredentialError:
+            tenant_config = {}
+        tenant_account_sid = str(tenant_config.get("account_sid") or "").strip()
+        tenant_auth_token = str(tenant_config.get("auth_token") or "").strip()
+        if incoming_account_sid == tenant_account_sid and tenant_auth_token:
+            _validate_twilio_request(request, params, tenant_auth_token)
+            return "workspace"
+        if incoming_account_sid == settings.twilio_account_sid.strip():
+            _validate_twilio_request(request, params, settings.twilio_auth_token)
+            return "platform"
+        raise HTTPException(status_code=401, detail="Invalid Twilio webhook signature")
+    _validate_twilio_request(request, params, settings.twilio_auth_token)
+    return "platform"
+
+
+def _require_native_twilio_callback_identity(
+    params: dict[str, str],
+    call: Call,
+    *,
+    callback_claim: str | None,
+    credential_source: str | None = None,
+) -> None:
+    """Bind a signed native callback to its exact persisted Twilio call.
+
+    A workspace Twilio secret authenticates the provider account, not one
+    particular call.  Without this second check, a validly signed callback for
+    another call in the same account could obtain this call's media capability
+    and advance its lifecycle.  New native calls persist both a speech-provider
+    marker and a workspace credential binding, so either marker is sufficient
+    to require the fail-closed identity check.
+    """
+    metadata = call.call_metadata if isinstance(call.call_metadata, dict) else {}
+    runtime = metadata.get("runtime") if isinstance(metadata.get("runtime"), dict) else {}
+    binding = (
+        metadata.get("telephony_credential_binding")
+        if isinstance(metadata.get("telephony_credential_binding"), dict)
+        else {}
+    )
+    speech_provider = str(
+        metadata.get("speech_provider") or runtime.get("speech_provider") or ""
+    ).strip()
+    native_twilio = (
+        speech_provider in {"sarvam", "elevenlabs"}
+        or str(binding.get("source") or "").strip() == "workspace"
+        or credential_source == "workspace"
+        or TWILIO_CALLBACK_CLAIM_METADATA_KEY in metadata
+    )
+    if call.provider != "twilio" or not native_twilio:
+        return
+
+    incoming_call_sid = str(params.get("CallSid") or "").strip()
+    persisted_call_sid = str(call.provider_call_sid or "").strip()
+    if persisted_call_sid:
+        if not incoming_call_sid or not hmac.compare_digest(
+            incoming_call_sid,
+            persisted_call_sid,
+        ):
+            raise HTTPException(status_code=409, detail="Conflicting Twilio call identity")
+        call.call_metadata = mark_twilio_callback_claim_bound(
+            metadata,
+            source="persisted_identity",
+        )
+        return
+
+    # The provider can legitimately invoke a callback before make_call()
+    # returns its CallSid. The per-dispatch capability proves which unbound
+    # local call owns that first signed callback. The caller row is already
+    # locked, making this a single-winner compare-and-bind across replicas.
+    if not incoming_call_sid or not twilio_callback_claim_matches(metadata, callback_claim):
+        raise HTTPException(status_code=409, detail="Conflicting Twilio call identity")
+    call.provider_call_sid = incoming_call_sid
+    call.call_metadata = mark_twilio_callback_claim_bound(
+        metadata,
+        source="provider_callback",
+    )
+
+
+async def _require_and_persist_native_twilio_callback_identity(
+    db: AsyncSession,
+    params: dict[str, str],
+    call: Call,
+    *,
+    callback_claim: str | None,
+    credential_source: str | None = None,
+) -> None:
+    """Validate and durably reserve a first callback CallSid.
+
+    The caller-row lock serializes callbacks for one local call, but two
+    different local calls can still race to claim the same provider CallSid.
+    Flush the first-SID assignment while it is still the only pending database
+    mutation and convert the unique-index loser into the same fail-closed 409
+    used for every other call-identity conflict.
+    """
+
+    had_persisted_call_sid = bool(str(call.provider_call_sid or "").strip())
+    _require_native_twilio_callback_identity(
+        params,
+        call,
+        callback_claim=callback_claim,
+        credential_source=credential_source,
+    )
+    if had_persisted_call_sid or not str(call.provider_call_sid or "").strip():
+        return
+    try:
+        await db.flush()
+    except IntegrityError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=409, detail="Conflicting Twilio call identity") from exc
+
+
 def _runtime_stream_url(call_id: UUID) -> str:
     public = urlsplit(settings.base_url)
     websocket_origin = urlunsplit(
@@ -571,10 +963,586 @@ def _runtime_stream_url(call_id: UUID) -> str:
     return f"{websocket_origin}/api/v1/realtime/twilio/{call_id}"
 
 
+def _twilio_inbound_voice_url() -> str:
+    return f"{settings.base_url.rstrip('/')}/api/v1/webhooks/twilio/voice/inbound"
+
+
 def _runtime_stream_parameters(call_id: UUID) -> dict[str, str]:
     # Twilio does not forward query strings on <Stream> URLs. Custom
     # parameters arrive in the signed stream's `start` event instead.
     return {"token": create_media_token(call_id)}
+
+
+def _twilio_runtime_unavailable_response() -> Response:
+    return Response(
+        content=(
+            '<?xml version="1.0"?><Response><Say>This voice agent is temporarily '
+            "unavailable. Goodbye.</Say><Hangup/></Response>"
+        ),
+        media_type="application/xml",
+    )
+
+
+async def _lock_native_twilio_voice_callback_runtime(
+    db: AsyncSession,
+    *,
+    proof: _TwilioVoiceCallbackAuthProof,
+    request: Request,
+    params: dict[str, str],
+) -> tuple[Call, Agent | None, AgentRuntimeProfile | None, bool]:
+    """Revalidate a native outbound callback inside credential-rotation locks.
+
+    The order is shared with runtime mutation and credential rotation:
+    provider boundary -> agent runtime -> Agent -> Profile -> credential.  A
+    native outbound call has no campaign aggregate, so its Call row is locked
+    last without introducing the campaign graph -> Agent inversion used by
+    legacy campaign callbacks.
+    """
+
+    await lock_provider_runtime_boundaries(db, proof.tenant_id, "twilio")
+    if db.get_bind().dialect.name == "postgresql":
+        await db.execute(
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
+            {"lock_key": f"agent-runtime:{proof.tenant_id}:{proof.agent_id}"},
+        )
+
+    agent = await db.scalar(
+        select(Agent)
+        .where(Agent.id == proof.agent_id, Agent.tenant_id == proof.tenant_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    runtime_profile = await db.scalar(
+        select(AgentRuntimeProfile)
+        .where(
+            AgentRuntimeProfile.agent_id == proof.agent_id,
+            AgentRuntimeProfile.tenant_id == proof.tenant_id,
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    try:
+        route_credential = await load_workspace_twilio_route_credential(
+            db,
+            proof.tenant_id,
+            for_update=True,
+        )
+    except ProviderCredentialError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Twilio workspace callback credential is unavailable",
+        ) from exc
+    if route_credential is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Twilio workspace callback credential is unavailable",
+        )
+
+    call = await db.scalar(
+        select(Call)
+        .where(
+            Call.id == proof.call_id,
+            Call.tenant_id == proof.tenant_id,
+            Call.agent_id == proof.agent_id,
+            Call.campaign_id.is_(None),
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if call is None:
+        raise HTTPException(status_code=409, detail="Call mapping changed during callback")
+
+    # Authentication is deliberately repeated with the credential row locked.
+    # A callback authenticated just before a credential rotation must not mint
+    # a media capability or mutate call state after that rotation commits.
+    _validate_twilio_workspace_call_callback(
+        request,
+        params,
+        call,
+        route_credential,
+    )
+    route_is_current = bool(
+        agent is not None
+        and runtime_profile is not None
+        and call.direction == "outbound"
+        and call.provider == "twilio"
+        and _native_twilio_speech_provider(call) == proof.native_speech_provider
+        and agent.is_active
+        and agent.voice_provider == proof.native_speech_provider
+        and runtime_profile.enabled
+        and runtime_profile.status == "active"
+        and runtime_profile.telephony_provider == "twilio"
+        and runtime_profile.primary_speech_provider == agent.voice_provider
+        and runtime_profile.llm_provider == "openai"
+        and call.from_number in (runtime_profile.assigned_numbers or [])
+        and twilio_route_verification_is_current(
+            runtime_profile,
+            route_credential,
+            expected_voice_url=_twilio_inbound_voice_url(),
+        )
+    )
+    return call, agent, runtime_profile, route_is_current
+
+
+async def _lock_twilio_callback_graph_under_provider_boundary(
+    db: AsyncSession,
+    *,
+    proof: _TwilioVoiceCallbackAuthProof | _TwilioStatusCallbackAuthProof,
+    request: Request,
+    params: dict[str, str],
+) -> tuple[Call, str]:
+    """Lock and re-resolve a callback authority without Agent inversion.
+
+    Explicit workspace calls and every source-less compatibility call use this
+    path. The shared provider boundary serializes both credential creation and
+    rotation, then the current credential and existing campaign graph (or
+    direct Call) are locked before authority and signature are checked again.
+    """
+
+    await lock_provider_runtime_boundaries(db, proof.tenant_id, "twilio")
+    try:
+        route_credential = await load_workspace_twilio_route_credential(
+            db,
+            proof.tenant_id,
+            for_update=True,
+        )
+    except ProviderCredentialError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Twilio workspace callback credential is unavailable",
+        ) from exc
+
+    call_probe = await db.scalar(
+        select(Call).where(
+            Call.id == proof.call_id,
+            Call.tenant_id == proof.tenant_id,
+            Call.agent_id == proof.agent_id,
+            Call.campaign_id == proof.campaign_id,
+            Call.provider == "twilio",
+        )
+    )
+    if call_probe is None:
+        raise HTTPException(status_code=409, detail="Call mapping changed during callback")
+    call, _attempt = await _lock_callback_call_graph(db, call_probe)
+    if call.provider != "twilio" or call.campaign_id != proof.campaign_id:
+        raise HTTPException(status_code=409, detail="Call mapping changed during callback")
+
+    current_source = _validate_twilio_call_callback_with_locked_credential(
+        request,
+        params,
+        call,
+        route_credential,
+    )
+    if current_source != proof.credential_source:
+        raise HTTPException(status_code=409, detail="Call mapping changed during callback")
+    return call, current_source
+
+
+_INBOUND_CAPACITY_LIFECYCLE_ERRORS = {
+    "daily": "runtime_capacity_daily_limit_reached",
+    "concurrent": "runtime_capacity_concurrent_limit_reached",
+    "budget": "runtime_capacity_monthly_budget_reached",
+}
+
+
+async def _persist_failed_twilio_inbound_call(
+    db: AsyncSession,
+    *,
+    profile: AgentRuntimeProfile,
+    agent: Agent,
+    call_sid: str,
+    from_number: str,
+    to_number: str,
+    lifecycle_error: str,
+    knowledge_identity: dict[str, str | int] | None = None,
+) -> Call:
+    """Persist one bounded, terminal audit row for a rejected inbound attempt."""
+
+    now = datetime.now(UTC)
+    runtime: dict[str, object] = {
+        "transport": "twilio_fallback_twiml",
+        "media_stream_started": False,
+        "speech_provider": agent.voice_provider,
+        "llm_provider": profile.llm_provider,
+        "llm_model": profile.llm_model,
+    }
+    if knowledge_identity:
+        runtime.update(knowledge_identity)
+    call = Call(
+        tenant_id=agent.tenant_id,
+        agent_id=agent.id,
+        direction="inbound",
+        status="failed",
+        from_number=from_number,
+        to_number=to_number,
+        provider="twilio",
+        provider_call_sid=call_sid,
+        started_at=now,
+        answered_at=now,
+        ended_at=now,
+        # Twilio has answered and will render the fallback <Say>. Reserve a
+        # minimum billable duration until an authoritative provider callback
+        # supplies the exact value, so rejected calls are never cost-invisible.
+        duration_seconds=1,
+        call_metadata={
+            "agent_configuration": agent_configuration_snapshot(agent),
+            "conversation_type": "telephonyInbound",
+            "channel": "phone",
+            "speech_provider": agent.voice_provider,
+            "lifecycle_error": lifecycle_error,
+            "runtime": {
+                **runtime,
+                "cost_state": "pending_provider_billing_sync",
+                "duration_source": "minimum_answered_rejection",
+            },
+        },
+    )
+    db.add(call)
+    await db.commit()
+    return call
+
+
+async def _reserve_twilio_inbound_call(
+    db: AsyncSession,
+    *,
+    profile: AgentRuntimeProfile,
+    agent: Agent,
+    authenticated_route_credential: TwilioRouteCredential,
+    call_sid: str,
+    from_number: str,
+    to_number: str,
+) -> Call | None:
+    """Idempotently admit one inbound call before exposing its media URL."""
+
+    await _acquire_provider_callback_db_lock(db, f"twilio:inbound:{call_sid}")
+    tenant_id = agent.tenant_id
+    agent_id = agent.id
+
+    # Credential rotation, runtime mutation, and admission all share one fixed
+    # global order: provider boundary -> agent runtime -> capacity -> rows.
+    # This prevents a rotation already in progress from being overtaken and
+    # avoids advisory/row-lock inversions across PostgreSQL replicas.
+    await lock_provider_runtime_boundaries(db, tenant_id, "twilio")
+    if db.get_bind().dialect.name == "postgresql":
+        await db.execute(
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:route_key, 0))"),
+            {"route_key": f"agent-runtime:{tenant_id}:{agent_id}"},
+        )
+
+    # A replay must not take the capacity lock while holding its Call row:
+    # terminal processing takes those in the opposite order. The provider and
+    # agent boundaries already serialize same-route admission, so it is safe to
+    # decide whether this is a replay first and take the capacity lock only for
+    # a genuinely new reservation.
+    call = await db.scalar(
+        select(Call)
+        .where(Call.provider_call_sid == call_sid)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if call is None:
+        await lock_agent_runtime_limits(
+            db,
+            tenant_id=tenant_id,
+            agent_id=agent_id,
+        )
+
+    # Candidate objects were loaded before signature validation and may now be
+    # stale. Reload every routing field inside the admission boundaries.
+    agent = await db.scalar(
+        select(Agent)
+        .where(Agent.id == agent_id, Agent.tenant_id == tenant_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    profile = await db.scalar(
+        select(AgentRuntimeProfile)
+        .where(
+            AgentRuntimeProfile.agent_id == agent_id,
+            AgentRuntimeProfile.tenant_id == tenant_id,
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    route_is_current = bool(
+        agent is not None
+        and profile is not None
+        and agent.is_active
+        and agent.voice_provider in {"sarvam", "elevenlabs"}
+        and profile.enabled
+        and profile.status == "active"
+        and profile.telephony_provider == "twilio"
+        and profile.primary_speech_provider == agent.voice_provider
+        and profile.llm_provider == "openai"
+        and to_number in (profile.assigned_numbers or [])
+    )
+    if not route_is_current or agent is None or profile is None:
+        logger.warning(
+            "twilio_inbound_runtime_revalidation_rejected",
+            tenant_id=str(tenant_id),
+            agent_id=str(agent_id),
+            to_number=to_number,
+        )
+        return None
+
+    try:
+        current_route_credential = await load_workspace_twilio_route_credential(
+            db,
+            tenant_id,
+            for_update=True,
+        )
+    except ProviderCredentialError:
+        current_route_credential = None
+    if current_route_credential is None:
+        logger.warning(
+            "twilio_inbound_runtime_credential_revalidation_rejected",
+            tenant_id=str(tenant_id),
+            agent_id=str(agent_id),
+            reason="credential_unavailable",
+        )
+        return None
+    if not hmac.compare_digest(
+        twilio_callback_credential_fingerprint(authenticated_route_credential),
+        twilio_callback_credential_fingerprint(current_route_credential),
+    ):
+        logger.warning(
+            "twilio_inbound_runtime_credential_revalidation_rejected",
+            tenant_id=str(tenant_id),
+            agent_id=str(agent_id),
+            reason="credential_changed_after_authentication",
+        )
+        return None
+    if not twilio_route_verification_is_current(
+        profile,
+        current_route_credential,
+        expected_voice_url=_twilio_inbound_voice_url(),
+    ):
+        logger.warning(
+            "twilio_inbound_runtime_credential_revalidation_rejected",
+            tenant_id=str(tenant_id),
+            agent_id=str(agent_id),
+            reason="route_reverification_required",
+        )
+        return None
+
+    if call is not None:
+        metadata = call.call_metadata if isinstance(call.call_metadata, dict) else {}
+        runtime = metadata.get("runtime")
+        try:
+            durably_admitted = knowledge_admission_is_durable(call.call_metadata)
+            speech_lexicon_artifact_id = speech_lexicon_artifact_id_from_call_metadata(
+                call.call_metadata
+            )
+            speech_lexicon_content_sha256 = speech_lexicon_content_sha256_from_call_metadata(
+                call.call_metadata
+            )
+        except KnowledgeServingError:
+            durably_admitted = False
+            speech_lexicon_artifact_id = None
+            speech_lexicon_content_sha256 = None
+        replay_identity_matches = bool(
+            durably_admitted
+            and speech_lexicon_artifact_id is not None
+            and speech_lexicon_content_sha256 is not None
+            and isinstance(runtime, dict)
+            and call.tenant_id == agent.tenant_id
+            and call.agent_id == agent.id
+            and call.direction == "inbound"
+            and call.provider == "twilio"
+            and call.from_number == from_number
+            and call.to_number == to_number
+            and call.status not in RUNTIME_TERMINAL_CALL_STATUSES
+            and profile.primary_speech_provider == agent.voice_provider
+            and metadata.get("speech_provider") == agent.voice_provider
+            and runtime.get("transport") == "twilio_media_streams"
+            and runtime.get("speech_provider") == agent.voice_provider
+            and runtime.get("knowledge_admission_state") == INBOUND_KNOWLEDGE_ADMISSION_STATE
+        )
+        if not replay_identity_matches:
+            logger.warning(
+                "twilio_inbound_replay_identity_rejected",
+                tenant_id=str(agent.tenant_id),
+                agent_id=str(agent.id),
+                call_id=str(call.id),
+                existing_direction=call.direction,
+                existing_provider=call.provider,
+            )
+            return None
+        await db.commit()
+        return call
+
+    try:
+        await enforce_runtime_capacity(
+            db,
+            model=agent,
+            profile=profile,
+            lock_already_held=True,
+        )
+    except RuntimeCapacityError as exc:
+        lifecycle_error = _INBOUND_CAPACITY_LIFECYCLE_ERRORS.get(
+            exc.kind,
+            "runtime_capacity_rejected",
+        )
+        logger.warning(
+            "twilio_inbound_runtime_capacity_rejected",
+            tenant_id=str(agent.tenant_id),
+            agent_id=str(agent.id),
+            call_sid=call_sid,
+            capacity_kind=exc.kind,
+        )
+        await _persist_failed_twilio_inbound_call(
+            db,
+            profile=profile,
+            agent=agent,
+            call_sid=call_sid,
+            from_number=from_number,
+            to_number=to_number,
+            lifecycle_error=lifecycle_error,
+        )
+        return None
+
+    (
+        serving_revision,
+        serving_revocation_generation,
+    ) = await load_agent_serving_revision_identity(
+        db,
+        tenant_id=agent.tenant_id,
+        agent_id=agent.id,
+        include_sources=False,
+    )
+    if serving_revision is None or serving_revocation_generation is None:
+        logger.warning(
+            "twilio_inbound_knowledge_unavailable",
+            tenant_id=str(agent.tenant_id),
+            agent_id=str(agent.id),
+            call_sid=call_sid,
+        )
+        await _persist_failed_twilio_inbound_call(
+            db,
+            profile=profile,
+            agent=agent,
+            call_sid=call_sid,
+            from_number=from_number,
+            to_number=to_number,
+            lifecycle_error="immutable_knowledge_unavailable",
+        )
+        return None
+
+    try:
+        knowledge_identity = knowledge_call_reservation_metadata(
+            serving_revision,
+            serving_revocation_generation,
+        )
+    except KnowledgeServingError:
+        logger.warning(
+            "twilio_inbound_knowledge_reservation_failed",
+            tenant_id=str(agent.tenant_id),
+            agent_id=str(agent.id),
+            call_sid=call_sid,
+            serving_revision_id=str(serving_revision.id),
+        )
+        await _persist_failed_twilio_inbound_call(
+            db,
+            profile=profile,
+            agent=agent,
+            call_sid=call_sid,
+            from_number=from_number,
+            to_number=to_number,
+            lifecycle_error="immutable_knowledge_reservation_failed",
+            knowledge_identity={
+                "knowledge_serving_revision_id": str(serving_revision.id),
+                "knowledge_serving_knowledge_base_id": str(serving_revision.knowledge_base_id),
+                "knowledge_serving_content_sha256": serving_revision.content_sha256,
+                "knowledge_source_revision_sha256": serving_revision.source_revision_sha256,
+                "knowledge_serving_revocation_generation": serving_revocation_generation,
+            },
+        )
+        return None
+
+    now = datetime.now(UTC)
+    call = Call(
+        tenant_id=agent.tenant_id,
+        agent_id=agent.id,
+        direction="inbound",
+        status="in_progress",
+        from_number=from_number,
+        to_number=to_number,
+        provider="twilio",
+        provider_call_sid=call_sid,
+        started_at=now,
+        answered_at=now,
+        call_metadata={
+            "agent_configuration": agent_configuration_snapshot(agent),
+            "conversation_type": "telephonyInbound",
+            "channel": "phone",
+            "speech_provider": agent.voice_provider,
+            "runtime": {
+                "transport": "twilio_media_streams",
+                "media_stream_started": False,
+                "speech_provider": agent.voice_provider,
+                "llm_provider": profile.llm_provider,
+                "llm_model": profile.llm_model,
+                "stt_model": "sarvam/saaras:v3-realtime",
+                "stt_language_configured": profile.stt_language,
+                **recording_runtime_metadata(
+                    profile,
+                    transport="twilio_media_streams",
+                ),
+                **knowledge_identity,
+            },
+        },
+    )
+    db.add(call)
+    await db.flush()
+    try:
+        call = await admit_inbound_twilio_knowledge_call(
+            db,
+            tenant_id=agent.tenant_id,
+            agent_id=agent.id,
+            call_id=call.id,
+        )
+    except KnowledgeServingError as exc:
+        # This is a policy race, not a database error. Keep the transaction and
+        # advisory lock, terminalize the same durable row, and return friendly
+        # TwiML instead of releasing the lock through a broad rollback.
+        logger.warning(
+            "twilio_inbound_knowledge_admission_failed",
+            tenant_id=str(agent.tenant_id),
+            agent_id=str(agent.id),
+            call_sid=call_sid,
+            reason=str(exc),
+        )
+        now = datetime.now(UTC)
+        call.status = "failed"
+        call.answered_at = call.answered_at or now
+        call.ended_at = now
+        answered_at = call.answered_at
+        if answered_at.tzinfo is None:
+            answered_at = answered_at.replace(tzinfo=UTC)
+        call.duration_seconds = max(
+            call.duration_seconds or 0,
+            round((now - answered_at).total_seconds()),
+            1,
+        )
+        metadata = call.call_metadata if isinstance(call.call_metadata, dict) else {}
+        runtime = metadata.get("runtime")
+        preserved_runtime = runtime if isinstance(runtime, dict) else {}
+        call.call_metadata = {
+            **metadata,
+            "lifecycle_error": "immutable_knowledge_admission_failed",
+            "runtime": {
+                **preserved_runtime,
+                "transport": "twilio_fallback_twiml",
+                "media_stream_started": False,
+                "cost_state": "pending_provider_billing_sync",
+                "duration_source": preserved_runtime.get("duration_source")
+                or "minimum_answered_rejection",
+            },
+        }
+        await db.commit()
+        return None
+    await db.commit()
+    return call
 
 
 async def _process_smallest_webhook(
@@ -827,7 +1795,14 @@ async def twilio_inbound_webhook(request: Request):
         _validate_twilio_request(request, params, settings.twilio_auth_token)
         raise HTTPException(status_code=400, detail="Missing Twilio inbound call identity")
 
-    async with async_session_factory() as db:
+    # Acquire the in-process CallSid guard before even opening a session. This
+    # keeps duplicate deliveries from reading the same empty reservation state
+    # on SQLite/tests; PostgreSQL still uses the transaction advisory lock in
+    # ``_reserve_twilio_inbound_call`` for cross-replica serialization.
+    async with (
+        _local_provider_callback_lock(f"twilio:inbound:{call_sid}"),
+        async_session_factory() as db,
+    ):
         candidates = (
             await db.execute(
                 select(AgentRuntimeProfile, Agent)
@@ -850,37 +1825,63 @@ async def twilio_inbound_webhook(request: Request):
             for profile, agent in candidates
             if to_number in (profile.assigned_numbers or [])
         ]
-        account_sid = params.get("AccountSid", "")
-        validated_matches: list[tuple[AgentRuntimeProfile, Agent]] = []
-        configured_token_seen = False
+        account_sid = params.get("AccountSid", "").strip()
+        validated_matches: list[tuple[AgentRuntimeProfile, Agent, TwilioRouteCredential]] = []
+        account_scoped_token_seen = False
         for profile, candidate_agent in matches:
             try:
-                twilio_config = await _tenant_twilio_config(db, candidate_agent.tenant_id)
+                route_credential = await load_workspace_twilio_route_credential(
+                    db,
+                    candidate_agent.tenant_id,
+                )
             except ProviderCredentialError:
                 logger.warning(
                     "twilio_inbound_credential_unavailable",
                     tenant_id=str(candidate_agent.tenant_id),
                 )
-                twilio_config = {}
-            candidate_account_sid = str(
-                twilio_config.get("account_sid") or settings.twilio_account_sid
-            )
-            candidate_auth_token = str(
-                twilio_config.get("auth_token") or settings.twilio_auth_token
-            )
-            configured_token_seen = configured_token_seen or bool(candidate_auth_token)
-            if account_sid and candidate_account_sid and account_sid != candidate_account_sid:
+                route_credential = None
+            # A self-asserted DID is never an ownership credential. Only a
+            # complete workspace credential for the exact webhook AccountSid
+            # is allowed to participate in tenant routing.
+            if (
+                route_credential is None
+                or not account_sid
+                or route_credential.account_sid != account_sid
+            ):
                 continue
-            if _twilio_request_is_valid(request, params, candidate_auth_token):
-                validated_matches.append((profile, candidate_agent))
+            if not twilio_route_verification_is_current(
+                profile,
+                route_credential,
+                expected_voice_url=_twilio_inbound_voice_url(),
+            ):
+                logger.warning(
+                    "twilio_inbound_route_reverification_required",
+                    tenant_id=str(candidate_agent.tenant_id),
+                    agent_id=str(candidate_agent.id),
+                    to_number=to_number,
+                )
+                continue
+            account_scoped_token_seen = True
+            if _twilio_request_is_valid(request, params, route_credential.auth_token):
+                validated_matches.append((profile, candidate_agent, route_credential))
 
         if not validated_matches:
-            if configured_token_seen:
+            platform_account_sid = settings.twilio_account_sid.strip()
+            platform_auth_token = settings.twilio_auth_token.strip()
+            platform_authenticated = bool(
+                account_sid
+                and platform_account_sid
+                and account_sid == platform_account_sid
+                and platform_auth_token
+                and _twilio_request_is_valid(request, params, platform_auth_token)
+            )
+            if not platform_authenticated and (account_scoped_token_seen or platform_auth_token):
                 raise HTTPException(status_code=401, detail="Invalid Twilio webhook signature")
-            # No tenant route exposed a credential. A platform credential may
-            # still authenticate the request so Twilio receives safe fallback
-            # TwiML instead of an unsigned routing response.
-            _validate_twilio_request(request, params, settings.twilio_auth_token)
+            if not platform_authenticated:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Twilio webhook validation is not configured",
+                )
 
         if len(validated_matches) != 1:
             logger.warning(
@@ -898,33 +1899,22 @@ async def twilio_inbound_webhook(request: Request):
                 media_type="application/xml",
             )
 
-        _profile, agent = validated_matches[0]
-        call = await db.scalar(select(Call).where(Call.provider_call_sid == call_sid))
-        if call is None:
-            now = datetime.now(UTC)
-            call = Call(
-                tenant_id=agent.tenant_id,
-                agent_id=agent.id,
-                direction="inbound",
-                status="in_progress",
+        profile, agent, authenticated_route_credential = validated_matches[0]
+        # PostgreSQL serializes this across replicas with its transaction
+        # advisory lock. The matching in-process agent guard gives SQLite and
+        # single-process development the same distinct-CallSid semantics.
+        async with _local_provider_callback_lock(f"runtime-limits:{agent.tenant_id}:{agent.id}"):
+            call = await _reserve_twilio_inbound_call(
+                db,
+                profile=profile,
+                agent=agent,
+                authenticated_route_credential=authenticated_route_credential,
+                call_sid=call_sid,
                 from_number=from_number,
                 to_number=to_number,
-                provider="twilio",
-                provider_call_sid=call_sid,
-                started_at=now,
-                answered_at=now,
-                call_metadata={
-                    "agent_configuration": agent_configuration_snapshot(agent),
-                    "conversation_type": "telephonyInbound",
-                    "channel": "phone",
-                    "speech_provider": agent.voice_provider,
-                },
             )
-            db.add(call)
-            await db.flush()
-        elif call.tenant_id != agent.tenant_id or call.agent_id != agent.id:
-            raise HTTPException(status_code=409, detail="Conflicting inbound call identity")
-        await db.commit()
+        if call is None:
+            return _twilio_runtime_unavailable_response()
 
     twiml = get_telephony_provider().generate_connect_stream(
         _runtime_stream_url(call.id),
@@ -937,60 +1927,157 @@ async def twilio_inbound_webhook(request: Request):
 async def twilio_voice_webhook(call_id: UUID, request: Request):
     """Handle Twilio voice webhook - called when outbound call connects."""
     untrusted_params = await _parse_twilio_request(request)
-    if not untrusted_params.get("AccountSid"):
-        _validate_twilio_request(
-            request,
-            untrusted_params,
-            settings.twilio_auth_token,
-        )
+    callback_claim = _twilio_callback_claim_from_request(request)
     async with async_session_factory() as db:
-        result = await db.execute(select(Call).where(Call.id == call_id))
-        call_probe = result.scalar_one_or_none()
-        if not call_probe:
+        call_probe = await db.scalar(select(Call).where(Call.id == call_id))
+        if call_probe is None:
             await _verify_twilio_request(request)
             return Response(
                 content='<?xml version="1.0"?><Response><Hangup/></Response>',
                 media_type="application/xml",
             )
-        twilio_config = await _tenant_twilio_config(db, call_probe.tenant_id)
-        await _verify_twilio_request(
+        # Authenticate the complete signed URL before taking even the local
+        # serialization guard. Invalid requests therefore cannot queue behind
+        # a real callback and turn its lock into a cheap denial-of-service.
+        credential_source = await _validate_twilio_call_callback(
+            db,
             request,
-            auth_token=str(twilio_config.get("auth_token") or settings.twilio_auth_token),
+            untrusted_params,
+            call_probe,
         )
-        call, _attempt = await _lock_callback_call_graph(db, call_probe)
+        proof = _TwilioVoiceCallbackAuthProof(
+            call_id=call_probe.id,
+            tenant_id=call_probe.tenant_id,
+            agent_id=call_probe.agent_id,
+            campaign_id=call_probe.campaign_id,
+            native_speech_provider=_native_twilio_speech_provider(call_probe),
+            credential_source=credential_source,
+            credential_binding_source=_twilio_callback_binding_source(call_probe),
+        )
 
-        if call.status not in TERMINAL_CALL_STATUSES:
-            call.status = "in_progress"
-            call.answered_at = call.answered_at or datetime.now(UTC)
+    # PostgreSQL's caller-row lock provides the cross-replica guarantee. This
+    # matching process lock gives SQLite and one-process development the same
+    # single-winner semantics and spans the commit, not just the comparison.
+    async with _local_provider_callback_lock(f"twilio:direct:{call_id}"):
+        return await _twilio_voice_webhook_locked(
+            request,
+            params=untrusted_params,
+            callback_claim=callback_claim,
+            proof=proof,
+        )
 
-        # Get the agent
-        agent_result = await db.execute(
-            select(Agent).where(
-                Agent.id == call.agent_id,
-                Agent.tenant_id == call.tenant_id,
+
+async def _twilio_voice_webhook_locked(
+    request: Request,
+    *,
+    params: dict[str, str],
+    callback_claim: str | None,
+    proof: _TwilioVoiceCallbackAuthProof,
+):
+    async with async_session_factory() as db:
+        route_is_current = False
+        locked_credential_source = proof.credential_source
+        if (
+            proof.native_speech_provider is not None
+            and proof.campaign_id is None
+            and proof.credential_source == "workspace"
+        ):
+            (
+                call,
+                agent,
+                runtime_profile,
+                route_is_current,
+            ) = await _lock_native_twilio_voice_callback_runtime(
+                db,
+                proof=proof,
+                request=request,
+                params=params,
             )
-        )
-        agent = agent_result.scalar_one_or_none()
-
-        provider = get_telephony_provider()
-        runtime_profile = None
-        if agent is not None:
-            runtime_profile = await db.scalar(
-                select(AgentRuntimeProfile).where(
-                    AgentRuntimeProfile.agent_id == agent.id,
-                    AgentRuntimeProfile.tenant_id == agent.tenant_id,
+        elif not (
+            proof.credential_source == "platform" and proof.credential_binding_source == "platform"
+        ):
+            (
+                call,
+                locked_credential_source,
+            ) = await _lock_twilio_callback_graph_under_provider_boundary(
+                db,
+                proof=proof,
+                request=request,
+                params=params,
+            )
+            agent = await db.scalar(
+                select(Agent).where(
+                    Agent.id == call.agent_id,
+                    Agent.tenant_id == call.tenant_id,
                 )
             )
+            runtime_profile = None
+            if agent is not None:
+                runtime_profile = await db.scalar(
+                    select(AgentRuntimeProfile).where(
+                        AgentRuntimeProfile.agent_id == agent.id,
+                        AgentRuntimeProfile.tenant_id == agent.tenant_id,
+                    )
+                )
+        else:
+            call_probe = await db.scalar(
+                select(Call).where(
+                    Call.id == proof.call_id,
+                    Call.tenant_id == proof.tenant_id,
+                    Call.agent_id == proof.agent_id,
+                    Call.campaign_id == proof.campaign_id,
+                )
+            )
+            if call_probe is None:
+                return Response(
+                    content='<?xml version="1.0"?><Response><Hangup/></Response>',
+                    media_type="application/xml",
+                )
+            call, _attempt = await _lock_callback_call_graph(db, call_probe)
+            # Platform-owned compatibility calls keep their established graph
+            # order and are re-authenticated against the locked Call. A change
+            # in selected authority fails closed rather than crossing tenants.
+            current_source = await _validate_twilio_call_callback(db, request, params, call)
+            if current_source != proof.credential_source:
+                raise HTTPException(status_code=409, detail="Call mapping changed during callback")
+            agent = await db.scalar(
+                select(Agent).where(
+                    Agent.id == call.agent_id,
+                    Agent.tenant_id == call.tenant_id,
+                )
+            )
+            runtime_profile = None
+            if agent is not None:
+                runtime_profile = await db.scalar(
+                    select(AgentRuntimeProfile).where(
+                        AgentRuntimeProfile.agent_id == agent.id,
+                        AgentRuntimeProfile.tenant_id == agent.tenant_id,
+                    )
+                )
 
-        if (
-            agent
-            and agent.voice_provider in {"sarvam", "elevenlabs"}
-            and runtime_profile
-            and runtime_profile.enabled
-            and runtime_profile.status == "active"
-            and runtime_profile.telephony_provider == "twilio"
-            and runtime_profile.primary_speech_provider == agent.voice_provider
-        ):
+        # Signature verification proves the Twilio account, while CallSid
+        # proves this callback belongs to this exact native call.  Compare
+        # against the locked row before mutating state or minting a media token
+        # into TwiML.
+        await _require_and_persist_native_twilio_callback_identity(
+            db,
+            params,
+            call,
+            callback_claim=callback_claim,
+            credential_source=locked_credential_source,
+        )
+
+        if call.status in RUNTIME_TERMINAL_CALL_STATUSES:
+            await db.commit()
+            return Response(
+                content='<?xml version="1.0"?><Response><Hangup/></Response>',
+                media_type="application/xml",
+            )
+        call.status = "in_progress"
+        call.answered_at = call.answered_at or datetime.now(UTC)
+
+        provider = get_telephony_provider()
+        if route_is_current and agent is not None and runtime_profile is not None:
             twiml = provider.generate_connect_stream(
                 _runtime_stream_url(call.id),
                 _runtime_stream_parameters(call.id),
@@ -1028,62 +2115,133 @@ async def twilio_status_callback(
 ):
     """Handle Twilio status callbacks for call state changes."""
     untrusted_params = await _parse_twilio_request(request)
-    if not untrusted_params.get("AccountSid"):
-        _validate_twilio_request(
-            request,
-            untrusted_params,
-            settings.twilio_auth_token,
-        )
+    callback_claim = _twilio_callback_claim_from_request(request)
     async with async_session_factory() as db:
-        result = await db.execute(select(Call).where(Call.id == call_id))
-        call_probe = result.scalar_one_or_none()
-        if not call_probe:
+        call_probe = await db.scalar(select(Call).where(Call.id == call_id))
+        if call_probe is None:
             await _verify_twilio_request(request)
             return {"status": "not_found"}
-        twilio_config = await _tenant_twilio_config(db, call_probe.tenant_id)
-        params = await _verify_twilio_request(
+        # Authenticate before taking the local contention lock so invalid
+        # requests cannot queue behind a legitimate callback. Native callbacks
+        # are authenticated again under the provider/credential boundary below.
+        credential_source = await _validate_twilio_call_callback(
+            db,
             request,
-            auth_token=str(twilio_config.get("auth_token") or settings.twilio_auth_token),
+            untrusted_params,
+            call_probe,
         )
+        proof = _TwilioStatusCallbackAuthProof(
+            call_id=call_probe.id,
+            tenant_id=call_probe.tenant_id,
+            agent_id=call_probe.agent_id,
+            campaign_id=call_probe.campaign_id,
+            native_speech_provider=_native_twilio_speech_provider(call_probe),
+            credential_source=credential_source,
+            credential_binding_source=_twilio_callback_binding_source(call_probe),
+        )
+
+    async with _local_provider_callback_lock(f"twilio:direct:{call_id}"):
+        return await _twilio_status_callback_locked(
+            request,
+            params=untrusted_params,
+            callback_claim=callback_claim,
+            proof=proof,
+        )
+
+
+async def _twilio_status_callback_locked(
+    request: Request,
+    *,
+    params: dict[str, str],
+    callback_claim: str | None,
+    proof: _TwilioStatusCallbackAuthProof,
+):
+    async with async_session_factory() as db:
+        locked_credential_source = proof.credential_source
+        if not (
+            proof.credential_source == "platform" and proof.credential_binding_source == "platform"
+        ):
+            (
+                call,
+                locked_credential_source,
+            ) = await _lock_twilio_callback_graph_under_provider_boundary(
+                db,
+                proof=proof,
+                request=request,
+                params=params,
+            )
+        else:
+            call_probe = await db.scalar(
+                select(Call).where(
+                    Call.id == proof.call_id,
+                    Call.tenant_id == proof.tenant_id,
+                    Call.agent_id == proof.agent_id,
+                    Call.campaign_id == proof.campaign_id,
+                )
+            )
+            if call_probe is None:
+                return {"status": "not_found"}
+            call, _attempt = await _lock_callback_call_graph(db, call_probe)
+            current_source = await _validate_twilio_call_callback(db, request, params, call)
+            if current_source != proof.credential_source:
+                raise HTTPException(status_code=409, detail="Call mapping changed during callback")
+
         call_sid = params.get("CallSid", "")
         call_status = params.get("CallStatus", "")
-        call_duration = params.get("CallDuration", "0")
+        call_duration = params.get("CallDuration")
         recording_url = params.get("RecordingUrl", "")
-        call, _attempt = await _lock_callback_call_graph(db, call_probe)
+        await _require_and_persist_native_twilio_callback_identity(
+            db,
+            params,
+            call,
+            callback_claim=callback_claim,
+            credential_source=locked_credential_source,
+        )
 
-        status_map = {
-            "completed": "completed",
-            "busy": "busy",
-            "no-answer": "no_answer",
-            "canceled": "failed",
-            "failed": "failed",
-            "in-progress": "in_progress",
-        }
-        incoming_status = status_map.get(call_status, call_status)
-        if call.status not in TERMINAL_CALL_STATUSES:
-            call.status = incoming_status
+        incoming_status = _TWILIO_STATUS_MAP.get(call_status)
+        is_terminal = call_status in _TWILIO_TERMINAL_STATUSES
+        # Legacy non-workspace calls did not always persist or receive a
+        # CallSid. Preserve that compatibility while continuing to reject an
+        # explicit identity conflict. Native/workspace callbacks have already
+        # passed the stricter presence-and-equality check above.
         if call.provider_call_sid and call_sid and call.provider_call_sid != call_sid:
             raise HTTPException(status_code=409, detail="Conflicting Twilio call identity")
+        if incoming_status is None:
+            # A signed but malformed/unsupported provider status must never
+            # move a call outside the states covered by capacity recovery.
+            await db.commit()
+            return {"status": "ignored_unknown_status"}
+        if call.status in RUNTIME_TERMINAL_CALL_STATUSES and not is_terminal:
+            # A terminal call can be reconciled only by a definitive provider
+            # outcome. Ignore delayed ringing/answer events entirely so they
+            # cannot alter billing, recordings, campaigns, or capacity state.
+            await db.commit()
+            return {"status": "ignored_stale_nonterminal"}
+        if not is_terminal and (
+            _TWILIO_ACTIVE_STATUS_RANK.get(call.status, -1)
+            > _TWILIO_ACTIVE_STATUS_RANK[incoming_status]
+        ):
+            # Twilio callbacks may arrive out of order. Do not regress an
+            # answered call to queued/ringing or let a stale event overwrite
+            # duration/recording fields.
+            await db.commit()
+            return {"status": "ignored_stale_nonterminal"}
         call.provider_call_sid = call_sid or call.provider_call_sid
+        if call.status not in TERMINAL_CALL_STATUSES:
+            call.status = incoming_status
 
         if call_duration:
             try:
-                call.duration_seconds = max(int(call_duration), 0)
+                reported_duration = max(int(call_duration), 0)
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail="Invalid Twilio call duration") from exc
+            call.duration_seconds = max(call.duration_seconds or 0, reported_duration)
 
         if recording_url:
             call.provider_recording_url = recording_url
 
-        is_terminal = call_status in (
-            "completed",
-            "busy",
-            "no-answer",
-            "canceled",
-            "failed",
-        )
         if is_terminal:
-            call.ended_at = datetime.now(UTC)
+            call.ended_at = call.ended_at or datetime.now(UTC)
         lifecycle = await sync_campaign_call_lifecycle(db, call, provider_callback=True)
         status_effects = ProviderWebhookEffects(
             lifecycle=lifecycle,
@@ -1093,7 +2251,7 @@ async def twilio_status_callback(
             process_call_id=str(call.id) if is_terminal else None,
             process_tenant_id=str(call.tenant_id) if is_terminal else None,
             process_revision=(
-                f"twilio:{call_sid}:{call_status}:{call_duration}:{recording_url}"
+                f"twilio:{call_sid}:{call_status}:{call_duration or ''}:{recording_url}"
                 if is_terminal
                 else None
             ),

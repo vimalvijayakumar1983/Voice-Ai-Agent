@@ -32,9 +32,40 @@ from app.services.compliance_policy import (
     is_outbound_consent_revoked,
     is_recording_consent_revoked,
 )
+from app.services.knowledge_serving import (
+    KnowledgeServingError,
+    knowledge_call_reservation_metadata,
+    load_agent_serving_revision_identity,
+    pre_admit_outbound_knowledge_call,
+)
 from app.services.phone_numbers import is_number_on_tenant_dnc, tenant_phone_dnc_lock
-from app.services.provider_credentials import load_provider_config
+from app.services.provider_credentials import (
+    ProviderCredentialError,
+    load_provider_config,
+    lock_provider_runtime_boundaries,
+)
+from app.services.realtime_speech_config import (
+    configured_inworld_stt_model,
+    resolve_inworld_stt_language,
+    resolve_inworld_stt_model,
+)
+from app.services.recording_policy import recording_runtime_metadata
 from app.services.recordings import RecordingError, fetch_call_recording
+from app.services.runtime_capacity import (
+    TERMINAL_CALL_STATUSES as RUNTIME_TERMINAL_CALL_STATUSES,
+)
+from app.services.twilio_callback_claim import (
+    TWILIO_CALLBACK_CLAIM_METADATA_KEY,
+    append_twilio_callback_claim,
+    create_twilio_callback_claim,
+    mark_twilio_callback_claim_bound,
+    twilio_callback_claim_matches,
+)
+from app.services.twilio_route_security import (
+    TwilioRouteCredential,
+    twilio_callback_credential_fingerprint,
+    twilio_route_verification_is_current,
+)
 from app.services.usage_ledger import (
     lock_agent_runtime_limits,
     monthly_agent_budget_commitment,
@@ -454,6 +485,94 @@ async def get_call(
     return CallResponse.model_validate(call)
 
 
+async def _lock_call_after_provider_dispatch(
+    db: AsyncSession,
+    *,
+    call: Call,
+    tenant_id: UUID,
+) -> Call:
+    """Reload and lock a call before merging its provider response."""
+
+    call_id = call.id
+    db.expire(call)
+    current_result = await db.execute(
+        select(Call)
+        .where(Call.id == call_id, Call.tenant_id == tenant_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    return current_result.scalar_one()
+
+
+def _direct_twilio_credential_binding(
+    credential: TwilioRouteCredential,
+    source: str,
+) -> dict[str, str]:
+    return {
+        "provider": "twilio",
+        "source": source,
+        "account_sid": credential.account_sid,
+        "credential_fingerprint": twilio_callback_credential_fingerprint(credential),
+    }
+
+
+def _direct_twilio_binding_is_current(
+    binding: object,
+    credential: TwilioRouteCredential,
+    source: str,
+) -> bool:
+    if not isinstance(binding, dict):
+        return False
+    expected = _direct_twilio_credential_binding(credential, source)
+    return all(str(binding.get(key) or "") == value for key, value in expected.items())
+
+
+async def _resolve_direct_twilio_route(
+    db: AsyncSession,
+    tenant_id: UUID,
+    *,
+    workspace_required: bool,
+    for_update: bool = False,
+) -> tuple[TwilioRouteCredential, str, str | None] | None:
+    """Resolve one credential authority and its associated caller-ID default."""
+
+    config = await load_provider_config(
+        db,
+        tenant_id,
+        "twilio",
+        for_update=for_update,
+    )
+    if config is not None:
+        account_sid = str(config.get("account_sid") or "").strip()
+        auth_token = str(config.get("auth_token") or "").strip()
+        # A present but partial workspace credential is an invalid route, not
+        # permission to silently fall back to the platform account.
+        if not account_sid or not auth_token:
+            return None
+        default_from_number = str(
+            config.get("default_from_number")
+            or ("" if workspace_required else settings.twilio_default_from_number)
+        ).strip()
+        return (
+            TwilioRouteCredential(account_sid=account_sid, auth_token=auth_token),
+            "workspace",
+            default_from_number or None,
+        )
+
+    if workspace_required:
+        return None
+    account_sid = settings.twilio_account_sid.strip()
+    auth_token = settings.twilio_auth_token.strip()
+    if not account_sid or not auth_token:
+        return None
+    default_from_number = settings.twilio_default_from_number.strip()
+    return (
+        TwilioRouteCredential(account_sid=account_sid, auth_token=auth_token),
+        "platform",
+        default_from_number or None,
+    )
+
+
 @router.post("", response_model=CallResponse, status_code=201)
 async def initiate_outbound_call(
     data: CallOutbound,
@@ -508,23 +627,60 @@ async def initiate_outbound_call(
 
     is_smallest = agent.voice_provider == "smallest"
     is_inworld = agent.voice_provider == "inworld"
+    is_native_twilio = agent.voice_provider in {"sarvam", "elevenlabs"}
+    uses_twilio = not is_smallest and not is_inworld
     smallest_config = (
         await load_provider_config(db, current_user.tenant_id, "smallest") if is_smallest else None
     )
-    twilio_config = (
-        await load_provider_config(db, current_user.tenant_id, "twilio")
-        if not is_smallest and not is_inworld
-        else None
+    reserved_twilio_route: tuple[TwilioRouteCredential, str, str | None] | None = None
+    if uses_twilio:
+        try:
+            reserved_twilio_route = await _resolve_direct_twilio_route(
+                db,
+                current_user.tenant_id,
+                workspace_required=is_native_twilio,
+            )
+        except ProviderCredentialError as exc:
+            if is_native_twilio:
+                raise HTTPException(
+                    status_code=409,
+                    detail="This workspace's Twilio credential is unavailable",
+                ) from exc
+            raise
+        if reserved_twilio_route is None:
+            detail = (
+                "Add this workspace's own Twilio account SID and auth token before "
+                "placing a native VAV call"
+                if is_native_twilio
+                else "Configure a complete Twilio account SID and auth token before placing a call"
+            )
+            raise HTTPException(
+                status_code=409,
+                detail=detail,
+            )
+    native_twilio_credential = (
+        reserved_twilio_route[0] if is_native_twilio and reserved_twilio_route is not None else None
     )
     sip_config = (
         await load_provider_config(db, current_user.tenant_id, "livekit_sip")
         if is_inworld
         else None
     )
-    twilio_default_from_number = str(
-        (twilio_config or {}).get("default_from_number") or settings.twilio_default_from_number
-    ).strip()
+    twilio_default_from_number = (
+        reserved_twilio_route[2] if reserved_twilio_route is not None else None
+    )
+    twilio_credential_binding = (
+        _direct_twilio_credential_binding(
+            reserved_twilio_route[0],
+            reserved_twilio_route[1],
+        )
+        if reserved_twilio_route is not None
+        else None
+    )
     runtime_profile = None
+    knowledge_serving_revision = None
+    knowledge_serving_revocation_generation = None
+    knowledge_reservation_metadata: dict[str, str | int] | None = None
     if agent.voice_provider in {"sarvam", "elevenlabs", "inworld"}:
         runtime_profile = await db.scalar(
             select(AgentRuntimeProfile).where(
@@ -548,11 +704,55 @@ async def initiate_outbound_call(
                 status_code=409,
                 detail=f"Outbound dispatch requires the active {expected_telephony} runtime",
             )
+        if is_native_twilio and (
+            native_twilio_credential is None
+            or not twilio_route_verification_is_current(
+                runtime_profile,
+                native_twilio_credential,
+                expected_voice_url=(
+                    f"{settings.base_url.rstrip('/')}/api/v1/webhooks/twilio/voice/inbound"
+                ),
+            )
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Re-run runtime readiness to verify this workspace's Twilio account and "
+                    "assigned caller IDs before placing a call"
+                ),
+            )
         if is_inworld and not (sip_config or {}).get("outbound_trunk_id"):
             raise HTTPException(
                 status_code=409,
                 detail="Record a verified LiveKit outbound trunk ID before placing outbound calls",
             )
+        (
+            knowledge_serving_revision,
+            knowledge_serving_revocation_generation,
+        ) = await load_agent_serving_revision_identity(
+            db,
+            tenant_id=current_user.tenant_id,
+            agent_id=agent.id,
+            include_sources=False,
+        )
+        if knowledge_serving_revision is None or knowledge_serving_revocation_generation is None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Approve and publish the agent's knowledge base before placing "
+                    "a VAV realtime call"
+                ),
+            )
+        try:
+            knowledge_reservation_metadata = knowledge_call_reservation_metadata(
+                knowledge_serving_revision,
+                knowledge_serving_revocation_generation,
+            )
+        except KnowledgeServingError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail="The published knowledge release failed integrity validation",
+            ) from exc
         now = datetime.now(UTC)
         day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         month_start = day_start.replace(day=1)
@@ -576,7 +776,7 @@ async def initiate_outbound_call(
             .where(
                 Call.tenant_id == current_user.tenant_id,
                 Call.agent_id == agent.id,
-                Call.status.notin_(TERMINAL_CALL_STATUSES),
+                Call.status.notin_(RUNTIME_TERMINAL_CALL_STATUSES),
             )
         )
         monthly_budget = await monthly_agent_budget_commitment(
@@ -656,6 +856,13 @@ async def initiate_outbound_call(
         str(runtime_profile.id) if runtime_profile else None,
         runtime_profile.updated_at.isoformat() if runtime_profile else None,
     )
+    twilio_callback_claim_token: str | None = None
+    twilio_callback_claim_metadata: dict[str, object] | None = None
+    if not is_smallest and not is_inworld:
+        (
+            twilio_callback_claim_token,
+            twilio_callback_claim_metadata,
+        ) = create_twilio_callback_claim()
 
     # Create call record
     call = Call(
@@ -672,37 +879,77 @@ async def initiate_outbound_call(
             "agent_configuration": agent_configuration_snapshot(agent),
             "runtime_profile_id": str(runtime_profile.id) if runtime_profile else None,
             "speech_provider": agent.voice_provider,
+            "telephony_credential_binding": twilio_credential_binding,
+            **(
+                {
+                    TWILIO_CALLBACK_CLAIM_METADATA_KEY: twilio_callback_claim_metadata,
+                }
+                if twilio_callback_claim_metadata is not None
+                else {}
+            ),
             "runtime": (
                 {
-                    "transport": "livekit_sip",
-                    "speech_provider": "inworld",
+                    "transport": "livekit_sip" if is_inworld else "twilio_media_streams",
+                    "speech_provider": agent.voice_provider,
                     "llm_provider": runtime_profile.llm_provider,
                     "llm_model": runtime_profile.llm_model,
-                    "stt_model": "inworld/inworld-stt-1",
-                    "stt_language": (
-                        agent.language
-                        if runtime_profile.stt_language == "auto"
-                        else runtime_profile.stt_language
+                    **({} if is_inworld else {"media_stream_started": False}),
+                    **(
+                        {
+                            "stt_model": resolve_inworld_stt_model(
+                                model=agent,
+                                profile=runtime_profile,
+                            ),
+                            "stt_model_configured": configured_inworld_stt_model(
+                                profile=runtime_profile
+                            ),
+                            "stt_language": resolve_inworld_stt_language(
+                                model=agent,
+                                profile=runtime_profile,
+                            ),
+                            "stt_language_configured": runtime_profile.stt_language,
+                            "tts_model": "inworld-tts-2",
+                            "tts_delivery_mode": str(
+                                (
+                                    runtime_profile.runtime_config.get("tts_delivery_mode")
+                                    if isinstance(runtime_profile.runtime_config, dict)
+                                    else None
+                                )
+                                or "balanced"
+                            ).lower(),
+                        }
+                        if is_inworld
+                        else {
+                            "stt_model": "sarvam/saaras:v3-realtime",
+                            "stt_language_configured": runtime_profile.stt_language,
+                        }
                     ),
-                    "stt_language_configured": runtime_profile.stt_language,
-                    "tts_model": "inworld-tts-2",
-                    "tts_delivery_mode": str(
-                        (
-                            runtime_profile.runtime_config.get("tts_delivery_mode")
-                            if isinstance(runtime_profile.runtime_config, dict)
-                            else None
-                        )
-                        or "balanced"
-                    ).lower(),
-                    "recording_enabled": False,
+                    **recording_runtime_metadata(
+                        runtime_profile,
+                        transport=("livekit_sip" if is_inworld else "twilio_media_streams"),
+                    ),
+                    **knowledge_reservation_metadata,
                 }
-                if is_inworld and runtime_profile
+                if runtime_profile
+                and knowledge_serving_revision is not None
+                and knowledge_serving_revocation_generation is not None
+                and knowledge_reservation_metadata is not None
                 else {}
             ),
         },
     )
     db.add(call)
     try:
+        if agent.voice_provider in {"sarvam", "elevenlabs", "inworld"}:
+            try:
+                call = await pre_admit_outbound_knowledge_call(
+                    db,
+                    tenant_id=current_user.tenant_id,
+                    agent_id=agent.id,
+                    call_id=call.id,
+                )
+            except KnowledgeServingError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
         # Persist the durable dispatch claim before the paid provider side
         # effect. A crash leaves a reconcilable `dispatching` record; a retry
         # with the same key never dials again.
@@ -743,6 +990,7 @@ async def initiate_outbound_call(
         return CallResponse.model_validate(call)
 
     provider_call_sid: str | None = None
+    livekit_room_name: str | None = None
     dispatch_error: Exception | None = None
     dispatch_is_ambiguous = True
     dispatch_terminal_status: str | None = None
@@ -750,6 +998,15 @@ async def initiate_outbound_call(
         # This check and provider invocation share the same tenant+number lock
         # as DNC POST/DELETE, closing the final check-to-call race across API
         # replicas. The transaction ends before the local guard is released.
+        if uses_twilio:
+            # Credential mutation and Twilio dispatch share one global order:
+            # DNC -> provider boundary -> Agent/Profile -> credential. Hold the
+            # provider boundary through paid I/O and commit.
+            await lock_provider_runtime_boundaries(
+                db,
+                current_user.tenant_id,
+                "twilio",
+            )
         if await is_number_on_tenant_dnc(db, current_user.tenant_id, data.to_number):
             call.status = "failed"
             call.call_metadata = {**(call.call_metadata or {}), "dispatch_error": "dnc"}
@@ -788,17 +1045,86 @@ async def initiate_outbound_call(
                     AgentRuntimeProfile.tenant_id == current_user.tenant_id,
                 )
                 .with_for_update()
+                .execution_options(populate_existing=True)
             )
+        current_twilio_route: tuple[TwilioRouteCredential, str, str | None] | None = None
+        if current_agent and current_agent.voice_provider in {"twilio", "sarvam", "elevenlabs"}:
+            try:
+                current_twilio_route = await _resolve_direct_twilio_route(
+                    db,
+                    current_user.tenant_id,
+                    workspace_required=current_agent.voice_provider in {"sarvam", "elevenlabs"},
+                    for_update=True,
+                )
+            except ProviderCredentialError:
+                current_twilio_route = None
+        current_native_twilio_credential = (
+            current_twilio_route[0]
+            if current_agent
+            and current_agent.voice_provider in {"sarvam", "elevenlabs"}
+            and current_twilio_route is not None
+            else None
+        )
         current_assigned_numbers = (
             current_runtime_profile.assigned_numbers if current_runtime_profile else []
+        )
+        current_twilio_default_from_number = (
+            current_twilio_route[2] if current_twilio_route is not None else None
         )
         current_from_number = (
             "provider-managed"
             if current_agent and current_agent.voice_provider == "smallest"
             else data.from_number
             or (current_assigned_numbers[0] if current_assigned_numbers else None)
-            or twilio_default_from_number
+            or current_twilio_default_from_number
         )
+
+        # Re-read the durable dispatch reservation under the same provider
+        # boundary before paid I/O. The raw claim must still match its stored
+        # digest, and the stored binding must match both the reserved and final
+        # route exactly.
+        twilio_route_changed = False
+        if uses_twilio:
+            locked_call = await db.scalar(
+                select(Call)
+                .where(
+                    Call.id == call_id,
+                    Call.tenant_id == current_user.tenant_id,
+                    Call.agent_id == data.agent_id,
+                    Call.campaign_id.is_(None),
+                    Call.direction == "outbound",
+                )
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+            if locked_call is None:
+                await db.rollback()
+                raise HTTPException(status_code=409, detail="Call dispatch reservation changed")
+            call = locked_call
+            metadata = call.call_metadata if isinstance(call.call_metadata, dict) else {}
+            persisted_binding = metadata.get("telephony_credential_binding")
+            twilio_route_changed = bool(
+                current_twilio_route is None
+                or twilio_credential_binding != persisted_binding
+                or not _direct_twilio_binding_is_current(
+                    twilio_credential_binding,
+                    current_twilio_route[0],
+                    current_twilio_route[1],
+                )
+                or not _direct_twilio_binding_is_current(
+                    persisted_binding,
+                    current_twilio_route[0],
+                    current_twilio_route[1],
+                )
+                or not twilio_callback_claim_matches(
+                    metadata,
+                    twilio_callback_claim_token,
+                )
+                or call.provider != "twilio"
+                or call.status != "dispatching"
+                or call.from_number != from_number
+                or current_from_number != from_number
+            )
         provider_identity_changed = bool(
             current_agent
             and (
@@ -835,6 +1161,21 @@ async def initiate_outbound_call(
                 or current_runtime_profile.telephony_provider
                 != ("livekit_sip" if current_agent.voice_provider == "inworld" else "twilio")
                 or current_runtime_profile.primary_speech_provider != current_agent.voice_provider
+                or (
+                    current_agent.voice_provider in {"sarvam", "elevenlabs"}
+                    and (
+                        current_native_twilio_credential is None
+                        or not twilio_route_verification_is_current(
+                            current_runtime_profile,
+                            current_native_twilio_credential,
+                            expected_voice_url=(
+                                f"{settings.base_url.rstrip('/')}"
+                                "/api/v1/webhooks/twilio/voice/inbound"
+                            ),
+                        )
+                        or current_from_number not in current_assigned_numbers
+                    )
+                )
             )
         )
         if (
@@ -843,16 +1184,24 @@ async def initiate_outbound_call(
             or provider_identity_changed
             or provider_not_ready
             or runtime_not_ready
+            or twilio_route_changed
         ):
-            reason = (
-                "agent_inactive"
-                if current_agent is not None and not current_agent.is_active
-                else (
-                    "agent_not_synced"
-                    if provider_not_ready
-                    else ("runtime_not_ready" if runtime_not_ready else "agent_provider_changed")
-                )
-            )
+            if current_agent is not None and not current_agent.is_active:
+                reason = "agent_inactive"
+            elif provider_not_ready:
+                reason = "agent_not_synced"
+            elif runtime_not_ready:
+                reason = "runtime_not_ready"
+            elif (
+                current_agent is not None
+                and current_agent.voice_provider == provider_identity[0]
+                and twilio_route_changed
+            ):
+                reason = "twilio_route_changed"
+            elif provider_identity_changed or current_agent is None:
+                reason = "agent_provider_changed"
+            else:
+                reason = "twilio_route_changed"
             call.status = "failed"
             call.call_metadata = {**(call.call_metadata or {}), "dispatch_error": reason}
             await db.commit()
@@ -888,23 +1237,23 @@ async def initiate_outbound_call(
                     max_call_duration_seconds=current_agent.max_call_duration_seconds,
                 )
                 provider_call_sid = livekit_result.provider_call_sid
-                call.call_metadata = {
-                    **(call.call_metadata or {}),
-                    "livekit_room": livekit_result.room_name,
-                }
+                livekit_room_name = livekit_result.room_name
             else:
-                provider = (
-                    get_telephony_provider(
-                        account_sid=str(twilio_config.get("account_sid")).strip(),
-                        auth_token=str(twilio_config.get("auth_token")).strip(),
-                    )
-                    if twilio_config
-                    and twilio_config.get("account_sid")
-                    and twilio_config.get("auth_token")
-                    else get_telephony_provider()
+                assert current_twilio_route is not None
+                current_twilio_credential = current_twilio_route[0]
+                provider = get_telephony_provider(
+                    account_sid=current_twilio_credential.account_sid,
+                    auth_token=current_twilio_credential.auth_token,
                 )
-                webhook_url = f"{settings.base_url}/api/v1/webhooks/twilio/voice/{call.id}"
-                status_url = f"{settings.base_url}/api/v1/webhooks/twilio/status/{call.id}"
+                assert twilio_callback_claim_token is not None
+                webhook_url = append_twilio_callback_claim(
+                    f"{settings.base_url}/api/v1/webhooks/twilio/voice/{call.id}",
+                    twilio_callback_claim_token,
+                )
+                status_url = append_twilio_callback_claim(
+                    f"{settings.base_url}/api/v1/webhooks/twilio/status/{call.id}",
+                    twilio_callback_claim_token,
+                )
                 provider_result = await provider.make_call(
                     CallRequest(
                         to_number=data.to_number,
@@ -928,15 +1277,17 @@ async def initiate_outbound_call(
     # A signed callback may update this row while the provider request is in
     # flight. Re-lock and repopulate before merging the request result so a late
     # HTTP response can never regress an answered/completed call.
-    db.expire(call)
-    current_result = await db.execute(
-        select(Call)
-        .where(Call.id == call_id, Call.tenant_id == current_user.tenant_id)
-        .with_for_update()
-        .execution_options(populate_existing=True)
+    current_call = await _lock_call_after_provider_dispatch(
+        db,
+        call=call,
+        tenant_id=current_user.tenant_id,
     )
-    current_call = current_result.scalar_one()
     if dispatch_error is None and provider_call_sid:
+        if livekit_room_name is not None:
+            current_call.call_metadata = {
+                **(current_call.call_metadata or {}),
+                "livekit_room": livekit_room_name,
+            }
         if current_call.provider_call_sid and current_call.provider_call_sid != provider_call_sid:
             current_call.call_metadata = {
                 **(current_call.call_metadata or {}),
@@ -944,6 +1295,10 @@ async def initiate_outbound_call(
             }
         else:
             current_call.provider_call_sid = current_call.provider_call_sid or provider_call_sid
+            current_call.call_metadata = mark_twilio_callback_claim_bound(
+                current_call.call_metadata,
+                source="provider_response",
+            )
             if current_call.status == "dispatching":
                 current_call.status = "ringing"
                 current_call.started_at = current_call.started_at or datetime.now(UTC)

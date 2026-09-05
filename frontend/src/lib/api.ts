@@ -57,7 +57,14 @@ function createIdempotencyKey() {
   throw new Error('Secure idempotency-key generation is unavailable in this browser.');
 }
 
+export interface KnowledgeCompanyScope {
+  semantic_retrieval_enabled?: boolean;
+  default_company: string | null;
+  companies: { name: string; aliases: string[] }[];
+}
+
 export interface VoiceAgent {
+  knowledge_company_scope?: KnowledgeCompanyScope | null;
   id: string;
   name: string;
   description: string | null;
@@ -180,9 +187,12 @@ export interface RuntimeProfile {
   llm_provider: 'openai' | 'inworld';
   llm_model: string;
   voice_runtime: 'pipeline' | 'inworld_realtime';
+  knowledge_turn_mode: 'tool_loop' | 'single_pass_experimental';
   stt_language: string;
   stt_model: 'auto' | 'assemblyai/u3-rt-pro' | 'soniox/stt-rt-v4' | 'inworld/inworld-stt-1';
   tts_delivery_mode: 'stable' | 'balanced' | 'creative';
+  inworld_realtime_tts_model: 'inworld-tts-1.5-max' | 'inworld-tts-1.5-mini' | 'inworld-tts-2';
+  diagnostic_recording_mode: 'off' | 'livekit_egress_explicit_consent';
   max_concurrent_calls: number;
   daily_call_limit: number;
   monthly_budget_cents: number;
@@ -295,6 +305,7 @@ export interface KnowledgeSource {
   error_message: string | null;
   source_metadata: Record<string, unknown> | null;
   retrieval_ready: boolean;
+  company_fact_count?: number;
   extracted_character_count: number;
   last_synced_at: string | null;
   created_at: string;
@@ -347,6 +358,22 @@ export interface KnowledgeCrawl {
   updated_at: string;
 }
 
+export interface KnowledgeServingRevision {
+  revision_id: string;
+  compiler_version: string;
+  source_revision_sha256: string;
+  chunk_revision_sha256: string;
+  fact_revision_sha256: string;
+  entity_revision_sha256: string;
+  content_sha256: string;
+  published_at: string;
+  source_count: number;
+  chunk_count: number;
+  fact_count: number;
+  entity_count: number;
+  speech_lexicon_artifact_id: string;
+}
+
 export interface KnowledgeBase {
   id: string;
   name: string;
@@ -364,6 +391,18 @@ export interface KnowledgeBase {
   indexed_source_count: number;
   last_synced_at: string | null;
   published_at: string | null;
+  speech_lexicon: {
+    artifact_id: string;
+    compiler_version: string;
+    source_revision_sha256: string;
+    content_sha256: string;
+    generated_at: string;
+    source_count: number;
+    entry_count: number;
+    coverage: Record<string, number>;
+  } | null;
+  serving_revision: KnowledgeServingRevision | null;
+  has_pending_changes: boolean;
   sources: KnowledgeSource[];
   agent_bindings: KnowledgeAgentBinding[];
   crawls: KnowledgeCrawl[];
@@ -1772,6 +1811,20 @@ class ApiClient {
     return this.request<KnowledgeBase>(`/api/v1/knowledge/${id}/approval`, {
       method: 'POST',
       body: JSON.stringify({ approved }),
+    });
+  }
+
+  async listKnowledgeReleases(id: string) {
+    return this.request<KnowledgeServingRevision[]>(`/api/v1/knowledge/${id}/releases`);
+  }
+
+  async reactivateKnowledgeRelease(id: string, revisionId: string, data: {
+    expected_current_revision_id: string | null;
+    reason: string;
+  }) {
+    return this.request<KnowledgeBase>(`/api/v1/knowledge/${id}/releases/${revisionId}/activate`, {
+      method: 'POST',
+      body: JSON.stringify(data),
     });
   }
 

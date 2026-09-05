@@ -3,12 +3,14 @@ import json
 import httpx
 import pytest
 
+from app.api.v1.endpoints import runtime as runtime_endpoint
 from app.core.config import settings
 from app.models.agent import Agent
 from app.providers.elevenlabs import ElevenLabsClient, ElevenLabsError
 from app.realtime import elevenlabs_stream
 from app.realtime.elevenlabs_stream import ElevenLabsTTSStream
 from app.realtime.session import audio_with_fallback
+from tests.knowledge_test_utils import publish_test_knowledge
 
 
 @pytest.mark.asyncio
@@ -254,18 +256,49 @@ async def test_elevenlabs_agent_runtime_uses_vav_readiness_pipeline(
     db,
     monkeypatch,
 ):
+    async def verify_route(**_kwargs):
+        return None
+
     async def synthesize_ok(self, *, voice_id: str, language: str, speed: float = 1.0):
         assert voice_id == "voice-a"
         assert language == "en"
         return b"preview"
 
+    async def sarvam_synthesize_ok(*_args, **_kwargs):
+        return b"RIFFaudio"
+
+    async def readiness_ok(*_args, **_kwargs):
+        return None
+
     monkeypatch.setattr(ElevenLabsClient, "synthesize_voice_preview", synthesize_ok)
+    monkeypatch.setattr(
+        runtime_endpoint.SarvamAIClient,
+        "synthesize_voice_preview",
+        sarvam_synthesize_ok,
+    )
+    monkeypatch.setattr(runtime_endpoint, "_sarvam_stt_readiness_probe", readiness_ok)
+    monkeypatch.setattr(
+        runtime_endpoint.OpenAIProviderClient,
+        "tool_readiness_probe",
+        readiness_ok,
+    )
+    monkeypatch.setattr(runtime_endpoint, "verify_twilio_route_ownership", verify_route)
     monkeypatch.setattr(settings, "sarvam_api_key", "sarvam-test-key-long-enough")
     monkeypatch.setattr(settings, "elevenlabs_api_key", "elevenlabs-test-key-long-enough")
     monkeypatch.setattr(settings, "openai_api_key", "openai-test-key-long-enough")
     monkeypatch.setattr(settings, "twilio_account_sid", "ACtest")
     monkeypatch.setattr(settings, "twilio_auth_token", "twilio-test-token")
     monkeypatch.setattr(settings, "base_url", "https://voice.example.com")
+    saved = await client.put(
+        "/api/v1/runtime/credentials/twilio/account",
+        headers=auth_headers,
+        json={
+            "account_sid": "AC" + "3" * 32,
+            "auth_token": "workspace-twilio-test-token",
+            "default_from_number": "+15551234567",
+        },
+    )
+    assert saved.status_code == 200
     agent = Agent(
         tenant_id=tenant.id,
         name="ElevenLabs concierge",
@@ -276,6 +309,13 @@ async def test_elevenlabs_agent_runtime_uses_vav_readiness_pipeline(
         supported_languages=["en"],
     )
     db.add(agent)
+    await db.flush()
+    await publish_test_knowledge(
+        db,
+        tenant_id=tenant.id,
+        agent=agent,
+        label="ElevenLabs clinic",
+    )
     await db.commit()
 
     configured = await client.put(
@@ -301,12 +341,15 @@ async def test_elevenlabs_agent_runtime_uses_vav_readiness_pipeline(
 
     assert configured.status_code == 200
     assert configured.json()["primary_speech_provider"] == "elevenlabs"
-    assert configured.json()["ready"] is True
+    assert configured.json()["ready"] is False
     assert tested.status_code == 200
     assert tested.json()["checks"]["stt_credential"] is True
     assert tested.json()["checks"]["tts_credential"] is True
     assert tested.json()["checks"]["speech_provider_match"] is True
     assert tested.json()["checks"]["tts_provider_live"] is True
+    assert tested.json()["checks"]["fallback_tts_provider_live"] is True
+    assert tested.json()["checks"]["stt_provider_live"] is True
+    assert tested.json()["checks"]["llm_provider_live"] is True
 
 
 @pytest.mark.asyncio
@@ -317,16 +360,47 @@ async def test_elevenlabs_live_readiness_fails_closed_when_synthesis_fails(
     db,
     monkeypatch,
 ):
+    async def verify_route(**_kwargs):
+        return None
+
     async def synthesize_failed(self, *, voice_id: str, language: str, speed: float = 1.0):
         raise ElevenLabsError("selected voice is unavailable", status_code=403)
 
+    async def sarvam_synthesize_ok(*_args, **_kwargs):
+        return b"RIFFaudio"
+
+    async def readiness_ok(*_args, **_kwargs):
+        return None
+
     monkeypatch.setattr(ElevenLabsClient, "synthesize_voice_preview", synthesize_failed)
+    monkeypatch.setattr(
+        runtime_endpoint.SarvamAIClient,
+        "synthesize_voice_preview",
+        sarvam_synthesize_ok,
+    )
+    monkeypatch.setattr(runtime_endpoint, "_sarvam_stt_readiness_probe", readiness_ok)
+    monkeypatch.setattr(
+        runtime_endpoint.OpenAIProviderClient,
+        "tool_readiness_probe",
+        readiness_ok,
+    )
+    monkeypatch.setattr(runtime_endpoint, "verify_twilio_route_ownership", verify_route)
     monkeypatch.setattr(settings, "sarvam_api_key", "sarvam-test-key-long-enough")
     monkeypatch.setattr(settings, "elevenlabs_api_key", "elevenlabs-test-key-long-enough")
     monkeypatch.setattr(settings, "openai_api_key", "openai-test-key-long-enough")
     monkeypatch.setattr(settings, "twilio_account_sid", "ACtest")
     monkeypatch.setattr(settings, "twilio_auth_token", "twilio-test-token")
     monkeypatch.setattr(settings, "base_url", "https://voice.example.com")
+    saved = await client.put(
+        "/api/v1/runtime/credentials/twilio/account",
+        headers=auth_headers,
+        json={
+            "account_sid": "AC" + "4" * 32,
+            "auth_token": "workspace-twilio-test-token",
+            "default_from_number": "+15551234567",
+        },
+    )
+    assert saved.status_code == 200
     agent = Agent(
         tenant_id=tenant.id,
         name="Broken ElevenLabs voice",
@@ -337,6 +411,13 @@ async def test_elevenlabs_live_readiness_fails_closed_when_synthesis_fails(
         supported_languages=["en"],
     )
     db.add(agent)
+    await db.flush()
+    await publish_test_knowledge(
+        db,
+        tenant_id=tenant.id,
+        agent=agent,
+        label="Broken voice clinic",
+    )
     await db.commit()
     await client.put(
         f"/api/v1/runtime/agents/{agent.id}",
@@ -352,6 +433,9 @@ async def test_elevenlabs_live_readiness_fails_closed_when_synthesis_fails(
     assert tested.status_code == 200
     assert tested.json()["ready"] is False
     assert tested.json()["checks"]["tts_provider_live"] is False
+    assert tested.json()["checks"]["fallback_tts_provider_live"] is True
+    assert tested.json()["checks"]["stt_provider_live"] is True
+    assert tested.json()["checks"]["llm_provider_live"] is True
     assert tested.json()["blockers"] == [
-        "ElevenLabs live synthesis failed: selected voice is unavailable"
+        "ElevenLabs live TTS synthesis failed: selected voice is unavailable"
     ]

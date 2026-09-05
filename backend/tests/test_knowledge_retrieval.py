@@ -1,8 +1,11 @@
 """Focused tests for provider-neutral knowledge ranking."""
 
 from collections import Counter
+from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
+from sqlalchemy.dialects import postgresql
 
 from app.models.agent import Agent, AgentKnowledgeBinding, KnowledgeBase, KnowledgeSource
 from app.services import knowledge_retrieval
@@ -49,8 +52,48 @@ def test_semantic_variant_retrieves_source_worded_as_inception():
         limit=4,
     )
 
+    assert plan.recovered_terms == ()
     assert matches
     assert "inception in 2003" in matches[0].text
+
+
+def test_response_style_words_do_not_block_division_detail_retrieval():
+    documents = [
+        (
+            "Al Zaabi Healthcare – Al Zaabi Group",
+            "Al Zaabi Healthcare provides primary care, preventive medical services, "
+            "and healthcare packages through Adam & Eve Specialized Medical Centre.",
+        )
+    ]
+    plan = build_contextual_query_plan(
+        "Tell me briefly about the healthcare division.",
+        supplied_variants=("Al Zaabi Group. Tell me briefly about the healthcare division.",),
+        terminology=("HEALTHCARE Al", "DIVISIONS Al"),
+    )
+
+    matches = knowledge_retrieval._rank_contextual_knowledge(
+        plan.variants,
+        documents,
+        limit=4,
+    )
+
+    assert matches
+    assert "primary care" in matches[0].text
+
+
+def test_service_capability_query_ignores_privacy_policy_advisers():
+    matches = rank_knowledge(
+        "Can Al Zaabi Group provide legal services for us?",
+        [
+            (
+                "Privacy Policy – Al Zaabi Group",
+                "Professional advisers including lawyers provide legal and accounting "
+                "services to the company for compliance purposes.",
+            )
+        ],
+    )
+
+    assert matches == []
 
 
 def test_structured_retrieval_keeps_parent_and_subsidiary_dates_separate():
@@ -315,6 +358,93 @@ def test_phone_number_query_matches_tel_labeled_contact_evidence():
 
     assert matches
     assert "+971 2 665 9998" in matches[0].text
+
+
+def test_postgres_revision_query_unions_bounded_contact_and_broad_fallbacks():
+    tenant_id = uuid4()
+    revision_id = uuid4()
+
+    statement = knowledge_retrieval._postgres_serving_revision_source_query(
+        tenant_id=tenant_id,
+        serving_revision_id=revision_id,
+        query="What is the phone number for the company group?",
+        contact_query=True,
+        broad_query=True,
+    )
+    sql = " ".join(
+        str(
+            statement.compile(
+                dialect=postgresql.dialect(),
+                compile_kwargs={"literal_binds": True},
+            )
+        ).split()
+    ).lower()
+
+    assert sql.count("union all") == 2
+    assert "revision_fts_candidates" in sql
+    assert "revision_contact_candidates" in sql
+    assert "revision_broad_title_candidates" in sql
+    assert "group by revision_candidate_union.original_source_id" in sql
+    assert "limit 32" in sql
+    assert "limit 12" in sql
+    assert "limit 8" in sql
+    assert sql.endswith("limit 48")
+    # Every candidate lane and the final content lookup are independently
+    # tenant/revision scoped. This protects a pinned call even if an ID were
+    # ever duplicated or a future join were widened.
+    assert sql.count(f"tenant_id = '{tenant_id}'") == 4
+    assert sql.count(f"serving_revision_id = '{revision_id}'") == 4
+
+
+def test_postgres_revision_query_keeps_fallback_bounded_without_fts_terms():
+    statement = knowledge_retrieval._postgres_serving_revision_source_query(
+        tenant_id=uuid4(),
+        serving_revision_id=uuid4(),
+        query="Tell me about it",
+        contact_query=False,
+        broad_query=True,
+    )
+    sql = " ".join(
+        str(
+            statement.compile(
+                dialect=postgresql.dialect(),
+                compile_kwargs={"literal_binds": True},
+            )
+        ).split()
+    ).lower()
+
+    assert "revision_broad_title_candidates" in sql
+    assert "revision_fts_candidates" not in sql
+    assert "to_tsquery" not in sql
+    assert "limit 8" in sql
+    assert sql.endswith("limit 48")
+
+
+@pytest.mark.asyncio
+async def test_postgres_stopword_only_revision_query_avoids_source_read():
+    class NoSourceReadSession:
+        @staticmethod
+        def get_bind():
+            return SimpleNamespace(dialect=SimpleNamespace(name="postgresql"))
+
+        @staticmethod
+        async def execute(*_args, **_kwargs):
+            raise AssertionError("stopword-only retrieval must not query revision sources")
+
+    result = await knowledge_retrieval._retrieve_serving_revision_context(
+        NoSourceReadSession(),
+        tenant_id=uuid4(),
+        revision=SimpleNamespace(id=uuid4(), knowledge_content=None),
+        query_plan=knowledge_retrieval.ContextualQueryPlan(
+            primary_query="Please tell me",
+            variants=("Please tell me",),
+            recovered_terms=(),
+        ),
+        limit=6,
+        max_context_chars=knowledge_retrieval.MAX_CONTEXT_CHARS,
+    )
+
+    assert result is None
 
 
 def test_phone_query_excludes_other_organizations_on_same_contact_page():

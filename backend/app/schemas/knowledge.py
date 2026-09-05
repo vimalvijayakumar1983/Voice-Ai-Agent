@@ -133,6 +133,7 @@ class KnowledgeSourceResponse(BaseModel):
     error_message: str | None
     source_metadata: dict | None
     retrieval_ready: bool = False
+    company_fact_count: int = 0
     extracted_character_count: int = 0
     last_synced_at: datetime | None
     created_at: datetime
@@ -191,6 +192,33 @@ class KnowledgeCrawlResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class KnowledgeSpeechLexiconResponse(BaseModel):
+    artifact_id: UUID
+    compiler_version: str
+    source_revision_sha256: str
+    content_sha256: str
+    generated_at: datetime
+    source_count: int
+    entry_count: int
+    coverage: dict[str, int | float]
+
+
+class KnowledgeServingRevisionResponse(BaseModel):
+    revision_id: UUID
+    compiler_version: str
+    source_revision_sha256: str
+    chunk_revision_sha256: str
+    fact_revision_sha256: str
+    entity_revision_sha256: str
+    content_sha256: str
+    published_at: datetime
+    source_count: int
+    chunk_count: int
+    fact_count: int
+    entity_count: int
+    speech_lexicon_artifact_id: UUID
+
+
 class KnowledgeBaseResponse(BaseModel):
     id: UUID
     name: str
@@ -208,6 +236,9 @@ class KnowledgeBaseResponse(BaseModel):
     indexed_source_count: int
     last_synced_at: datetime | None
     published_at: datetime | None
+    speech_lexicon: KnowledgeSpeechLexiconResponse | None = None
+    serving_revision: KnowledgeServingRevisionResponse | None = None
+    has_pending_changes: bool = False
     sources: list[KnowledgeSourceResponse] = Field(default_factory=list)
     agent_bindings: list[KnowledgeAgentBindingResponse] = Field(default_factory=list)
     crawls: list[KnowledgeCrawlResponse] = Field(default_factory=list)
@@ -270,6 +301,20 @@ class AgentKnowledgeBindRequest(BaseModel):
 
 class KnowledgeApprovalRequest(BaseModel):
     approved: bool
+
+
+class KnowledgeReleaseReactivationRequest(BaseModel):
+    """Compare-and-swap contract for an audited historical release restore."""
+
+    expected_current_revision_id: UUID | None
+    reason: Annotated[str, Field(min_length=3, max_length=500)]
+
+    model_config = {"extra": "forbid"}
+
+    @field_validator("reason", mode="before")
+    @classmethod
+    def clean_reason(cls, value: object) -> object:
+        return value.strip() if isinstance(value, str) else value
 
 
 def _validate_knowledge_url(value: HttpUrl) -> None:

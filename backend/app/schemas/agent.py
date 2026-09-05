@@ -6,6 +6,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.services.agent_catalog import language_code
+from app.services.conversation_scope import KnowledgeCompanyScope
 from app.services.provider_variables import validate_provider_variables
 
 
@@ -47,6 +48,7 @@ def validate_language_configuration(
 
 
 class AgentCreate(BaseModel):
+    knowledge_company_scope: KnowledgeCompanyScope | None = None
     name: str = Field(min_length=2, max_length=255)
     description: str | None = Field(None, max_length=2000)
     system_prompt: str = Field(min_length=10, max_length=4000)
@@ -109,6 +111,7 @@ class AgentCreate(BaseModel):
 
 
 class AgentUpdate(BaseModel):
+    knowledge_company_scope: KnowledgeCompanyScope | None = None
     name: str | None = Field(None, min_length=2, max_length=255)
     description: str | None = Field(None, max_length=2000)
     system_prompt: str | None = Field(None, min_length=10, max_length=4000)
@@ -183,6 +186,7 @@ class AgentUpdate(BaseModel):
 
 
 class AgentResponse(BaseModel):
+    knowledge_company_scope: KnowledgeCompanyScope | None = None
     id: UUID
     tenant_id: UUID
     name: str

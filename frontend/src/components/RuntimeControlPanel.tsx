@@ -41,9 +41,12 @@ export default function RuntimeControlPanel({ agent, profile, onClose, onChange 
     llm_provider: form.llm_provider,
     llm_model: form.llm_model,
     voice_runtime: form.voice_runtime,
+    knowledge_turn_mode: form.knowledge_turn_mode,
     stt_language: form.stt_language,
     stt_model: form.stt_model,
     tts_delivery_mode: form.tts_delivery_mode,
+    inworld_realtime_tts_model: form.inworld_realtime_tts_model,
+    diagnostic_recording_mode: form.diagnostic_recording_mode,
     max_concurrent_calls: Number(form.max_concurrent_calls),
     daily_call_limit: Number(form.daily_call_limit),
     monthly_budget_cents: Number(form.monthly_budget_cents),
@@ -56,9 +59,12 @@ export default function RuntimeControlPanel({ agent, profile, onClose, onChange 
     llm_provider: profile.llm_provider,
     llm_model: profile.llm_model,
     voice_runtime: profile.voice_runtime,
+    knowledge_turn_mode: profile.knowledge_turn_mode,
     stt_language: profile.stt_language,
     stt_model: profile.stt_model,
     tts_delivery_mode: profile.tts_delivery_mode,
+    inworld_realtime_tts_model: profile.inworld_realtime_tts_model,
+    diagnostic_recording_mode: profile.diagnostic_recording_mode,
     max_concurrent_calls: Number(profile.max_concurrent_calls),
     daily_call_limit: Number(profile.daily_call_limit),
     monthly_budget_cents: Number(profile.monthly_budget_cents),
@@ -137,6 +143,9 @@ export default function RuntimeControlPanel({ agent, profile, onClose, onChange 
               setForm({
                 ...form,
                 voice_runtime: voiceRuntime,
+                knowledge_turn_mode: voiceRuntime === 'inworld_realtime'
+                  ? form.knowledge_turn_mode
+                  : 'tool_loop',
                 llm_provider: voiceRuntime === 'inworld_realtime' ? 'inworld' : form.llm_provider,
                 llm_model: voiceRuntime === 'inworld_realtime' && (form.llm_provider !== 'inworld' || form.llm_model === 'auto')
                   ? 'openai/gpt-4o-mini'
@@ -146,27 +155,87 @@ export default function RuntimeControlPanel({ agent, profile, onClose, onChange 
               <option value="inworld_realtime">Native Inworld Realtime · production pilot</option>
               <option value="pipeline">Classic component pipeline · rollback</option>
             </select>
-            <p className="form-hint">Native mode uses one persistent Inworld speech-to-speech session for transcription, semantic turn-taking, reasoning, interruptions, and TTS. The VAV knowledge base remains available through a required grounded tool.</p>
+            <p className="form-hint">Native mode uses one persistent Inworld speech-to-speech session for transcription, semantic turn-taking, reasoning, interruptions, and TTS. Choose the grounded knowledge policy separately below.</p>
+          </div>
+        ) : null}
+        {inworldRuntime && form.voice_runtime === 'inworld_realtime' ? (
+          <div className="form-group">
+            <label htmlFor="runtime-knowledge-turn-mode">Knowledge turn policy</label>
+            <select
+              id="runtime-knowledge-turn-mode"
+              value={form.knowledge_turn_mode}
+              onChange={(event) => setForm({
+                ...form,
+                knowledge_turn_mode: event.target.value as RuntimeProfile['knowledge_turn_mode'],
+              })}
+            >
+              <option value="tool_loop">Grounded tool loop · control</option>
+              <option value="single_pass_experimental">Single pass · experimental canary</option>
+            </select>
+            <p className="form-hint">The control lets Inworld invoke approved knowledge tools. The canary waits for the final transcript, performs one approved evidence lookup, then requests one tool-free reply.</p>
+            {form.knowledge_turn_mode === 'single_pass_experimental' ? (
+              <p className="form-hint" role="note">Agent-level A/B warning: this is not a per-call split. Every new call for this agent uses the experimental single-pass path until you switch back to the tool-loop control. Save and pass readiness before activation.</p>
+            ) : null}
           </div>
         ) : null}
         <div className="form-group">
           <label htmlFor="runtime-telephony">Telephony edge</label>
-          <select id="runtime-telephony" value={form.telephony_provider} disabled={inworldRuntime} onChange={(event) => setForm({ ...form, telephony_provider: event.target.value as RuntimeProfile['telephony_provider'] })}>
+          <select id="runtime-telephony" value={form.telephony_provider} disabled={inworldRuntime} onChange={(event) => {
+            const telephonyProvider = event.target.value as RuntimeProfile['telephony_provider'];
+            setForm({
+              ...form,
+              telephony_provider: telephonyProvider,
+              diagnostic_recording_mode: telephonyProvider === 'livekit_sip'
+                ? form.diagnostic_recording_mode
+                : 'off',
+            });
+          }}>
             <option value="twilio">Twilio Media Streams</option>
             <option value="livekit_sip">Etisalat SIP via LiveKit</option>
           </select>
           <p className="form-hint">LiveKit SIP also requires the encrypted trunk credentials in Settings.</p>
         </div>
         <div className="form-group">
+          <label htmlFor="runtime-diagnostic-recording">Diagnostic call audio policy</label>
+          <select
+            id="runtime-diagnostic-recording"
+            value={form.diagnostic_recording_mode}
+            onChange={(event) => setForm({
+              ...form,
+              diagnostic_recording_mode: event.target.value as RuntimeProfile['diagnostic_recording_mode'],
+            })}
+          >
+            <option value="off">Off · safe default</option>
+            <option value="livekit_egress_explicit_consent" disabled={form.telephony_provider !== 'livekit_sip'}>
+              Request LiveKit diagnostic capture · explicit consent
+            </option>
+          </select>
+          <p className="form-hint">This saves an opt-in policy request only. It does not start LiveKit Egress, store audio, or make VAV playback available.</p>
+          {form.diagnostic_recording_mode !== 'off' ? (
+            <p className="form-hint" role="note">Activation remains blocked until every call requires explicit recording consent—absence is not consent—and LiveKit Egress, encrypted regional storage, retention, deletion, and access auditing are verified.</p>
+          ) : null}
+        </div>
+        <div className="form-group">
           <label htmlFor="runtime-speech-provider">Speech output</label>
           <input
             id="runtime-speech-provider"
-            value={inworldRuntime ? (form.voice_runtime === 'inworld_realtime' ? 'Inworld Realtime + TTS-2' : 'Inworld STT + TTS-2 components') : speechProvider === 'elevenlabs' ? 'ElevenLabs Flash v2.5' : 'Sarvam Bulbul v3'}
+            value={inworldRuntime ? (form.voice_runtime === 'inworld_realtime' ? `Inworld Realtime + ${form.inworld_realtime_tts_model}` : 'Inworld STT + TTS-2 components') : speechProvider === 'elevenlabs' ? 'ElevenLabs Flash v2.5' : 'Sarvam Bulbul v3'}
             readOnly
             aria-readonly="true"
           />
           <p className="form-hint">This follows the agent&apos;s selected voice provider. Native Realtime uses the same Inworld workspace credential for the complete session.</p>
         </div>
+        {inworldRuntime && form.voice_runtime === 'inworld_realtime' ? (
+          <div className="form-group">
+            <label htmlFor="runtime-realtime-tts-model">Realtime voice engine</label>
+            <select id="runtime-realtime-tts-model" value={form.inworld_realtime_tts_model} onChange={(event) => setForm({ ...form, inworld_realtime_tts_model: event.target.value as RuntimeProfile['inworld_realtime_tts_model'] })}>
+              <option value="inworld-tts-1.5-max">TTS 1.5 Max · recommended quality and speed</option>
+              <option value="inworld-tts-1.5-mini">TTS 1.5 Mini · lowest latency</option>
+              <option value="inworld-tts-2">TTS-2 · expressive rollback option</option>
+            </select>
+            <p className="form-hint">Saved per agent, verified by readiness, and stamped into every call trace. Start with Max; use Mini only when the latency gate requires it.</p>
+          </div>
+        ) : null}
         <div className="form-group">
           <label htmlFor="runtime-llm">LLM route</label>
           <select id="runtime-llm" value={`${form.llm_provider}:${form.llm_model}`} onChange={(event) => {

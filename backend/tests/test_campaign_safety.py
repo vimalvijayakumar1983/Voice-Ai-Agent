@@ -314,7 +314,7 @@ async def test_worker_uses_tenant_dnc_and_routes_smallest_agents(tenant, db, mon
     monkeypatch.setattr(
         campaign_tasks,
         "get_telephony_provider",
-        lambda: pytest.fail("Twilio must not be used for a Smallest.ai agent"),
+        lambda **_kwargs: pytest.fail("Twilio must not be used for a Smallest.ai agent"),
     )
     apply_async = Mock()
     monkeypatch.setattr(campaign_tasks.run_campaign, "apply_async", apply_async)
@@ -386,7 +386,11 @@ async def test_worker_routes_twilio_only_for_twilio_agent_and_records_failure(
     )
     monkeypatch.setattr(database, "async_session_factory", session_factory)
     monkeypatch.setattr(settings, "twilio_default_from_number", "+971503333333")
-    monkeypatch.setattr(campaign_tasks, "get_telephony_provider", lambda: twilio_provider)
+    monkeypatch.setattr(
+        campaign_tasks,
+        "get_telephony_provider",
+        lambda **_kwargs: twilio_provider,
+    )
     monkeypatch.setattr(
         campaign_tasks,
         "get_smallest_client",

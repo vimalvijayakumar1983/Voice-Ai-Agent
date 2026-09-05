@@ -18,6 +18,14 @@ InworldSTTModel = Literal[
     "soniox/stt-rt-v4",
     "inworld/inworld-stt-1",
 ]
+InworldRealtimeTTSModel = Literal[
+    "inworld-tts-1.5-max",
+    "inworld-tts-1.5-mini",
+    "inworld-tts-2",
+]
+
+DiagnosticRecordingMode = Literal["off", "livekit_egress_explicit_consent"]
+KnowledgeTurnMode = Literal["tool_loop", "single_pass_experimental"]
 
 
 class RuntimeProfileUpdate(BaseModel):
@@ -27,9 +35,12 @@ class RuntimeProfileUpdate(BaseModel):
     llm_provider: Literal["openai", "inworld"] = "openai"
     llm_model: str = Field("gpt-4o-mini", min_length=2, max_length=100)
     voice_runtime: Literal["pipeline", "inworld_realtime"] = "pipeline"
+    knowledge_turn_mode: KnowledgeTurnMode = "tool_loop"
     stt_language: str = Field("auto", min_length=2, max_length=30)
     stt_model: InworldSTTModel = "auto"
     tts_delivery_mode: Literal["stable", "balanced", "creative"] = "balanced"
+    inworld_realtime_tts_model: InworldRealtimeTTSModel = "inworld-tts-1.5-max"
+    diagnostic_recording_mode: DiagnosticRecordingMode = "off"
     max_concurrent_calls: int = Field(1, ge=1, le=100)
     daily_call_limit: int = Field(100, ge=1, le=100_000)
     monthly_budget_cents: int = Field(5000, ge=100, le=100_000_000)
@@ -69,6 +80,11 @@ class RuntimeProfileUpdate(BaseModel):
             )
         if self.voice_runtime == "inworld_realtime" and model == "auto":
             raise ValueError("Native Inworld Realtime requires an explicit production model route")
+        if (
+            self.knowledge_turn_mode == "single_pass_experimental"
+            and self.voice_runtime != "inworld_realtime"
+        ):
+            raise ValueError("Experimental single-pass knowledge requires Native Inworld Realtime")
         return self
 
 
@@ -82,9 +98,12 @@ class RuntimeProfileResponse(BaseModel):
     llm_provider: str
     llm_model: str
     voice_runtime: Literal["pipeline", "inworld_realtime"]
+    knowledge_turn_mode: KnowledgeTurnMode
     stt_language: str
     stt_model: InworldSTTModel
     tts_delivery_mode: Literal["stable", "balanced", "creative"]
+    inworld_realtime_tts_model: InworldRealtimeTTSModel
+    diagnostic_recording_mode: DiagnosticRecordingMode
     max_concurrent_calls: int
     daily_call_limit: int
     monthly_budget_cents: int

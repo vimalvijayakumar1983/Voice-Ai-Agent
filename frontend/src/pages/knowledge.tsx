@@ -35,10 +35,15 @@ import {
   KnowledgeBase,
   KnowledgeCrawl,
   KnowledgeProcessingMode,
+  KnowledgeServingRevision,
   KnowledgeScope,
   KnowledgeSource,
   VoiceAgent,
 } from '@/lib/api';
+import {
+  canBindKnowledgeAgent,
+  knowledgeBindingGuidance,
+} from '@/lib/knowledge-binding.cjs';
 import styles from '@/styles/Knowledge.module.css';
 
 type Notice = { type: 'success' | 'error' | 'info'; text: string };
@@ -79,8 +84,13 @@ export default function KnowledgeStudio() {
   const [sourceMode, setSourceMode] = useState<SourceMode>('crawl');
   const [sitemapUrls, setSitemapUrls] = useState<string[]>([]);
   const [selectedSitemapUrls, setSelectedSitemapUrls] = useState<Set<string>>(new Set());
+  const [releaseHistory, setReleaseHistory] = useState<KnowledgeServingRevision[]>([]);
+  const [releaseHistoryKnowledgeBaseId, setReleaseHistoryKnowledgeBaseId] = useState<string | null>(null);
+  const [rollbackRevisionId, setRollbackRevisionId] = useState('');
+  const [rollbackReason, setRollbackReason] = useState('');
   const detailHeadingRef = useRef<HTMLHeadingElement>(null);
   const completedCrawlSyncRef = useRef<Set<string>>(new Set());
+  const selectedIdRef = useRef<string | null>(null);
 
   useEffect(() => {
     let active = true;
@@ -102,6 +112,38 @@ export default function KnowledgeStudio() {
   }, []);
 
   const selected = knowledgeBases.find((kb) => kb.id === selectedId) || null;
+
+  useEffect(() => {
+    selectedIdRef.current = selectedId;
+  }, [selectedId]);
+
+  useEffect(() => {
+    let active = true;
+    if (!selectedId) return () => { active = false; };
+    api.listKnowledgeReleases(selectedId)
+      .then((releases) => {
+        if (!active) return;
+        setReleaseHistory(releases);
+        setReleaseHistoryKnowledgeBaseId(selectedId);
+        setRollbackRevisionId('');
+        setRollbackReason('');
+      })
+      .catch((error) => {
+        if (!active) return;
+        setReleaseHistory([]);
+        setReleaseHistoryKnowledgeBaseId(selectedId);
+        setNotice({ type: 'error', text: errorMessage(error, 'Could not load release history.') });
+      });
+    return () => { active = false; };
+  }, [selectedId]);
+
+  const visibleReleaseHistory = releaseHistoryKnowledgeBaseId === selectedId ? releaseHistory : [];
+  const rollbackCandidates = visibleReleaseHistory.filter(
+    (release) => release.revision_id !== selected?.serving_revision?.revision_id,
+  );
+  const effectiveRollbackRevisionId = rollbackCandidates.some(
+    (release) => release.revision_id === rollbackRevisionId,
+  ) ? rollbackRevisionId : rollbackCandidates[0]?.revision_id || '';
   const selectedHasActiveRepair = Boolean(selected?.sources.some((source) => {
     const recovery = sourceRecovery(source);
     return recovery?.status === 'queued' || recovery?.status === 'processing';
@@ -214,6 +256,18 @@ export default function KnowledgeStudio() {
     try {
       updated = await action();
       replaceKnowledgeBase(updated);
+      if (key === 'approve' && updated.id === selectedIdRef.current) {
+        try {
+          const releases = await api.listKnowledgeReleases(updated.id);
+          if (updated.id === selectedIdRef.current) {
+            setReleaseHistory(releases);
+            setReleaseHistoryKnowledgeBaseId(updated.id);
+          }
+        } catch {
+          // Approval succeeded; the next selection or reload retries this
+          // read-only history refresh without misreporting publication failure.
+        }
+      }
     } catch (error) {
       setNotice({ type: 'error', text: errorMessage(error, 'The knowledge operation failed.') });
       setWorking(null);
@@ -249,6 +303,34 @@ export default function KnowledgeStudio() {
         type: 'error',
         text: `${success} Automatic agent synchronization did not complete: ${errorMessage(error, 'Check the agent provider status.')}`,
       });
+    } finally {
+      setWorking(null);
+    }
+  };
+
+  const reactivateRelease = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!selected || !effectiveRollbackRevisionId || rollbackReason.trim().length < 3) return;
+    const target = visibleReleaseHistory.find(
+      (release) => release.revision_id === effectiveRollbackRevisionId,
+    );
+    if (!target) return;
+    if (!window.confirm(`Reactivate release ${target.revision_id.slice(0, 12)} for new calls? Calls already running keep their existing release.`)) return;
+    setWorking('reactivate-release');
+    setNotice(null);
+    try {
+      const updated = await api.reactivateKnowledgeRelease(selected.id, target.revision_id, {
+        expected_current_revision_id: selected.serving_revision?.revision_id || null,
+        reason: rollbackReason.trim(),
+      });
+      replaceKnowledgeBase(updated);
+      const releases = await api.listKnowledgeReleases(selected.id);
+      setReleaseHistory(releases);
+      setRollbackRevisionId(releases.find((release) => release.revision_id !== target.revision_id)?.revision_id || '');
+      setRollbackReason('');
+      setNotice({ type: 'success', text: 'The selected immutable release and its speech lexicon are live for new calls. Draft content still requires review.' });
+    } catch (error) {
+      setNotice({ type: 'error', text: errorMessage(error, 'The historical release could not be reactivated.') });
     } finally {
       setWorking(null);
     }
@@ -421,12 +503,12 @@ export default function KnowledgeStudio() {
 
   const removeSource = async (source: KnowledgeSource) => {
     if (!selected || !window.confirm(
-      `Remove ${source.name}? This permanently removes it from VAV and Smallest.ai. If Smallest grouped multiple URLs into one crawl, those grouped URLs will also be removed.`,
+      `Stage removal of ${source.name}? It will be removed from the editable source set and Smallest.ai now. If a VAV release is already live, new VAV calls keep using that approved release until you approve these changes or choose “Revoke live release now.” Historical releases remain for audit. If Smallest grouped multiple URLs into one crawl, those grouped URLs will also be removed.`,
     )) return;
     await runAction(
       `delete-source-${source.id}`,
       () => api.deleteKnowledgeSource(selected.id, source.id),
-      `${source.name} was removed from VAV and Smallest.ai.`,
+      `${source.name} was removed from the draft and Smallest.ai. Approve the pending VAV release to make the removal live.`,
       { syncPendingBindings: true },
     );
   };
@@ -617,7 +699,7 @@ export default function KnowledgeStudio() {
                 <div className={styles.detailIdentity}>
                   <div className={styles.heroIcon}><BookOpenCheck size={23} /></div>
                   <div>
-                    <div className={styles.eyebrowRow}><span className="page-kicker">{scopeLabel(selected)}</span><StatusBadge status={selected.sync_status} /><span className={`badge ${selected.approval_status === 'approved' ? 'badge-success' : 'badge-neutral'}`}>{selected.approval_status}</span></div>
+                    <div className={styles.eyebrowRow}><span className="page-kicker">{scopeLabel(selected)}</span><StatusBadge status={selected.sync_status} /><span className={`badge ${selected.approval_status === 'approved' ? 'badge-success' : 'badge-neutral'}`}>{selected.approval_status === 'approved' ? 'approved' : selected.serving_revision ? 'changes pending' : 'draft'}</span></div>
                     <h2 ref={detailHeadingRef} id="knowledge-detail-heading" tabIndex={-1}>{selected.name}</h2>
                     <p>{selected.description || 'No description added yet.'}</p>
                   </div>
@@ -679,16 +761,57 @@ export default function KnowledgeStudio() {
 
               <section className={styles.section} aria-labelledby="governance-heading">
                 <div className={styles.sectionHeading}>
-                  <div><span className={styles.sectionIcon}><ShieldCheck size={15} /></span><div><h3 id="governance-heading">Approval & agent access</h3><p>Only provider-indexed, approved knowledge can be published to a live agent.</p></div></div>
+                  <div><span className={styles.sectionIcon}><ShieldCheck size={15} /></span><div><h3 id="governance-heading">Approval & agent access</h3><p>Calls use the last approved immutable release while newer changes remain in draft.</p></div></div>
                 </div>
                 <div className={styles.governanceGrid}>
                   <div className={styles.approvalCard}>
                     <span className={styles.miniLabel}>Release gate</span>
-                    <strong>{selected.approval_status === 'approved' ? 'Approved for agent use' : 'Draft—not available to agents'}</strong>
+                    <strong>{selected.approval_status === 'approved' ? 'Approved for agent use' : selected.serving_revision ? 'Draft changes pending approval; last approved release remains live' : 'Draft—not available to agents'}</strong>
+                    {selected.serving_revision && (
+                      <p>
+                        Live release {selected.serving_revision.revision_id.slice(0, 12)} · {selected.serving_revision.source_count} sources · {selected.serving_revision.chunk_count} retrieval chunks · published {new Date(selected.serving_revision.published_at).toLocaleString()}. Calls remain pinned to this immutable release until the draft passes approval.
+                      </p>
+                    )}
                     <p>{selected.sync_status === 'ready' ? 'Every source has VAV-searchable content. An owner or admin may change approval.' : 'Make every source VAV-searchable before approval becomes available.'}</p>
-                    {canGovernKnowledge && <button type="button" className={`btn ${selected.approval_status === 'approved' ? 'btn-secondary' : 'btn-primary'} btn-sm`} disabled={working !== null || (selected.approval_status !== 'approved' && selected.sync_status !== 'ready')} onClick={() => runAction('approve', () => api.approveKnowledgeBase(selected.id, selected.approval_status !== 'approved'), selected.approval_status === 'approved' ? 'Approval removed; bound agents require review.' : 'Knowledge approved for agent binding.')}>
-                      {selected.approval_status === 'approved' ? <X size={12} /> : <Check size={12} />}{selected.approval_status === 'approved' ? 'Return to draft' : 'Approve knowledge'}
+                    {selected.speech_lexicon ? (
+                      <p role="status">
+                        Voice recognition artifact {selected.speech_lexicon.artifact_id.slice(0, 12)} · {selected.speech_lexicon.entry_count} complete terms · {typeof selected.speech_lexicon.coverage.tier_one_coverage_pct === 'number' ? `${selected.speech_lexicon.coverage.tier_one_coverage_pct.toFixed(1)}% critical-name coverage` : 'critical-name coverage unavailable'}. It is pinned to this approved source revision.
+                      </p>
+                    ) : selected.approval_status === 'approved' ? (
+                      <p role="status">This legacy approval is awaiting its versioned voice-recognition backfill. Calls retain the safe legacy terminology path until publication.</p>
+                    ) : (
+                      <p>The versioned voice-recognition artifact is compiled automatically when this exact source revision is approved.</p>
+                    )}
+                    {canGovernKnowledge && selected.approval_status !== 'approved' && <button type="button" className="btn btn-primary btn-sm" disabled={working !== null || selected.sync_status !== 'ready'} onClick={() => runAction('approve', () => api.approveKnowledgeBase(selected.id, true), 'Knowledge approved for agent binding.')}>
+                      <Check size={12} /> Approve knowledge
                     </button>}
+                    {canGovernKnowledge && selected.serving_revision && <button type="button" className="btn btn-danger btn-sm" disabled={working !== null} onClick={() => runAction('revoke-live', () => api.approveKnowledgeBase(selected.id, false), 'Live release revoked. New calls cannot use this knowledge; calls already in progress keep their immutable release.')}>
+                      <X size={12} /> Revoke live release now
+                    </button>}
+                    {canGovernKnowledge && selected.approval_status === 'approved' && !selected.serving_revision && <button type="button" className="btn btn-secondary btn-sm" disabled={working !== null} onClick={() => runAction('revoke-legacy', () => api.approveKnowledgeBase(selected.id, false), 'Legacy approval removed; bound agents require review.')}>
+                      <X size={12} /> Return legacy approval to draft
+                    </button>}
+                    {canGovernKnowledge && rollbackCandidates.length > 0 && (
+                      <details className={styles.releaseHistory}>
+                        <summary>Restore a previous VAV release</summary>
+                        <p>For incidents only. The immutable release and its matching voice-recognition artifact move together. A concurrent operator change is rejected.</p>
+                        <form onSubmit={reactivateRelease}>
+                          <label htmlFor="knowledge-release-rollback">Verified release</label>
+                          <select id="knowledge-release-rollback" value={effectiveRollbackRevisionId} onChange={(event) => setRollbackRevisionId(event.target.value)} disabled={working !== null} required>
+                            {rollbackCandidates.map((release) => (
+                              <option key={release.revision_id} value={release.revision_id}>
+                                {new Date(release.published_at).toLocaleString()} · {release.source_count} sources · {release.revision_id.slice(0, 12)}
+                              </option>
+                            ))}
+                          </select>
+                          <label htmlFor="knowledge-release-reason">Incident or rollback reason</label>
+                          <input id="knowledge-release-reason" value={rollbackReason} onChange={(event) => setRollbackReason(event.target.value)} minLength={3} maxLength={500} placeholder="Why is this verified release safer?" disabled={working !== null} required />
+                          <button type="submit" className="btn btn-secondary btn-sm" disabled={working !== null || !effectiveRollbackRevisionId || rollbackReason.trim().length < 3}>
+                            {working === 'reactivate-release' ? <Loader2 className="spin" size={12} /> : <RefreshCw size={12} />} Reactivate for new calls
+                          </button>
+                        </form>
+                      </details>
+                    )}
                   </div>
                   <AgentBinding selected={selected} agents={agents} busy={working !== null} canManage={canGovernKnowledge} onBind={(agentId) => runAction('bind', () => api.bindKnowledgeAgent(selected.id, agentId), 'Agent binding saved.', { syncAgentIds: [agentId] })} onUnbind={(agentId) => runAction('unbind', () => api.unbindKnowledgeAgent(selected.id, agentId), 'Agent was unbound.', { syncAgentIds: [agentId] })} />
                 </div>
@@ -793,26 +916,28 @@ function TextForm({ busy, onSubmit }: { busy: boolean; onSubmit: (event: FormEve
 }
 
 function SourcesSection({ sources, canRepair, canRemove, busy, onRepair, onRemove }: { sources: KnowledgeSource[]; canRepair: boolean; canRemove: boolean; busy: boolean; onRepair: (source: KnowledgeSource) => void; onRemove: (source: KnowledgeSource) => void }) {
-  const readyCount = sources.filter((source) => source.retrieval_ready && source.status === 'indexed').length;
-  return <section className={styles.section} aria-labelledby="sources-heading"><div className={styles.sectionHeading}><div><span className={styles.sectionIcon}><Layers3 size={15} /></span><div><h3 id="sources-heading">Source inventory</h3><p>One canonical row per document. “Ready for agents” always requires searchable VAV text.</p></div></div><span className="badge badge-neutral">{sources.length} documents · {readyCount} ready</span></div>{sources.length === 0 ? <div className={styles.sourceEmpty}><FileText size={20} /><div><strong>No sources yet</strong><p>Add curated web pages, searchable text, or an approved PDF to begin.</p></div></div> : <div className={styles.sourceList}>{sources.map((source) => {
+  const readyCount = sources.filter((source) => source.retrieval_ready && source.status === 'indexed' && (source.company_fact_count ?? 0) > 0).length;
+  return <section className={styles.section} aria-labelledby="sources-heading"><div className={styles.sectionHeading}><div><span className={styles.sectionIcon}><Layers3 size={15} /></span><div><h3 id="sources-heading">Source inventory</h3><p>Text extraction and company attribution are checked separately. Scoped agents need approved facts for their configured company.</p></div></div><span className="badge badge-neutral">{sources.length} documents · {readyCount} with company facts</span></div>{sources.length === 0 ? <div className={styles.sourceEmpty}><FileText size={20} /><div><strong>No sources yet</strong><p>Add curated web pages, searchable text, or an approved PDF to begin.</p></div></div> : <div className={styles.sourceList}>{sources.map((source) => {
     const method = typeof source.source_metadata?.extraction_method === 'string' ? source.source_metadata.extraction_method : null;
     const compiler = sourceCompiler(source);
-    const isReady = source.retrieval_ready && source.status === 'indexed';
+    const isReady = source.retrieval_ready && source.status === 'indexed' && (source.company_fact_count ?? 0) > 0;
     const recovery = sourceRecovery(source);
     const isWebsite = source.source_type === 'url' || source.source_type === 'website' || source.source_type === 'sitemap';
     // Ready web pages may still need a deliberate refresh when their website
     // changes or a better extraction strategy becomes available.
     const repairable = isWebsite;
-    const detail = recovery?.status === 'queued' || recovery?.status === 'processing'
+    const recoveryDetail = recovery?.status === 'queued' || recovery?.status === 'processing'
       ? recovery.message || `VAV is ${recoveryStageLabel(recovery.stage)}…`
       : recovery?.status === 'failed' && isReady
         ? recovery.message || 'Latest refresh failed; the previous approved content remains active.'
       : !source.retrieval_ready
         ? isWebsite ? 'VAV could not read this page yet. Use Repair page to recover it automatically.' : 'VAV cannot use this document yet. Re-upload it to run extraction and OCR repair.'
         : null;
+    const detail = [recoveryDetail, source.retrieval_ready && !(source.company_fact_count ?? 0)
+      ? 'Text is readable, but no company-attributed facts are compiled. This source is unavailable to company-scoped agents. Refresh it with AI-verified extraction, then review and approve the compiled knowledge.' : null].filter(Boolean).join(' ');
     const recoveryActive = recovery?.status === 'queued' || recovery?.status === 'processing';
     const refreshLabel = isReady ? 'Refresh page' : 'Repair page';
-    return <article className={styles.sourceRow} key={source.id}><span className={styles.sourceTypeIcon}>{source.source_type === 'file' ? <FileText size={16} /> : source.source_type === 'text' ? <Layers3 size={16} /> : <Globe2 size={16} />}</span><div className={styles.sourceIdentity}><strong>{source.name}</strong><span>{source.location || (source.size_bytes ? formatBytes(source.size_bytes) : source.source_type)} · {source.retrieval_ready ? `${source.extracted_character_count.toLocaleString()} searchable characters${method ? ` · ${method === 'native' ? 'text extracted' : method === 'static_html' ? 'HTML extracted' : method === 'javascript_render' ? 'JavaScript rendered' : method}` : ''}${compiler ? ` · ${compilerLabel(compiler)}` : ''}` : 'no voice-searchable text'}</span>{compiler?.warning && <p>{compiler.warning}</p>}{detail && <p className={recoveryActive ? styles.recoveryProgress : undefined}>{detail}</p>}{source.error_message && source.error_message !== detail && <p>{source.error_message}</p>}</div><span className={`badge ${isReady ? 'badge-success' : sourceBadge(source.status)}`}>{isReady ? 'Ready for agents' : recoveryActive ? recoveryStageLabel(recovery.stage) : source.status.replace('_', ' ')}</span><time>{formatDate(source.last_synced_at || source.updated_at)}</time><span className={styles.sourceActions}>{canRepair && repairable && <button type="button" className="btn btn-secondary btn-sm" disabled={busy || recoveryActive} onClick={() => onRepair(source)} aria-label={`${refreshLabel} ${source.name} and re-index its searchable content`} title="Download, render, extract, index and verify the latest page content"><RefreshCw size={12} className={recoveryActive ? 'spin' : undefined} /> {refreshLabel}</button>}{canRemove && <button type="button" className="icon-button" disabled={busy} onClick={() => onRemove(source)} aria-label={`Remove ${source.name} from VAV and Smallest.ai`} title="Remove from VAV and Smallest.ai"><Trash2 size={14} /></button>}</span></article>;
+    return <article className={styles.sourceRow} key={source.id}><span className={styles.sourceTypeIcon}>{source.source_type === 'file' ? <FileText size={16} /> : source.source_type === 'text' ? <Layers3 size={16} /> : <Globe2 size={16} />}</span><div className={styles.sourceIdentity}><strong>{source.name}</strong><span>{source.location || (source.size_bytes ? formatBytes(source.size_bytes) : source.source_type)} · {source.retrieval_ready ? `${source.extracted_character_count.toLocaleString()} searchable characters${method ? ` · ${method === 'native' ? 'text extracted' : method === 'static_html' ? 'HTML extracted' : method === 'javascript_render' ? 'JavaScript rendered' : method}` : ''}${compiler ? ` · ${compilerLabel(compiler)}` : ''}` : 'no voice-searchable text'}</span>{compiler?.warning && <p>{compiler.warning}</p>}{detail && <p className={recoveryActive ? styles.recoveryProgress : undefined}>{detail}</p>}{source.error_message && source.error_message !== detail && <p>{source.error_message}</p>}</div><span className={`badge ${isReady ? 'badge-success' : sourceBadge(source.status)}`}>{isReady ? 'Company facts available' : recoveryActive ? recoveryStageLabel(recovery.stage) : source.retrieval_ready && source.status === 'indexed' ? 'Text searchable' : source.status.replace('_', ' ')}</span><time>{formatDate(source.last_synced_at || source.updated_at)}</time><span className={styles.sourceActions}>{canRepair && repairable && <button type="button" className="btn btn-secondary btn-sm" disabled={busy || recoveryActive} onClick={() => onRepair(source)} aria-label={`${refreshLabel} ${source.name} and re-index its searchable content`} title="Download, render, extract, index and verify the latest page content"><RefreshCw size={12} className={recoveryActive ? 'spin' : undefined} /> {refreshLabel}</button>}{canRemove && <button type="button" className="icon-button" disabled={busy} onClick={() => onRemove(source)} aria-label={`Stage removal of ${source.name}`} title="Stage removal for the next approved VAV release"><Trash2 size={14} /></button>}</span></article>;
   })}</div>}</section>;
 }
 
@@ -820,7 +945,10 @@ function AgentBinding({ selected, agents, busy, canManage, onBind, onUnbind }: {
   const [agentId, setAgentId] = useState('');
   const boundIds = new Set(selected.agent_bindings.map((binding) => binding.agent_id));
   const available = agents.filter((agent) => !boundIds.has(agent.id));
-  return <div className={styles.bindingCard}><div className={styles.bindingHeader}><div><span className={styles.miniLabel}>Agent access</span><strong>{selected.agent_bindings.length} agents bound</strong></div><Bot size={18} /></div><div className={styles.bindingList}>{selected.agent_bindings.map((binding) => <div key={binding.id}><span className={styles.agentAvatar}><Bot size={13} /></span><span><strong>{binding.agent_name}</strong><small>{binding.sync_status === 'synced' ? 'Live knowledge retrieval' : 'Publish agent to make binding live'}</small></span>{canManage && <button type="button" className="icon-button" disabled={busy} onClick={() => onUnbind(binding.agent_id)} aria-label={`Unbind ${binding.agent_name}`}><Unlink size={14} /></button>}</div>)}{selected.agent_bindings.length === 0 && <p className={styles.bindingEmpty}>No agents can use this knowledge yet.</p>}</div>{canManage && <div className={styles.bindControl}><select aria-label="Agent to bind" value={agentId} disabled={busy || selected.approval_status !== 'approved'} onChange={(event) => setAgentId(event.target.value)}><option value="">Select an agent…</option>{available.map((agent) => <option key={agent.id} value={agent.id}>{agent.name}</option>)}</select><button type="button" className="btn btn-secondary btn-sm" disabled={busy || !agentId || selected.approval_status !== 'approved'} onClick={() => { onBind(agentId); setAgentId(''); }}><Link2 size={12} /> Bind</button></div>}</div>;
+  const selectedAgent = available.find((agent) => agent.id === agentId);
+  const eligible = available.filter((agent) => canBindKnowledgeAgent(selected, agent));
+  const guidance = knowledgeBindingGuidance(selected);
+  return <div className={styles.bindingCard}><div className={styles.bindingHeader}><div><span className={styles.miniLabel}>Agent access</span><strong>{selected.agent_bindings.length} agents bound</strong></div><Bot size={18} /></div><div className={styles.bindingList}>{selected.agent_bindings.map((binding) => <div key={binding.id}><span className={styles.agentAvatar}><Bot size={13} /></span><span><strong>{binding.agent_name}</strong><small>{binding.sync_status === 'synced' ? 'Live knowledge retrieval' : 'Publish agent to make binding live'}</small></span>{canManage && <button type="button" className="icon-button" disabled={busy} onClick={() => onUnbind(binding.agent_id)} aria-label={`Unbind ${binding.agent_name}`}><Unlink size={14} /></button>}</div>)}{selected.agent_bindings.length === 0 && <p className={styles.bindingEmpty}>No agents can use this knowledge yet.</p>}</div>{canManage && <div className={styles.bindControl}><select aria-label="Agent to bind" value={agentId} disabled={busy || eligible.length === 0} onChange={(event) => setAgentId(event.target.value)}><option value="">Select an agent…</option>{available.map((agent) => <option key={agent.id} value={agent.id} disabled={!canBindKnowledgeAgent(selected, agent)}>{agent.name}</option>)}</select><button type="button" className="btn btn-secondary btn-sm" disabled={busy || !agentId || !canBindKnowledgeAgent(selected, selectedAgent)} onClick={() => { onBind(agentId); setAgentId(''); }}><Link2 size={12} /> Bind</button>{guidance && <p className="form-hint">{guidance}</p>}</div>}</div>;
 }
 
 function StatusBadge({ status }: { status: KnowledgeBase['sync_status'] }) {

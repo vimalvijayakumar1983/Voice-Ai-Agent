@@ -62,6 +62,14 @@ class Agent(TenantScopedModel):
     transfer_number: Mapped[str | None] = mapped_column(String(20))
     agent_metadata: Mapped[dict | None] = mapped_column("metadata", JSONB)
 
+    @property
+    def knowledge_company_scope(self) -> dict | None:
+        return (self.agent_metadata or {}).get("knowledge_company_scope")
+
+    @knowledge_company_scope.setter
+    def knowledge_company_scope(self, value: dict | None) -> None:
+        self.agent_metadata = {**(self.agent_metadata or {}), "knowledge_company_scope": value}
+
     # Relationships
     tenant = relationship("Tenant", back_populates="agents")
     knowledge_bases = relationship(
@@ -147,6 +155,40 @@ class KnowledgeBase(TenantScopedModel):
     indexed_source_count: Mapped[int] = mapped_column(Integer, default=0)
     last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Points at one immutable, source-revision-stamped speech lexicon.  New
+    # source revisions create a new artifact and approval atomically swaps this
+    # pointer; historical artifacts are retained for audit and call replay.
+    speech_lexicon_artifact_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "knowledge_speech_lexicons.id",
+            name="fk_knowledge_bases_speech_lexicon_artifact_id",
+            ondelete="SET NULL",
+            use_alter=True,
+        ),
+        index=True,
+    )
+    # Atomic blue/green publication pointer. Draft source rows may continue to
+    # change while calls read the immutable serving revision referenced here.
+    serving_revision_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "knowledge_serving_revisions.id",
+            name="fk_knowledge_bases_serving_revision_id",
+            ondelete="SET NULL",
+            use_alter=True,
+        ),
+        index=True,
+    )
+    # Explicit revocation fence for calls that reserve a serving revision before
+    # joining LiveKit. Ordinary blue/green publication leaves this generation
+    # unchanged, while unapproval increments it so a pre-admission reservation
+    # cannot begin speaking after access was revoked.
+    serving_revocation_generation: Mapped[int] = mapped_column(
+        Integer,
+        default=0,
+        nullable=False,
+    )
 
     # Relationships
     legacy_agent = relationship("Agent", back_populates="knowledge_bases", foreign_keys=[agent_id])
@@ -168,6 +210,34 @@ class KnowledgeBase(TenantScopedModel):
         lazy="selectin",
         cascade="all, delete-orphan",
         order_by="KnowledgeCrawl.created_at.desc()",
+    )
+    speech_lexicons = relationship(
+        "KnowledgeSpeechLexicon",
+        back_populates="knowledge_base",
+        foreign_keys="KnowledgeSpeechLexicon.knowledge_base_id",
+        lazy="noload",
+        cascade="all, delete-orphan",
+    )
+    speech_lexicon = relationship(
+        "KnowledgeSpeechLexicon",
+        primaryjoin=(
+            "foreign(KnowledgeBase.speech_lexicon_artifact_id) == KnowledgeSpeechLexicon.id"
+        ),
+        lazy="selectin",
+        viewonly=True,
+    )
+    serving_revisions = relationship(
+        "KnowledgeServingRevision",
+        back_populates="knowledge_base",
+        foreign_keys="KnowledgeServingRevision.knowledge_base_id",
+        lazy="noload",
+        cascade="all, delete-orphan",
+    )
+    serving_revision = relationship(
+        "KnowledgeServingRevision",
+        primaryjoin=("foreign(KnowledgeBase.serving_revision_id) == KnowledgeServingRevision.id"),
+        lazy="selectin",
+        viewonly=True,
     )
 
 
@@ -207,6 +277,202 @@ class KnowledgeSource(TenantScopedModel):
         back_populates="knowledge_source",
         lazy="noload",
     )
+
+
+class KnowledgeProviderCleanup(TenantScopedModel):
+    """Durable deletion intent for a provider artifact that must not be served.
+
+    Rows stay present until the remote delete is confirmed.  Provider-backed
+    binding and publication paths therefore have one transactional, fail-closed
+    signal instead of depending on a best-effort worker log entry.
+    """
+
+    __tablename__ = "knowledge_provider_cleanups"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "provider",
+            "provider_knowledge_base_id",
+            "provider_item_id",
+            name="uq_knowledge_provider_cleanup_artifact",
+        ),
+    )
+
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), index=True
+    )
+    # Deleting a local knowledge base must not discard the only durable record
+    # of an already-created remote artifact.
+    knowledge_base_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("knowledge_bases.id", ondelete="SET NULL"),
+        index=True,
+    )
+    # A failed/removed source must not erase cleanup work for its remote item.
+    knowledge_source_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("knowledge_sources.id", ondelete="SET NULL"),
+        index=True,
+    )
+    repair_run_id: Mapped[str | None] = mapped_column(String(36))
+    provider: Mapped[str] = mapped_column(String(50), nullable=False)
+    provider_knowledge_base_id: Mapped[str] = mapped_column(String(100), nullable=False)
+    provider_item_id: Mapped[str] = mapped_column(String(100), nullable=False)
+    provider_artifact_name: Mapped[str | None] = mapped_column(String(255))
+    status: Mapped[str] = mapped_column(String(30), default="pending", nullable=False, index=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(Text)
+
+
+class KnowledgeSpeechLexicon(TenantScopedModel):
+    """Immutable speech-recognition artifact for one approved KB revision.
+
+    The row is append-only by service contract.  ``KnowledgeBase`` owns the
+    mutable publication pointer, so a call can always identify exactly which
+    source revision and compiler output supplied its recognition vocabulary.
+    """
+
+    __tablename__ = "knowledge_speech_lexicons"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "knowledge_base_id",
+            "source_revision_sha256",
+            "compiler_version",
+            name="uq_knowledge_speech_lexicon_revision",
+        ),
+    )
+
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), index=True
+    )
+    knowledge_base_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("knowledge_bases.id", ondelete="CASCADE"),
+        index=True,
+    )
+    source_revision_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    content_sha256: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    compiler_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    generated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    source_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    entries: Mapped[list[dict]] = mapped_column(JSONB, default=list, nullable=False)
+    source_revisions: Mapped[list[dict]] = mapped_column(JSONB, default=list, nullable=False)
+    coverage: Mapped[dict] = mapped_column(JSONB, default=dict, nullable=False)
+
+    knowledge_base = relationship(
+        "KnowledgeBase",
+        back_populates="speech_lexicons",
+        foreign_keys=[knowledge_base_id],
+    )
+
+
+class KnowledgeServingRevision(TenantScopedModel):
+    """Immutable, fully self-contained knowledge release served to callers."""
+
+    __tablename__ = "knowledge_serving_revisions"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "knowledge_base_id",
+            "content_sha256",
+            "compiler_version",
+            name="uq_knowledge_serving_revision_content",
+        ),
+    )
+
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), index=True
+    )
+    knowledge_base_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("knowledge_bases.id", ondelete="CASCADE"),
+        index=True,
+    )
+    speech_lexicon_artifact_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("knowledge_speech_lexicons.id", ondelete="RESTRICT"),
+        index=True,
+    )
+    compiler_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_revision_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    chunk_revision_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    fact_revision_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    entity_revision_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    content_sha256: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    published_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    published_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+    )
+    source_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    chunk_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    fact_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    entity_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    knowledge_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    knowledge_description: Mapped[str | None] = mapped_column(Text)
+    knowledge_content: Mapped[str | None] = mapped_column(Text)
+    scope_type: Mapped[str] = mapped_column(String(30), nullable=False)
+    scope_label: Mapped[str | None] = mapped_column(String(255))
+    languages: Mapped[list[str]] = mapped_column(JSONB, default=list, nullable=False)
+    tags: Mapped[list[str]] = mapped_column(JSONB, default=list, nullable=False)
+    provider: Mapped[str] = mapped_column(String(50), nullable=False)
+    provider_knowledge_base_id: Mapped[str | None] = mapped_column(String(100))
+    manifest: Mapped[dict] = mapped_column(JSONB, default=dict, nullable=False)
+
+    knowledge_base = relationship(
+        "KnowledgeBase",
+        back_populates="serving_revisions",
+        foreign_keys=[knowledge_base_id],
+    )
+    sources = relationship(
+        "KnowledgeServingRevisionSource",
+        back_populates="serving_revision",
+        lazy="noload",
+        cascade="all, delete-orphan",
+    )
+    speech_lexicon = relationship("KnowledgeSpeechLexicon", lazy="noload", viewonly=True)
+
+
+class KnowledgeServingRevisionSource(TenantScopedModel):
+    """Immutable copy of one compiled source inside a serving revision."""
+
+    __tablename__ = "knowledge_serving_revision_sources"
+    __table_args__ = (
+        UniqueConstraint(
+            "serving_revision_id",
+            "original_source_id",
+            name="uq_knowledge_serving_revision_source",
+        ),
+    )
+
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), index=True
+    )
+    serving_revision_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("knowledge_serving_revisions.id", ondelete="CASCADE"),
+        index=True,
+    )
+    knowledge_base_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("knowledge_bases.id", ondelete="CASCADE"),
+        index=True,
+    )
+    original_source_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    source_type: Mapped[str] = mapped_column(String(30), nullable=False)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    location: Mapped[str | None] = mapped_column(Text)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    structured_content: Mapped[dict | None] = mapped_column(JSONB)
+    content_sha256: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    compiled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    source_metadata: Mapped[dict | None] = mapped_column(JSONB)
+    chunk_count: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    serving_revision = relationship("KnowledgeServingRevision", back_populates="sources")
 
 
 class KnowledgeCrawl(TenantScopedModel):

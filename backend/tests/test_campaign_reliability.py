@@ -7,10 +7,11 @@ import json
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from fastapi import HTTPException
-from sqlalchemy import event, func, select
+from sqlalchemy import event, func, select, text
 from starlette.requests import Request
 from twilio.request_validator import RequestValidator
 
@@ -26,10 +27,21 @@ from app.models.campaign import (
     ProviderCallbackOutbox,
 )
 from app.models.compliance import DncEntry
+from app.models.provider_credential import ProviderCredential
 from app.models.user import User
 from app.models.workflow import Workflow
 from app.providers.smallest import SmallestAIError
 from app.services.campaign_lifecycle import sync_campaign_call_lifecycle
+from app.services.provider_credentials import store_provider_config
+from app.services.twilio_callback_claim import (
+    TWILIO_CALLBACK_CLAIM_METADATA_KEY,
+    append_twilio_callback_claim,
+    mark_twilio_callback_claim_bound,
+)
+from app.services.twilio_route_security import (
+    TwilioRouteCredential,
+    twilio_callback_credential_fingerprint,
+)
 from app.tasks import call_tasks, campaign_tasks
 from tests.conftest import engine as test_engine
 from tests.conftest import test_session_factory as session_factory
@@ -1043,6 +1055,356 @@ async def test_postgres_waiting_callbacks_refresh_call_before_state_merge(
 
 
 @pytest.mark.asyncio
+async def test_twilio_campaign_dispatch_persists_binding_and_propagates_one_claim(
+    tenant,
+    db,
+    monkeypatch,
+):
+    account_sid = "AC" + "4" * 32
+    auth_token = "twilio-campaign-claim-auth-token"
+    monkeypatch.setattr(campaign_tasks.settings, "base_url", "https://voice.example.test")
+    monkeypatch.setattr(campaign_tasks.settings, "twilio_account_sid", account_sid)
+    monkeypatch.setattr(campaign_tasks.settings, "twilio_auth_token", auth_token)
+    monkeypatch.setattr(campaign_tasks.settings, "twilio_default_from_number", "+971501111111")
+    await store_provider_config(
+        db,
+        tenant.id,
+        "twilio",
+        {
+            "account_sid": account_sid,
+            "auth_token": auth_token,
+            "default_from_number": "+971501111111",
+        },
+    )
+    await db.commit()
+    _agent, campaign, _contacts = await _seed_campaign(db, tenant.id, provider="twilio")
+    async with session_factory() as worker_db:
+        plan = await campaign_tasks._prepare_campaign_batch(
+            worker_db,
+            campaign.id,
+            tenant.id,
+        )
+    async with session_factory() as worker_db:
+        preparation = await campaign_tasks._prepare_attempt_dispatch(
+            worker_db,
+            plan.attempt_ids[0],
+            tenant.id,
+        )
+    assert preparation.payload is not None
+    payload = preparation.payload
+    callback_claim = payload.twilio_callback_claim_token
+    assert callback_claim
+    assert callback_claim not in repr(payload)
+
+    db.expire_all()
+    stored_call = await db.get(Call, payload.call_id)
+    binding = stored_call.call_metadata["telephony_credential_binding"]
+    claim = stored_call.call_metadata[TWILIO_CALLBACK_CLAIM_METADATA_KEY]
+    assert binding["source"] == "workspace"
+    assert binding["account_sid"] == account_sid
+    assert binding["credential_fingerprint"] == twilio_callback_credential_fingerprint(
+        TwilioRouteCredential(account_sid=account_sid, auth_token=auth_token)
+    )
+    assert claim["state"] == "pending"
+    assert callback_claim not in str(stored_call.call_metadata)
+
+    provider = SimpleNamespace(
+        make_call=AsyncMock(
+            return_value=SimpleNamespace(provider_call_sid="CA-campaign-provider-response")
+        )
+    )
+    provider_factory = Mock(return_value=provider)
+    monkeypatch.setattr(campaign_tasks, "get_telephony_provider", provider_factory)
+    async with session_factory() as worker_db:
+        provider_call_sid = await campaign_tasks._call_provider(worker_db, payload)
+
+    assert provider_call_sid == "CA-campaign-provider-response"
+    provider_factory.assert_called_once_with(account_sid=account_sid, auth_token=auth_token)
+    request = provider.make_call.await_args.args[0]
+    assert parse_qs(urlsplit(request.webhook_url).query)["vav_callback_claim"] == [callback_claim]
+    assert parse_qs(urlsplit(request.status_callback_url).query)["vav_callback_claim"] == [
+        callback_claim
+    ]
+
+    # Emulate a callback winning before make_call() returns. Reconciliation of
+    # the same SID must preserve the active state and bound claim.
+    async with session_factory() as callback_db:
+        callback_call = await callback_db.get(Call, payload.call_id, with_for_update=True)
+        callback_attempt = await callback_db.get(
+            CampaignContactAttempt,
+            payload.attempt_id,
+            with_for_update=True,
+        )
+        callback_call.provider_call_sid = provider_call_sid
+        callback_call.status = "in_progress"
+        callback_call.call_metadata = mark_twilio_callback_claim_bound(
+            callback_call.call_metadata,
+            source="provider_callback",
+        )
+        callback_attempt.provider_call_sid = provider_call_sid
+        callback_attempt.state = "accepted"
+        await callback_db.commit()
+    async with session_factory() as worker_db:
+        await campaign_tasks._record_provider_acceptance(
+            worker_db,
+            payload,
+            provider_call_sid,
+        )
+    db.expire_all()
+    stored_call = await db.get(Call, payload.call_id)
+    assert stored_call.status == "in_progress"
+    assert stored_call.call_metadata[TWILIO_CALLBACK_CLAIM_METADATA_KEY]["bound_via"] == (
+        "provider_callback"
+    )
+
+    async with session_factory() as worker_db:
+        with pytest.raises(RuntimeError, match="conflicting call identities"):
+            await campaign_tasks._record_provider_acceptance(
+                worker_db,
+                payload,
+                "CA-different-provider-response",
+            )
+
+
+@pytest.mark.asyncio
+async def test_twilio_campaign_credential_change_before_final_guard_never_calls_provider(
+    tenant,
+    db,
+    monkeypatch,
+):
+    account_sid = "AC" + "2" * 32
+    await store_provider_config(
+        db,
+        tenant.id,
+        "twilio",
+        {
+            "account_sid": account_sid,
+            "auth_token": "campaign-original-auth-token",
+            "default_from_number": "+971501111111",
+        },
+    )
+    await db.commit()
+    _agent, campaign, _contacts = await _seed_campaign(db, tenant.id, provider="twilio")
+    async with session_factory() as worker_db:
+        plan = await campaign_tasks._prepare_campaign_batch(
+            worker_db,
+            campaign.id,
+            tenant.id,
+        )
+    async with session_factory() as worker_db:
+        preparation = await campaign_tasks._prepare_attempt_dispatch(
+            worker_db,
+            plan.attempt_ids[0],
+            tenant.id,
+        )
+    assert preparation.payload is not None
+    payload = preparation.payload
+
+    await store_provider_config(
+        db,
+        tenant.id,
+        "twilio",
+        {
+            "account_sid": account_sid,
+            "auth_token": "campaign-rotated-auth-token",
+            "default_from_number": "+971501111111",
+        },
+    )
+    await db.commit()
+    provider_factory = Mock(side_effect=AssertionError("provider I/O must not run"))
+    monkeypatch.setattr(campaign_tasks, "get_telephony_provider", provider_factory)
+
+    async with session_factory() as worker_db:
+        result = await campaign_tasks._call_provider_with_final_guard(worker_db, payload)
+
+    assert result is None
+    provider_factory.assert_not_called()
+    db.expire_all()
+    stored_call = await db.get(Call, payload.call_id)
+    stored_attempt = await db.get(CampaignContactAttempt, payload.attempt_id)
+    stored_campaign = await db.get(Campaign, payload.campaign_id)
+    assert stored_call.status == "cancelled"
+    assert stored_attempt.state == "cancelled"
+    assert stored_campaign.status == "paused"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["preparation", "final_guard"])
+async def test_postgres_twilio_campaign_never_locks_credential_before_agent(
+    stage,
+    tenant,
+    db,
+    monkeypatch,
+):
+    """Campaign dispatch must not invert direct native Agent -> credential order."""
+
+    if test_engine.dialect.name != "postgresql":
+        pytest.skip("Requires PostgreSQL row-lock semantics")
+
+    await store_provider_config(
+        db,
+        tenant.id,
+        "twilio",
+        {
+            "account_sid": "AC" + "6" * 32,
+            "auth_token": "campaign-lock-order-auth-token",
+            "default_from_number": "+971501111111",
+        },
+    )
+    await db.commit()
+    agent, campaign, _contacts = await _seed_campaign(db, tenant.id, provider="twilio")
+    agent_id = agent.id
+    async with session_factory() as batch_db:
+        plan = await campaign_tasks._prepare_campaign_batch(
+            batch_db,
+            campaign.id,
+            tenant.id,
+        )
+
+    payload = None
+    if stage == "final_guard":
+        async with session_factory() as prepare_db:
+            preparation = await campaign_tasks._prepare_attempt_dispatch(
+                prepare_db,
+                plan.attempt_ids[0],
+                tenant.id,
+            )
+        assert preparation.payload is not None
+        payload = preparation.payload
+
+    blocker = session_factory()
+    dispatch_task: asyncio.Task | None = None
+    dispatch_waiting_on_agent = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    listener_installed = False
+
+    try:
+        locked_agent = await blocker.scalar(
+            select(Agent).where(Agent.id == agent_id).with_for_update()
+        )
+        assert locked_agent is not None
+
+        def observe_agent_wait(
+            _connection,
+            _cursor,
+            statement,
+            _parameters,
+            _context,
+            _executemany,
+        ):
+            normalized = " ".join(str(statement).upper().split())
+            is_wait_point = (
+                "INSERT INTO CALLS" in normalized
+                if stage == "preparation"
+                else "FROM AGENTS" in normalized and "FOR UPDATE" in normalized
+            )
+            if is_wait_point:
+                loop.call_soon_threadsafe(dispatch_waiting_on_agent.set)
+
+        event.listen(test_engine.sync_engine, "before_cursor_execute", observe_agent_wait)
+        listener_installed = True
+
+        async def dispatch():
+            async with session_factory() as worker_db:
+                if stage == "preparation":
+                    return await campaign_tasks._prepare_attempt_dispatch(
+                        worker_db,
+                        plan.attempt_ids[0],
+                        tenant.id,
+                    )
+                assert payload is not None
+                return await campaign_tasks._call_provider_with_final_guard(
+                    worker_db,
+                    payload,
+                )
+
+        provider_call = AsyncMock(return_value="CA-lock-order-provider-call")
+        monkeypatch.setattr(campaign_tasks, "_call_provider", provider_call)
+        dispatch_task = asyncio.create_task(dispatch())
+        await asyncio.wait_for(dispatch_waiting_on_agent.wait(), timeout=5)
+        assert not dispatch_task.done()
+
+        # The waiting campaign transaction must not already own the credential
+        # row. Direct native dispatch holds Agent before requesting this row;
+        # keeping it free here proves there is no Credential -> Agent cycle.
+        async with session_factory() as probe_db, probe_db.begin():
+            await probe_db.execute(text("SET LOCAL lock_timeout = '500ms'"))
+            credential = await probe_db.scalar(
+                select(ProviderCredential)
+                .where(
+                    ProviderCredential.tenant_id == tenant.id,
+                    ProviderCredential.provider == "twilio",
+                )
+                .with_for_update()
+            )
+            assert credential is not None
+
+        await blocker.commit()
+        result = await asyncio.wait_for(dispatch_task, timeout=5)
+        if stage == "preparation":
+            assert result.payload is not None
+            provider_call.assert_not_awaited()
+        else:
+            assert result == "CA-lock-order-provider-call"
+            provider_call.assert_awaited_once()
+    finally:
+        if listener_installed:
+            event.remove(test_engine.sync_engine, "before_cursor_execute", observe_agent_wait)
+        await blocker.rollback()
+        await blocker.close()
+        if dispatch_task is not None and not dispatch_task.done():
+            dispatch_task.cancel()
+        if dispatch_task is not None:
+            await asyncio.gather(dispatch_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_twilio_campaign_provider_failure_redacts_live_callback_claim(
+    tenant,
+    db,
+    monkeypatch,
+):
+    monkeypatch.setattr(campaign_tasks.settings, "twilio_account_sid", "AC" + "3" * 32)
+    monkeypatch.setattr(campaign_tasks.settings, "twilio_auth_token", "campaign-failure-token")
+    monkeypatch.setattr(campaign_tasks.settings, "twilio_default_from_number", "+971501111111")
+    _agent, campaign, _contacts = await _seed_campaign(db, tenant.id, provider="twilio")
+    async with session_factory() as worker_db:
+        plan = await campaign_tasks._prepare_campaign_batch(
+            worker_db,
+            campaign.id,
+            tenant.id,
+        )
+    async with session_factory() as worker_db:
+        preparation = await campaign_tasks._prepare_attempt_dispatch(
+            worker_db,
+            plan.attempt_ids[0],
+            tenant.id,
+        )
+    assert preparation.payload is not None
+    payload = preparation.payload
+    callback_secret = payload.twilio_callback_claim_token
+    assert callback_secret
+    leaked_url = (
+        "Url=https%3A%2F%2Fvoice.example.test%2Fcallback%3F"
+        f"vav_callback_claim%3D{callback_secret}%26keep%3D1"
+    )
+
+    async with session_factory() as worker_db:
+        await campaign_tasks._record_provider_failure(
+            worker_db,
+            payload,
+            RuntimeError(f"provider echoed {leaked_url}"),
+        )
+
+    db.expire_all()
+    stored_call = await db.get(Call, payload.call_id)
+    stored_attempt = await db.get(CampaignContactAttempt, payload.attempt_id)
+    persisted = f"{stored_call.call_metadata} {stored_attempt.error_message}"
+    assert callback_secret not in persisted
+    assert "[REDACTED]" in persisted
+
+
+@pytest.mark.asyncio
 async def test_twilio_terminal_callback_updates_campaign_idempotently(
     client,
     tenant,
@@ -1052,6 +1414,10 @@ async def test_twilio_terminal_callback_updates_campaign_idempotently(
     _agent, campaign, contacts = await _seed_campaign(db, tenant.id, provider="twilio")
     campaign_id = campaign.id
     contact_id = contacts[0].id
+    account_sid = "AC" + "5" * 32
+    auth_token = "twilio-reliability-auth-token"
+    monkeypatch.setattr(campaign_tasks.settings, "twilio_account_sid", account_sid)
+    monkeypatch.setattr(campaign_tasks.settings, "twilio_auth_token", auth_token)
     monkeypatch.setattr(campaign_tasks.settings, "twilio_default_from_number", "+971501111111")
     monkeypatch.setattr(database, "async_session_factory", session_factory)
     async with session_factory() as worker_db:
@@ -1069,10 +1435,14 @@ async def test_twilio_terminal_callback_updates_campaign_idempotently(
     assert preparation.payload is not None
     call_id = preparation.payload.call_id
 
-    auth_token = "twilio-reliability-auth-token"
     path = f"/api/v1/webhooks/twilio/status/{call_id}"
+    path = append_twilio_callback_claim(
+        path,
+        preparation.payload.twilio_callback_claim_token,
+    )
     url = f"http://test{path}"
     form = {
+        "AccountSid": account_sid,
         "CallSid": "CA-reliable-campaign",
         "CallStatus": "completed",
         "CallDuration": "31",

@@ -9,10 +9,11 @@ from app.core.database import engine
 
 logger = structlog.get_logger()
 
-# Keep this in lockstep with the Alembic script head. A test compares the two so
-# adding a migration without updating API readiness fails CI instead of making a
-# newly deployed service advertise an older schema as ready.
-EXPECTED_DATABASE_REVISIONS = frozenset({"20260904_021"})
+# The preceding compatibility commit accepts 021-024 only as a transition
+# bridge while feature writes are frozen. It is never a post-feature rollback
+# image: once serving-revision pointers are written, rollback must use the
+# pointer-aware release described in the runbook.
+EXPECTED_DATABASE_REVISIONS = frozenset({"20260904_024"})
 READINESS_TIMEOUT_SECONDS = 3.0
 
 

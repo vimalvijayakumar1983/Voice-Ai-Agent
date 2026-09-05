@@ -1,9 +1,24 @@
 """Celery worker configuration."""
 
 from celery import Celery
+from celery.signals import after_setup_logger, after_setup_task_logger
 from kombu import Queue
 
 from app.core.config import settings
+from app.core.logging_security import install_callback_claim_log_redaction
+
+# Celery workers do not import ``app.main``, so install the same process-wide
+# callback-capability redaction before task arguments or exceptions are logged.
+install_callback_claim_log_redaction()
+
+
+@after_setup_logger.connect
+@after_setup_task_logger.connect
+def _install_worker_callback_claim_redaction(**_kwargs) -> None:
+    """Wrap handlers Celery creates after this module is imported."""
+
+    install_callback_claim_log_redaction()
+
 
 celery_app = Celery(
     "voice_ai_agent",
@@ -19,6 +34,9 @@ celery_app.conf.update(
     enable_utc=True,
     task_track_started=True,
     task_acks_late=True,
+    # With late acknowledgements, an abruptly terminated child must put its
+    # in-flight delivery back on the queue instead of acknowledging it as lost.
+    task_reject_on_worker_lost=True,
     worker_prefetch_multiplier=1,
     # A worker started without ``-Q`` consumes every queue declared here. This
     # keeps the existing Railway command compatible with the routed queues.
@@ -57,6 +75,14 @@ celery_app.conf.update(
         "sweep-provider-callback-outbox": {
             "task": "app.tasks.campaign_tasks.sweep_provider_callback_outbox",
             "schedule": 60.0,
+        },
+        "sweep-provider-cleanup-outbox": {
+            "task": "app.tasks.knowledge_tasks.sweep_provider_cleanup_outbox",
+            "schedule": 60.0,
+        },
+        "sweep-stale-knowledge-repairs": {
+            "task": "app.tasks.knowledge_tasks.sweep_stale_knowledge_repairs",
+            "schedule": 300.0,
         },
         "sweep-pending-webhook-deliveries": {
             "task": "app.tasks.webhook_tasks.sweep_pending_webhook_deliveries",

@@ -5,9 +5,25 @@ import pytest
 
 from app.services.knowledge_compiler import (
     KnowledgeCompilerError,
+    _Fact,
+    _validated_fact,
     compile_website_knowledge,
 )
 from app.services.knowledge_retrieval import rank_knowledge
+
+
+def test_person_profile_predicate_must_be_grounded_too():
+    source = "Jane Doe is Director of Harbour Group."
+    fields = dict(
+        subject="Harbour Group",
+        predicate="person profile: Jane Doe",
+        value="Director",
+        evidence=source,
+        search_phrases=["Who is Jane Doe?"],
+    )
+    assert _validated_fact(source, _Fact(**fields)) is not None
+    fields["predicate"] = "person profile: John Smith"
+    assert _validated_fact(source, _Fact(**fields)) is None
 
 
 class _FakeCompletions:
@@ -43,6 +59,10 @@ async def test_fast_compilation_is_searchable_without_an_llm():
     assert "+971 2 555 0100" in result.content
     assert "care@clinic.example" in result.content
     assert result.structured["compiler"]["estimated_cost_usd"] == 0
+    assert result.structured["exact_fact_coverage"] == {
+        "complete": False,
+        "reason": "deterministic_extraction_only",
+    }
 
 
 @pytest.mark.asyncio
@@ -93,6 +113,22 @@ async def test_ai_compilation_rejects_every_fact_without_verbatim_evidence():
     assert len(result.structured["facts"]) == 1
     assert result.structured["facts"][0]["value"] == "+971 2 665 9998"
     assert result.structured["validation"]["facts_rejected"] == 1
+    assert result.structured["exact_fact_coverage"] == {
+        "complete": False,
+        "absence_authoritative": False,
+        "returned_facts_validated": False,
+        "reason": "partial_or_rejected_ai_extraction",
+    }
+    assert result.structured["speech_entities"] == [
+        {
+            "canonical": "Royal Clinic",
+            "entity_type": "organization",
+            "language": "und",
+            "critical": True,
+            "aliases": [],
+            "evidence_sha256": ("6ed39545b247ac9841a32a6cdd6e5df7e893a28ef885236c5c47d7a8ff78d6c8"),
+        }
+    ]
     assert "Invented Person" not in result.content
     assert result.input_tokens == 800
     assert result.output_tokens == 200
@@ -159,8 +195,66 @@ async def test_ai_compilation_keeps_natural_questions_with_verified_fact():
     )
 
     assert matches
+    assert result.structured["exact_fact_coverage"] == {
+        "complete": False,
+        "absence_authoritative": False,
+        "returned_facts_validated": True,
+        "reason": "validated_ai_facts_without_absence_audit",
+    }
     assert "inception year: 2003" in matches[0].text
     assert "when was Al Zaabi Group formed" in matches[0].text
+
+
+@pytest.mark.asyncio
+async def test_ai_compilation_projects_explicit_role_message_heading():
+    evidence = (
+        "Chairman's Message\n\nA Winning Combination of Minds\n\n"
+        "Al Zaabi Group will continue its strides towards excellence.\n\n"
+        "T.R. Vijayakumar"
+    )
+    client = _FakeClient(
+        {
+            "page_type": "overview",
+            "entities": [
+                {
+                    "name": "Al Zaabi Group",
+                    "entity_type": "organization",
+                    "evidence": "Al Zaabi Group",
+                },
+                {
+                    "name": "T.R. Vijayakumar",
+                    "entity_type": "person",
+                    "evidence": "T.R. Vijayakumar",
+                },
+            ],
+            "facts": [
+                {
+                    "subject": "T.R. Vijayakumar",
+                    "predicate": "message title",
+                    "value": "Chairman's Message",
+                    "evidence": evidence,
+                    "search_phrases": ["Who gave the Chairman's Message?"],
+                }
+            ],
+        }
+    )
+
+    result = await compile_website_knowledge(
+        title="Management – Al Zaabi Group",
+        url="https://alzaabigroup.example/management",
+        text=evidence,
+        requested_mode="ai_verified",
+        api_key="test-key",
+        client=client,
+    )
+
+    assert any(
+        fact["subject"] == "Al Zaabi Group"
+        and fact["predicate"] == "chairman"
+        and fact["value"] == "T.R. Vijayakumar"
+        for fact in result.structured["facts"]
+    )
+    assert result.structured["compiler"]["version"] == "vav-knowledge-compiler-12"
 
 
 @pytest.mark.asyncio
@@ -354,6 +448,41 @@ async def test_contact_fact_rejects_unassociated_value_from_later_page_block():
     result = await compile_website_knowledge(
         title="Contact – Al Zaabi Group",
         url="https://www.alzaabigroup.com/contact/",
+        text=text,
+        requested_mode="ai_verified",
+        api_key="test-key",
+        client=client,
+    )
+
+    assert result.structured["facts"] == []
+    assert result.structured["validation"]["facts_rejected"] == 1
+
+
+@pytest.mark.asyncio
+async def test_contact_fact_cannot_borrow_subject_from_earlier_flattened_directory_text():
+    text = (
+        "Al Zaabi Group provides corporate services. Other Company reception telephone "
+        "is +971 2 111 2222 and serves Abu Dhabi."
+    )
+    client = _FakeClient(
+        {
+            "page_type": "directory",
+            "entities": [],
+            "facts": [
+                {
+                    "subject": "Al Zaabi Group",
+                    "predicate": "primary telephone",
+                    "value": "+971 2 111 2222",
+                    "evidence": "Other Company reception telephone is +971 2 111 2222",
+                    "search_phrases": ["Al Zaabi Group phone contact"],
+                }
+            ],
+        }
+    )
+
+    result = await compile_website_knowledge(
+        title="Flattened group directory",
+        url="https://www.alzaabigroup.com/directory/",
         text=text,
         requested_mode="ai_verified",
         api_key="test-key",

@@ -5,7 +5,11 @@ from app.models.agent import (
     KnowledgeBase,
     KnowledgeCrawl,
     KnowledgeCrawlPage,
+    KnowledgeProviderCleanup,
+    KnowledgeServingRevision,
+    KnowledgeServingRevisionSource,
     KnowledgeSource,
+    KnowledgeSpeechLexicon,
 )
 from app.models.audit import AuditEvent
 from app.models.billing import BillingPlan, TenantSubscription, UsageRecord
@@ -36,6 +40,10 @@ __all__ = [
     "KnowledgeBase",
     "KnowledgeCrawl",
     "KnowledgeCrawlPage",
+    "KnowledgeProviderCleanup",
+    "KnowledgeSpeechLexicon",
+    "KnowledgeServingRevision",
+    "KnowledgeServingRevisionSource",
     "KnowledgeSource",
     "AgentKnowledgeBinding",
     "AuditEvent",

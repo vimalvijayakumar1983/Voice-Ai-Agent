@@ -634,6 +634,7 @@ export default function Agents() {
 
 function editorValues(agent: VoiceAgent): AgentEditorValues {
   return {
+    knowledge_company_scope: agent.knowledge_company_scope ?? null,
     name: agent.name,
     description: agent.description ?? '',
     system_prompt: agent.system_prompt,
@@ -657,6 +658,7 @@ function editorValues(agent: VoiceAgent): AgentEditorValues {
 function aiDraftValues(result: AgentAIDraftResponse): AgentEditorValues {
   const draft = result.draft;
   return {
+    knowledge_company_scope: null,
     name: draft.name,
     description: draft.description ?? '',
     system_prompt: draft.system_prompt,

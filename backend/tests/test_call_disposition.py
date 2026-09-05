@@ -10,6 +10,38 @@ from app.services.call_disposition import (
 )
 
 
+def test_repeated_routing_or_search_failure_requires_review_without_grounding_event():
+    analysis = normalize_call_analysis(
+        {
+            "summary": "Some questions answered.",
+            "disposition": "information_provided",
+            "resolution": "resolved",
+            "confidence": 0.9,
+        },
+        profile="receptionist",
+    )
+    grounding = summarize_runtime_grounding(
+        {
+            "runtime": {
+                "turn_diagnostics": [
+                    {
+                        "outcome": "answered",
+                        "conversation_recovery_failure": "repeated_entity_clarification",
+                    },
+                    {
+                        "outcome": "answered",
+                        "conversation_recovery_failure": "search_budget_exhausted",
+                    },
+                ]
+            }
+        }
+    )
+    result = apply_grounding_quality_guard(analysis, grounding=grounding)["disposition_details"]
+    assert result["needs_review"] is True
+    assert result["resolution"] == "partially_resolved"
+    assert result["grounding"]["conversation_recovery_failure"] == 2
+
+
 def test_receptionist_information_call_is_resolved_without_follow_up():
     result = normalize_call_analysis(
         {
@@ -136,7 +168,7 @@ def test_grounding_guard_downgrades_only_unsupported_no_match_answer():
         {
             "runtime": {
                 "turn_diagnostics": [
-                    {"grounding_outcome": "verified_answer"},
+                    {"grounding_outcome": "response_after_verified_retrieval"},
                     {"grounding_outcome": "no_match_correctly_refused"},
                     {"grounding_outcome": "no_match_unverified_response"},
                 ]
@@ -149,7 +181,7 @@ def test_grounding_guard_downgrades_only_unsupported_no_match_answer():
     assert guarded["disposition_details"]["resolution"] == "partially_resolved"
     assert guarded["disposition_details"]["needs_review"] is True
     assert guarded["disposition_details"]["confidence"] == 0.5
-    assert guarded["disposition_details"]["grounding"]["verified_answer"] == 1
+    assert guarded["disposition_details"]["grounding"]["response_after_verified_retrieval"] == 1
     assert guarded["disposition_details"]["grounding"]["no_match_correctly_refused"] == 1
 
 
@@ -171,3 +203,142 @@ def test_grounding_guard_keeps_correct_refusal_out_of_manual_review():
 
     assert guarded["disposition_details"]["resolution"] == "resolved"
     assert guarded["disposition_details"]["needs_review"] is False
+
+
+def test_grounding_guard_downgrades_refusal_or_clarification_despite_exact_evidence():
+    analysis = normalize_call_analysis(
+        {
+            "summary": "The agent did not use exact facts that retrieval supplied.",
+            "disposition": "information_provided",
+            "resolution": "resolved",
+            "confidence": 0.94,
+        },
+        profile="receptionist",
+    )
+    grounding = summarize_runtime_grounding(
+        {
+            "runtime": {
+                "turn_diagnostics": [
+                    {
+                        "grounding_outcome": "response_after_verified_retrieval",
+                        "response_action": "refused_despite_verified_evidence",
+                        "exact_fact_action": "answer",
+                    },
+                    {
+                        "grounding_outcome": "response_after_verified_retrieval",
+                        "response_action": "asked_clarification_despite_verified_evidence",
+                        "exact_fact_action": "answer",
+                    },
+                ]
+            }
+        }
+    )
+
+    guarded = apply_grounding_quality_guard(analysis, grounding=grounding)
+
+    details = guarded["disposition_details"]
+    assert grounding["refused_despite_verified_evidence"] == 1
+    assert grounding["clarified_despite_verified_exact_fact"] == 1
+    assert details["resolution"] == "partially_resolved"
+    assert details["needs_review"] is True
+    assert details["confidence"] == 0.5
+    assert "refused despite verified evidence" in details["evidence"][-1]
+    assert "verified exact-fact answer" in details["evidence"][-1]
+
+
+def test_grounding_guard_downgrades_knowledge_tool_errors_but_not_correct_refusals():
+    analysis = normalize_call_analysis(
+        {
+            "summary": "The call ended after the knowledge tool failed.",
+            "disposition": "information_provided",
+            "resolution": "resolved",
+            "confidence": 0.95,
+        },
+        profile="receptionist",
+    )
+
+    guarded = apply_grounding_quality_guard(
+        analysis,
+        grounding={
+            "knowledge_error_response": 1,
+            "no_match_correctly_refused": 2,
+        },
+    )
+
+    details = guarded["disposition_details"]
+    assert details["resolution"] == "partially_resolved"
+    assert details["needs_review"] is True
+    assert details["confidence"] == 0.5
+    assert details["grounding"]["no_match_correctly_refused"] == 2
+    assert "knowledge retrieval error" in details["evidence"][-1]
+
+
+def test_grounding_guard_downgrades_interrupted_answer_without_forging_verification():
+    analysis = normalize_call_analysis(
+        {
+            "summary": "The assistant began answering before the call ended.",
+            "disposition": "information_provided",
+            "resolution": "resolved",
+            "confidence": 0.91,
+        },
+        profile="receptionist",
+    )
+    grounding = summarize_runtime_grounding(
+        {
+            "runtime": {
+                "ignored_interrupted_assistant_item_count": 1,
+                "turn_diagnostics": [
+                    {
+                        "outcome": "answered",
+                        "knowledge_result": "verified",
+                    }
+                ],
+            }
+        }
+    )
+
+    guarded = apply_grounding_quality_guard(analysis, grounding=grounding)
+
+    details = guarded["disposition_details"]
+    assert grounding["answered_without_grounding"] == 1
+    assert grounding["response_after_verified_retrieval"] == 0
+    assert details["resolution"] == "partially_resolved"
+    assert details["needs_review"] is True
+    assert details["confidence"] == 0.5
+    assert "no completed grounding verdict" in details["evidence"][-1]
+
+
+def test_completed_grounded_answer_is_not_downgraded_after_an_earlier_barge_in():
+    analysis = normalize_call_analysis(
+        {
+            "summary": "The caller received a verified answer after changing the question.",
+            "disposition": "information_provided",
+            "resolution": "resolved",
+            "confidence": 0.91,
+        },
+        profile="receptionist",
+    )
+    grounding = summarize_runtime_grounding(
+        {
+            "runtime": {
+                # This counter is useful operational telemetry, but a normal
+                # barge-in is not itself evidence that the final turn failed.
+                "ignored_interrupted_assistant_item_count": 1,
+                "turn_diagnostics": [
+                    {
+                        "outcome": "answered",
+                        "knowledge_result": "verified",
+                        "grounding_outcome": "response_after_verified_retrieval",
+                    }
+                ],
+            }
+        }
+    )
+
+    guarded = apply_grounding_quality_guard(analysis, grounding=grounding)
+
+    details = guarded["disposition_details"]
+    assert grounding["answered_without_grounding"] == 0
+    assert details["resolution"] == "resolved"
+    assert details["needs_review"] is False
+    assert details["confidence"] == 0.91

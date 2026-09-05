@@ -11,10 +11,26 @@ from difflib import SequenceMatcher
 from urllib.parse import unquote, urlsplit
 from uuid import UUID
 
-from sqlalchemy import Text, case, cast, func, literal_column, or_, select
+from sqlalchemy import (
+    Text,
+    case,
+    cast,
+    func,
+    literal,
+    literal_column,
+    or_,
+    select,
+    union_all,
+)
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.agent import AgentKnowledgeBinding, KnowledgeBase, KnowledgeSource
+from app.models.agent import (
+    AgentKnowledgeBinding,
+    KnowledgeBase,
+    KnowledgeServingRevision,
+    KnowledgeServingRevisionSource,
+    KnowledgeSource,
+)
 
 _TOKEN = re.compile(r"[^\W_]+", re.UNICODE)
 _SPLIT = re.compile(r"(?:\r?\n){2,}|(?<=[.!?।])\s+")
@@ -49,6 +65,8 @@ _QUERY_STOP_WORDS = {
     "been",
     "being",
     "basically",
+    "brief",
+    "briefly",
     "can",
     "could",
     "do",
@@ -70,6 +88,7 @@ _QUERY_STOP_WORDS = {
     "kind",
     "know",
     "like",
+    "let",
     "long",
     "maybe",
     "me",
@@ -80,6 +99,8 @@ _QUERY_STOP_WORDS = {
     "ok",
     "okay",
     "please",
+    "quick",
+    "quickly",
     "right",
     "so",
     "something",
@@ -196,6 +217,7 @@ _QUERY_INTENT_TOKENS = (
         "consultation",
         "cost",
         "detail",
+        "healthcare",
         "hour",
         "hierarchy",
         "information",
@@ -238,6 +260,7 @@ _ENTITY_SEQUENCE = re.compile(
 )
 _UPPERCASE_ENTITY = re.compile(r"\b[A-Z][A-Z0-9&'’-]{3,}\b", re.UNICODE)
 _CONTACT_SOURCE_MARKERS = (
+    "call us",
     "contact",
     "phone",
     "telephone",
@@ -248,8 +271,17 @@ _CONTACT_SOURCE_MARKERS = (
     "mailto:",
     "@",
 )
+_STRONG_CONTACT_TITLE_LOCATION_MARKERS = (
+    "contact",
+    "reach us",
+    "reach-us",
+    "reach_us",
+    "reachus",
+)
+_STRONG_CONTACT_CONTENT_MARKERS = ("call us", "tel:", "telephone", "phone", "mobile")
 _PHONE_TERMS = {"mobile", "phone", "tel", "telephone"}
 _PHONE_NUMBER = re.compile(r"(?<!\w)\+?\d[\d\s().-]{6,}\d(?!\w)")
+_NON_SERVICE_SOURCE_TITLE_TOKENS = frozenset({"cookie", "privacy", "terms", "policy"})
 
 # Provider-neutral semantic relations. These are deliberately limited to
 # meaning-preserving business vocabulary; company names and factual values are
@@ -333,6 +365,24 @@ def _is_phone_query(value: str, query_tokens: set[str]) -> bool:
     )
 
 
+def _is_service_capability_query(value: str) -> bool:
+    """Identify questions asking whether the business supplies a service."""
+
+    normalized = " ".join(_base_tokens(value))
+    return bool(
+        re.search(
+            r"\b(?:can|could|do|does|will|would)\b.{0,80}\b"
+            r"(?:offer|offers|provide|provides|specialise|specialises|"
+            r"specialize|specializes)\b",
+            normalized,
+        )
+        or re.search(
+            r"\b(?:what|which)\b.{0,40}\b(?:services?|offerings?)\b",
+            normalized,
+        )
+    )
+
+
 def _has_phone_evidence(value: str, tokens: set[str]) -> bool:
     return bool(tokens & _PHONE_TERMS) or bool(_PHONE_NUMBER.search(value))
 
@@ -411,7 +461,9 @@ def _terminology_phrases(values: Iterable[object]) -> dict[str, str]:
                 if any(token.isdigit() for token in normalized_tokens):
                     continue
                 distinctive = [
-                    token for token in normalized_tokens if len(token) >= 4 and token not in ignored
+                    token
+                    for token in normalized_tokens
+                    if len(token) >= 4 and _singular(token) not in ignored
                 ]
                 if not distinctive:
                     continue
@@ -805,7 +857,9 @@ def _intent_content(value: str, *, phone_query: bool) -> str:
     return structured if _has_phone_evidence(structured, structured_tokens) else value
 
 
-def _structured_retrieval_content(value: object) -> str | None:
+def _structured_retrieval_content(
+    value: object, *, company_subject: str | None = None
+) -> str | None:
     """Render verified JSON facts for ranking without loading raw source prose.
 
     PostgreSQL headline extraction is useful for legacy documents, but it can
@@ -824,6 +878,11 @@ def _structured_retrieval_content(value: object) -> str | None:
         if not isinstance(fact, dict):
             continue
         subject = " ".join(str(fact.get("subject") or "").split()).strip()
+        if company_subject is not None:
+            from app.services.conversation_scope import company_key
+
+            if company_key(subject) != company_key(company_subject):
+                continue
         predicate = " ".join(str(fact.get("predicate") or "").split()).strip()
         fact_value = " ".join(str(fact.get("value") or "").split()).strip()
         evidence = " ".join(str(fact.get("evidence") or "").split()).strip()
@@ -851,17 +910,82 @@ def _structured_retrieval_content(value: object) -> str | None:
     return "\n\n".join(blocks).strip() if blocks else None
 
 
+def _structured_absence_is_authoritative(value: object) -> bool:
+    """Return whether omitting a fact from structured data is proven complete."""
+
+    if not isinstance(value, dict):
+        return False
+    coverage = value.get("exact_fact_coverage")
+    if not isinstance(coverage, dict):
+        # Legacy/imported structured documents predate the explicit completeness
+        # contract. Their returned facts may be valid, but absence from that list
+        # never proves absence from the approved source. Keep raw text searchable.
+        return False
+    return coverage.get("complete") is True and coverage.get("absence_authoritative") is True
+
+
+def _canonical_source_content(value: object) -> str | None:
+    """Recover approved canonical source text from compiler output when present."""
+
+    if not isinstance(value, str) or not value.strip():
+        return None
+    marker = "\n\nSOURCE CONTENT"
+    start = value.find(marker)
+    content = value[start + len(marker) :] if start >= 0 else value
+    cleaned = content.replace("<b>", "").replace("</b>", "").strip()
+    return cleaned or None
+
+
+def _source_retrieval_documents(
+    *,
+    name: str,
+    content: object,
+    structured_content: object,
+    company_subject: str | None = None,
+) -> list[tuple[str, str]]:
+    """Keep verified facts fast without hiding facts an AI extractor omitted."""
+
+    structured = _structured_retrieval_content(structured_content, company_subject=company_subject)
+    if company_subject is not None:
+        # A mention in a footer/title is not ownership. Unattributed raw prose
+        # must not reintroduce a subsidiary's facts through a fallback lane.
+        return [(name, structured)] if structured else []
+    raw = _canonical_source_content(content)
+    if structured is None:
+        return [(name, raw)] if raw else []
+    documents = [(name, structured)]
+    if not _structured_absence_is_authoritative(structured_content) and raw:
+        documents.append((f"{name} · approved source text", raw))
+    return documents
+
+
+def _structured_core(value: str) -> str:
+    """Rank the fact, not a shared paragraph quoting many unrelated facts."""
+    if "VERIFIED STRUCTURED FACTS" not in value and not value.startswith("SUBJECT:"):
+        return value
+    if "\n" in value:
+        # Compiler evidence is normalized onto one line. Preserve those
+        # boundaries: a dash inside a quote must not look like a new fact.
+        return re.sub(r"(?m)^[ \t]*Evidence:.*(?:\n|$)", "", value)
+    return re.split(r"\s+Evidence:\s*", value, maxsplit=1)[0]
+
+
 def _chunks(
     value: str,
     *,
     max_chars: int = 900,
     preserve_paragraphs: bool = False,
+    preserve_lines: bool = False,
 ) -> list[str]:
     chunks: list[str] = []
     current = ""
     splitter = _PARAGRAPH_SPLIT if preserve_paragraphs else _SPLIT
     for part in splitter.split(value):
-        part = " ".join(part.split()).strip()
+        part = (
+            "\n".join(" ".join(line.split()) for line in part.splitlines()).strip()
+            if preserve_lines
+            else " ".join(part.split()).strip()
+        )
         if not part:
             continue
         if preserve_paragraphs and current:
@@ -901,10 +1025,18 @@ def rank_knowledge(
     ordered_query_tokens = sorted(query_tokens)
     ubiquitous_source_terms = _ubiquitous_source_terms(documents)
     broad_query = _is_broad_query(query, query_tokens)
+    service_capability_query = _is_service_capability_query(query)
     directory_query = bool(query_tokens & _DIRECTORY_QUERY_TOKENS)
     requested_subject_tokens = _requested_subject_tokens(query)
     matches: list[KnowledgeMatch] = []
     for source, content in documents:
+        if service_capability_query and (
+            set(_base_tokens(source)) & _NON_SERVICE_SOURCE_TITLE_TOKENS
+        ):
+            # Privacy, cookie and terms pages describe third-party advisers and
+            # compliance obligations; they are not authoritative catalogues of
+            # services the business offers to callers.
+            continue
         source_terms = _source_terms(source)
         source_compounds = _source_compounds(source)
         ranked_content = _intent_content(content, phone_query=phone_query)
@@ -912,9 +1044,16 @@ def rank_knowledge(
         for chunk in _chunks(
             ranked_content,
             preserve_paragraphs=phone_query or structured_facts,
+            preserve_lines=structured_facts,
         ):
+            normalized_chunk = " ".join(chunk.split())
+            if structured_facts and not normalized_chunk.startswith(
+                ("VERIFIED STRUCTURED FACTS SUBJECT:", "SUBJECT:")
+            ):
+                # Never promote a detached quotation after a size-bound split.
+                continue
             structured_subject_tokens = (
-                _structured_subject_tokens(chunk) if structured_facts else set()
+                _structured_subject_tokens(normalized_chunk) if structured_facts else set()
             )
             if (
                 requested_subject_tokens
@@ -922,8 +1061,15 @@ def rank_knowledge(
                 and not requested_subject_tokens <= structured_subject_tokens
             ):
                 continue
-            chunk_base_tokens = _base_tokens(chunk)
+            chunk_base_tokens = _base_tokens(_structured_core(chunk))
             chunk_tokens = _token_forms(chunk_base_tokens)
+            if structured_facts:
+                # Company/title matches cannot satisfy the requested topic.
+                # Healthcare, pricing, dates etc must occur in this fact's
+                # searchable core, not only in another fact's shared quotation.
+                topic_tokens = query_tokens - structured_subject_tokens - _BROAD_QUERY_TOKENS
+                if topic_tokens and not topic_tokens <= chunk_tokens:
+                    continue
             chunk_has_phone = _has_phone_evidence(chunk, chunk_tokens)
             if phone_query and not chunk_has_phone:
                 # A contact-page title alone must not satisfy a request for a
@@ -1024,6 +1170,18 @@ def rank_knowledge(
 def _query_aware_excerpt(content: str, query_tokens: set[str], *, limit: int) -> str:
     if len(content) <= limit:
         return content
+    if content.startswith("VERIFIED STRUCTURED FACTS"):
+        blocks = _PARAGRAPH_SPLIT.split(content)
+        ranked_blocks = sorted(
+            blocks, key=lambda block: -len(query_tokens & _query_tokens(_structured_core(block)))
+        )
+        selected: list[str] = []
+        used = 0
+        for block in ranked_blocks:
+            if used + len(block) + 2 <= limit:
+                selected.append(block)
+                used += len(block) + 2
+        return "\n\n".join(selected)
     # ``str.find``/``rfind`` run in C and avoid a full Python-level regex walk over
     # large crawled documents. Keep both ends so repeated navigation near the start
     # cannot hide a substantive answer near the end.
@@ -1229,6 +1387,8 @@ async def load_agent_knowledge_terminology(
     tenant_id: UUID,
     agent_id: UUID,
     hints: Iterable[object] = (),
+    serving_revision_id: UUID | None = None,
+    knowledge_base_id: UUID | None = None,
 ) -> tuple[str, ...]:
     """Load a bounded proper-name vocabulary for one bound agent.
 
@@ -1236,6 +1396,26 @@ async def load_agent_knowledge_terminology(
     window contributes only high-confidence proper names so spoken brand names
     can be recovered without treating ordinary prose as aliases.
     """
+    # New approved revisions publish a deterministic, tier-ranked artifact.
+    # Keep the legacy metadata/content scan as a rolling-deploy and backfill
+    # fallback for approved knowledge bases created before that artifact.
+    from app.services.speech_lexicon import load_agent_speech_lexicon
+
+    speech_lexicon = await load_agent_speech_lexicon(
+        db,
+        tenant_id=tenant_id,
+        agent_id=agent_id,
+        serving_revision_id=serving_revision_id,
+        knowledge_base_id=knowledge_base_id,
+    )
+    if speech_lexicon is not None:
+        return tuple(entry.canonical for entry in speech_lexicon.entries)
+    if serving_revision_id is not None:
+        # A pinned call must never scan the mutable source workspace when its
+        # historical lexicon cannot be resolved. Keep only caller-supplied
+        # non-knowledge hints and let readiness/telemetry expose the bad pin.
+        return tuple(str(value) for value in hints if str(value or "").strip())
+
     row = (
         await db.execute(
             select(
@@ -1389,6 +1569,44 @@ async def _broad_title_candidate_ids(
     )
 
 
+def _contact_candidate_predicate_and_priority(lower_name, lower_location, lower_content):
+    """Build consistent contact-page selection for draft and release corpora.
+
+    Generic website footers make ``email``, ``mailto:`` and ``@`` ubiquitous.
+    Keep those rows eligible, but rank a named Contact/Reach Us page or explicit
+    telephone evidence ahead of them before applying the bounded candidate limit.
+    """
+
+    strong_contact_identity = or_(
+        *(lower_name.contains(marker) for marker in _STRONG_CONTACT_TITLE_LOCATION_MARKERS),
+        *(lower_location.contains(marker) for marker in _STRONG_CONTACT_TITLE_LOCATION_MARKERS),
+    )
+    strong_phone_evidence = or_(
+        *(
+            column.contains(marker)
+            for column in (lower_name, lower_content)
+            for marker in _STRONG_CONTACT_CONTENT_MARKERS
+        )
+    )
+    weaker_named_contact = or_(
+        *(lower_name.contains(marker) for marker in sorted(_CONTACT_QUERY_TOKENS)),
+        lower_location.contains("location"),
+    )
+    predicate = or_(
+        strong_contact_identity,
+        strong_phone_evidence,
+        weaker_named_contact,
+        *(lower_content.contains(marker) for marker in _CONTACT_SOURCE_MARKERS),
+    )
+    priority = case(
+        (strong_contact_identity, 0),
+        (strong_phone_evidence, 1),
+        (weaker_named_contact, 2),
+        else_=3,
+    )
+    return predicate, priority
+
+
 def _is_contact_query(query: str) -> bool:
     return bool(_query_tokens(query) & _CONTACT_QUERY_TOKENS)
 
@@ -1403,16 +1621,10 @@ async def _contact_candidate_source_ids(
     lower_name = func.lower(KnowledgeSource.name)
     lower_location = func.lower(func.coalesce(KnowledgeSource.location, ""))
     lower_content = func.lower(KnowledgeSource.content)
-    contact_predicate = or_(
-        *(lower_name.contains(marker) for marker in _CONTACT_QUERY_TOKENS),
-        *(lower_location.contains(marker) for marker in ("contact", "location")),
-        *(lower_content.contains(marker) for marker in _CONTACT_SOURCE_MARKERS),
-    )
-    title_priority = case(
-        (lower_name.contains("contact"), 0),
-        (lower_location.contains("contact"), 1),
-        (lower_name.contains("location"), 2),
-        else_=3,
+    contact_predicate, contact_priority = _contact_candidate_predicate_and_priority(
+        lower_name,
+        lower_location,
+        lower_content,
     )
     return list(
         (
@@ -1425,7 +1637,7 @@ async def _contact_candidate_source_ids(
                     ),
                     contact_predicate,
                 )
-                .order_by(title_priority, KnowledgeSource.updated_at.desc(), KnowledgeSource.id)
+                .order_by(contact_priority, KnowledgeSource.updated_at.desc(), KnowledgeSource.id)
                 .limit(_CONTACT_CANDIDATE_LIMIT)
             )
         ).all()
@@ -1614,6 +1826,320 @@ async def _candidate_source_ids(
     )
 
 
+def _postgres_serving_revision_source_query(
+    *,
+    tenant_id: UUID,
+    serving_revision_id: UUID,
+    query: str,
+    contact_query: bool,
+    broad_query: bool,
+):
+    """Build one bounded PostgreSQL candidate union for an immutable release.
+
+    Full-text search is intentionally only one candidate lane. A contact page
+    can contain ``Call us at +971 ...`` without the caller's literal words
+    ``phone number``, while a general company question can require an About or
+    Overview page whose body does not repeat the query. Each fallback lane has
+    its own limit so a large FTS result set cannot crowd it out; the outer query
+    then deduplicates and reapplies the global source bound.
+    """
+
+    source = KnowledgeServingRevisionSource
+    scope_filters = (
+        source.tenant_id == tenant_id,
+        source.serving_revision_id == serving_revision_id,
+    )
+    fts_terms = _postgres_fts_terms(query)
+    candidate_lanes = []
+    if fts_terms:
+        empty_text = literal_column("''", type_=Text())
+        search_text = (
+            func.coalesce(cast(source.name, Text), empty_text)
+            + literal_column("' '", type_=Text())
+            + func.coalesce(source.location, empty_text)
+            + literal_column("' '", type_=Text())
+            + func.coalesce(source.content, empty_text)
+        )
+        search_vector = func.to_tsvector(
+            literal_column("'simple'::regconfig"),
+            search_text,
+        )
+        ts_query = _postgres_ts_query(query)
+        rank = func.ts_rank_cd(search_vector, ts_query)
+        fts_lane = (
+            select(
+                source.original_source_id.label("original_source_id"),
+                literal(2).label("lane_priority"),
+                rank.label("fts_rank"),
+            )
+            .where(*scope_filters, search_vector.op("@@")(ts_query))
+            .order_by(rank.desc(), source.created_at.desc(), source.original_source_id)
+            .limit(_FTS_CANDIDATE_LIMIT)
+            .subquery("revision_fts_candidates")
+        )
+        candidate_lanes.append(
+            select(
+                fts_lane.c.original_source_id,
+                fts_lane.c.lane_priority,
+                fts_lane.c.fts_rank,
+            )
+        )
+
+    lower_name = func.lower(source.name)
+    if contact_query:
+        lower_location = func.lower(func.coalesce(source.location, ""))
+        lower_content = func.lower(source.content)
+        contact_predicate, contact_priority = _contact_candidate_predicate_and_priority(
+            lower_name,
+            lower_location,
+            lower_content,
+        )
+        contact_lane = (
+            select(
+                source.original_source_id.label("original_source_id"),
+                literal(0).label("lane_priority"),
+                literal(0.0).label("fts_rank"),
+            )
+            .where(*scope_filters, contact_predicate)
+            .order_by(
+                contact_priority,
+                source.created_at.desc(),
+                source.original_source_id,
+            )
+            .limit(_CONTACT_CANDIDATE_LIMIT)
+            .subquery("revision_contact_candidates")
+        )
+        candidate_lanes.append(
+            select(
+                contact_lane.c.original_source_id,
+                contact_lane.c.lane_priority,
+                contact_lane.c.fts_rank,
+            )
+        )
+
+    if broad_query:
+        broad_title = or_(
+            lower_name.like("the group%"),
+            lower_name.contains("overview"),
+            lower_name.contains("about"),
+            lower_name.contains("profile"),
+            lower_name.contains("division"),
+        )
+        broad_priority = case(
+            (lower_name.like("the group%"), 0),
+            (lower_name.contains("overview"), 1),
+            (lower_name.contains("about"), 1),
+            (lower_name.contains("profile"), 2),
+            (lower_name.contains("division"), 3),
+            else_=4,
+        )
+        broad_lane = (
+            select(
+                source.original_source_id.label("original_source_id"),
+                literal(1).label("lane_priority"),
+                literal(0.0).label("fts_rank"),
+            )
+            .where(*scope_filters, broad_title)
+            .order_by(
+                broad_priority,
+                source.created_at.desc(),
+                source.original_source_id,
+            )
+            .limit(_TITLE_CANDIDATE_LIMIT)
+            .subquery("revision_broad_title_candidates")
+        )
+        candidate_lanes.append(
+            select(
+                broad_lane.c.original_source_id,
+                broad_lane.c.lane_priority,
+                broad_lane.c.fts_rank,
+            )
+        )
+
+    if not candidate_lanes:
+        raise ValueError("PostgreSQL revision candidate search requires a search lane")
+    candidate_union = union_all(*candidate_lanes).subquery("revision_candidate_union")
+    deduplicated_candidates = (
+        select(
+            candidate_union.c.original_source_id,
+            func.min(candidate_union.c.lane_priority).label("lane_priority"),
+            func.max(candidate_union.c.fts_rank).label("fts_rank"),
+        )
+        .group_by(candidate_union.c.original_source_id)
+        .subquery("revision_candidates")
+    )
+    return (
+        select(
+            source.original_source_id,
+            source.name,
+            source.content,
+            source.structured_content,
+        )
+        .join(
+            deduplicated_candidates,
+            deduplicated_candidates.c.original_source_id == source.original_source_id,
+        )
+        .where(*scope_filters)
+        .order_by(
+            deduplicated_candidates.c.lane_priority,
+            deduplicated_candidates.c.fts_rank.desc(),
+            source.created_at.desc(),
+            source.original_source_id,
+        )
+        .limit(MAX_SOURCE_CANDIDATES)
+    )
+
+
+async def _retrieve_serving_revision_context(
+    db: AsyncSession,
+    *,
+    tenant_id: UUID,
+    revision: KnowledgeServingRevision,
+    query_plan: ContextualQueryPlan,
+    limit: int,
+    max_context_chars: int,
+    company_subject: str | None = None,
+) -> str | None:
+    """Search only an immutable release while a newer draft is being edited."""
+
+    combined_query = " ".join(query_plan.variants)
+    query_tokens = _query_tokens(combined_query)
+    exact_terms = sorted(_tokens(combined_query) - _QUERY_STOP_WORDS)[:16]
+    lower_name = func.lower(KnowledgeServingRevisionSource.name)
+    lower_location = func.lower(func.coalesce(KnowledgeServingRevisionSource.location, ""))
+    lower_content = func.lower(KnowledgeServingRevisionSource.content)
+    lower_structured = func.lower(cast(KnowledgeServingRevisionSource.structured_content, Text))
+    predicates = [
+        predicate
+        for term in exact_terms
+        for predicate in (
+            lower_name.contains(term),
+            lower_content.contains(term),
+            lower_structured.contains(term),
+        )
+    ]
+    contact_query = any(_is_contact_query(value) for value in query_plan.variants)
+    if contact_query:
+        predicates.extend(
+            [
+                *(lower_name.contains(marker) for marker in sorted(_CONTACT_QUERY_TOKENS)),
+                *(lower_location.contains(marker) for marker in ("contact", "location")),
+                *(lower_content.contains(marker) for marker in _CONTACT_SOURCE_MARKERS),
+            ]
+        )
+    broad_query = any(_is_broad_query(value, _query_tokens(value)) for value in query_plan.variants)
+    if broad_query:
+        predicates.extend(
+            (
+                lower_name.like("the group%"),
+                lower_name.contains("overview"),
+                lower_name.contains("about"),
+                lower_name.contains("profile"),
+                lower_name.contains("division"),
+            )
+        )
+
+    dialect = db.get_bind().dialect.name
+    order_by: tuple[object, ...] = (
+        KnowledgeServingRevisionSource.created_at.desc(),
+        KnowledgeServingRevisionSource.original_source_id,
+    )
+    if dialect == "postgresql":
+        if not (_postgres_fts_terms(combined_query) or contact_query or broad_query):
+            # A stopword-only query has no safe retrieval signal. Returning
+            # before executing a source query avoids loading the whole pinned
+            # revision only for the ranker to reject its empty query tokens.
+            return None
+        source_query = _postgres_serving_revision_source_query(
+            tenant_id=tenant_id,
+            serving_revision_id=revision.id,
+            query=combined_query,
+            contact_query=contact_query,
+            broad_query=broad_query,
+        )
+    else:
+        source_query = select(
+            KnowledgeServingRevisionSource.original_source_id,
+            KnowledgeServingRevisionSource.name,
+            KnowledgeServingRevisionSource.content,
+            KnowledgeServingRevisionSource.structured_content,
+        ).where(
+            KnowledgeServingRevisionSource.tenant_id == tenant_id,
+            KnowledgeServingRevisionSource.serving_revision_id == revision.id,
+        )
+        if predicates:
+            source_query = source_query.where(or_(*predicates))
+        # SQLite is used only for local/test execution and has no production
+        # tsvector path.  Fetch every predicate match so the in-process ranker
+        # can choose the best 48, rather than truncating by creation time first.
+        source_query = source_query.order_by(*order_by)
+    source_rows = (await db.execute(source_query)).all()
+
+    # A fuzzy name fallback stays bounded and never switches to mutable draft
+    # rows. It catches ASR spelling variants without widening tenant scope.
+    if not source_rows and query_tokens:
+        recent_rows = (
+            await db.execute(
+                select(
+                    KnowledgeServingRevisionSource.original_source_id,
+                    KnowledgeServingRevisionSource.name,
+                    KnowledgeServingRevisionSource.content,
+                    KnowledgeServingRevisionSource.structured_content,
+                )
+                .where(
+                    KnowledgeServingRevisionSource.tenant_id == tenant_id,
+                    KnowledgeServingRevisionSource.serving_revision_id == revision.id,
+                )
+                .order_by(
+                    KnowledgeServingRevisionSource.created_at.desc(),
+                    KnowledgeServingRevisionSource.original_source_id,
+                )
+                .limit(_TITLE_CANDIDATE_LIMIT)
+            )
+        ).all()
+        source_rows = [
+            row
+            for row in recent_rows
+            if any(
+                _best_fuzzy_source_match(token, _source_compounds(row.name))[0] > 0
+                for token in query_tokens
+            )
+        ]
+
+    documents: list[tuple[str, str]] = []
+    for row in source_rows:
+        documents.extend(
+            _source_retrieval_documents(
+                name=row.name,
+                content=row.content,
+                structured_content=row.structured_content,
+                company_subject=company_subject,
+            )
+        )
+    if revision.knowledge_content and company_subject is None:
+        documents.append((revision.knowledge_name, revision.knowledge_content))
+    matches = await asyncio.to_thread(
+        _rank_contextual_knowledge,
+        query_plan.variants,
+        documents,
+        limit,
+    )
+    if not matches:
+        return None
+    interpretation = ""
+    if query_plan.recovered_terms:
+        interpretation = (
+            "Contextual terminology considered: "
+            + ", ".join(query_plan.recovered_terms)
+            + ". Verify the intended term against the evidence below; ask a brief "
+            "clarifying question if it would materially change the answer.\n\n"
+        )
+    context = interpretation + "\n\n".join(
+        f"Source: {match.source}\n{match.text}" for match in matches
+    )
+    return context[:max_context_chars]
+
+
 async def retrieve_knowledge_context(
     db: AsyncSession,
     *,
@@ -1624,37 +2150,97 @@ async def retrieve_knowledge_context(
     terminology: Iterable[object] = (),
     limit: int = 6,
     max_context_chars: int = MAX_CONTEXT_CHARS,
+    serving_revision_id: UUID | None = None,
+    knowledge_base_id: UUID | None = None,
+    company_subject: str | None = None,
 ) -> str | None:
-    binding = await db.scalar(
-        select(AgentKnowledgeBinding).where(
-            AgentKnowledgeBinding.tenant_id == tenant_id,
-            AgentKnowledgeBinding.agent_id == agent_id,
+    """Retrieve only from the call-pinned or currently published corpus.
+
+    ``serving_revision_id`` may identify a historical release. A revision-only
+    pin is verified through the current agent binding. A call that already
+    crossed admission may also supply its immutable ``knowledge_base_id`` and
+    retain that exact tenant-owned release across a later rebind. Invalid pins
+    return no evidence instead of silently changing revisions.
+    """
+
+    if knowledge_base_id is not None and serving_revision_id is None:
+        raise ValueError("knowledge_base_id requires an explicit serving_revision_id")
+
+    revision = None
+    if serving_revision_id is not None and knowledge_base_id is not None:
+        # Admission already authenticated this immutable identity. A running
+        # call must keep its exact release when the agent is subsequently
+        # rebound, unbound, or its live pointer is explicitly revoked.
+        revision = await db.scalar(
+            select(KnowledgeServingRevision).where(
+                KnowledgeServingRevision.id == serving_revision_id,
+                KnowledgeServingRevision.tenant_id == tenant_id,
+                KnowledgeServingRevision.knowledge_base_id == knowledge_base_id,
+            )
         )
-    )
-    if binding is None:
-        return None
-    knowledge_base = await db.scalar(
-        select(KnowledgeBase).where(
+        if revision is None:
+            return None
+        knowledge_base = None
+    else:
+        binding = await db.scalar(
+            select(AgentKnowledgeBinding).where(
+                AgentKnowledgeBinding.tenant_id == tenant_id,
+                AgentKnowledgeBinding.agent_id == agent_id,
+            )
+        )
+        if binding is None:
+            return None
+        knowledge_base_query = select(KnowledgeBase).where(
             KnowledgeBase.id == binding.knowledge_base_id,
             KnowledgeBase.tenant_id == tenant_id,
             KnowledgeBase.is_active.is_(True),
-            KnowledgeBase.approval_status == "approved",
         )
-    )
-    if knowledge_base is None:
-        return None
+        if serving_revision_id is None:
+            knowledge_base_query = knowledge_base_query.where(
+                or_(
+                    KnowledgeBase.serving_revision_id.is_not(None),
+                    KnowledgeBase.approval_status == "approved",
+                )
+            )
+        knowledge_base = await db.scalar(knowledge_base_query)
+        if knowledge_base is None:
+            return None
+        effective_revision_id = serving_revision_id or knowledge_base.serving_revision_id
+        if effective_revision_id is not None:
+            revision = await db.scalar(
+                select(KnowledgeServingRevision).where(
+                    KnowledgeServingRevision.id == effective_revision_id,
+                    KnowledgeServingRevision.tenant_id == tenant_id,
+                    KnowledgeServingRevision.knowledge_base_id == knowledge_base.id,
+                )
+            )
+            if revision is None:
+                return None
+    terminology_name = revision.knowledge_name if revision is not None else knowledge_base.name
+    terminology_scope = revision.scope_label if revision is not None else knowledge_base.scope_label
+    terminology_tags = revision.tags if revision is not None else knowledge_base.tags
     query_plan = build_contextual_query_plan(
         query,
         supplied_variants=query_variants,
         terminology=(
             *terminology,
-            knowledge_base.name,
-            knowledge_base.scope_label,
-            *(knowledge_base.tags if isinstance(knowledge_base.tags, list) else []),
+            terminology_name,
+            terminology_scope,
+            *(terminology_tags if isinstance(terminology_tags, list) else []),
         ),
     )
     if not query_plan.variants:
         return None
+    if revision is not None:
+        return await _retrieve_serving_revision_context(
+            db,
+            tenant_id=tenant_id,
+            revision=revision,
+            query_plan=query_plan,
+            limit=limit,
+            max_context_chars=max_context_chars,
+            company_subject=company_subject,
+        )
     combined_query = " ".join(query_plan.variants)
     candidate_ids = await _candidate_source_ids(
         db,
@@ -1700,15 +2286,18 @@ async def retrieve_knowledge_context(
         ).all()
     sources_by_id = {}
     for source_id, source_name, source_content, structured_content in source_rows:
-        retrieval_content = _structured_retrieval_content(structured_content)
-        if retrieval_content is None and isinstance(source_content, str):
-            retrieval_content = source_content.replace("<b>", "").replace("</b>", "")
-        if retrieval_content and retrieval_content.strip():
-            sources_by_id[source_id] = (source_name, retrieval_content)
+        retrieval_documents = _source_retrieval_documents(
+            name=source_name,
+            content=source_content,
+            structured_content=structured_content,
+            company_subject=company_subject,
+        )
+        if retrieval_documents:
+            sources_by_id[source_id] = retrieval_documents
     documents = [
-        sources_by_id[source_id] for source_id in candidate_ids if source_id in sources_by_id
+        document for source_id in candidate_ids for document in sources_by_id.get(source_id, ())
     ]
-    if knowledge_base.content:
+    if knowledge_base.content and company_subject is None:
         documents.append((knowledge_base.name, knowledge_base.content))
     matches = await asyncio.to_thread(
         _rank_contextual_knowledge,

@@ -8,7 +8,7 @@ import pytest
 from sqlalchemy import select
 
 from app.api.v1.endpoints import agents as agents_endpoint
-from app.models.agent import Agent, AgentKnowledgeBinding, KnowledgeBase
+from app.models.agent import Agent, AgentKnowledgeBinding, AgentRuntimeProfile, KnowledgeBase
 from app.models.audit import AuditEvent
 from app.models.provider_credential import ProviderCredential
 from app.providers.sarvam import SarvamAIClient, SarvamAIError, sarvam_voice_catalog
@@ -90,6 +90,83 @@ async def test_workspace_sarvam_key_is_write_only_and_can_be_removed(
     )
     assert deleted.status_code == 200
     assert deleted.json()["source"] in {"none", "platform"}
+
+
+@pytest.mark.asyncio
+async def test_legacy_sarvam_credential_mutations_invalidate_all_native_dependents(
+    client,
+    auth_headers,
+    tenant,
+    db,
+):
+    created = await client.put(
+        "/api/v1/agents/provider/sarvam/credential",
+        headers=auth_headers,
+        json={"api_key": "sk_initial_sarvam_runtime_key_123456789"},
+    )
+    assert created.status_code == 200
+    sarvam_agent = Agent(
+        tenant_id=tenant.id,
+        name="Sarvam credential dependent",
+        system_prompt="Help callers.",
+        voice_provider="sarvam",
+        voice_id="sarvam:ishita",
+    )
+    elevenlabs_agent = Agent(
+        tenant_id=tenant.id,
+        name="ElevenLabs STT credential dependent",
+        system_prompt="Help callers.",
+        voice_provider="elevenlabs",
+        voice_id="elevenlabs:test-voice",
+    )
+    db.add_all([sarvam_agent, elevenlabs_agent])
+    await db.flush()
+    profiles = [
+        AgentRuntimeProfile(
+            tenant_id=tenant.id,
+            agent_id=sarvam_agent.id,
+            enabled=True,
+            status="active",
+            telephony_provider="twilio",
+            primary_speech_provider="sarvam",
+        ),
+        AgentRuntimeProfile(
+            tenant_id=tenant.id,
+            agent_id=elevenlabs_agent.id,
+            enabled=True,
+            status="active",
+            telephony_provider="twilio",
+            primary_speech_provider="elevenlabs",
+        ),
+    ]
+    db.add_all(profiles)
+    await db.commit()
+
+    rotated = await client.put(
+        "/api/v1/agents/provider/sarvam/credential",
+        headers=auth_headers,
+        json={"api_key": "sk_rotated_sarvam_runtime_key_123456789"},
+    )
+
+    assert rotated.status_code == 200
+    for profile in profiles:
+        await db.refresh(profile)
+        assert profile.enabled is False
+        assert profile.status == "draft"
+        profile.enabled = True
+        profile.status = "active"
+    await db.commit()
+
+    deleted = await client.delete(
+        "/api/v1/agents/provider/sarvam/credential",
+        headers=auth_headers,
+    )
+
+    assert deleted.status_code == 200
+    for profile in profiles:
+        await db.refresh(profile)
+        assert profile.enabled is False
+        assert profile.status == "draft"
 
 
 @pytest.mark.asyncio

@@ -303,3 +303,156 @@ async def test_inworld_auto_router_cost_is_partial_without_actual_model(
     assert "Railway LiveKit worker hosting allocation" in row["missing_cost_inputs"]
     assert all(component["provider"] != "Inworld Router" for component in row["components"])
     assert report["summary"]["fully_priced_calls"] == 0
+
+
+@pytest.mark.asyncio
+async def test_cost_report_counts_session_and_direct_prewarm_tts_once(
+    client,
+    auth_headers,
+    db,
+    tenant,
+):
+    agent = Agent(
+        tenant_id=tenant.id,
+        name="Mixed TTS accounting",
+        system_prompt="Use approved knowledge.",
+        voice_provider="inworld",
+        voice_id="inworld:Ashley",
+    )
+    db.add(agent)
+    await db.flush()
+    call = Call(
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        direction="inbound",
+        status="completed",
+        from_number="+971500000001",
+        to_number="+971500000002",
+        provider="livekit_sip",
+        duration_seconds=60,
+        call_metadata={
+            "runtime": {
+                "speech_provider": "inworld",
+                "llm_provider": "inworld",
+                # Includes deterministic/clarification text spoken through
+                # session.say, but excludes audio= prewarmed outside session.
+                "tts_characters": 200,
+                "external_tts_request_count": 1,
+                "external_tts_characters": 7,
+                "external_tts_sources": ["greeting_preparation"],
+                "external_tts_provider_reconciliation_required": True,
+            }
+        },
+    )
+    db.add(call)
+    await db.commit()
+
+    response = await client.get("/api/v1/billing/cost-report?days=30", headers=auth_headers)
+
+    assert response.status_code == 200
+    row = next(item for item in response.json()["calls"] if item["call_id"] == str(call.id))
+    tts = next(item for item in row["components"] if item["service"] == "TTS 2")
+    assert tts["quantity"] == pytest.approx(0.207)
+    assert "session + direct prewarm" in tts["basis"]
+    assert row["cost_state"] == "pending_provider_billing_sync"
+    assert "External TTS provider invoice reconciliation" in row["missing_cost_inputs"]
+    assert row["pricing_completeness"] == "partial"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("duration_seconds", [0, 1])
+async def test_cost_report_preserves_pending_provider_billing_state(
+    client,
+    auth_headers,
+    db,
+    tenant,
+    duration_seconds,
+):
+    agent = Agent(
+        tenant_id=tenant.id,
+        name="Rejected inbound accounting",
+        system_prompt="Help callers.",
+        voice_provider="sarvam",
+    )
+    db.add(agent)
+    await db.flush()
+    call = Call(
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        direction="inbound",
+        status="failed",
+        from_number="+14155550123",
+        to_number="+14142934703",
+        provider="twilio",
+        answered_at=datetime.now(UTC),
+        ended_at=datetime.now(UTC),
+        duration_seconds=duration_seconds,
+        call_metadata={
+            "runtime": {
+                "speech_provider": "sarvam",
+                "cost_state": "pending_provider_billing_sync",
+                "duration_source": "minimum_answered_rejection",
+            }
+        },
+    )
+    db.add(call)
+    await db.commit()
+
+    response = await client.get("/api/v1/billing/cost-report?days=30", headers=auth_headers)
+
+    assert response.status_code == 200
+    report = response.json()
+    row = next(item for item in report["calls"] if item["call_id"] == str(call.id))
+    assert row["cost_state"] == "pending_provider_billing_sync"
+    assert "Provider invoice reconciliation" in row["missing_cost_inputs"]
+    assert row["pricing_completeness"] == "partial"
+    assert report["summary"]["fully_priced_calls"] == 0
+
+
+@pytest.mark.asyncio
+async def test_rejected_inbound_fallback_does_not_invent_media_or_ai_usage(
+    client,
+    auth_headers,
+    db,
+    tenant,
+):
+    agent = Agent(
+        tenant_id=tenant.id,
+        name="Pre-media rejection accounting",
+        system_prompt="Help callers.",
+        voice_provider="sarvam",
+    )
+    db.add(agent)
+    await db.flush()
+    call = Call(
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        direction="inbound",
+        status="failed",
+        from_number="+14155550123",
+        to_number="+14142934703",
+        provider="twilio",
+        answered_at=datetime.now(UTC),
+        ended_at=datetime.now(UTC),
+        duration_seconds=1,
+        call_metadata={
+            "runtime": {
+                "transport": "twilio_fallback_twiml",
+                "media_stream_started": False,
+                "speech_provider": "sarvam",
+                "llm_provider": "openai",
+                "cost_state": "pending_provider_billing_sync",
+                "duration_source": "minimum_answered_rejection",
+            }
+        },
+    )
+    db.add(call)
+    await db.commit()
+
+    response = await client.get("/api/v1/billing/cost-report?days=30", headers=auth_headers)
+
+    assert response.status_code == 200
+    row = next(item for item in response.json()["calls"] if item["call_id"] == str(call.id))
+    assert row["cost_state"] == "pending_provider_billing_sync"
+    assert {component["service"] for component in row["components"]} == {"Programmable Voice"}
+    assert "Provider invoice reconciliation" in row["missing_cost_inputs"]

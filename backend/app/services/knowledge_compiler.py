@@ -6,6 +6,7 @@ realtime call path: callers search the already-compiled document.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from dataclasses import dataclass
@@ -16,7 +17,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 ProcessingMode = Literal["automatic", "fast", "ai_verified"]
 
-COMPILER_VERSION = "vav-knowledge-compiler-7"
+COMPILER_VERSION = "vav-knowledge-compiler-12"
 AUTOMATIC_MODEL = "gpt-5.6-luna"
 VERIFIED_MODEL = "gpt-5.6-terra"
 _MODEL_PRICES_PER_MILLION = {
@@ -30,6 +31,17 @@ _EMAIL_RE = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.I)
 _SPACE_RE = re.compile(r"\s+")
 _GROUNDING_SEPARATOR_RE = re.compile(r"[^\w]+", re.UNICODE)
 _PARAGRAPH_RE = re.compile(r"\n\s*\n+")
+_ROLE_MESSAGE_RE = re.compile(
+    r"\b(?P<role>chairman|chairperson|chairwoman|president)(?:\s+s)?\s+message\b"
+)
+_ROLE_MESSAGE_PREDICATES = {
+    "heading",
+    "message heading",
+    "message title",
+    "section heading",
+    "section title",
+    "title",
+}
 
 
 class KnowledgeCompilerError(RuntimeError):
@@ -123,7 +135,13 @@ def _value_is_grounded(value: str, evidence: str) -> bool:
     return len(value_digits) >= 7 and value_digits in evidence_digits
 
 
-def _subject_is_grounded_in_context(source: str, subject: str, evidence: str) -> bool:
+def _subject_is_grounded_in_context(
+    source: str,
+    subject: str,
+    evidence: str,
+    *,
+    strict_block: bool = False,
+) -> bool:
     """Require a fact's subject in its evidence or its immediate heading block."""
 
     if _value_is_grounded(subject, evidence):
@@ -140,17 +158,18 @@ def _subject_is_grounded_in_context(source: str, subject: str, evidence: str) ->
         evidence_index = normalized_paragraph.find(normalized_evidence)
         if evidence_index < 0:
             continue
-        # Narrative pages often name the organization at the start of a
-        # paragraph and use "we" later in that same paragraph. Accept that
-        # bounded, explicit context without allowing a fact to borrow a subject
-        # from another paragraph or section.
-        subject_index = normalized_paragraph.rfind(
-            normalized_subject,
-            0,
-            evidence_index + len(normalized_subject),
-        )
-        if subject_index >= 0 and evidence_index - subject_index <= 1_200:
-            return True
+        if not strict_block:
+            # Narrative pages often name the organization at the start of a
+            # paragraph and use "we" later in that same paragraph. Contact
+            # facts deliberately cannot use this allowance: one flattened
+            # directory paragraph may contain several organizations.
+            subject_index = normalized_paragraph.rfind(
+                normalized_subject,
+                0,
+                evidence_index + len(normalized_subject),
+            )
+            if subject_index >= 0 and evidence_index - subject_index <= 1_200:
+                return True
         if index == 0:
             continue
         previous = _grounding_normalized(paragraphs[index - 1])
@@ -172,12 +191,24 @@ def _validated_fact(source: str, fact: _Fact) -> dict | None:
     """
 
     evidence = fact.evidence
-    if not _value_is_grounded(fact.subject, evidence) and not (
+    if fact.predicate.casefold().startswith("person profile:"):
+        # The person encoded in this relationship predicate is a factual claim
+        # too, not a free-form search hint. Validate it alongside subject/value.
+        person = fact.predicate.split(":", 1)[1].strip()
+        if not person or not _value_is_grounded(person, evidence):
+            return None
+    normalized_predicate = _grounding_normalized(fact.predicate)
+    is_contact_fact = bool(
         _PHONE_RE.search(fact.value)
         or _PHONE_RE.search(evidence)
         or _EMAIL_RE.search(fact.value)
         or _EMAIL_RE.search(evidence)
-    ):
+        or any(
+            marker in normalized_predicate.split()
+            for marker in ("phone", "telephone", "email", "address", "location", "contact")
+        )
+    )
+    if not _value_is_grounded(fact.subject, evidence) and not is_contact_fact:
         evidence_start = source.find(evidence)
         if evidence_start >= 0:
             subject_start = source.rfind(
@@ -191,11 +222,83 @@ def _validated_fact(source: str, fact: _Fact) -> dict | None:
                     evidence = candidate
     if not (
         _evidence_is_grounded(source, evidence)
-        and _subject_is_grounded_in_context(source, fact.subject, evidence)
+        and _subject_is_grounded_in_context(
+            source,
+            fact.subject,
+            evidence,
+            strict_block=is_contact_fact,
+        )
         and _value_is_grounded(fact.value, evidence)
     ):
         return None
     return {**fact.model_dump(), "evidence": evidence}
+
+
+def _project_role_heading_facts(*, entities: list[dict], facts: list[dict]) -> list[dict]:
+    """Turn an explicit role-message heading and author into a reusable role fact."""
+
+    organizations = list(
+        dict.fromkeys(
+            str(entity.get("name") or "").strip()
+            for entity in entities
+            if str(entity.get("entity_type") or "").strip().lower()
+            in {"organization", "organisation"}
+            and str(entity.get("name") or "").strip()
+        )
+    )
+    projected = list(facts)
+    seen = {
+        (
+            _grounding_normalized(str(fact.get("subject") or "")),
+            _grounding_normalized(str(fact.get("predicate") or "")),
+            _grounding_normalized(str(fact.get("value") or "")),
+        )
+        for fact in facts
+    }
+    for fact in facts:
+        if _grounding_normalized(str(fact.get("predicate") or "")) not in (
+            _ROLE_MESSAGE_PREDICATES
+        ):
+            continue
+        match = _ROLE_MESSAGE_RE.search(_grounding_normalized(str(fact.get("value") or "")))
+        if match is None:
+            continue
+        person = str(fact.get("subject") or "").strip()
+        evidence = str(fact.get("evidence") or "").strip()
+        matching_organizations = [
+            organization
+            for organization in organizations
+            if _value_is_grounded(organization, evidence)
+        ]
+        if (
+            not person
+            or not evidence
+            or len(matching_organizations) != 1
+            or not _value_is_grounded(person, evidence)
+        ):
+            continue
+        role = match.group("role")
+        key = (
+            _grounding_normalized(matching_organizations[0]),
+            role,
+            _grounding_normalized(person),
+        )
+        if key in seen:
+            continue
+        projected.append(
+            {
+                "subject": matching_organizations[0],
+                "predicate": role,
+                "value": person,
+                "evidence": evidence,
+                "search_phrases": [
+                    f"Who is the {role} of {matching_organizations[0]}?",
+                    f"Who leads {matching_organizations[0]}?",
+                ],
+            }
+        )
+        seen.add(key)
+    return projected
 
 
 def _requires_ai(text: str) -> bool:
@@ -212,10 +315,71 @@ def _deterministic_structure(*, title: str, url: str, text: str) -> dict:
         "schema_version": COMPILER_VERSION,
         "page_type": "other",
         "entities": [],
+        "speech_entities": [],
         "facts": [],
+        "exact_fact_coverage": {
+            "complete": False,
+            "reason": "deterministic_extraction_only",
+        },
         "deterministic_contacts": {"phones": phones[:50], "emails": emails[:50]},
         "source": {"title": title, "url": url},
     }
+
+
+def _speech_entity_hints(
+    *,
+    title: str,
+    page_type: str,
+    entities: list[dict],
+    facts: list[dict],
+) -> list[dict]:
+    """Derive source-grounded speech hints without inventing aliases.
+
+    The realtime layer should never have to rediscover which structured values
+    are names.  These hints retain entity type, criticality and an evidence
+    stamp; provider-specific limits and pronunciation repair are handled by the
+    versioned speech-lexicon compiler.
+    """
+
+    normalized_title = _grounding_normalized(title)
+    fact_subjects = {
+        _grounding_normalized(str(fact.get("subject") or ""))
+        for fact in facts
+        if str(fact.get("subject") or "").strip()
+    }
+    selected: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for entity in entities:
+        canonical = " ".join(str(entity.get("name") or "").split()).strip(" |,.;:")
+        entity_type = str(entity.get("entity_type") or "other").strip().lower()
+        evidence = str(entity.get("evidence") or "").strip()
+        folded = canonical.casefold()
+        key = (folded, entity_type)
+        if not canonical or key in seen:
+            continue
+        critical = entity_type in {"organization", "person", "location"} or (
+            entity_type in {"service", "product"}
+            and (
+                page_type == "service"
+                or _grounding_normalized(canonical) in normalized_title
+                or _grounding_normalized(canonical) in fact_subjects
+            )
+        )
+        selected.append(
+            {
+                "canonical": canonical,
+                "entity_type": entity_type,
+                "language": "und",
+                "critical": critical,
+                # Aliases are deliberately empty unless a future governed
+                # source explicitly supplies them.  A generative alias must
+                # never silently become a verified business fact.
+                "aliases": [],
+                "evidence_sha256": hashlib.sha256(evidence.encode("utf-8")).hexdigest(),
+            }
+        )
+        seen.add(key)
+    return selected
 
 
 def _build_document(*, title: str, url: str, text: str, structured: dict) -> str:
@@ -293,10 +457,43 @@ they, begin the evidence at the nearest explicit subject sentence or heading and
 the intervening source text through the value. Omit anything ambiguous. For every fact,
 provide up to eight short search_phrases expressing natural ways a caller could request
 that SAME fact.
+When a management page has an explicit role heading such as Chairman's Message or
+President's Message followed by the named author, also emit the direct organization role
+fact (organization / chairman or president / person) only when one contiguous evidence
+span contains the organization name, the role heading, and the person's name.
 Include both everyday wording and the source's terminology (for example, formed, founded,
 established and inception for an explicit inception year). Search phrases are retrieval
 hints only: never add an answer, entity, date, number or claim that is not already in the
 fact. Do not produce medical advice."""
+    prompt += """
+When the source explicitly identifies a subsidiary/member of a parent organization,
+also extract parent portfolio facts where the SAME contiguous evidence span proves
+both the relationship and the child's stated activity. Keep the parent's canonical
+name as subject only if that name occurs verbatim in the evidence. Name the child
+in the predicate (for example, 'healthcare profile via <child name>') so attribution
+is never lost. Keep the activity value verbatim. Do not project phone numbers,
+addresses, prices, availability or account data from a child onto a parent. Never
+infer membership from a navigation link, shared page, logo, or similar name alone.
+For each person's explicitly established organizational role, retain the person fact
+AND emit a company-owned profile fact: subject is the organization; predicate is
+'person profile: <full person name>'; value is the verbatim job title or role.
+Also emit organization / exact role / person facts when that precise role is supported.
+The evidence must contain the person, organization and role in one contiguous span
+proving that relationship. If a person's role heading and the company affiliation
+are in adjacent paragraphs of the SAME person's biography, include that full span.
+Do not cross another person's biography or attach roles using a footer, page title,
+search phrase, competitor mention, customer relationship or mere co-occurrence.
+Preserve distinctions such as director, managing director and executive director.
+These profile facts let a company-scoped agent answer questions about its people
+without granting access to unrelated companies or all person records.
+Preserve each explicitly listed service, business division and branch as its own
+atomic fact, not only a summary or a count. Use the organization as subject and
+predicates 'service offering', 'business segment', or 'branch name' respectively.
+The value must be the verbatim entry name. Include source evidence establishing
+that this entry belongs to that organization. Never treat footer links, partners,
+customers, or another company's address as the organization's branches. Do not
+assert that extraction or the source list is exhaustive; VAV tracks coverage.
+"""
     payload = {"source_title": title, "source_url": url, "source_text": text[:120_000]}
     openai_client = client or AsyncOpenAI(api_key=api_key, timeout=45.0, max_retries=1)
     try:
@@ -331,6 +528,11 @@ fact. Do not produce medical advice."""
     accepted_facts = [
         validated for fact in result.facts if (validated := _validated_fact(text, fact)) is not None
     ]
+    validated_input_count = len(accepted_facts)
+    accepted_facts = _project_role_heading_facts(
+        entities=accepted_entities,
+        facts=accepted_facts,
+    )
     usage = getattr(response, "usage", None)
     input_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
     output_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
@@ -339,12 +541,35 @@ fact. Do not produce medical advice."""
         {
             "page_type": result.page_type,
             "entities": accepted_entities,
+            "speech_entities": _speech_entity_hints(
+                title=title,
+                page_type=result.page_type,
+                entities=accepted_entities,
+                facts=accepted_facts,
+            ),
             "facts": accepted_facts,
+            "exact_fact_coverage": {
+                # A generative extractor can prove that returned facts are
+                # source-grounded; it cannot prove that it returned *every*
+                # fact present in the source. Absence must therefore never be
+                # used as an authoritative refusal boundary.
+                "complete": False,
+                "absence_authoritative": False,
+                "returned_facts_validated": (
+                    len(text) <= 120_000 and validated_input_count == len(result.facts)
+                ),
+                "reason": (
+                    "validated_ai_facts_without_absence_audit"
+                    if len(text) <= 120_000 and validated_input_count == len(result.facts)
+                    else "partial_or_rejected_ai_extraction"
+                ),
+            },
             "validation": {
                 "entities_accepted": len(accepted_entities),
                 "entities_rejected": len(result.entities) - len(accepted_entities),
                 "facts_accepted": len(accepted_facts),
-                "facts_rejected": len(result.facts) - len(accepted_facts),
+                "facts_rejected": len(result.facts) - validated_input_count,
+                "facts_projected": len(accepted_facts) - validated_input_count,
                 "all_evidence_source_grounded": True,
             },
         }

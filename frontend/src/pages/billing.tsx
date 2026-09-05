@@ -75,6 +75,7 @@ function providerName(value: string | null) {
 
 function costStateLabel(value: string) {
   if (value === 'public_rate_estimate') return 'Public-rate estimate';
+  if (value === 'pending_provider_billing_sync') return 'Awaiting provider bill';
   if (value === 'recorded_ledger_estimate') return 'Ledger estimate';
   if (value === 'zero_duration') return 'Zero duration';
   return 'Unpriced';

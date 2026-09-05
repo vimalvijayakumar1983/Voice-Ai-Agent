@@ -4,17 +4,29 @@ from __future__ import annotations
 
 from typing import Any
 
-CLASSIFIER_VERSION = "vav-call-outcome-v3"
+CLASSIFIER_VERSION = "vav-call-outcome-v4"
 
 ANALYSIS_SOURCES = frozenset({"provider_analytics", "vav_ai", "rules", "unavailable"})
 
 GROUNDING_OUTCOMES = frozenset(
     {
+        # ``verified_answer`` is retained only for historical call rows. New
+        # runtime traces use the truthful retrieval-level label below.
         "verified_answer",
+        "response_after_verified_retrieval",
         "no_match_correctly_refused",
         "no_match_clarification",
         "no_match_unverified_response",
         "knowledge_error_response",
+    }
+)
+GROUNDING_QUALITY_FLAGS = frozenset(
+    {
+        "answered_without_grounding",
+        "refused_despite_verified_evidence",
+        "clarified_despite_verified_exact_fact",
+        "conversation_recovery_failure",
+        "unresolved_requests",
     }
 )
 
@@ -323,21 +335,44 @@ def normalize_call_analysis(payload: object, *, profile: str) -> dict[str, Any]:
 
 def summarize_runtime_grounding(call_metadata: object) -> dict[str, int]:
     """Count content-free grounding outcomes captured by the realtime runtime."""
-    counts = {outcome: 0 for outcome in sorted(GROUNDING_OUTCOMES)}
+    counts = {outcome: 0 for outcome in sorted(GROUNDING_OUTCOMES | GROUNDING_QUALITY_FLAGS)}
     if not isinstance(call_metadata, dict):
         return counts
     runtime = call_metadata.get("runtime")
     if not isinstance(runtime, dict):
         return counts
+    unresolved = runtime.get("conversation_requests_unresolved")
+    if runtime.get("conversation_ledger_version") == "v1" and type(unresolved) is int:
+        counts["unresolved_requests"] = max(0, unresolved)
     traces = runtime.get("turn_diagnostics")
     if not isinstance(traces, list):
         return counts
     for trace in traces[-50:]:
         if not isinstance(trace, dict):
             continue
+        if trace.get("conversation_recovery_failure"):
+            counts["conversation_recovery_failure"] += 1
         outcome = trace.get("grounding_outcome")
         if outcome in counts:
             counts[outcome] += 1
+        response_action = trace.get("response_action")
+        if response_action == "refused_despite_verified_evidence":
+            counts["refused_despite_verified_evidence"] += 1
+        elif (
+            response_action == "asked_clarification_despite_verified_evidence"
+            and trace.get("exact_fact_action") == "answer"
+        ):
+            # Clarification can be valid for broad or ambiguous prose. It is a
+            # deterministic quality failure only when the exact-fact resolver
+            # had already produced a single answer action for this turn.
+            counts["clarified_despite_verified_exact_fact"] += 1
+        knowledge_result = trace.get("retrieval_result", trace.get("knowledge_result"))
+        if (
+            trace.get("outcome") == "answered"
+            and knowledge_result in {"verified", "no_match", "error"}
+            and outcome not in GROUNDING_OUTCOMES
+        ):
+            counts["answered_without_grounding"] += 1
     return counts
 
 
@@ -351,11 +386,27 @@ def apply_grounding_quality_guard(
     if not isinstance(details, dict):
         return analysis
     safe_counts = {
-        outcome: max(0, int(grounding.get(outcome, 0))) for outcome in sorted(GROUNDING_OUTCOMES)
+        outcome: max(0, int(grounding.get(outcome, 0)))
+        for outcome in sorted(GROUNDING_OUTCOMES | GROUNDING_QUALITY_FLAGS)
     }
     details["grounding"] = safe_counts
     unsupported_count = safe_counts["no_match_unverified_response"]
-    if unsupported_count <= 0:
+    knowledge_error_count = safe_counts["knowledge_error_response"]
+    unlinked_answer_count = safe_counts["answered_without_grounding"]
+    verified_refusal_count = safe_counts["refused_despite_verified_evidence"]
+    verified_exact_clarification_count = safe_counts["clarified_despite_verified_exact_fact"]
+    recovery_failure_count = safe_counts["conversation_recovery_failure"]
+    unresolved_count = safe_counts["unresolved_requests"]
+    grounding_issue_count = (
+        unsupported_count
+        + knowledge_error_count
+        + unlinked_answer_count
+        + verified_refusal_count
+        + verified_exact_clarification_count
+        + recovery_failure_count
+        + unresolved_count
+    )
+    if grounding_issue_count <= 0:
         return analysis
 
     if details.get("resolution") == "resolved":
@@ -368,6 +419,36 @@ def apply_grounding_quality_guard(
     evidence = details.get("evidence")
     if not isinstance(evidence, list):
         evidence = []
-    warning = f"{unsupported_count} response(s) followed a no-match knowledge result."
+    warning_parts: list[str] = []
+    if unresolved_count:
+        warning_parts.append(
+            f"{unresolved_count} request(s) remained unanswered or awaiting clarification"
+        )
+    if recovery_failure_count:
+        warning_parts.append(
+            f"{recovery_failure_count} conversation recovery failure(s) require review"
+        )
+    if unsupported_count:
+        warning_parts.append(
+            f"{unsupported_count} response(s) followed a no-match knowledge result"
+        )
+    if knowledge_error_count:
+        warning_parts.append(
+            f"{knowledge_error_count} response(s) followed a knowledge retrieval error"
+        )
+    if unlinked_answer_count:
+        warning_parts.append(
+            f"{unlinked_answer_count} answered turn(s) had no completed grounding verdict"
+        )
+    if verified_refusal_count:
+        warning_parts.append(
+            f"{verified_refusal_count} response(s) refused despite verified evidence"
+        )
+    if verified_exact_clarification_count:
+        warning_parts.append(
+            f"{verified_exact_clarification_count} response(s) asked for clarification "
+            "despite a verified exact-fact answer"
+        )
+    warning = "; ".join(warning_parts) + "."
     details["evidence"] = [*evidence[:2], warning]
     return analysis

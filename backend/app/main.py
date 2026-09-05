@@ -9,9 +9,14 @@ from fastapi.responses import JSONResponse
 
 from app.api.v1.router import api_router
 from app.core.config import settings
+from app.core.logging_security import install_callback_claim_log_redaction
 from app.core.readiness import database_schema_is_ready
 from app.middleware.request_body_limit import RequestBodyLimitMiddleware
 from app.middleware.security_headers import SecurityHeadersMiddleware
+
+# Uvicorn configures its access logger before importing this module. Install
+# the process-wide scrubber before constructing the app or accepting requests.
+install_callback_claim_log_redaction()
 
 logger = structlog.get_logger()
 APP_VERSION = "0.3.1"
@@ -19,6 +24,8 @@ APP_VERSION = "0.3.1"
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Catch handlers added by programmatic ASGI launchers after module import.
+    install_callback_claim_log_redaction()
     logger.info("starting_voice_ai_agent", env=settings.app_env)
     yield
     logger.info("shutting_down_voice_ai_agent")
