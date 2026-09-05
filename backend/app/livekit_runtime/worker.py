@@ -70,9 +70,13 @@ from app.models.provider_credential import ProviderCredential
 from app.services.call_metadata import agent_configuration_snapshot
 from app.services.conversation_scope import (
     KnowledgeCompanyScope,
+    candidate_companies,
     company_key,
+    company_request_remainder,
     mentioned_companies,
+    person_company_directory,
     repeat_spoken,
+    routing_text,
     scope_reply,
 )
 from app.services.exact_fact_protocol import decode_exact_fact_evidence
@@ -2090,6 +2094,9 @@ class VAVInworldAgent(Agent):
         self._single_pass_active_subject: str | None = None
         scope = getattr(model, "knowledge_company_scope", None)
         self._company_scope = KnowledgeCompanyScope.model_validate(scope) if scope else None
+        self._conversation_routing_v2 = bool(
+            (getattr(model, "agent_metadata", None) or {}).get("conversation_routing_v2", False)
+        )
         if self._company_scope:
             self._single_pass_active_subject = self._company_scope.default_company
         self._company_epoch = 0
@@ -2101,6 +2108,8 @@ class VAVInworldAgent(Agent):
         self._semantic_repairs: dict[tuple[str, str, str], Any] = {}
         self._semantic_attempts: dict[tuple[str, str, str], int] = {}
         self._requested_detail: tuple[ExactFactType, ...] = ()
+        self._pending_company_choices: tuple[str, ...] = ()
+        self._person_company_directory: dict[str, tuple[str, ...]] | None = None
         self._single_pass_last_verified_evidence: str | None = None
         self._single_pass_verified_evidence_by_type: dict[ExactFactType, str] = {}
         self._single_pass_follow_up_offered = False
@@ -2415,8 +2424,8 @@ Knowledge policy:
                 if trace is not None:
                     trace["knowledge_interpretation_status"] = "retry_budget_exhausted"
                 return scope_reply(
-                    "The search service is having trouble. Please ask for the specific detail "
-                    "you need, or contact the team for help."
+                    "I couldn't find that detail with the available search. "
+                    "Could you clarify the company and the specific detail you need?"
                 )
             try:
                 async with async_session_factory() as db:
@@ -2545,6 +2554,8 @@ Knowledge policy:
         """Plan one contextual lookup without modifying the provider transcript."""
 
         text = str(transcript or "").strip()
+        if self._conversation_routing_v2:
+            text = routing_text(text)
         normalized = _normalized_utterance(text)
         if not normalized or _is_courtesy_utterance(text):
             return NO_KNOWLEDGE_REQUIRED
@@ -2557,16 +2568,74 @@ Knowledge policy:
         if self._company_scope:
             correction = re.split(r"\b(?:i mean|instead i mean)\b", text, flags=re.I)
             selection_text = correction[-1] if len(correction) > 1 else text
-            companies = mentioned_companies(selection_text, self._company_scope)
+            was_pending = bool(self._pending_company_choices)
+            companies = (
+                candidate_companies(
+                    selection_text, self._company_scope, self._pending_company_choices
+                )
+                if self._conversation_routing_v2
+                else mentioned_companies(selection_text, self._company_scope)
+            )
+            # A person's approved company-owned profile resolves their owner;
+            # the directory is restricted to this call's pinned KB and allowed
+            # companies. It never expands the configured permission list.
+            if (
+                self._conversation_routing_v2
+                and not companies
+                and re.search(r"\b(?:who is|tell me about)\b", text, re.I)
+            ):
+                if self._person_company_directory is None:
+                    self._person_company_directory = {}
+                    if self._knowledge_serving_revision_id and self._knowledge_base_id:
+                        async with async_session_factory() as db:
+                            sources = (
+                                await db.scalars(
+                                    select(KnowledgeServingRevisionSource.structured_content)
+                                    .where(
+                                        KnowledgeServingRevisionSource.tenant_id == self._tenant_id,
+                                        KnowledgeServingRevisionSource.knowledge_base_id
+                                        == self._knowledge_base_id,
+                                        KnowledgeServingRevisionSource.serving_revision_id
+                                        == self._knowledge_serving_revision_id,
+                                    )
+                                    .limit(500)
+                                )
+                            ).all()
+                        self._person_company_directory = person_company_directory(
+                            list(sources), self._company_scope
+                        )
+                names = [
+                    name
+                    for name in self._person_company_directory
+                    if " " + company_key(name) + " " in " " + company_key(text) + " "
+                ]
+                if len(names) == 1:
+                    companies = self._person_company_directory[names[0]]
             if len(companies) > 1:
+                self._pending_company_choices = companies
                 self._switch_company(None)
-                return scope_reply("Which company should I answer for first?")
+                return scope_reply("Which company do you mean: " + " or ".join(companies) + "?")
             if companies:
+                self._pending_company_choices = ()
                 self._switch_company(companies[0])
                 labels = next(c for c in self._company_scope.companies if c.name == companies[0])
-                remainder = company_key(selection_text)
-                for label in sorted([labels.name, *labels.aliases], key=len, reverse=True):
-                    remainder = re.sub(r"\b" + re.escape(company_key(label)) + r"\b", "", remainder)
+                remainder = company_request_remainder(selection_text, labels)
+                if was_pending and self._requested_detail == (ExactFactType.PHONE,):
+                    selection_terms = set(company_key(selection_text).split())
+                    label_terms = set(company_key(labels.name).split()) | {
+                        "the",
+                        "one",
+                        "please",
+                        "i",
+                        "mean",
+                        "what",
+                        "about",
+                        "centre",
+                    }
+                    if not explicit_intents and selection_terms <= label_terms:
+                        lookup = "What is the phone number?"
+                        self._single_pass_previous_explicit_query = lookup
+                        return await self._retrieve_approved_knowledge(query=lookup)
                 if set(remainder.split()) <= {
                     "what",
                     "how",
@@ -2591,8 +2660,23 @@ Knowledge policy:
                     return scope_reply(f"Okay, {companies[0]}. What would you like to know?")
             # An unresolved company correction must not retain the previous company.
             elif len(correction) > 1 or re.match(r"^(?:no[, ]+)?(?:about|for)\s+", text, re.I):
+                self._pending_company_choices = ()
                 self._switch_company(None)
                 return scope_reply("Which of this agent's configured companies do you mean?")
+
+            elif self._speech_lexicon_entries:
+                entity = resolve_canonical_entity(selection_text, self._speech_lexicon_entries)
+                if (
+                    entity.safe_to_apply
+                    and entity.entity_type in {"organization", "organisation"}
+                    and entity.canonical
+                ):
+                    if not mentioned_companies(entity.canonical, self._company_scope):
+                        self._switch_company(None)
+                        return scope_reply(
+                            "That company is not configured for this agent. "
+                            "Which of the configured companies would you like help with?"
+                        )
 
             if "repeat" in normalized.split() or "say again" in normalized:
                 subject = self._single_pass_active_subject

@@ -6,7 +6,106 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 def company_key(value: str) -> str:
-    return " ".join(re.findall(r"[^\W_]+", value.casefold()))
+    return " ".join(re.findall(r"[^\W_]+", value.casefold().replace("&", " and ")))
+
+
+def routing_text(value: str) -> str:
+    """Remove discourse noise without changing stored/provider transcripts or constraints."""
+    value = value.strip().replace("’", "'")
+    value = re.sub(r"\b(who|what|where|when|how)'s\b", r"\1 is", value, flags=re.I)
+    value = re.sub(r"\b(?:uh|um|erm)\b[,\s]*", "", value, flags=re.I)
+    value = re.sub(r"^(?:(?:sorry|okay|ok|well|so|please)[,\s]+)+", "", value, flags=re.I)
+    value = re.sub(r"^and\s+(?=(?:who|what|how|where|when)\b)", "", value, flags=re.I)
+    value = re.sub(
+        r"^(?:i (?:want|wanted|would like) to (?:know|get)|i'd like to know)\s+",
+        "",
+        value,
+        flags=re.I,
+    )
+    return " ".join(value.split()).strip()
+
+
+_LABEL_GENERIC = {
+    "the",
+    "a",
+    "an",
+    "and",
+    "company",
+    "group",
+    "medical",
+    "center",
+    "centre",
+    "llc",
+    "limited",
+}
+
+
+def candidate_companies(
+    text: str, scope: "KnowledgeCompanyScope", pending: tuple[str, ...] = ()
+) -> tuple[str, ...]:
+    """Resolve only allowed companies. Shared prefixes ask a choice, never grant access."""
+    exact = mentioned_companies(text, scope)
+    if exact:
+        return exact
+    normalized = company_key(text)
+    if pending:
+        terms = set(normalized.split()) - _LABEL_GENERIC - {"one", "please", "mean", "i"}
+        choices = tuple(
+            c.name
+            for c in scope.companies
+            if c.name in pending
+            and terms
+            and terms <= (set(company_key(c.name).split()) - _LABEL_GENERIC)
+        )
+        if choices:
+            return choices
+    prefixes: dict[str, list[str]] = {}
+    for company in scope.companies:
+        tokens = company_key(company.name).split()
+        for width in range(2, len(tokens)):
+            prefix = " ".join(tokens[:width])
+            if len(set(tokens[:width]) - _LABEL_GENERIC) >= 2:
+                prefixes.setdefault(prefix, []).append(company.name)
+    for prefix in sorted(prefixes, key=len, reverse=True):
+        if len(prefixes[prefix]) > 1 and re.search(r"\b" + re.escape(prefix) + r"\b", normalized):
+            return tuple(prefixes[prefix])
+    return ()
+
+
+def company_request_remainder(text: str, company: "KnowledgeCompany") -> str:
+    remainder = company_key(text)
+    for label in sorted([company.name, *company.aliases], key=len, reverse=True):
+        remainder = re.sub(r"\b" + re.escape(company_key(label)) + r"\b", "", remainder)
+    return " ".join(remainder.split())
+
+
+def person_company_directory(
+    sources: list[dict], scope: "KnowledgeCompanyScope"
+) -> dict[str, tuple[str, ...]]:
+    """Read only approved company-owned profiles; never infer membership from co-occurrence."""
+    allowed = {company_key(c.name): c.name for c in scope.companies}
+    directory: dict[str, list[str]] = {}
+    for source in sources:
+        for fact in (source or {}).get("facts", []):
+            if not isinstance(fact, dict):
+                continue
+            company = allowed.get(company_key(str(fact.get("subject") or "")))
+            predicate = str(fact.get("predicate") or "")
+            if not company or not predicate.casefold().startswith("person profile:"):
+                continue
+            name = predicate.split(":", 1)[1].strip()
+            evidence = " " + company_key(str(fact.get("evidence") or "")) + " "
+            if (
+                not name
+                or not fact.get("value")
+                or any(
+                    " " + company_key(v) + " " not in evidence
+                    for v in [name, company, str(fact.get("value") or "")]
+                )
+            ):
+                continue
+            directory.setdefault(name, []).append(company)
+    return {name: tuple(dict.fromkeys(companies)) for name, companies in directory.items()}
 
 
 class KnowledgeCompany(BaseModel):

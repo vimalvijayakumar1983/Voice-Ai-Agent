@@ -5,9 +5,25 @@ import pytest
 
 from app.services.knowledge_compiler import (
     KnowledgeCompilerError,
+    _Fact,
+    _validated_fact,
     compile_website_knowledge,
 )
 from app.services.knowledge_retrieval import rank_knowledge
+
+
+def test_person_profile_predicate_must_be_grounded_too():
+    source = "Jane Doe is Director of Harbour Group."
+    fields = dict(
+        subject="Harbour Group",
+        predicate="person profile: Jane Doe",
+        value="Director",
+        evidence=source,
+        search_phrases=["Who is Jane Doe?"],
+    )
+    assert _validated_fact(source, _Fact(**fields)) is not None
+    fields["predicate"] = "person profile: John Smith"
+    assert _validated_fact(source, _Fact(**fields)) is None
 
 
 class _FakeCompletions:
@@ -238,7 +254,7 @@ async def test_ai_compilation_projects_explicit_role_message_heading():
         and fact["value"] == "T.R. Vijayakumar"
         for fact in result.structured["facts"]
     )
-    assert result.structured["compiler"]["version"] == "vav-knowledge-compiler-10"
+    assert result.structured["compiler"]["version"] == "vav-knowledge-compiler-11"
 
 
 @pytest.mark.asyncio

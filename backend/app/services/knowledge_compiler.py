@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 ProcessingMode = Literal["automatic", "fast", "ai_verified"]
 
-COMPILER_VERSION = "vav-knowledge-compiler-10"
+COMPILER_VERSION = "vav-knowledge-compiler-11"
 AUTOMATIC_MODEL = "gpt-5.6-luna"
 VERIFIED_MODEL = "gpt-5.6-terra"
 _MODEL_PRICES_PER_MILLION = {
@@ -191,6 +191,12 @@ def _validated_fact(source: str, fact: _Fact) -> dict | None:
     """
 
     evidence = fact.evidence
+    if fact.predicate.casefold().startswith("person profile:"):
+        # The person encoded in this relationship predicate is a factual claim
+        # too, not a free-form search hint. Validate it alongside subject/value.
+        person = fact.predicate.split(":", 1)[1].strip()
+        if not person or not _value_is_grounded(person, evidence):
+            return None
     normalized_predicate = _grounding_normalized(fact.predicate)
     is_contact_fact = bool(
         _PHONE_RE.search(fact.value)
@@ -468,6 +474,18 @@ in the predicate (for example, 'healthcare profile via <child name>') so attribu
 is never lost. Keep the activity value verbatim. Do not project phone numbers,
 addresses, prices, availability or account data from a child onto a parent. Never
 infer membership from a navigation link, shared page, logo, or similar name alone.
+For each person's explicitly established organizational role, retain the person fact
+AND emit a company-owned profile fact: subject is the organization; predicate is
+'person profile: <full person name>'; value is the verbatim job title or role.
+Also emit organization / exact role / person facts when that precise role is supported.
+The evidence must contain the person, organization and role in one contiguous span
+proving that relationship. If a person's role heading and the company affiliation
+are in adjacent paragraphs of the SAME person's biography, include that full span.
+Do not cross another person's biography or attach roles using a footer, page title,
+search phrase, competitor mention, customer relationship or mere co-occurrence.
+Preserve distinctions such as director, managing director and executive director.
+These profile facts let a company-scoped agent answer questions about its people
+without granting access to unrelated companies or all person records.
 """
     payload = {"source_title": title, "source_url": url, "source_text": text[:120_000]}
     openai_client = client or AsyncOpenAI(api_key=api_key, timeout=45.0, max_retries=1)
@@ -503,6 +521,7 @@ infer membership from a navigation link, shared page, logo, or similar name alon
     accepted_facts = [
         validated for fact in result.facts if (validated := _validated_fact(text, fact)) is not None
     ]
+    validated_input_count = len(accepted_facts)
     accepted_facts = _project_role_heading_facts(
         entities=accepted_entities,
         facts=accepted_facts,
@@ -530,11 +549,11 @@ infer membership from a navigation link, shared page, logo, or similar name alon
                 "complete": False,
                 "absence_authoritative": False,
                 "returned_facts_validated": (
-                    len(text) <= 120_000 and len(accepted_facts) == len(result.facts)
+                    len(text) <= 120_000 and validated_input_count == len(result.facts)
                 ),
                 "reason": (
                     "validated_ai_facts_without_absence_audit"
-                    if len(text) <= 120_000 and len(accepted_facts) == len(result.facts)
+                    if len(text) <= 120_000 and validated_input_count == len(result.facts)
                     else "partial_or_rejected_ai_extraction"
                 ),
             },
@@ -542,7 +561,8 @@ infer membership from a navigation link, shared page, logo, or similar name alon
                 "entities_accepted": len(accepted_entities),
                 "entities_rejected": len(result.entities) - len(accepted_entities),
                 "facts_accepted": len(accepted_facts),
-                "facts_rejected": len(result.facts) - len(accepted_facts),
+                "facts_rejected": len(result.facts) - validated_input_count,
+                "facts_projected": len(accepted_facts) - validated_input_count,
                 "all_evidence_source_grounded": True,
             },
         }
