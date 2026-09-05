@@ -52,6 +52,7 @@ def test_semantic_variant_retrieves_source_worded_as_inception():
         limit=4,
     )
 
+    assert plan.recovered_terms == ()
     assert matches
     assert "inception in 2003" in matches[0].text
 
@@ -67,6 +68,7 @@ def test_response_style_words_do_not_block_division_detail_retrieval():
     plan = build_contextual_query_plan(
         "Tell me briefly about the healthcare division.",
         supplied_variants=("Al Zaabi Group. Tell me briefly about the healthcare division.",),
+        terminology=("HEALTHCARE Al",),
     )
 
     matches = knowledge_retrieval._rank_contextual_knowledge(

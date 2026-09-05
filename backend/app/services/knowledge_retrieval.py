@@ -216,6 +216,7 @@ _QUERY_INTENT_TOKENS = (
         "consultation",
         "cost",
         "detail",
+        "healthcare",
         "hour",
         "hierarchy",
         "information",
