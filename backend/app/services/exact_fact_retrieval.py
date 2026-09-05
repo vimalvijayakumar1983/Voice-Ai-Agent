@@ -1208,6 +1208,10 @@ def _requested_tokens(query: str, intents: Iterable[ExactFactType]) -> set[str]:
     ignored = _QUERY_STOP_WORDS | _GENERIC_ENTITY_TOKENS | _ALL_INTENT_TOKENS
     for intent in intents:
         ignored |= _INTENT_QUERY_TOKENS[intent]
+        if intent == ExactFactType.LEADERSHIP and re.search(
+            r"\bat (?:the )?top\b", _normalized(query)
+        ):
+            ignored |= {"sit", "sits", "top", "organization", "organisation"}
     return _tokens(query) - ignored
 
 
@@ -1492,6 +1496,20 @@ def resolve_exact_fact(
             if fact.fact_type not in intents:
                 intents.append(fact.fact_type)
     intent_tuple = tuple(intents)
+    # A named service overview needs its descriptive source, not a list of all
+    # business divisions merely containing the requested topic.
+    if intent_tuple == (ExactFactType.SERVICES,) and re.search(
+        r"\b(?:tell me about|explain|describe|rundown|details|more about)\b", _normalized(query)
+    ):
+        subject_tokens = set().union(*(_tokens(fact.subject) for fact in index.facts))
+        topic = _requested_tokens(query, intent_tuple) - subject_tokens
+        if topic:
+            return _resolution(
+                action=ExactFactResponseAction.FALLBACK,
+                intents=intent_tuple,
+                reason="service_details_require_descriptive_evidence",
+                max_evidence_chars=max_evidence_chars,
+            )
     if not queries or not intent_tuple:
         return _resolution(
             action=ExactFactResponseAction.FALLBACK,

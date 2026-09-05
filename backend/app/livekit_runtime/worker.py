@@ -2568,6 +2568,18 @@ Knowledge policy:
                 for label in sorted([labels.name, *labels.aliases], key=len, reverse=True):
                     remainder = re.sub(r"\b" + re.escape(company_key(label)) + r"\b", "", remainder)
                 if set(remainder.split()) <= {
+                    "what",
+                    "how",
+                    "about",
+                    "and",
+                    "the",
+                    "please",
+                } and re.search(r"\b(?:what about|how about|and)\b", selection_text, re.I):
+                    if self._requested_detail == (ExactFactType.PHONE,):
+                        query = "What is the phone number?"
+                        self._single_pass_previous_explicit_query = query
+                        return await self._retrieve_approved_knowledge(query=query)
+                if set(remainder.split()) <= {
                     "no",
                     "not",
                     "about",

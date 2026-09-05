@@ -87,6 +87,60 @@ def test_index_is_stable_source_grounded_and_carries_provenance():
     assert fact.provenance.compiler_version == "compiler-test-v1"
 
 
+def test_specific_service_overview_cannot_answer_with_entire_division_list():
+    source = ExactFactSource(
+        source_id="portfolio",
+        source_name="Portfolio",
+        structured_content={
+            "facts": [
+                {
+                    "subject": "Harbour Group",
+                    "predicate": "business segment",
+                    "value": value,
+                    "evidence": f"Harbour Group operates {value}.",
+                    "search_phrases": [],
+                }
+                for value in ["Healthcare", "Trading"]
+            ]
+        },
+    )
+    index = build_exact_fact_index((source,), revision="portfolio")
+    result = resolve_exact_fact(
+        index,
+        query="Harbour Group. Tell me about the healthcare division",
+        company_subject="Harbour Group",
+    )
+    assert result.response_action == ExactFactResponseAction.FALLBACK
+    assert result.reason == "service_details_require_descriptive_evidence"
+
+
+def test_top_of_organisation_requests_roles_without_inventing_hierarchy():
+    source = ExactFactSource(
+        source_id="roles",
+        source_name="Leadership",
+        structured_content={
+            "facts": [
+                {
+                    "subject": "Harbour Group",
+                    "predicate": role,
+                    "value": name,
+                    "evidence": f"Harbour Group {role} is {name}.",
+                    "search_phrases": [],
+                }
+                for role, name in [("chairman", "Alex Doe"), ("president", "Sam Doe")]
+            ]
+        },
+    )
+    index = build_exact_fact_index((source,), revision="roles")
+    result = resolve_exact_fact(
+        index,
+        query="Harbour Group. Who sits at the top of the organization?",
+        company_subject="Harbour Group",
+    )
+    assert result.response_action == ExactFactResponseAction.CLARIFY
+    assert {fact.predicate for fact in result.evidence} == {"chairman", "president"}
+
+
 @pytest.mark.parametrize(
     ("subject", "value", "evidence"),
     (

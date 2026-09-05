@@ -230,6 +230,8 @@ async def test_repeated_timeouts_have_a_bounded_retry_budget(db, tenant, monkeyp
 async def test_company_correction_then_that_number_refetches_new_company(db, tenant, monkeypatch):
     runtime = await enabled_runtime(db, tenant, monkeypatch)
     await runtime.retrieve_single_pass_evidence("What is the phone number?")
+    result = await runtime.retrieve_single_pass_evidence("What about Northstar Trading?")
+    assert "551 3831" in result and "665 9998" not in result
     await runtime.retrieve_single_pass_evidence("About Northstar Trading")
     result = await runtime.retrieve_single_pass_evidence("Give me that number")
     assert "551 3831" in result and "665 9998" not in result
