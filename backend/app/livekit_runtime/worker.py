@@ -72,6 +72,7 @@ from app.services.call_metadata import agent_configuration_snapshot
 from app.services.conversation_foundation import (
     FOUNDATION_FLAG,
     RequestLedger,
+    booking_decline,
     canonical_company_text,
     capability_question,
     company_alias_scope,
@@ -3032,6 +3033,11 @@ Knowledge policy:
                 and not re.search(r"\b(?:who|what|where|when|how|give|tell)\b", text, re.I)
             )
             resumes = resumes or bool(excluded_detail and state.topic_query)
+            if booking_decline(text):
+                resumes = resumes or any(
+                    request_id == self._request_ledger.active and capability_question(question)
+                    for question, request_id in self._request_ids.items()
+                )
             self._request_ids[str(transcript)] = self._request_ledger.begin(resumes=resumes)
             if len(self._request_ids) > 256:
                 self._request_ids.pop(next(iter(self._request_ids)))
@@ -3053,7 +3059,7 @@ Knowledge policy:
                         query=state.topic_query, allow_semantic_repair=False
                     )
                 return scope_reply("Which detail would you like instead?")
-            if capability_question(text):
+            if capability_question(text) or booking_decline(text):
                 # This lane registers search_approved_knowledge only. Do not claim
                 # actions from a business prompt or from booking-related KB text.
                 return scope_reply(

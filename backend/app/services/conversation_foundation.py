@@ -121,6 +121,18 @@ def capability_question(text: str) -> bool:
     )
 
 
+def booking_decline(text: str) -> bool:
+    """A standalone prohibition is a control, not a request for business facts."""
+    normalized = company_key(text)
+    return bool(
+        re.fullmatch(
+            r"(?:please )?(?:don t|do not|never) (?:book|schedule|change|cancel) "
+            r"(?:anything|(?:an? |any |my |the )?appointments?)(?: please)?",
+            normalized,
+        )
+    )
+
+
 def person_mentions(text: str, directory: dict[str, tuple[str, ...]]) -> tuple[str, ...]:
     words = company_key(text).split()
     starts = {company_key(name).split()[0] for name in directory if company_key(name)}

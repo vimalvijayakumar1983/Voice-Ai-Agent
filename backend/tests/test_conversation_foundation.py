@@ -13,6 +13,7 @@ from app.services.call_disposition import (
 from app.services.call_metadata import public_call_metadata
 from app.services.conversation_foundation import (
     RequestLedger,
+    booking_decline,
     capability_question,
     company_alias_scope,
     contextual_plan,
@@ -219,6 +220,29 @@ async def test_capability_is_not_a_knowledge_gap_or_booking(db, tenant, monkeypa
     )
     assert "cannot" in answer.lower() and "book" in answer.lower()
     assert "clarify" not in answer and "confirmed" not in answer
+
+
+async def test_split_booking_decline_finishes_capability_request(db, tenant, monkeypatch):
+    r, _ = await foundation(db, tenant, monkeypatch)
+    q = "Can you actually book an appointment or only provide information?"
+    e = await r.retrieve_single_pass_evidence(q)
+    r.prepare_spoken_response(q, e)("I can provide")
+    reply = await ask(r, "Don't book anything.")
+    assert "cannot book" in reply and "clarify" not in reply
+    assert r._request_ledger.metrics()["conversation_requests_total"] == 1
+    assert r._request_ledger.metrics()["conversation_requests_unresolved"] == 0
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Don't book anything. What is the price?",
+        "What is the policy if I do not book an appointment?",
+        "Cancel my appointment.",
+    ],
+)
+def test_booking_prohibition_does_not_swallow_questions_or_actions(text):
+    assert not booking_decline(text)
 
 
 async def test_incomplete_question_never_reaches_retrieval_and_joins_continuation():
