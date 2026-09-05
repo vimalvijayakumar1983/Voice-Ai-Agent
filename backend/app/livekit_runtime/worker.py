@@ -20,7 +20,7 @@ import math
 import os
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
@@ -69,6 +69,7 @@ from app.models.agent import (
 from app.models.call import Call, CallTranscript
 from app.models.provider_credential import ProviderCredential
 from app.services.call_metadata import agent_configuration_snapshot
+from app.services.conversation_intent import apply_intent, interpret_conversation_turn
 from app.services.conversation_scope import (
     KnowledgeCompanyScope,
     candidate_companies,
@@ -2139,6 +2140,10 @@ class VAVInworldAgent(Agent):
         self._conversation_state = ConversationState(
             company=self._company_scope.default_company if self._company_scope else None
         )
+        self._structured_intent_enabled = bool(
+            (getattr(model, "agent_metadata", None) or {}).get("conversation_intent_v1", False)
+        )
+        self._intent_sequence = 0
         self._collection_playback: CollectionPlayback | None = None
         if self._company_scope:
             self._single_pass_active_subject = self._company_scope.default_company
@@ -2942,12 +2947,19 @@ Knowledge policy:
 
     async def _retrieve_conversation_state_evidence(self, transcript: str) -> str:
         """Separate topic, company, identity and playback state on the opt-in lane."""
+        self._intent_sequence += 1
+        intent_sequence = self._intent_sequence
         control = conversation_control(str(transcript or ""))
         if control == "hold":
             return scope_reply("Of course. Take your time.")
         if control == "courtesy":
             return NO_KNOWLEDGE_REQUIRED
         text = routing_text(str(transcript or ""))
+        if self._structured_intent_enabled:
+            # Remove an acknowledgement prefix, not the question or stored transcript.
+            text = re.sub(r"^(?:yeah|yes|right)[,\s]+(?=\w)", "", text, flags=re.I)
+            if _normalized_utterance(text) in {"uh huh", "huh", "mm hmm"}:
+                return SUPPRESS_REPLY
         text = re.sub(r"^stop[—,\s-]+(?:just\s+)?(?=give|tell|what|who|list)", "", text, flags=re.I)
         normalized = _normalized_utterance(text)
         if normalized in {
@@ -2974,7 +2986,7 @@ Knowledge policy:
             return NO_KNOWLEDGE_REQUIRED
         state = self._conversation_state
         if self._person_company_directory is None and (
-            person_reference(text) or state.pending_people
+            person_reference(text) or state.pending_people or self._structured_intent_enabled
         ):
             # Same tenant/agent/revision fence as normal retrieval. Reuse the
             # cached index; never infer an employee's company from page co-occurrence.
@@ -3039,9 +3051,45 @@ Knowledge policy:
             )
             if resolution.safe_to_apply and resolution.entity_type == "person":
                 person_hint = resolution.canonical
-        plan = state.plan(
+        proposed_state = replace(state) if self._structured_intent_enabled else state
+        plan = proposed_state.plan(
             text, self._company_scope, self._person_company_directory or {}, person_hint=person_hint
         )
+        interpreted = False
+        if self._structured_intent_enabled:
+            # Fast paths are supported by typed slots or explicit entity resolution,
+            # not by a broad prose result that happens to contain matching words.
+            typed = classify_exact_fact_intents(plan.query)
+            mentions_person = any(
+                re.search(
+                    r"\b" + re.escape(company_key(name).split()[0]) + r"\b", company_key(text)
+                )
+                for name in (self._person_company_directory or {})
+                if company_key(name)
+            )
+            fast = (
+                plan.action in {"recall", "selection", "person_reference"}
+                or (
+                    plan.action == "clarify"
+                    and bool(proposed_state.pending_companies)
+                    and not mentions_person
+                )
+                or (
+                    plan.action == "lookup"
+                    and (
+                        (bool(typed) and not state.pending_companies)
+                        or (proposed_state.person is not None and plan.query.startswith("Who is "))
+                        or bool(collection_request(plan.query, plan.company or "")[0])
+                    )
+                )
+            )
+            if not fast:
+                interpreted = True
+                proposed_state = replace(state)
+                plan = await self._interpret_turn_plan(text, proposed_state)
+            if intent_sequence != self._intent_sequence:
+                raise asyncio.CancelledError
+            self._conversation_state = state = proposed_state
         if self._telemetry:
             self._telemetry.runtime_metrics["conversation_state_version"] = "v3"
             trace = self._telemetry._trace()
@@ -3065,7 +3113,90 @@ Knowledge policy:
         self._collection_cursor = None
         self._single_pass_previous_explicit_query = plan.query
         self._requested_detail = classify_exact_fact_intents(plan.query)
-        return await self._retrieve_approved_knowledge(query=plan.query)
+        if self._structured_intent_enabled and not interpreted:
+            state.requested_detail = (
+                self._requested_detail[0].value if len(self._requested_detail) == 1 else "other"
+            )
+        return await self._retrieve_approved_knowledge(
+            query=plan.query, **({"allow_semantic_repair": False} if interpreted else {})
+        )
+
+    async def _interpret_turn_plan(self, text: str, state: ConversationState):
+        """Interpret before lookup; share the existing repair budget, never chain two LLM passes."""
+        trace = self._telemetry._trace() if self._telemetry else None
+        metrics = self._telemetry.runtime_metrics if self._telemetry else {}
+        metrics["conversation_intent_version"] = "v1"
+        if trace is not None:
+            trace["conversation_intent_version"] = "v1"
+
+        def unavailable(status):
+            if trace is not None:
+                trace["conversation_intent_status"] = status
+                trace["conversation_recovery_failure"] = status
+            return state._clarify(
+                "I couldn't reliably interpret that. Please state the company or person's name "
+                "and the detail you need together."
+            )
+
+        key = (state.company or "", text, state.topic_query or "")
+        if len(text) > 800:
+            return unavailable("intent_input_too_large")
+        if sum(self._semantic_attempts.values()) >= 8 or self._semantic_attempts.get(key, 0) >= 2:
+            return unavailable("intent_budget_exhausted")
+        try:
+            async with async_session_factory() as db:
+                config = await load_provider_config(db, self._tenant_id, "openai")
+                api_key = str((config or {}).get("api_key") or "").strip()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return unavailable("intent_configuration_unavailable")
+        if not api_key:
+            return unavailable("intent_unavailable")
+        self._semantic_attempts[key] = self._semantic_attempts.get(key, 0) + 1
+        metrics["knowledge_interpretation_requests"] = (
+            int(metrics.get("knowledge_interpretation_requests", 0)) + 1
+        )
+        metrics["knowledge_interpretation_model"] = QUERY_MODEL
+        try:
+            result = await interpret_conversation_turn(
+                api_key=api_key,
+                question=text,
+                state=state,
+                scope=self._company_scope,
+                directory=self._person_company_directory or {},
+            )
+        except asyncio.CancelledError:
+            metrics["knowledge_interpretation_usage_incomplete"] = True
+            raise
+        for suffix, value in (
+            ("input_tokens", result.input_tokens),
+            ("output_tokens", result.output_tokens),
+        ):
+            if value is not None:
+                field_name = "knowledge_interpretation_" + suffix
+                metrics[field_name] = int(metrics.get(field_name, 0)) + value
+            elif result.attempted:
+                metrics["knowledge_interpretation_usage_incomplete"] = True
+        if trace is not None:
+            trace["conversation_intent_ms"] = result.elapsed_ms
+            trace["conversation_intent_status"] = result.status
+        if result.plan is None:
+            return unavailable("intent_" + result.status)
+        try:
+            plan = apply_intent(
+                result.plan,
+                utterance=text,
+                state=state,
+                scope=self._company_scope,
+                directory=self._person_company_directory or {},
+            )
+        except ValueError:
+            return unavailable("intent_validation_failed")
+        if trace is not None:
+            trace["conversation_intent_action"] = result.plan.intent
+            trace["conversation_requested_detail"] = result.plan.detail
+        return plan
 
     def observe_single_pass_assistant_content(self, content: str) -> None:
         """Remember only explicit offers that make a later "yes" meaningful."""

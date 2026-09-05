@@ -76,6 +76,7 @@ def public_call_metadata(value: Any) -> dict[str, Any] | None:
     if isinstance(runtime, dict):
         safe_runtime: dict[str, Any] = {}
         string_fields = {
+            "conversation_intent_version",
             "knowledge_interpretation_model",
             "knowledge_interpretation_last_status",
             "speech_provider",
@@ -279,6 +280,7 @@ def public_call_metadata(value: Any) -> dict[str, Any] | None:
         if isinstance(turn_diagnostics, list):
             safe_turns: list[dict[str, Any]] = []
             numeric_trace_fields = {
+                "conversation_intent_ms",
                 "knowledge_interpretation_ms",
                 "turn",
                 "user_speech_ms",
@@ -329,6 +331,11 @@ def public_call_metadata(value: Any) -> dict[str, Any] | None:
                 if isinstance(trace.get("barge_in"), bool):
                     safe_trace["barge_in"] = trace["barge_in"]
                 for field in (
+                    "conversation_intent_version",
+                    "conversation_intent_status",
+                    "conversation_intent_action",
+                    "conversation_requested_detail",
+                    "conversation_recovery_failure",
                     "tool_call",
                     "knowledge_fallback_used",
                     "exact_fact_cache_hit",

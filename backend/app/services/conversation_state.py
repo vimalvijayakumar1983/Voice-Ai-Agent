@@ -194,6 +194,7 @@ class ConversationState:
     company: str | None = None
     topic_query: str | None = None
     person: str | None = None
+    requested_detail: str | None = None
     pending_companies: tuple[str, ...] = ()
     pending_query: str | None = None
     pending_people: tuple[str, ...] = ()
