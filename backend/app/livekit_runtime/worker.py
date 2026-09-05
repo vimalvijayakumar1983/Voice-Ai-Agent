@@ -91,6 +91,13 @@ from app.services.integration_security import (
     IntegrationConfigUnavailableError,
     decrypt_integration_config,
 )
+from app.services.knowledge_collections import (
+    CollectionPage,
+    collection_reply,
+    collection_request,
+    decode_collection,
+    retrieve_collection,
+)
 from app.services.knowledge_query_interpreter import (
     QUERY_MODEL,
     interpret_knowledge_question,
@@ -1339,6 +1346,8 @@ class _LiveKitRuntimeTelemetry:
                 "knowledge_company_subject",
                 "exact_fact_action",
                 "exact_fact_reason",
+                "collection_category",
+                "collection_coverage",
             ):
                 value = details.get(key)
                 if isinstance(value, str) and value:
@@ -1354,12 +1363,22 @@ class _LiveKitRuntimeTelemetry:
                 "exact_fact_total_ms",
                 "exact_fact_evidence_count",
                 "exact_fact_candidate_count",
+                "collection_total",
+                "collection_offset",
+                "collection_next_offset",
             ):
                 value = details.get(key)
                 if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
                     trace[key] = round(float(value), 3)
                     if is_latest_completed_lookup:
                         self.runtime_metrics[f"last_{key}"] = trace[key]
+            if isinstance(details.get("collection_blocked"), bool):
+                trace["collection_blocked"] = details["collection_blocked"]
+            collection_ids = details.get("collection_evidence_ids")
+            if isinstance(collection_ids, list):
+                trace["collection_evidence_ids"] = [
+                    str(value)[:160] for value in collection_ids[:100]
+                ]
             cache_hit = details.get("exact_fact_cache_hit")
             if isinstance(cache_hit, bool):
                 trace["exact_fact_cache_hit"] = cache_hit
@@ -2097,6 +2116,10 @@ class VAVInworldAgent(Agent):
         self._conversation_routing_v2 = bool(
             (getattr(model, "agent_metadata", None) or {}).get("conversation_routing_v2", False)
         )
+        self._collections_enabled = bool(
+            (getattr(model, "agent_metadata", None) or {}).get("knowledge_collections_v1", False)
+        )
+        self._collection_cursor: CollectionPage | None = None
         if self._company_scope:
             self._single_pass_active_subject = self._company_scope.default_company
         self._company_epoch = 0
@@ -2237,6 +2260,7 @@ Knowledge policy:
         query: str,
         query_variants: tuple[str, ...] = (),
         allow_semantic_repair: bool = True,
+        collection_offset: int = 0,
     ) -> str:
         started_at = time.perf_counter()
         originating_trace = (
@@ -2276,6 +2300,65 @@ Knowledge policy:
         trace_details: dict[str, Any] = {}
         try:
             async with async_session_factory() as db:
+                if self._collections_enabled and company_subject:
+                    labels = next(
+                        c for c in self._company_scope.companies if c.name == company_subject
+                    )
+                    category, clarification = collection_request(
+                        company_request_remainder(query, labels), company_subject
+                    )
+                    if clarification:
+                        return scope_reply(clarification)
+                    if category:
+                        index = await load_agent_exact_fact_index(
+                            db,
+                            tenant_id=self._tenant_id,
+                            agent_id=self._agent_id,
+                            serving_revision_id=self._knowledge_serving_revision_id,
+                            knowledge_base_id=self._knowledge_base_id,
+                        )
+                        hard_limits = {
+                            "source_limit",
+                            "source_coverage_mismatch",
+                            "per_source_fact_limit",
+                            "index_fact_limit",
+                        }
+                        page = retrieve_collection(
+                            index.collection_records if index else (),
+                            company=company_subject,
+                            category=category,
+                            query=query,
+                            revision=index.revision if index else "unavailable",
+                            offset=collection_offset,
+                            blocked=index is None
+                            or bool(hard_limits.intersection(index.truncation_reasons)),
+                        )
+                        context = page.encode()
+                        if self._telemetry is not None:
+                            self._telemetry.record_knowledge_lookup(
+                                elapsed_ms=round((time.perf_counter() - started_at) * 1000),
+                                result="verified"
+                                if page.total and not page.blocked
+                                else "no_match",
+                                evidence_chars=len(context),
+                                query_variant_count=1,
+                                fallback_used=False,
+                                details={
+                                    "knowledge_retrieval_path": "collection",
+                                    "knowledge_company_subject": company_subject,
+                                    "collection_category": category,
+                                    "collection_total": page.total,
+                                    "collection_offset": page.offset,
+                                    "collection_next_offset": page.next_offset,
+                                    "collection_coverage": page.coverage,
+                                    "collection_blocked": page.blocked,
+                                    "collection_evidence_ids": [
+                                        e for item in page.items for e in item.evidence_ids
+                                    ],
+                                },
+                                originating_trace=originating_trace,
+                            )
+                        return context
                 if self._knowledge_terminology is None:
                     self._knowledge_terminology = await load_agent_knowledge_terminology(
                         db,
@@ -2707,6 +2790,35 @@ Knowledge policy:
                     "What would you like me to look up?"
                 )
 
+        if self._collections_enabled and self._company_scope:
+            if normalized in {
+                "next",
+                "next please",
+                "continue",
+                "go on",
+                "the rest",
+                "show more",
+                "more",
+                "remaining",
+                "remaining entries",
+            }:
+                cursor = self._collection_cursor
+                if cursor and cursor.company == self._single_pass_active_subject:
+                    return await self._retrieve_approved_knowledge(
+                        query=cursor.query, collection_offset=cursor.next_offset
+                    )
+                return scope_reply("Which list would you like me to continue?")
+            subject = self._single_pass_active_subject
+            self._collection_cursor = None
+            if subject:
+                labels = next(c for c in self._company_scope.companies if c.name == subject)
+                category, clarification = collection_request(
+                    company_request_remainder(text, labels), subject
+                )
+                if category or clarification:
+                    self._single_pass_previous_explicit_query = text
+                    return await self._retrieve_approved_knowledge(query=text)
+
         if _is_conversation_control_utterance(text):
             if "repeat" in normalized or "say again" in normalized:
                 requested_intents = classify_exact_fact_intents(text)
@@ -2811,6 +2923,7 @@ Knowledge policy:
             return
         self._single_pass_active_subject = subject
         self._company_epoch += 1
+        self._collection_cursor = None
         self._single_pass_previous_explicit_query = None
         self._single_pass_last_verified_evidence = None
         self._single_pass_verified_evidence_by_type.clear()
@@ -2825,6 +2938,7 @@ Knowledge policy:
         sequence = self._spoken_response_sequence
         intents = classify_exact_fact_intents(query)
         envelope = decode_exact_fact_evidence(evidence or "")
+        collection = decode_collection(evidence)
         if not intents and envelope is not None and envelope.response_action == "answer":
             # A paraphrase such as "ring your office" need not contain the
             # word "phone". The retrieved typed fact supplies the repeat slot;
@@ -2853,6 +2967,12 @@ Knowledge policy:
             ):
                 return
             self._last_committed_response_sequence = sequence
+            if collection is not None and not collection.blocked and not collection.count_only:
+                # A cancelled/partial answer must not advance the page cursor.
+                if _normalized_utterance(content) == _normalized_utterance(
+                    collection_reply(collection)
+                ):
+                    self._collection_cursor = collection
             self._last_spoken_answer = (subject, content)
             for intent in intents:
                 self._spoken_answers[(subject, intent)] = content

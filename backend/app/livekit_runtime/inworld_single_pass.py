@@ -29,6 +29,7 @@ from openai.types.realtime.realtime_audio_input_turn_detection import SemanticVa
 
 from app.services.conversation_scope import SCOPE_REPLY_PREFIX, SPOKEN_REPEAT_PREFIX
 from app.services.exact_fact_protocol import decode_exact_fact_evidence
+from app.services.knowledge_collections import collection_reply, decode_collection
 
 logger = logging.getLogger(__name__)
 
@@ -379,6 +380,9 @@ def deterministic_grounded_reply(
             return "What would you like me to repeat?"
         return None
 
+    collection = decode_collection(evidence)
+    if collection is not None:
+        return collection_reply(collection)
     envelope = decode_exact_fact_evidence(evidence)
     if envelope is None:
         return None

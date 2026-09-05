@@ -37,6 +37,7 @@ from app.models.agent import (
 )
 from app.services.conversation_scope import company_key
 from app.services.exact_fact_protocol import ExactFactWireFact, encode_exact_fact_evidence
+from app.services.knowledge_collections import CollectionRecord, collection_record
 
 MIN_EVIDENCE_CONTEXT_CHARS = 600
 DEFAULT_EVIDENCE_CONTEXT_CHARS = 800
@@ -133,6 +134,7 @@ class ExactFactIndex:
     index_truncated: bool = False
     truncation_reasons: tuple[str, ...] = ()
     absence_authoritative: bool = True
+    collection_records: tuple[CollectionRecord, ...] = ()
 
     @property
     def fact_count(self) -> int:
@@ -1052,6 +1054,7 @@ def build_exact_fact_index(
             else "source_coverage_mismatch"
         )
     facts: list[ExactFact] = []
+    collection_records: list[CollectionRecord] = []
     completely_structured_sources = 0
     absence_authoritative = True
     seen_ids: set[str] = set()
@@ -1120,6 +1123,30 @@ def build_exact_fact_index(
             predicate = _clean_text(raw_fact.get("predicate"), limit=100)
             value = _clean_text(raw_fact.get("value"), limit=1_000)
             evidence = _clean_text(raw_fact.get("evidence"), limit=1_500)
+            if (
+                all((subject, predicate, value, evidence))
+                and _value_is_grounded(value, evidence)
+                and _subject_is_grounded(subject, evidence)
+            ):
+                record = collection_record(
+                    subject=subject,
+                    predicate=predicate,
+                    value=value,
+                    evidence=evidence,
+                    evidence_id=_stable_evidence_id(
+                        source_id=provenance.source_id,
+                        subject=subject,
+                        predicate=predicate,
+                        value=value,
+                        evidence=evidence,
+                        explicit_id=raw_fact.get("evidence_id"),
+                    ),
+                )
+                if record is not None:
+                    if len(collection_records) < MAX_INDEX_FACTS:
+                        collection_records.append(record)
+                    else:
+                        truncation_reasons.add("index_fact_limit")
             fact_type = classify_structured_fact(raw_fact)
             if not all((subject, predicate, value, evidence, fact_type)):
                 truncation_reasons.add("invalid_structured_fact")
@@ -1193,6 +1220,7 @@ def build_exact_fact_index(
         index_truncated=bool(truncation_reasons),
         truncation_reasons=tuple(sorted(truncation_reasons)),
         absence_authoritative=absence_authoritative,
+        collection_records=tuple(collection_records),
     )
 
 

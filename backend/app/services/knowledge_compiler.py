@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 ProcessingMode = Literal["automatic", "fast", "ai_verified"]
 
-COMPILER_VERSION = "vav-knowledge-compiler-11"
+COMPILER_VERSION = "vav-knowledge-compiler-12"
 AUTOMATIC_MODEL = "gpt-5.6-luna"
 VERIFIED_MODEL = "gpt-5.6-terra"
 _MODEL_PRICES_PER_MILLION = {
@@ -486,6 +486,13 @@ search phrase, competitor mention, customer relationship or mere co-occurrence.
 Preserve distinctions such as director, managing director and executive director.
 These profile facts let a company-scoped agent answer questions about its people
 without granting access to unrelated companies or all person records.
+Preserve each explicitly listed service, business division and branch as its own
+atomic fact, not only a summary or a count. Use the organization as subject and
+predicates 'service offering', 'business segment', or 'branch name' respectively.
+The value must be the verbatim entry name. Include source evidence establishing
+that this entry belongs to that organization. Never treat footer links, partners,
+customers, or another company's address as the organization's branches. Do not
+assert that extraction or the source list is exhaustive; VAV tracks coverage.
 """
     payload = {"source_title": title, "source_url": url, "source_text": text[:120_000]}
     openai_client = client or AsyncOpenAI(api_key=api_key, timeout=45.0, max_retries=1)
