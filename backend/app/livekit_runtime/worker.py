@@ -477,7 +477,9 @@ def _runtime_date_context(
     return local_date, selected_timezone
 
 
-def _inworld_recognition_terms(terminology: tuple[str, ...]) -> tuple[str, ...]:
+def _inworld_recognition_terms(
+    terminology: tuple[str, ...], *, max_chars: int = 1500
+) -> tuple[str, ...]:
     """Select whole terminology values that fit the provider prompt boundary."""
     selected: list[str] = []
     used_chars = 0
@@ -486,7 +488,7 @@ def _inworld_recognition_terms(terminology: tuple[str, ...]) -> tuple[str, ...]:
         if not value:
             continue
         added_chars = len(value) + (2 if selected else 0)
-        if used_chars + added_chars > 1500:
+        if used_chars + added_chars > max_chars:
             break
         selected.append(value)
         used_chars += added_chars
@@ -1935,18 +1937,27 @@ def _build_inworld_realtime_model(
 ) -> InworldRealtimeModel:
     """Build the single-session Inworld speech-to-speech lane."""
 
-    recognition_terms = _inworld_recognition_terms(terminology)
+    stt_model = _inworld_stt_model(model=model, profile=profile)
+    transcription_prompt = (
+        inworld_transcription_language_hint(model=model, profile=profile)
+        + "Customer-service call. Preserve business, person, treatment, product, and "
+        f"place names exactly. Agent scope: {str(model.name or '').strip()[:180]}."
+    )
+    # U3 streaming caps the entire prompt at 1,750 characters, not just the
+    # vocabulary. Reserve framing/language space and keep only whole terms.
+    vocabulary_prefix = " Approved knowledge terminology: "
+    vocabulary_budget = 1500
+    if stt_model == INWORLD_STT_FAST_ACCURATE:
+        vocabulary_budget = min(
+            vocabulary_budget, max(0, 1750 - len(transcription_prompt) - len(vocabulary_prefix) - 1)
+        )
+    recognition_terms = _inworld_recognition_terms(terminology, max_chars=vocabulary_budget)
     vocabulary = ", ".join(recognition_terms)
-    vocabulary_instruction = f" Approved knowledge terminology: {vocabulary}." if vocabulary else ""
+    vocabulary_instruction = f"{vocabulary_prefix}{vocabulary}." if vocabulary else ""
     transcription = AudioTranscription(
-        model=_inworld_stt_model(model=model, profile=profile),
+        model=stt_model,
         language=inworld_stt_wire_language(model=model, profile=profile),
-        prompt=(
-            inworld_transcription_language_hint(model=model, profile=profile)
-            + "Customer-service call. Preserve business, person, treatment, product, and "
-            f"place names exactly. Agent scope: {str(model.name or '').strip()[:180]}."
-            f"{vocabulary_instruction}"
-        ),
+        prompt=transcription_prompt + vocabulary_instruction,
     )
     return InworldRealtimeModel(
         api_key=api_key,

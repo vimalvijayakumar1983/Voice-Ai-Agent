@@ -24,6 +24,9 @@ names, roles or answers are hardcoded into routing.
 - The QA U3 transcription prompt includes provider-recommended language guidance
   for a supported explicit language. No recognizer, TTS model, on-wire language,
   auto-language policy or unexpected-script safeguard is changed.
+- U3's full transcription prompt (language guidance, agent scope and whole
+  vocabulary terms) is capped at 1,750 characters. Budgeting vocabulary alone
+  is insufficient and can cause a provider `stt_unavailable` error.
 
 ## Speech evidence and limits
 

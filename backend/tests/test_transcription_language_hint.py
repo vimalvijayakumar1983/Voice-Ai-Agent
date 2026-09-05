@@ -70,3 +70,19 @@ async def test_qa_prompt_guidance_is_in_serialized_transcription_without_changin
     assert payload["prompt"].startswith("Transcribe English.")
     assert payload["language"] == "en-GB"
     await session.aclose()
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+@pytest.mark.parametrize("name", ["Example Support", "Long company name " * 30])
+def test_u3_total_prompt_budget_preserves_whole_vocabulary_terms(enabled, name):
+    model, profile = config(enabled=enabled)
+    model.name = name
+    terms = tuple(f"Approved Person {index:02d} With Long Name" for index in range(80))
+    runtime = _build_inworld_realtime_model(
+        model=model, profile=profile, api_key="test", terminology=terms
+    )
+    prompt = runtime._opts.input_audio_transcription.prompt
+    assert len(prompt) <= 1750
+    included = prompt.split(" Approved knowledge terminology: ")[1].removesuffix(".").split(", ")
+    assert included == list(terms[: len(included)])
+    assert runtime._recognition_lexicon_count == len(included)
