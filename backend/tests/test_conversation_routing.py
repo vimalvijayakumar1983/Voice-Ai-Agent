@@ -73,6 +73,18 @@ async def test_pending_company_choice_completes_previous_request(db, tenant, mon
     assert runtime._single_pass_active_subject == names[1]
 
 
+async def test_primary_number_is_not_confused_with_mobile_choices(db, tenant, monkeypatch):
+    runtime, names = await medical_runtime(db, tenant, monkeypatch)
+    source = await db.scalar(select(KnowledgeSource).where(KnowledgeSource.tenant_id == tenant.id))
+    mobile = phone_fact(names[0], "+971 50 123 4567")
+    mobile["predicate"] = "mobile"
+    source.structured_content = {"facts": [*source.structured_content["facts"], mobile]}
+    await db.commit()
+    await runtime.retrieve_single_pass_evidence("Sun and Moon phone number?")
+    reply = await runtime.retrieve_single_pass_evidence("The Specialized Centre")
+    assert "123 4000" in reply and "50 123" not in reply
+
+
 async def test_new_intent_overrides_pending_phone_request(db, tenant, monkeypatch):
     runtime, names = await medical_runtime(db, tenant, monkeypatch)
     await runtime.retrieve_single_pass_evidence("Sun and Moon phone number?")

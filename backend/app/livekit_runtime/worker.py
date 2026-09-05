@@ -2295,6 +2295,7 @@ Knowledge policy:
                     serving_revision_id=self._knowledge_serving_revision_id,
                     knowledge_base_id=self._knowledge_base_id,
                     **({"company_subject": company_subject} if company_subject else {}),
+                    **({"prefer_primary_phone": True} if self._conversation_routing_v2 else {}),
                 )
                 trace_details = _exact_fact_trace_details(exact_fact)
                 if company_subject:

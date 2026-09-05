@@ -24,6 +24,44 @@ from app.services.exact_fact_retrieval import (
 from tests.quality.tier1_fixtures import tier1_exact_fact_index
 
 
+@pytest.mark.parametrize(
+    "question", ["phone number", "all phone numbers", "mobile phone number", "fax number"]
+)
+def test_primary_phone_preference_preserves_explicit_subtype(question):
+    facts = [
+        {
+            "subject": "Harbour Clinic",
+            "predicate": predicate,
+            "value": number,
+            "evidence": f"Harbour Clinic {predicate}: {number}.",
+            "search_phrases": [],
+        }
+        for predicate, number in [
+            ("primary telephone", "+971 2 123 4000"),
+            ("mobile", "+971 50 123 4567"),
+        ]
+    ]
+    index = build_exact_fact_index(
+        (
+            ExactFactSource(
+                source_id="contact", source_name="Contact", structured_content={"facts": facts}
+            ),
+        ),
+        revision="r1",
+    )
+    result = resolve_exact_fact(
+        index, query=f"Harbour Clinic {question}?", prefer_primary_phone=True
+    )
+    if question == "phone number":
+        assert result.response_action == ExactFactResponseAction.ANSWER
+        assert result.evidence[0].value == "+971 2 123 4000"
+    else:
+        assert not (
+            result.response_action == ExactFactResponseAction.ANSWER
+            and any(f.value == "+971 2 123 4000" for f in result.evidence)
+        )
+
+
 def _service_source(number: int, *, fact_count: int = 1) -> ExactFactSource:
     facts = []
     for fact_number in range(1, fact_count + 1):

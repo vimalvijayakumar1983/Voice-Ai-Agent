@@ -1461,6 +1461,7 @@ def resolve_exact_fact(
     query_variants: Iterable[str] = (),
     max_evidence_chars: int = DEFAULT_EVIDENCE_CONTEXT_CHARS,
     company_subject: str | None = None,
+    prefer_primary_phone: bool = False,
 ) -> ExactFactResolution:
     """Resolve a caller query to an explicit, evidence-bearing action."""
 
@@ -1575,6 +1576,26 @@ def resolve_exact_fact(
         intent_ranked = [(score, fact) for score, fact in ranked if fact.fact_type == intent]
         top_score = intent_ranked[0][0]
         top_facts = [fact for score, fact in intent_ranked if score == top_score]
+        if prefer_primary_phone and intent == ExactFactType.PHONE and len(top_facts) > 1:
+            # A declared primary number is not an ambiguous branch choice. Do
+            # not apply this preference to a requested subtype or multiple owners.
+            explicit_subtype = re.search(
+                r"\b(?:mobile|cell|whatsapp|fax|emergency|hotline|all|every|numbers)\b",
+                _normalized(query),
+            )
+            primary = [
+                fact
+                for fact in top_facts
+                if _grounding_normalized(fact.predicate)
+                in {"primary telephone", "primary phone", "main telephone", "main phone"}
+            ]
+            if (
+                not explicit_subtype
+                and len(primary) == 1
+                and len({company_key(fact.subject) for fact in top_facts}) == 1
+            ):
+                selected.append(primary[0])
+                continue
         # Broad service/division questions intentionally return a short,
         # concrete verified list. Prefer one-fact-per-segment records over a
         # count-only summary such as "five segments" when both are present.
@@ -2031,6 +2052,7 @@ async def retrieve_exact_fact(
     knowledge_base_id: UUID | None = None,
     cache: ExactFactIndexCache | None = agent_exact_fact_cache,
     company_subject: str | None = None,
+    prefer_primary_phone: bool = False,
 ) -> ExactFactResolution:
     """Load an agent's approved index and resolve one deterministic Tier-1 query."""
 
@@ -2090,6 +2112,7 @@ async def retrieve_exact_fact(
         query_variants=queries[1:],
         max_evidence_chars=max_evidence_chars,
         company_subject=company_subject,
+        prefer_primary_phone=prefer_primary_phone,
     )
     resolution_ms = _elapsed_ms(resolution_started)
     return replace(
