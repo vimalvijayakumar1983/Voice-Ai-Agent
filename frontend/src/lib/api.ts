@@ -305,6 +305,7 @@ export interface KnowledgeSource {
   error_message: string | null;
   source_metadata: Record<string, unknown> | null;
   retrieval_ready: boolean;
+  company_fact_count?: number;
   extracted_character_count: number;
   last_synced_at: string | null;
   created_at: string;

@@ -58,7 +58,10 @@ async def test_repair_cannot_drop_critical_question_slots(question, rewrite):
     result = await interpreter.interpret_knowledge_question(
         api_key="test", question=question, company="Northstar", client=client
     )
-    assert result.plan.action == "clarify"
+    if interpreter.is_clear_pricing_request(question, company="Northstar"):
+        assert result.plan.action == "search" and result.plan.query == question
+    else:
+        assert result.plan.action == "clarify"
 
 
 @pytest.mark.parametrize(
@@ -146,7 +149,7 @@ async def test_real_scoped_retrieval_repairs_once_caches_and_keeps_step1(db, ten
     runtime = await enabled_runtime(db, tenant, monkeypatch)
     planner = AsyncMock(return_value=repaired())
     monkeypatch.setattr(worker, "interpret_knowledge_question", planner)
-    original = "How can I ring your office?"
+    original = "How do I get hold of the team?"
     result = await runtime.retrieve_single_pass_evidence(original)
     assert "665 9998" in result and "551 3831" not in result
     assert planner.await_count == 1
@@ -174,8 +177,107 @@ async def test_default_off_does_not_call_extra_model(db, tenant, monkeypatch):
     )
     planner = AsyncMock()
     monkeypatch.setattr(worker, "interpret_knowledge_question", planner)
-    await runtime.retrieve_single_pass_evidence("How can I ring your office?")
+    await runtime.retrieve_single_pass_evidence("How do I get hold of the team?")
     planner.assert_not_awaited()
+
+
+async def test_ring_office_uses_exact_phone_without_repair(db, tenant, monkeypatch):
+    runtime = await enabled_runtime(db, tenant, monkeypatch)
+    planner = AsyncMock()
+    monkeypatch.setattr(worker, "interpret_knowledge_question", planner)
+    result = await runtime.retrieve_single_pass_evidence("How can I ring your office?")
+    assert "665 9998" in result and "551 3831" not in result
+    planner.assert_not_awaited()
+
+
+async def test_timeout_is_not_cached_and_next_turn_can_recover(db, tenant, monkeypatch):
+    runtime = await enabled_runtime(db, tenant, monkeypatch)
+    planner = AsyncMock(
+        side_effect=[
+            interpreter.SearchRepairResult(None, "timeout", 2000, None, None, True),
+            repaired(),
+        ]
+    )
+    monkeypatch.setattr(worker, "interpret_knowledge_question", planner)
+    question = "How do I get hold of the team?"
+    first = await runtime.retrieve_single_pass_evidence(question)
+    assert "665 9998" not in first
+    second = await runtime.retrieve_single_pass_evidence(question)
+    assert "665 9998" in second
+    assert "665 9998" in await runtime.retrieve_single_pass_evidence(question)
+    assert planner.await_count == 2
+    metrics = runtime._telemetry.runtime_metrics
+    assert metrics["knowledge_interpretation_requests"] == 2
+    assert metrics["knowledge_interpretation_usage_incomplete"] is True
+
+
+async def test_repeated_timeouts_have_a_bounded_retry_budget(db, tenant, monkeypatch):
+    runtime = await enabled_runtime(db, tenant, monkeypatch)
+    planner = AsyncMock(
+        return_value=interpreter.SearchRepairResult(None, "timeout", 2000, None, None, True)
+    )
+    monkeypatch.setattr(worker, "interpret_knowledge_question", planner)
+    for _ in range(4):
+        result = await runtime.retrieve_single_pass_evidence("How do I get hold of the team?")
+        assert "665 9998" not in result
+    assert planner.await_count == 2
+    assert (
+        runtime._telemetry.current_turn_trace["knowledge_interpretation_status"]
+        == "retry_budget_exhausted"
+    )
+
+
+async def test_company_correction_then_that_number_refetches_new_company(db, tenant, monkeypatch):
+    runtime = await enabled_runtime(db, tenant, monkeypatch)
+    await runtime.retrieve_single_pass_evidence("What is the phone number?")
+    await runtime.retrieve_single_pass_evidence("About Northstar Trading")
+    result = await runtime.retrieve_single_pass_evidence("Give me that number")
+    assert "551 3831" in result and "665 9998" not in result
+    await runtime.retrieve_single_pass_evidence("No, I mean Northstar Group")
+    result = await runtime.retrieve_single_pass_evidence("Give me that number")
+    assert "665 9998" in result and "551 3831" not in result
+    assert result != worker.NO_KNOWLEDGE_REQUIRED
+
+
+async def test_number_without_a_known_detail_asks_for_clarification(db, tenant, monkeypatch):
+    runtime = await enabled_runtime(db, tenant, monkeypatch)
+    result = await runtime.retrieve_single_pass_evidence("Give me that number")
+    assert "Which number" in result
+    assert result != worker.NO_KNOWLEDGE_REQUIRED
+
+
+async def test_named_price_missing_from_knowledge_is_not_an_ambiguous_question(
+    db, tenant, monkeypatch
+):
+    runtime = await enabled_runtime(db, tenant, monkeypatch)
+    planner = AsyncMock(
+        return_value=interpreter.SearchRepairResult(
+            interpreter.SearchRepair(action="clarify", query=""), "completed", 100, 300, 20, True
+        )
+    )
+    monkeypatch.setattr(worker, "interpret_knowledge_question", planner)
+    assert (
+        await runtime.retrieve_single_pass_evidence("How much does Botox cost?")
+        == "NO_VERIFIED_KNOWLEDGE_MATCH"
+    )
+    assert not interpreter.is_clear_pricing_request(
+        "How much does it cost?", company="Northstar Group"
+    )
+
+
+async def test_source_readiness_distinguishes_text_from_company_facts(db, tenant, monkeypatch):
+    from sqlalchemy import select
+
+    from app.api.v1.endpoints.knowledge import _source_response
+    from app.models.agent import KnowledgeSource
+
+    await enabled_runtime(db, tenant, monkeypatch)
+    source = await db.scalar(select(KnowledgeSource).where(KnowledgeSource.tenant_id == tenant.id))
+    response = _source_response(source)
+    assert response.retrieval_ready and response.company_fact_count == 2
+    source.structured_content = None
+    response = _source_response(source)
+    assert response.retrieval_ready and response.company_fact_count == 0
 
 
 async def test_tool_loop_does_not_activate_single_pass_repair(db, tenant, monkeypatch):
@@ -183,7 +285,7 @@ async def test_tool_loop_does_not_activate_single_pass_repair(db, tenant, monkey
     runtime._single_pass_search_repair = False
     planner = AsyncMock()
     monkeypatch.setattr(worker, "interpret_knowledge_question", planner)
-    await runtime._retrieve_approved_knowledge(query="How can I ring your office?")
+    await runtime._retrieve_approved_knowledge(query="How do I get hold of the team?")
     planner.assert_not_awaited()
 
 
@@ -243,7 +345,7 @@ async def test_model_cannot_switch_company(db, tenant, monkeypatch):
         "interpret_knowledge_question",
         AsyncMock(return_value=repaired("Northstar Trading phone number?")),
     )
-    result = await runtime.retrieve_single_pass_evidence("How can I ring your office?")
+    result = await runtime.retrieve_single_pass_evidence("How do I get hold of the team?")
     assert "Which company" in result and "551" not in result
     assert runtime._single_pass_active_subject == "Northstar Group"
 
@@ -259,7 +361,7 @@ async def test_stale_company_epoch_rejects_repair_even_if_company_switches_back(
         return repaired()
 
     monkeypatch.setattr(worker, "interpret_knowledge_question", switch)
-    result = await runtime.retrieve_single_pass_evidence("How can I ring your office?")
+    result = await runtime.retrieve_single_pass_evidence("How do I get hold of the team?")
     assert "Which company" in result and "665" not in result
 
 

@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 ProcessingMode = Literal["automatic", "fast", "ai_verified"]
 
-COMPILER_VERSION = "vav-knowledge-compiler-9"
+COMPILER_VERSION = "vav-knowledge-compiler-10"
 AUTOMATIC_MODEL = "gpt-5.6-luna"
 VERIFIED_MODEL = "gpt-5.6-terra"
 _MODEL_PRICES_PER_MILLION = {
@@ -459,6 +459,16 @@ Include both everyday wording and the source's terminology (for example, formed,
 established and inception for an explicit inception year). Search phrases are retrieval
 hints only: never add an answer, entity, date, number or claim that is not already in the
 fact. Do not produce medical advice."""
+    prompt += """
+When the source explicitly identifies a subsidiary/member of a parent organization,
+also extract parent portfolio facts where the SAME contiguous evidence span proves
+both the relationship and the child's stated activity. Keep the parent's canonical
+name as subject only if that name occurs verbatim in the evidence. Name the child
+in the predicate (for example, 'healthcare profile via <child name>') so attribution
+is never lost. Keep the activity value verbatim. Do not project phone numbers,
+addresses, prices, availability or account data from a child onto a parent. Never
+infer membership from a navigation link, shared page, logo, or similar name alone.
+"""
     payload = {"source_title": title, "source_url": url, "source_text": text[:120_000]}
     openai_client = client or AsyncOpenAI(api_key=api_key, timeout=45.0, max_retries=1)
     try:

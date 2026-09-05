@@ -133,6 +133,7 @@ class KnowledgeSourceResponse(BaseModel):
     error_message: str | None
     source_metadata: dict | None
     retrieval_ready: bool = False
+    company_fact_count: int = 0
     extracted_character_count: int = 0
     last_synced_at: datetime | None
     created_at: datetime

@@ -120,6 +120,15 @@ def _source_response(source: KnowledgeSource) -> KnowledgeSourceResponse:
         update={
             "retrieval_ready": bool(content.strip()),
             "extracted_character_count": len(extracted.strip()),
+            "company_fact_count": sum(
+                1
+                for fact in (source.structured_content or {}).get("facts", [])
+                if isinstance(fact, dict)
+                and all(
+                    str(fact.get(field) or "").strip()
+                    for field in ("subject", "predicate", "value", "evidence")
+                )
+            ),
         }
     )
 

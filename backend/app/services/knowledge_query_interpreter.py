@@ -14,6 +14,21 @@ QUERY_MODEL = "gpt-4o-mini"
 QUERY_TIMEOUT_SECONDS = 2.0
 
 
+def is_clear_pricing_request(question: str, *, company: str) -> bool:
+    """A named pricing request is not ambiguous merely because a catalogue omits prices."""
+    if not re.search(r"\b(?:price|pricing|cost|costs|fees?|charges?)\b", question, re.I):
+        return False
+    words = set(re.findall(r"[^\W_]+", question.casefold()))
+    if words & {"it", "that", "this", "these", "those", "their", "they"}:
+        return False
+    fillers = set(
+        "a an the what how much many is are does do can could you me tell please "
+        "give of for at in your our company group price pricing cost costs fee fees "
+        "charge charges service services product products".split()
+    )
+    return bool(words - fillers - set(re.findall(r"[^\W_]+", company.casefold())))
+
+
 def preserves_query_constraints(original: str, rewrite: str) -> bool:
     """Reject silent loss of amounts, dates and consequential requested slots."""
     groups = (
@@ -113,6 +128,9 @@ async def interpret_knowledge_question(
                             "'Healthcare business segment', not 'medical activities'. "
                             "Keep additional requested constraints such as pricing; "
                             "a catalogue match alone never answers them."
+                            " A clearly named request remains clear even if its topic "
+                            "or price is absent from the catalogue. In that case return "
+                            "search with the original question, not clarify."
                         ),
                     },
                     {
@@ -142,8 +160,14 @@ async def interpret_knowledge_question(
             if plan.action == "search" and not plan.query.strip():
                 raise ValueError("empty search")
             if plan.action == "search" and not preserves_query_constraints(question, plan.query):
-                plan = SearchRepair(action="clarify", query="")
-            status = "completed"
+                plan = (
+                    SearchRepair(action="search", query=question)
+                    if is_clear_pricing_request(question, company=company) and len(question) <= 240
+                    else SearchRepair(action="clarify", query="")
+                )
+                status = "constraints_preserved_original"
+            else:
+                status = "completed"
     except asyncio.CancelledError:
         raise
     except TimeoutError:

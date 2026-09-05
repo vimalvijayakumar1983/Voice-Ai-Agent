@@ -276,6 +276,7 @@ _INTENT_QUERY_TOKENS = {
         "number",
         "phone",
         "reach",
+        "ring",
         "telephone",
     },
     ExactFactType.ADDRESS: {
@@ -391,7 +392,7 @@ _INTENT_PATTERNS: tuple[tuple[ExactFactType, tuple[re.Pattern[str], ...]], ...] 
             re.compile(r"\b(?:phone|telephone|mobile)(?:\s+number)?\b"),
             re.compile(r"\bcontact\s+(?:phone\s+)?number\b"),
             re.compile(
-                r"\b(?:call|dial|reach)\b.{0,80}\b"
+                r"\b(?:call|dial|reach|ring)\b.{0,80}\b"
                 r"(?:company|group|office|clinic|centre|center|number|phone|telephone)\b"
             ),
         ),
@@ -419,6 +420,7 @@ _INTENT_PATTERNS: tuple[tuple[ExactFactType, tuple[re.Pattern[str], ...]], ...] 
                 r"leadership|management|manager|owner|president)\b"
             ),
             re.compile(r"\bwho\s+(?:runs?|leads?|manages?|heads?|oversees?|owns?|founded)\b"),
+            re.compile(r"\bwho\s+(?:sits?|is)\s+at\s+(?:the\s+)?top\b"),
             re.compile(r"\bwho(?:'s|\s+is)?\s+(?:the\s+)?(?:person\s+)?in\s+charge\b"),
             re.compile(r"\bwho(?:'s|\s+is)?\s+responsible\s+for\b"),
             re.compile(r"\b(?:person|people)\s+in\s+charge\b"),

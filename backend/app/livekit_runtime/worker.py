@@ -87,7 +87,11 @@ from app.services.integration_security import (
     IntegrationConfigUnavailableError,
     decrypt_integration_config,
 )
-from app.services.knowledge_query_interpreter import QUERY_MODEL, interpret_knowledge_question
+from app.services.knowledge_query_interpreter import (
+    QUERY_MODEL,
+    interpret_knowledge_question,
+    is_clear_pricing_request,
+)
 from app.services.knowledge_retrieval import (
     load_agent_knowledge_terminology,
     retrieve_knowledge_context,
@@ -2095,6 +2099,8 @@ class VAVInworldAgent(Agent):
         self._spoken_answers: dict[tuple[str, ExactFactType], str] = {}
         self._last_spoken_answer: tuple[str, str] | None = None
         self._semantic_repairs: dict[tuple[str, str, str], Any] = {}
+        self._semantic_attempts: dict[tuple[str, str, str], int] = {}
+        self._requested_detail: tuple[ExactFactType, ...] = ()
         self._single_pass_last_verified_evidence: str | None = None
         self._single_pass_verified_evidence_by_type: dict[ExactFactType, str] = {}
         self._single_pass_follow_up_offered = False
@@ -2402,6 +2408,16 @@ Knowledge policy:
         cached = self._semantic_repairs.get(cache_key)
         result = cached
         if result is None:
+            if (
+                self._semantic_attempts.get(cache_key, 0) >= 2
+                or sum(self._semantic_attempts.values()) >= 8
+            ):
+                if trace is not None:
+                    trace["knowledge_interpretation_status"] = "retry_budget_exhausted"
+                return scope_reply(
+                    "The search service is having trouble. Please ask for the specific detail "
+                    "you need, or contact the team for help."
+                )
             try:
                 async with async_session_factory() as db:
                     config = await load_provider_config(db, self._tenant_id, "openai")
@@ -2437,6 +2453,7 @@ Knowledge policy:
                     break
             will_attempt = bool(key) and len(query) <= 800
             if will_attempt:
+                self._semantic_attempts[cache_key] = self._semantic_attempts.get(cache_key, 0) + 1
                 metrics["knowledge_interpretation_requests"] = (
                     int(metrics.get("knowledge_interpretation_requests", 0)) + 1
                 )
@@ -2453,9 +2470,12 @@ Knowledge policy:
                 if will_attempt:
                     metrics["knowledge_interpretation_usage_incomplete"] = True
                 raise
-            if len(self._semantic_repairs) >= 16:
-                self._semantic_repairs.pop(next(iter(self._semantic_repairs)))
-            self._semantic_repairs[cache_key] = result
+            # A transient failure is not a reusable interpretation. A later
+            # caller turn may retry, bounded by the per-query/per-call budgets.
+            if result.plan and result.plan.action == "search" and result.status == "completed":
+                if len(self._semantic_repairs) >= 16:
+                    self._semantic_repairs.pop(next(iter(self._semantic_repairs)))
+                self._semantic_repairs[cache_key] = result
             for field, value in (
                 ("input_tokens", result.input_tokens),
                 ("output_tokens", result.output_tokens),
@@ -2477,6 +2497,8 @@ Knowledge policy:
             # not proof that the original source has no answer.
             return scope_reply("I couldn't resolve that question. Could you rephrase it briefly?")
         if result.plan.action == "clarify":
+            if is_clear_pricing_request(query, company=company):
+                return "NO_VERIFIED_KNOWLEDGE_MATCH"
             return scope_reply("Could you clarify which detail you would like me to check?")
         rewrite = result.plan.query.strip()
         mentioned = mentioned_companies(rewrite, self._company_scope)
@@ -2528,6 +2550,9 @@ Knowledge policy:
             return NO_KNOWLEDGE_REQUIRED
         if _is_bare_hold_utterance(text) or _is_silent_stop_utterance(text):
             return NO_KNOWLEDGE_REQUIRED
+        explicit_intents = classify_exact_fact_intents(text)
+        if explicit_intents:
+            self._requested_detail = explicit_intents
 
         if self._company_scope:
             correction = re.split(r"\b(?:i mean|instead i mean)\b", text, flags=re.I)
@@ -2620,7 +2645,20 @@ Knowledge policy:
         )
         if referential_follow_up or affirmative_follow_up:
             if previous is None:
-                return NO_KNOWLEDGE_REQUIRED
+                # Switching company clears evidence, not the kind of detail
+                # requested. Re-fetch a number for the NEW company; never let
+                # a factual follow-up enter the social/no-retrieval lane.
+                if active_subject and "number" in normalized.split():
+                    if self._requested_detail == (ExactFactType.PHONE,):
+                        lookup_text = "What is the phone number?"
+                        self._single_pass_previous_explicit_query = lookup_text
+                        return await self._retrieve_approved_knowledge(query=lookup_text)
+                    return scope_reply(
+                        "Which number do you mean: a phone number or another reference?"
+                    )
+                if affirmative_follow_up:
+                    return NO_KNOWLEDGE_REQUIRED
+                return scope_reply("Which detail would you like me to look up?")
             self._single_pass_follow_up_offered = False
             contextual_query = f"{previous.rstrip(' .!?')}. {lookup_text}"
             # A caller commonly supplies a person's name and follows with
@@ -2644,9 +2682,7 @@ Knowledge policy:
             return await self._retrieve_approved_knowledge(
                 query=contextual_query,
                 query_variants=tuple(
-                    variant
-                    for variant in (active_subject_variant, previous, lookup_text)
-                    if variant
+                    variant for variant in (active_subject_variant, lookup_text) if variant
                 ),
             )
 
