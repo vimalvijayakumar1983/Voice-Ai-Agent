@@ -928,7 +928,7 @@ def classify_exact_fact_intents(query: str) -> tuple[ExactFactType, ...]:
         candidate_tokens = _TOKEN_RE.findall(named_person.group(1))
         candidate_set = set(candidate_tokens)
         if (
-            2 <= len(candidate_tokens) <= 4
+            2 <= len(candidate_tokens) <= 6
             and candidate_tokens[0] not in _NON_NAME_QUESTION_PREFIXES
             and not candidate_set.intersection(_NON_NAME_QUESTION_TERMS)
         ):
@@ -1225,6 +1225,11 @@ def _leadership_claim_tokens(query: str) -> set[str]:
             r"(?:both\s+)?"
             r"(?P<name>.{2,80}?)(?:\s+(?:right|correct))?(?:[?.!]|$)"
         ),
+        re.compile(
+            rf"\b(?:are|is)\s+(?:the\s+)?(?:{_LEADERSHIP_ROLE_PATTERN})\s+and\s+"
+            rf"(?:the\s+)?(?:{_LEADERSHIP_ROLE_PATTERN})(?:\s+of\s+.{{2,80}}?)?\s+"
+            r"(?:both\s+)?(?P<name>.{2,80}?)(?:\s+(?:right|correct))?(?:[?.!]|$)"
+        ),
     )
     for pattern in patterns:
         match = pattern.search(normalized)
@@ -1280,6 +1285,7 @@ def _fact_score(
         return None
     fact_tokens = _fact_tokens(fact)
     requested = _requested_tokens(query, intents)
+    claimed_name: set[str] = set()
     if fact.fact_type == ExactFactType.LEADERSHIP:
         claimed_name = _leadership_claim_tokens(query)
         # A caller's proposed name is not a retrieval constraint or evidence.
@@ -1300,7 +1306,10 @@ def _fact_score(
     normalized_query = _normalized(query)
     if subject and subject in normalized_query:
         score += 40
-    if value and value in normalized_query:
+    # A name inside a confirmation claim is caller input, not a reason to rank
+    # one governed role above another. This keeps multi-role corrections
+    # complete instead of returning only the role held by the proposed name.
+    if value and value in normalized_query and not claimed_name:
         score += 35
     score += 8 * len(requested & fact_tokens)
     score += 3 * len(_tokens(query) & _tokens(fact.predicate))

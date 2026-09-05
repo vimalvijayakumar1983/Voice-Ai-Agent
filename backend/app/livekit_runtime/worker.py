@@ -243,6 +243,7 @@ _CONVERSATION_CONTROL_PREFIXES = (
     "i cannot hear ",
     "please pronounce ",
     "pronounce ",
+    "repeat ",
     "repeat that ",
     "say that again ",
 )
@@ -2385,6 +2386,9 @@ Knowledge policy:
                 for intent in requested_intents:
                     remembered = self._single_pass_verified_evidence_by_type.get(intent)
                     if remembered:
+                        # Make a later elliptical command such as "repeat
+                        # slowly" refer to the fact the caller selected here.
+                        self._single_pass_last_verified_evidence = remembered
                         return remembered
                 if self._single_pass_last_verified_evidence:
                     return self._single_pass_last_verified_evidence
@@ -2414,6 +2418,24 @@ Knowledge policy:
                 return NO_KNOWLEDGE_REQUIRED
             self._single_pass_follow_up_offered = False
             contextual_query = f"{previous.rstrip(' .!?')}. {lookup_text}"
+            # A caller commonly supplies a person's name and follows with
+            # "Who is he/she?". Resolve the previous fragment only against the
+            # published person lexicon and create an explicit lookup. The
+            # canonical name remains a search clue; it is never evidence.
+            pronoun_identity_question = bool(
+                re.fullmatch(
+                    r"who(?:'s|\s+is)\s+(?:he|she|him|her|they|them)",
+                    lookup_normalized,
+                )
+            )
+            if pronoun_identity_question and self._speech_lexicon_entries:
+                entity = resolve_canonical_entity(
+                    previous,
+                    self._speech_lexicon_entries,
+                    expected_entity_types=("person",),
+                )
+                if entity.entity_type == "person" and entity.canonical:
+                    contextual_query = f"Who is {entity.canonical}?"
             return await self._retrieve_approved_knowledge(
                 query=contextual_query,
                 query_variants=tuple(

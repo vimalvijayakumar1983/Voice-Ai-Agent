@@ -56,6 +56,44 @@ def test_semantic_variant_retrieves_source_worded_as_inception():
     assert "inception in 2003" in matches[0].text
 
 
+def test_response_style_words_do_not_block_division_detail_retrieval():
+    documents = [
+        (
+            "Al Zaabi Healthcare – Al Zaabi Group",
+            "Al Zaabi Healthcare provides primary care, preventive medical services, "
+            "and healthcare packages through Adam & Eve Specialized Medical Centre.",
+        )
+    ]
+    plan = build_contextual_query_plan(
+        "Tell me briefly about the healthcare division.",
+        supplied_variants=("Al Zaabi Group. Tell me briefly about the healthcare division.",),
+    )
+
+    matches = knowledge_retrieval._rank_contextual_knowledge(
+        plan.variants,
+        documents,
+        limit=4,
+    )
+
+    assert matches
+    assert "primary care" in matches[0].text
+
+
+def test_service_capability_query_ignores_privacy_policy_advisers():
+    matches = rank_knowledge(
+        "Can Al Zaabi Group provide legal services for us?",
+        [
+            (
+                "Privacy Policy – Al Zaabi Group",
+                "Professional advisers including lawyers provide legal and accounting "
+                "services to the company for compliance purposes.",
+            )
+        ],
+    )
+
+    assert matches == []
+
+
 def test_structured_retrieval_keeps_parent_and_subsidiary_dates_separate():
     content = knowledge_retrieval._structured_retrieval_content(
         {

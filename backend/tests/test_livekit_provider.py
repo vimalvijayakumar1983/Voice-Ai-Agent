@@ -2291,6 +2291,73 @@ async def test_single_pass_repeats_remembered_verified_fact_without_search(monke
 
 
 @pytest.mark.asyncio
+async def test_single_pass_repeat_without_modal_keeps_selected_fact_for_elliptical_repeat(
+    monkeypatch,
+):
+    model = Agent(
+        tenant_id=uuid4(),
+        name="Reusable production QA agent",
+        system_prompt="Answer from approved knowledge.",
+        voice_provider="inworld",
+        voice_id="inworld:Ashley",
+        language="en-GB",
+    )
+    agent = livekit_worker.VAVInworldRealtimeAgent(model=model, single_pass=True)
+    agent._single_pass_last_verified_evidence = "address evidence"
+    agent._single_pass_verified_evidence_by_type[livekit_worker.ExactFactType.PHONE] = (
+        "phone evidence"
+    )
+    retrieval = AsyncMock()
+    monkeypatch.setattr(agent, "_retrieve_approved_knowledge", retrieval)
+
+    first = await agent.retrieve_single_pass_evidence("Repeat the phone number slowly.")
+    second = await agent.retrieve_single_pass_evidence("Can you repeat slowly?")
+
+    assert first == "phone evidence"
+    assert second == "phone evidence"
+    retrieval.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_single_pass_resolves_person_name_then_pronoun_from_published_lexicon(monkeypatch):
+    model = Agent(
+        tenant_id=uuid4(),
+        name="Reusable production QA agent",
+        system_prompt="Answer from approved knowledge.",
+        voice_provider="inworld",
+        voice_id="inworld:Ashley",
+        language="en-GB",
+    )
+    person = livekit_worker.SpeechLexiconEntry(
+        entry_id="person-1",
+        canonical="Saeed Yousif Ibrahim Al Zaabi",
+        normalized="saeed yousif ibrahim al zaabi",
+        entity_type="person",
+        tier=1,
+        priority=950,
+        critical=True,
+        languages=("en",),
+        aliases=("Saeed Yusuf Ibrahim",),
+        phonetic_keys=(),
+        source_ids=("management",),
+        evidence_sha256=("a" * 64,),
+    )
+    agent = livekit_worker.VAVInworldRealtimeAgent(
+        model=model,
+        single_pass=True,
+        speech_lexicon_entries=(person,),
+    )
+    retrieval = AsyncMock(return_value="verified person evidence")
+    monkeypatch.setattr(agent, "_retrieve_approved_knowledge", retrieval)
+
+    await agent.retrieve_single_pass_evidence("Saeed Yusuf Ibrahim.")
+    evidence = await agent.retrieve_single_pass_evidence("Who is he?")
+
+    assert evidence == "verified person evidence"
+    assert retrieval.await_args.kwargs["query"] == "Who is Saeed Yousif Ibrahim Al Zaabi?"
+
+
+@pytest.mark.asyncio
 async def test_single_pass_compound_correction_retrieves_only_the_fact_clause(monkeypatch):
     model = Agent(
         tenant_id=uuid4(),

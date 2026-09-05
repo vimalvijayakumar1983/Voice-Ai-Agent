@@ -65,6 +65,8 @@ _QUERY_STOP_WORDS = {
     "been",
     "being",
     "basically",
+    "brief",
+    "briefly",
     "can",
     "could",
     "do",
@@ -96,6 +98,8 @@ _QUERY_STOP_WORDS = {
     "ok",
     "okay",
     "please",
+    "quick",
+    "quickly",
     "right",
     "so",
     "something",
@@ -275,6 +279,7 @@ _STRONG_CONTACT_TITLE_LOCATION_MARKERS = (
 _STRONG_CONTACT_CONTENT_MARKERS = ("call us", "tel:", "telephone", "phone", "mobile")
 _PHONE_TERMS = {"mobile", "phone", "tel", "telephone"}
 _PHONE_NUMBER = re.compile(r"(?<!\w)\+?\d[\d\s().-]{6,}\d(?!\w)")
+_NON_SERVICE_SOURCE_TITLE_TOKENS = frozenset({"cookie", "privacy", "terms", "policy"})
 
 # Provider-neutral semantic relations. These are deliberately limited to
 # meaning-preserving business vocabulary; company names and factual values are
@@ -355,6 +360,24 @@ def _is_phone_query(value: str, query_tokens: set[str]) -> bool:
 
     return bool(query_tokens & _PHONE_TERMS) or bool(
         re.search(r"\bcontact\s+(?:phone\s+)?number\b", value.casefold())
+    )
+
+
+def _is_service_capability_query(value: str) -> bool:
+    """Identify questions asking whether the business supplies a service."""
+
+    normalized = " ".join(_base_tokens(value))
+    return bool(
+        re.search(
+            r"\b(?:can|could|do|does|will|would)\b.{0,80}\b"
+            r"(?:offer|offers|provide|provides|specialise|specialises|"
+            r"specialize|specializes)\b",
+            normalized,
+        )
+        or re.search(
+            r"\b(?:what|which)\b.{0,40}\b(?:services?|offerings?)\b",
+            normalized,
+        )
     )
 
 
@@ -970,10 +993,18 @@ def rank_knowledge(
     ordered_query_tokens = sorted(query_tokens)
     ubiquitous_source_terms = _ubiquitous_source_terms(documents)
     broad_query = _is_broad_query(query, query_tokens)
+    service_capability_query = _is_service_capability_query(query)
     directory_query = bool(query_tokens & _DIRECTORY_QUERY_TOKENS)
     requested_subject_tokens = _requested_subject_tokens(query)
     matches: list[KnowledgeMatch] = []
     for source, content in documents:
+        if service_capability_query and (
+            set(_base_tokens(source)) & _NON_SERVICE_SOURCE_TITLE_TOKENS
+        ):
+            # Privacy, cookie and terms pages describe third-party advisers and
+            # compliance obligations; they are not authoritative catalogues of
+            # services the business offers to callers.
+            continue
         source_terms = _source_terms(source)
         source_compounds = _source_compounds(source)
         ranked_content = _intent_content(content, phone_query=phone_query)

@@ -415,6 +415,22 @@ def test_multi_role_caller_claim_returns_both_governed_roles():
     }
 
 
+def test_multi_role_question_first_claim_returns_both_governed_roles():
+    result = resolve_exact_fact(
+        _future_company_leadership_index(),
+        query="Are the chairman and president both David Chen?",
+        query_variants=(
+            "Future Example Holdings. Are the chairman and president both David Chen?",
+        ),
+    )
+
+    assert result.response_action == ExactFactResponseAction.ANSWER
+    assert {(item.predicate, item.value) for item in result.evidence} == {
+        ("chairman", "Amal Rahman"),
+        ("president", "David Chen"),
+    }
+
+
 @pytest.mark.parametrize(
     "query",
     (
@@ -1260,6 +1276,9 @@ async def test_non_tier1_query_skips_database_and_reports_diagnostics(query):
 def test_preclassification_keeps_specific_intents_and_lowercase_person_names():
     assert classify_exact_fact_intents("Can you provide your address?") == (ExactFactType.ADDRESS,)
     assert classify_exact_fact_intents("who is devu vimal?") == (ExactFactType.LEADERSHIP,)
+    assert classify_exact_fact_intents("Who is Saeed Yousif Ibrahim Al Zaabi?") == (
+        ExactFactType.LEADERSHIP,
+    )
 
 
 @pytest.mark.parametrize("limit", (599, 901))

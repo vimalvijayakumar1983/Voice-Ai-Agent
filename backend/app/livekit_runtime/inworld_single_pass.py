@@ -403,8 +403,8 @@ def deterministic_grounded_reply(
 
     if len(facts) == 1:
         subject, predicate, value = facts[0]
+        normalized_query = " ".join(str(query or "").casefold().split())
         if envelope.facts[0].fact_type == "founding":
-            normalized_query = " ".join(str(query or "").casefold().split())
             duration_question = (
                 "how long" in normalized_query
                 or "since when" in normalized_query
@@ -427,6 +427,14 @@ def deterministic_grounded_reply(
             return f"The {predicate} of {subject} is {value}."
         if envelope.facts[0].fact_type == "services":
             return f"Verified services and divisions for {subject} include {value}."
+        if envelope.facts[0].fact_type == "phone":
+            spoken_value = value
+            if "slow" in normalized_query:
+                digits = ", ".join(character for character in value if character.isdigit())
+                spoken_value = f"plus {digits}" if "+" in value else digits
+            return f"The phone number for {subject} is {spoken_value}."
+        if envelope.facts[0].fact_type == "address":
+            return f"The address of {subject} is {value}."
         return f"The {predicate} for {subject} is {value}."
     fact_types = {fact.fact_type for fact in envelope.facts}
     subjects = {fact.subject for fact in envelope.facts}
