@@ -79,12 +79,14 @@ from app.services.exact_fact_retrieval import (
     ExactFactResponseAction,
     ExactFactType,
     classify_exact_fact_intents,
+    load_agent_exact_fact_index,
     retrieve_exact_fact,
 )
 from app.services.integration_security import (
     IntegrationConfigUnavailableError,
     decrypt_integration_config,
 )
+from app.services.knowledge_query_interpreter import QUERY_MODEL, interpret_knowledge_question
 from app.services.knowledge_retrieval import (
     load_agent_knowledge_terminology,
     retrieve_knowledge_context,
@@ -2085,6 +2087,7 @@ class VAVInworldAgent(Agent):
         self._last_committed_response_sequence = 0
         self._spoken_answers: dict[tuple[str, ExactFactType], str] = {}
         self._last_spoken_answer: tuple[str, str] | None = None
+        self._semantic_repairs: dict[tuple[str, str, str], Any] = {}
         self._single_pass_last_verified_evidence: str | None = None
         self._single_pass_verified_evidence_by_type: dict[ExactFactType, str] = {}
         self._single_pass_follow_up_offered = False
@@ -2211,6 +2214,7 @@ Knowledge policy:
         *,
         query: str,
         query_variants: tuple[str, ...] = (),
+        allow_semantic_repair: bool = True,
     ) -> str:
         started_at = time.perf_counter()
         originating_trace = (
@@ -2364,7 +2368,115 @@ Knowledge policy:
                 details=trace_details,
                 originating_trace=originating_trace,
             )
+        if (
+            not context
+            and company_subject
+            and allow_semantic_repair
+            and self._company_scope.semantic_retrieval_enabled
+        ):
+            return await self._repair_knowledge_search(
+                query=query,
+                company=company_subject,
+                trace=originating_trace,
+            )
         return context or "NO_VERIFIED_KNOWLEDGE_MATCH"
+
+    async def _repair_knowledge_search(self, *, query: str, company: str, trace) -> str:
+        """One optional meaning-preserving retry, with the same company/KB/revision fence."""
+        epoch = self._company_epoch
+        previous = (
+            self._last_spoken_answer[1]
+            if self._last_spoken_answer and self._last_spoken_answer[0] == company
+            else ""
+        )
+        cache_key = (company, query, previous)
+        metrics = self._telemetry.runtime_metrics if self._telemetry else {}
+        cached = self._semantic_repairs.get(cache_key)
+        result = cached
+        if result is None:
+            try:
+                async with async_session_factory() as db:
+                    config = await load_provider_config(db, self._tenant_id, "openai")
+                    index = await load_agent_exact_fact_index(
+                        db,
+                        tenant_id=self._tenant_id,
+                        agent_id=self._agent_id,
+                        serving_revision_id=self._knowledge_serving_revision_id,
+                        knowledge_base_id=self._knowledge_base_id,
+                    )
+                key = (
+                    str((config or {}).get("api_key") or "").strip()
+                    if config is not None
+                    else str(settings.openai_api_key or "").strip()
+                )
+            except ProviderCredentialError:
+                key = ""
+                index = None
+            vocabulary: list[str] = []
+            vocabulary_chars = 0
+            for fact in index.facts if index else ():
+                if company_key(fact.subject) != company_key(company):
+                    continue
+                term = (
+                    f"{fact.predicate}: {fact.value}"
+                    if fact.fact_type == ExactFactType.SERVICES
+                    else fact.predicate
+                )[:128]
+                if term not in vocabulary and vocabulary_chars + len(term) <= 1400:
+                    vocabulary.append(term)
+                    vocabulary_chars += len(term)
+                if len(vocabulary) >= 40:
+                    break
+            will_attempt = bool(key) and len(query) <= 800
+            if will_attempt:
+                metrics["knowledge_interpretation_requests"] = (
+                    int(metrics.get("knowledge_interpretation_requests", 0)) + 1
+                )
+            metrics["knowledge_interpretation_model"] = QUERY_MODEL
+            try:
+                result = await interpret_knowledge_question(
+                    api_key=key,
+                    question=query,
+                    company=company,
+                    previous_answer=previous,
+                    search_vocabulary=tuple(vocabulary),
+                )
+            except asyncio.CancelledError:
+                if will_attempt:
+                    metrics["knowledge_interpretation_usage_incomplete"] = True
+                raise
+            if len(self._semantic_repairs) >= 16:
+                self._semantic_repairs.pop(next(iter(self._semantic_repairs)))
+            self._semantic_repairs[cache_key] = result
+            for field, value in (
+                ("input_tokens", result.input_tokens),
+                ("output_tokens", result.output_tokens),
+            ):
+                if value is not None:
+                    name = "knowledge_interpretation_" + field
+                    metrics[name] = int(metrics.get(name, 0)) + value
+                elif result.attempted:
+                    metrics["knowledge_interpretation_usage_incomplete"] = True
+        metrics["knowledge_interpretation_last_ms"] = 0 if cached else result.elapsed_ms
+        metrics["knowledge_interpretation_last_status"] = "cache_hit" if cached else result.status
+        if trace is not None:
+            trace["knowledge_interpretation_ms"] = 0 if cached else result.elapsed_ms
+            trace["knowledge_interpretation_status"] = "cache_hit" if cached else result.status
+        if self._company_epoch != epoch or self._single_pass_active_subject != company:
+            return scope_reply("Which company are you asking about?")
+        if result.plan is None:
+            # A timeout/unavailable interpreter is an operational limitation,
+            # not proof that the original source has no answer.
+            return scope_reply("I couldn't resolve that question. Could you rephrase it briefly?")
+        if result.plan.action == "clarify":
+            return scope_reply("Could you clarify which detail you would like me to check?")
+        rewrite = result.plan.query.strip()
+        mentioned = mentioned_companies(rewrite, self._company_scope)
+        if any(name != company for name in mentioned):
+            return scope_reply("Which company are you asking about?")
+        if company_key(rewrite) == company_key(query):
+            return "NO_VERIFIED_KNOWLEDGE_MATCH"
+        return await self._retrieve_approved_knowledge(query=rewrite, allow_semantic_repair=False)
 
     async def on_user_turn_completed(
         self,

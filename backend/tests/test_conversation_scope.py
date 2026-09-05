@@ -23,6 +23,7 @@ from tests.test_inworld_single_pass import _FakeSession
 
 def scope(group="Northstar Group", trading="Northstar Trading"):
     return {
+        "semantic_retrieval_enabled": False,
         "default_company": group,
         "companies": [
             {"name": group, "aliases": ["the group", "head office"]},

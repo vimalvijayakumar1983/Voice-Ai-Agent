@@ -88,6 +88,7 @@ _QUERY_STOP_WORDS = {
     "kind",
     "know",
     "like",
+    "let",
     "long",
     "maybe",
     "me",
@@ -958,17 +959,33 @@ def _source_retrieval_documents(
     return documents
 
 
+def _structured_core(value: str) -> str:
+    """Rank the fact, not a shared paragraph quoting many unrelated facts."""
+    if "VERIFIED STRUCTURED FACTS" not in value and not value.startswith("SUBJECT:"):
+        return value
+    if "\n" in value:
+        # Compiler evidence is normalized onto one line. Preserve those
+        # boundaries: a dash inside a quote must not look like a new fact.
+        return re.sub(r"(?m)^[ \t]*Evidence:.*(?:\n|$)", "", value)
+    return re.split(r"\s+Evidence:\s*", value, maxsplit=1)[0]
+
+
 def _chunks(
     value: str,
     *,
     max_chars: int = 900,
     preserve_paragraphs: bool = False,
+    preserve_lines: bool = False,
 ) -> list[str]:
     chunks: list[str] = []
     current = ""
     splitter = _PARAGRAPH_SPLIT if preserve_paragraphs else _SPLIT
     for part in splitter.split(value):
-        part = " ".join(part.split()).strip()
+        part = (
+            "\n".join(" ".join(line.split()) for line in part.splitlines()).strip()
+            if preserve_lines
+            else " ".join(part.split()).strip()
+        )
         if not part:
             continue
         if preserve_paragraphs and current:
@@ -1027,9 +1044,16 @@ def rank_knowledge(
         for chunk in _chunks(
             ranked_content,
             preserve_paragraphs=phone_query or structured_facts,
+            preserve_lines=structured_facts,
         ):
+            normalized_chunk = " ".join(chunk.split())
+            if structured_facts and not normalized_chunk.startswith(
+                ("VERIFIED STRUCTURED FACTS SUBJECT:", "SUBJECT:")
+            ):
+                # Never promote a detached quotation after a size-bound split.
+                continue
             structured_subject_tokens = (
-                _structured_subject_tokens(chunk) if structured_facts else set()
+                _structured_subject_tokens(normalized_chunk) if structured_facts else set()
             )
             if (
                 requested_subject_tokens
@@ -1037,8 +1061,15 @@ def rank_knowledge(
                 and not requested_subject_tokens <= structured_subject_tokens
             ):
                 continue
-            chunk_base_tokens = _base_tokens(chunk)
+            chunk_base_tokens = _base_tokens(_structured_core(chunk))
             chunk_tokens = _token_forms(chunk_base_tokens)
+            if structured_facts:
+                # Company/title matches cannot satisfy the requested topic.
+                # Healthcare, pricing, dates etc must occur in this fact's
+                # searchable core, not only in another fact's shared quotation.
+                topic_tokens = query_tokens - structured_subject_tokens - _BROAD_QUERY_TOKENS
+                if topic_tokens and not topic_tokens <= chunk_tokens:
+                    continue
             chunk_has_phone = _has_phone_evidence(chunk, chunk_tokens)
             if phone_query and not chunk_has_phone:
                 # A contact-page title alone must not satisfy a request for a
@@ -1139,6 +1170,18 @@ def rank_knowledge(
 def _query_aware_excerpt(content: str, query_tokens: set[str], *, limit: int) -> str:
     if len(content) <= limit:
         return content
+    if content.startswith("VERIFIED STRUCTURED FACTS"):
+        blocks = _PARAGRAPH_SPLIT.split(content)
+        ranked_blocks = sorted(
+            blocks, key=lambda block: -len(query_tokens & _query_tokens(_structured_core(block)))
+        )
+        selected: list[str] = []
+        used = 0
+        for block in ranked_blocks:
+            if used + len(block) + 2 <= limit:
+                selected.append(block)
+                used += len(block) + 2
+        return "\n\n".join(selected)
     # ``str.find``/``rfind`` run in C and avoid a full Python-level regex walk over
     # large crawled documents. Keep both ends so repeated navigation near the start
     # cannot hide a substantive answer near the end.

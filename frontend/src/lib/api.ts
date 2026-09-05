@@ -58,6 +58,7 @@ function createIdempotencyKey() {
 }
 
 export interface KnowledgeCompanyScope {
+  semantic_retrieval_enabled?: boolean;
   default_company: string | null;
   companies: { name: string; aliases: string[] }[];
 }

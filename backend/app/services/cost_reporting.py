@@ -686,6 +686,40 @@ def _call_components(
         elif runtime.get("llm_tokens"):
             missing.append("OpenAI input/output token split")
 
+    repair_requests = runtime.get("knowledge_interpretation_requests", 0)
+    if isinstance(repair_requests, int) and repair_requests > 0:
+        repair_model = str(runtime.get("knowledge_interpretation_model") or "")
+        repair_rates = OPENAI_RATES.get(repair_model)
+        for label, field, rate in (
+            (
+                "input",
+                "knowledge_interpretation_input_tokens",
+                repair_rates[0] if repair_rates else None,
+            ),
+            (
+                "output",
+                "knowledge_interpretation_output_tokens",
+                repair_rates[1] if repair_rates else None,
+            ),
+        ):
+            quantity = runtime.get(field)
+            if rate is None or not isinstance(quantity, int) or isinstance(quantity, bool):
+                missing.append(f"Knowledge question interpretation {label} usage/rate")
+            elif quantity > 0:
+                components.append(
+                    _component(
+                        "OpenAI",
+                        f"Knowledge question interpretation {repair_model} {label}",
+                        Decimal(quantity) / Decimal("1000000"),
+                        "1M tokens",
+                        rate,
+                        OPENAI_SOURCE,
+                        "Separate search-repair request; provider-reported tokens, "
+                        "public-rate estimate",
+                    )
+                )
+        if runtime.get("knowledge_interpretation_usage_incomplete"):
+            missing.append("Knowledge question interpretation incomplete provider usage")
     return components, missing
 
 

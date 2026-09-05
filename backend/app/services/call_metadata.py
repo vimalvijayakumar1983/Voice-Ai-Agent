@@ -76,6 +76,8 @@ def public_call_metadata(value: Any) -> dict[str, Any] | None:
     if isinstance(runtime, dict):
         safe_runtime: dict[str, Any] = {}
         string_fields = {
+            "knowledge_interpretation_model",
+            "knowledge_interpretation_last_status",
             "speech_provider",
             "llm_provider",
             "llm_model",
@@ -114,6 +116,10 @@ def public_call_metadata(value: Any) -> dict[str, Any] | None:
             "recording_blocker",
         }
         numeric_fields = {
+            "knowledge_interpretation_requests",
+            "knowledge_interpretation_input_tokens",
+            "knowledge_interpretation_output_tokens",
+            "knowledge_interpretation_last_ms",
             "max_duration_seconds",
             "turn_count",
             "llm_tokens",
@@ -214,6 +220,7 @@ def public_call_metadata(value: Any) -> dict[str, Any] | None:
                 safe_runtime[field] = runtime[field]
         for field in (
             "runtime_usage_components_complete",
+            "knowledge_interpretation_usage_incomplete",
             "stt_session_update_serialized_complete",
             "stt_session_update_provider_acknowledgement_observed",
             "stt_provider_language_reported",
@@ -272,6 +279,7 @@ def public_call_metadata(value: Any) -> dict[str, Any] | None:
         if isinstance(turn_diagnostics, list):
             safe_turns: list[dict[str, Any]] = []
             numeric_trace_fields = {
+                "knowledge_interpretation_ms",
                 "turn",
                 "user_speech_ms",
                 "transcript_words",
@@ -356,6 +364,7 @@ def public_call_metadata(value: Any) -> dict[str, Any] | None:
                     safe_trace["response_action"] = trace["response_action"]
                 for field in (
                     "knowledge_retrieval_path",
+                    "knowledge_interpretation_status",
                     "knowledge_company_subject",
                     "exact_fact_action",
                     "exact_fact_reason",

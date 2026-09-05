@@ -26,6 +26,7 @@ class KnowledgeCompany(BaseModel):
 
 class KnowledgeCompanyScope(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    semantic_retrieval_enabled: bool = False
     default_company: str | None = Field(None, max_length=160)
     companies: list[KnowledgeCompany] = Field(min_length=1, max_length=50)
 
