@@ -1843,6 +1843,26 @@ def test_conversation_control_grammar_does_not_bypass_factual_grounding(
 
 
 @pytest.mark.parametrize(
+    "utterance",
+    ("Thank you again.", "Oh, thank you.", "Goodbye.", "Okay, thanks, goodbye."),
+)
+def test_short_courtesy_closings_skip_business_knowledge(utterance):
+    assert livekit_worker._is_courtesy_utterance(utterance) is True
+
+
+@pytest.mark.parametrize(
+    ("utterance", "focused"),
+    (
+        ("Why did you stop? Who's the chairman?", "Who's the chairman"),
+        ("Who's the chairman? You don't have the information.", "Who's the chairman"),
+        ("What businesses does the group operate?", "What businesses does the group operate?"),
+    ),
+)
+def test_compound_voice_turn_focuses_latest_exact_fact_clause(utterance, focused):
+    assert livekit_worker._latest_exact_fact_clause(utterance) == focused
+
+
+@pytest.mark.parametrize(
     ("partial", "meaningful"),
     [
         ("yes", False),
@@ -2244,6 +2264,53 @@ async def test_single_pass_keeps_governed_subject_for_unqualified_followups(monk
     retrieval.assert_awaited_once_with(
         query="What about the chairman?",
         query_variants=("Future Example Holdings. What about the chairman?",),
+    )
+
+
+@pytest.mark.asyncio
+async def test_single_pass_repeats_remembered_verified_fact_without_search(monkeypatch):
+    model = Agent(
+        tenant_id=uuid4(),
+        name="Reusable production QA agent",
+        system_prompt="Answer from approved knowledge.",
+        voice_provider="inworld",
+        voice_id="inworld:Ashley",
+        language="en-GB",
+    )
+    agent = livekit_worker.VAVInworldRealtimeAgent(model=model, single_pass=True)
+    agent._single_pass_verified_evidence_by_type[livekit_worker.ExactFactType.PHONE] = (
+        "phone evidence"
+    )
+    retrieval = AsyncMock()
+    monkeypatch.setattr(agent, "_retrieve_approved_knowledge", retrieval)
+
+    evidence = await agent.retrieve_single_pass_evidence("Can you repeat the phone number slowly?")
+
+    assert evidence == "phone evidence"
+    retrieval.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_single_pass_compound_correction_retrieves_only_the_fact_clause(monkeypatch):
+    model = Agent(
+        tenant_id=uuid4(),
+        name="Reusable production QA agent",
+        system_prompt="Answer from approved knowledge.",
+        voice_provider="inworld",
+        voice_id="inworld:Ashley",
+        language="en-GB",
+    )
+    agent = livekit_worker.VAVInworldRealtimeAgent(model=model, single_pass=True)
+    agent._single_pass_active_subject = "Future Example Holdings"
+    retrieval = AsyncMock(return_value="chairman evidence")
+    monkeypatch.setattr(agent, "_retrieve_approved_knowledge", retrieval)
+
+    evidence = await agent.retrieve_single_pass_evidence("Why did you stop? Who's the chairman?")
+
+    assert evidence == "chairman evidence"
+    retrieval.assert_awaited_once_with(
+        query="Who's the chairman",
+        query_variants=("Future Example Holdings. Who's the chairman",),
     )
 
 

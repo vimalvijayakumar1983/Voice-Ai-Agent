@@ -70,6 +70,8 @@ from app.models.provider_credential import ProviderCredential
 from app.services.call_metadata import agent_configuration_snapshot
 from app.services.exact_fact_retrieval import (
     ExactFactResponseAction,
+    ExactFactType,
+    classify_exact_fact_intents,
     retrieve_exact_fact,
 )
 from app.services.integration_security import (
@@ -188,7 +190,23 @@ _BACKCHANNEL_UTTERANCES = frozenset(
     }
 )
 _PASSIVE_SINGLE_PASS_BACKCHANNELS = frozenset(
-    {"fine", "got it", "ok", "okay", "sure", "thank you", "thanks", "yeah", "yep", "yes"}
+    {"fine", "got it", "ok", "okay", "sure", "yeah", "yep", "yes"}
+)
+_COURTESY_UTTERANCE_WORDS = frozenset(
+    {
+        "again",
+        "alright",
+        "bye",
+        "goodbye",
+        "great",
+        "oh",
+        "ok",
+        "okay",
+        "thanks",
+        "thank",
+        "well",
+        "you",
+    }
 )
 _CONVERSATION_CONTROL_EXACT = frozenset(
     {
@@ -218,6 +236,7 @@ _CONVERSATION_CONTROL_EXACT = frozenset(
 )
 _CONVERSATION_CONTROL_PREFIXES = (
     "can you hear me ",
+    "can you repeat ",
     "could you repeat ",
     "how do you pronounce ",
     "i can t hear ",
@@ -427,6 +446,31 @@ def _is_conversation_control_utterance(value: str) -> bool:
     return candidate in _CONVERSATION_CONTROL_EXACT or any(
         candidate.startswith(prefix) for prefix in _CONVERSATION_CONTROL_PREFIXES
     )
+
+
+def _is_courtesy_utterance(value: str) -> bool:
+    """Recognize short acknowledgements and closings without hiding a question."""
+
+    words = _normalized_utterance(value).split()
+    return bool(
+        words
+        and len(words) <= 5
+        and set(words) <= _COURTESY_UTTERANCE_WORDS
+        and ({"thank", "thanks", "bye", "goodbye"} & set(words))
+    )
+
+
+def _latest_exact_fact_clause(value: str) -> str:
+    """Focus retrieval on the latest fact question in a compound voice turn."""
+
+    text = str(value or "").strip()
+    clauses = [clause.strip(" ,") for clause in re.split(r"[?!.]+", text) if clause.strip(" ,")]
+    if len(clauses) <= 1:
+        return text
+    for clause in reversed(clauses):
+        if classify_exact_fact_intents(clause):
+            return clause
+    return text
 
 
 def _is_meaningful_single_pass_interruption(value: str) -> bool:
@@ -2023,6 +2067,8 @@ class VAVInworldAgent(Agent):
         # document retrieval.  This value is evidence-derived, never inferred
         # from a caller assertion.
         self._single_pass_active_subject: str | None = None
+        self._single_pass_last_verified_evidence: str | None = None
+        self._single_pass_verified_evidence_by_type: dict[ExactFactType, str] = {}
         self._single_pass_follow_up_offered = False
         call_variables = variables or {}
         rendered_prompt = _render_call_template(model.system_prompt, call_variables)
@@ -2208,6 +2254,13 @@ Knowledge policy:
                     if len(exact_subjects) == 1:
                         self._single_pass_active_subject = next(iter(exact_subjects))
                     exact_context = exact_fact.evidence_context
+                    if (
+                        exact_context
+                        and exact_fact.response_action == ExactFactResponseAction.ANSWER
+                    ):
+                        self._single_pass_last_verified_evidence = exact_context
+                        for intent in exact_fact.intents:
+                            self._single_pass_verified_evidence_by_type[intent] = exact_context
                     verified = bool(
                         exact_context
                         and exact_fact.response_action
@@ -2321,10 +2374,24 @@ Knowledge policy:
 
         text = str(transcript or "").strip()
         normalized = _normalized_utterance(text)
-        if not normalized or _is_conversation_control_utterance(text):
+        if not normalized or _is_courtesy_utterance(text):
             return NO_KNOWLEDGE_REQUIRED
         if _is_bare_hold_utterance(text) or _is_silent_stop_utterance(text):
             return NO_KNOWLEDGE_REQUIRED
+
+        if _is_conversation_control_utterance(text):
+            if "repeat" in normalized or "say again" in normalized:
+                requested_intents = classify_exact_fact_intents(text)
+                for intent in requested_intents:
+                    remembered = self._single_pass_verified_evidence_by_type.get(intent)
+                    if remembered:
+                        return remembered
+                if self._single_pass_last_verified_evidence:
+                    return self._single_pass_last_verified_evidence
+            return NO_KNOWLEDGE_REQUIRED
+
+        lookup_text = _latest_exact_fact_clause(text)
+        lookup_normalized = _normalized_utterance(lookup_text)
 
         previous = self._single_pass_previous_explicit_query
         affirmative_follow_up = normalized in {"ok", "okay", "sure", "yeah", "yep", "yes"}
@@ -2338,26 +2405,28 @@ Knowledge policy:
             return NO_KNOWLEDGE_REQUIRED
         active_subject = str(self._single_pass_active_subject or "").strip()
         active_subject_variant = (
-            f"{active_subject}. {text}"
-            if active_subject and _normalized_utterance(active_subject) not in normalized
+            f"{active_subject}. {lookup_text}"
+            if active_subject and _normalized_utterance(active_subject) not in lookup_normalized
             else None
         )
         if referential_follow_up or affirmative_follow_up:
             if previous is None:
                 return NO_KNOWLEDGE_REQUIRED
             self._single_pass_follow_up_offered = False
-            contextual_query = f"{previous.rstrip(' .!?')}. {text}"
+            contextual_query = f"{previous.rstrip(' .!?')}. {lookup_text}"
             return await self._retrieve_approved_knowledge(
                 query=contextual_query,
                 query_variants=tuple(
-                    variant for variant in (active_subject_variant, previous, text) if variant
+                    variant
+                    for variant in (active_subject_variant, previous, lookup_text)
+                    if variant
                 ),
             )
 
-        self._single_pass_previous_explicit_query = text
+        self._single_pass_previous_explicit_query = lookup_text
         self._single_pass_follow_up_offered = False
         return await self._retrieve_approved_knowledge(
-            query=text,
+            query=lookup_text,
             query_variants=(active_subject_variant,) if active_subject_variant else (),
         )
 

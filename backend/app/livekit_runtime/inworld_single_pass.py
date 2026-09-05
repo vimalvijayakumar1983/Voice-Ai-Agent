@@ -360,6 +360,16 @@ def deterministic_grounded_reply(
             return "What would you like me to check about that?"
         return "I don't have verified information about that."
     if evidence == NO_KNOWLEDGE_REQUIRED:
+        normalized_query = " ".join(str(query or "").casefold().split())
+        words = set(re.findall(r"[^\W_]+", normalized_query, re.UNICODE))
+        if words & {"bye", "goodbye"}:
+            if words & {"thank", "thanks"}:
+                return "You're welcome. Goodbye."
+            return "Goodbye."
+        if words & {"thank", "thanks"}:
+            return "You're welcome."
+        if "repeat" in words or "say again" in normalized_query:
+            return "What would you like me to repeat?"
         return None
 
     envelope = decode_exact_fact_evidence(evidence)

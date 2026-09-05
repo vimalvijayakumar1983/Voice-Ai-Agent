@@ -268,6 +268,14 @@ def test_no_match_and_compiler_exact_facts_have_deterministic_grounded_replies()
         == "What would you like me to check about that?"
     )
     assert deterministic_grounded_reply(NO_KNOWLEDGE_REQUIRED) is None
+    assert (
+        deterministic_grounded_reply(NO_KNOWLEDGE_REQUIRED, query="Oh, thank you.")
+        == "You're welcome."
+    )
+    assert (
+        deterministic_grounded_reply(NO_KNOWLEDGE_REQUIRED, query="Thank you, goodbye.")
+        == "You're welcome. Goodbye."
+    )
     evidence = encode_exact_fact_evidence(
         response_action="answer",
         facts=(
