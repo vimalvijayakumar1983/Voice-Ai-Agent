@@ -70,6 +70,44 @@ async def test_interpreter_reports_usage_and_does_not_modify_state():
     assert request["response_format"]["json_schema"]["strict"] is True
     assert "tools" not in request
     assert json.loads(request["messages"][1]["content"])["state"]["company"] == "Harbour Trading"
+    assert (
+        request["messages"][-1]["content"] == "I'm talking about Sun & Moon Cosmetic Medical Center"
+    )
+    context = json.loads(request["messages"][1]["content"])
+    assert context["context_only"] is True
+    assert context["explicit_companies_in_current_turn"] == ["Sun & Moon Cosmetic Medical Center"]
+
+
+@pytest.mark.parametrize("query", ["", "What is the phone number?"])
+def test_selection_uses_stored_request_not_model_supplied_facts(query):
+    state = ConversationState(company="Harbour Trading", topic_query="What is the phone number?")
+    result = apply_intent(
+        intent(intent="select_company", company="Sun & Moon Cosmetic Medical Center", query=query),
+        utterance="I'm referring to Sun & Moon Cosmetic Medical Center.",
+        state=state,
+        scope=SCOPE,
+        directory=PEOPLE,
+    )
+    assert result.company == "Sun & Moon Cosmetic Medical Center"
+    assert result.query == "what is the phone number"
+
+
+def test_selection_rejects_model_invented_replacement_question():
+    state = ConversationState(company="Harbour Trading", topic_query="What is the phone number?")
+    before = replace(state)
+    with pytest.raises(ValueError):
+        apply_intent(
+            intent(
+                intent="select_company",
+                company="Sun & Moon Cosmetic Medical Center",
+                query="What treatments are offered?",
+            ),
+            utterance="I'm referring to Sun & Moon Cosmetic Medical Center.",
+            state=state,
+            scope=SCOPE,
+            directory=PEOPLE,
+        )
+    assert state == before
 
 
 @pytest.mark.parametrize("payload", ["not JSON", '{"intent":"question","answer":"invented"}'])
@@ -200,9 +238,6 @@ def test_explicit_other_company_never_confirms_an_unverified_affiliation():
         (intent(company="Harbour Group"), "What does Harbour Trading offer?"),
         (intent(person="Invented Person", person_mention="Cara Harbour"), "Who is Cara Harbour?"),
         (intent(person="Cara Harbour", person_mention="Cara Harbour"), "Who is the manager?"),
-        (intent(query="Who is the president?"), "Who is the chairman?"),
-        (intent(query="Can I book an appointment?"), "Can I cancel an appointment tomorrow?"),
-        (intent(query="What is the price?"), "Is the price 400?"),
         (intent(company="Sun & Moon Cosmetic Medical Center"), "What about Sun and Moon?"),
         (intent(intent="courtesy", query=""), "Thank you, what is the phone number?"),
     ],
@@ -213,6 +248,45 @@ def test_rejected_plan_never_mutates_state(plan, text):
     with pytest.raises(ValueError):
         apply_intent(plan, utterance=text, state=state, scope=SCOPE, directory=PEOPLE)
     assert state == before
+
+
+@pytest.mark.parametrize(
+    "rewrite,utterance",
+    [
+        ("Who is the president?", "Who is the chairman?"),
+        ("Can I book an appointment?", "Can I cancel an appointment tomorrow?"),
+        ("What is the price?", "Is the price 400?"),
+        ("", "Is the price 400?"),
+        ("What is Harbour Trading phone number?", "What is Harbour Group phone number?"),
+    ],
+)
+def test_lossy_rewrite_falls_back_to_original_without_another_model_pass(rewrite, utterance):
+    state = ConversationState(company="Harbour Group")
+    result = apply_intent(
+        intent(query=rewrite), utterance=utterance, state=state, scope=SCOPE, directory=PEOPLE
+    )
+    assert result.query == utterance
+    assert result.company == "Harbour Group"
+
+
+def test_clear_identity_with_missing_company_evidence_is_lookup_not_entity_clarification():
+    state = ConversationState(company="Harbour Group")
+    result = apply_intent(
+        intent(
+            intent="clarify",
+            company="Harbour Trading",
+            person="Cara Harbour",
+            person_mention="Cara Harbour",
+            detail="person_affiliation",
+            query="Who is Cara Harbour in Harbour Trading?",
+        ),
+        utterance="Tell me more about Cara Harbour in Harbour Trading.",
+        state=state,
+        scope=SCOPE,
+        directory=PEOPLE,
+    )
+    assert result.action == "lookup" and result.company == "Harbour Trading"
+    assert result.query != "Who is Cara Harbour?"
 
 
 async def test_runtime_routes_natural_selection_before_lookup_without_second_model_pass(

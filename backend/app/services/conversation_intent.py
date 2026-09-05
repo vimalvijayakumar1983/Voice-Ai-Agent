@@ -37,6 +37,11 @@ or role in query. Hold/courtesy must contain no substantive question or business
 State resolves references but is never evidence. Preserve booking, cancelling, paying or
 transferring requests without executing them. Missing catalogue entries do not make a clear
 question ambiguous. Never substitute a company overview for a specific requested detail.
+The FINAL user message is the current utterance. The context message contains PAST questions,
+not requests to repeat. Do not copy a past question when the current utterance changes it.
+Explicit company names in the current utterance override the previous company. An open
+question about where a named person works must not become confirmation of the previous
+company. Use the directory owner for that lookup, not the previous conversational scope.
 """
 
 
@@ -98,7 +103,10 @@ async def interpret_conversation_turn(
                         "role": "user",
                         "content": json.dumps(
                             {
-                                "utterance": question,
+                                "context_only": True,
+                                "explicit_companies_in_current_turn": mentioned_companies(
+                                    question, scope
+                                ),
                                 "state": {
                                     "company": state.company,
                                     "person": state.person,
@@ -113,6 +121,7 @@ async def interpret_conversation_turn(
                             ensure_ascii=False,
                         ),
                     },
+                    {"role": "user", "content": question},
                 ],
             )
             usage = response.usage
@@ -175,7 +184,9 @@ def apply_intent(
     if plan.company and plan.company != state.company and not explicit:
         if plan.company not in candidates and not (len(owners) == 1 and plan.company in owners):
             raise ValueError("unsupported company switch")
-    if plan.intent == "clarify":
+    if plan.intent == "clarify" and not (
+        explicit and person and plan.detail in {"person_role", "person_affiliation"}
+    ):
         return state._clarify("Which company or person is your question about?")
     if plan.intent in {"hold", "courtesy"}:
         # Never let an LLM swallow a substantive request as small talk.
@@ -190,11 +201,15 @@ def apply_intent(
         )
     company = plan.company or state.company
     if plan.intent == "select_company":
-        if not plan.company or plan.query or person:
+        if not plan.company or person:
             raise ValueError("invalid company selection")
         if re.search(r"\b(?:not|never|without|except|book|cancel|pay|transfer)\b", utterance, re.I):
             raise ValueError("selection discarded a negation or action")
         old = state.pending_query or state.topic_query
+        # The model may echo the pending question despite the empty-query instruction.
+        # Never execute that proposed query: only the validated stored request is reused.
+        if plan.query and (not old or company_key(plan.query) != company_key(old)):
+            raise ValueError("selection introduced a different question")
         if not old:
             state.company = company
             return TurnPlan(
@@ -212,12 +227,15 @@ def apply_intent(
             label = next(c for c in scope.companies if c.name == state.company)
             query = company_request_remainder(query, label)
         return state._lookup(query, company)
+    # Interpretation owns slots, not the caller's factual predicate. If its rewrite
+    # is empty, lossy or crosses scope, search the original request under the
+    # validated company instead. This needs no second model pass and confirms nothing.
     query = plan.query.strip()
-    if not query or not preserves_query_constraints(utterance, query):
-        raise ValueError("invalid or lossy search query")
-    for other in mentioned_companies(query, scope):
-        if other != company:
-            raise ValueError("search query crosses company scope")
+    use_original = (
+        not query
+        or not preserves_query_constraints(utterance, query)
+        or any(other != company for other in mentioned_companies(query, scope))
+    )
     # Do not treat a paraphrase as permission to erase dates, negatives or actions.
     for pattern in (
         r"\b(?:not|never|without|except)\b",
@@ -226,7 +244,9 @@ def apply_intent(
         r"\b(?:email|phone)\b",
     ):
         if re.search(pattern, utterance, re.I) and not re.search(pattern, query, re.I):
-            raise ValueError("lost request constraint")
+            use_original = True
+    if use_original:
+        query = utterance.strip()
     # Canonical person role queries get a source-backed exact lookup. Confirmations
     # retain their original predicate instead of silently confirming a wrong role.
     if person and plan.detail in {"person_role", "person_affiliation"}:
