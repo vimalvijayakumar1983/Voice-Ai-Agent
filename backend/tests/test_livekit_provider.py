@@ -2108,6 +2108,7 @@ def test_inworld_recognition_terms_never_truncate_a_business_name():
     ("content", "expected"),
     [
         ("I cannot verify that from the approved information.", "no_match_correctly_refused"),
+        ("I don't have a published branches list for Harbour Group.", "no_match_correctly_refused"),
         ("Which location do you mean?", "no_match_clarification"),
         ("The chairman is the person you named.", "no_match_unverified_response"),
     ],

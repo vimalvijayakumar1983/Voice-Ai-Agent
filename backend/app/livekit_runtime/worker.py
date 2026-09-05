@@ -402,6 +402,7 @@ _GROUNDING_REFUSAL_PATTERNS = (
     "do not have that information",
     "don't have that information",
     "don't have verified information",
+    "don't have a published",
     "not available in",
     "unable to confirm",
     "unable to find",
