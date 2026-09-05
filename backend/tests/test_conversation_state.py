@@ -1,0 +1,277 @@
+"""Regression coverage for natural deviations in a multi-company voice call."""
+
+import asyncio
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
+from sqlalchemy import select
+
+from app.livekit_runtime import worker
+from app.livekit_runtime.inworld_single_pass import (
+    InworldSinglePassController,
+    deterministic_grounded_reply,
+)
+from app.models.agent import KnowledgeSource
+from app.services.conversation_scope import KnowledgeCompany, KnowledgeCompanyScope
+from app.services.conversation_state import ConversationState, match_people
+from app.services.knowledge_collections import collection_reply, decode_collection
+from tests.test_conversation_routing import medical_runtime
+from tests.test_inworld_single_pass import _FakeSession
+from tests.test_knowledge_collections import fact
+
+
+async def runtime_fixture(db, tenant, monkeypatch):
+    runtime, medical = await medical_runtime(db, tenant, monkeypatch)
+    runtime._conversation_state_v3 = runtime._collections_enabled = True
+    runtime._telemetry = worker._LiveKitRuntimeTelemetry({}, [], 0)
+    source = await db.scalar(select(KnowledgeSource).where(KnowledgeSource.tenant_id == tenant.id))
+    source.structured_content = {
+        "facts": [
+            *source.structured_content["facts"],
+            fact("Harbour Group", "person profile: Alice Jaykumar", "CEO & Managing Director"),
+            fact("Harbour Group", "person profile: Beth Brown", "Director"),
+            fact("Harbour Group", "person profile: Cara Harbour", "President"),
+            fact("Harbour Group", "person profile: Dan Jones", "Chairman"),
+            fact("Harbour Group", "person profile: Erin Smith", "Executive Director"),
+            fact("Harbour Group", "person profile: Victor Jaykumar", "Director"),
+            fact("Harbour Group", "business segment", "Trading"),
+            fact("Harbour Group", "business segment", "Healthcare"),
+        ]
+    }
+    await db.commit()
+    return runtime, medical
+
+
+async def ask(runtime, question):
+    evidence = await runtime.retrieve_single_pass_evidence(question)
+    reply = deterministic_grounded_reply(evidence, query=question)
+    if reply:
+        runtime.prepare_spoken_response(question, evidence)(reply)
+    return reply or evidence
+
+
+async def test_full_failed_call_natural_variations(db, tenant, monkeypatch):
+    runtime, medical = await runtime_fixture(db, tenant, monkeypatch)
+    planner = AsyncMock()
+    monkeypatch.setattr(worker, "interpret_knowledge_question", planner)
+    reply = await ask(runtime, "List all directors of Harbour Group.")
+    assert all(n in reply for n in ["Alice", "Beth", "Erin", "Victor"])
+    await ask(runtime, "It's Cara Harbour.")
+    assert runtime._single_pass_active_subject == "Harbour Group"
+    reply = await ask(runtime, "List the leadership team.")
+    assert "Say next" in reply and "Which company" not in reply
+    assert "Victor" in await ask(runtime, "Next.")
+    assert "end of" in await ask(runtime, "Next.")
+    assert "Healthcare" in await ask(runtime, "What are the business divisions?")
+    assert "665 9998" in await ask(runtime, "What is the way to ring the Harbour Group office?")
+    assert "551 3831" in await ask(runtime, "Sorry, I meant about Harbour Trading.")
+    assert "Which company" in await ask(runtime, "What about Sun and Moon?")
+    assert "567 8000" in await ask(runtime, "Cosmetic Center.")
+    assert runtime._single_pass_active_subject == medical[1]
+    assert "Victor Jaykumar" in await ask(runtime, "Who is Victor Jay Kumar?")
+    assert runtime._single_pass_active_subject == "Harbour Group"
+    assert "CEO" in await ask(runtime, "What position does Alice hold?")
+    assert "don't have a published branches list" in await ask(
+        runtime, "List all the group's branches."
+    )
+    reply = await ask(
+        runtime, "What is the revenue? What is the annual revenue? Is it 1 billion dirhams?"
+    )
+    assert "branches" not in reply and "1 billion" not in reply
+    assert "Say next" in await ask(runtime, "This is the leadership team.")
+    assert await ask(runtime, "Thank you and goodbye.") == "You're welcome. Goodbye."
+    planner.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "Sorry, I meant about Harbour Trading.",
+        "I mean Harbour Trading.",
+        "What about Harbour Trading?",
+        "Harbour Trading.",
+    ],
+)
+async def test_company_correction_retains_question_not_answer(db, tenant, monkeypatch, phrase):
+    runtime, _ = await runtime_fixture(db, tenant, monkeypatch)
+    await ask(runtime, "What is Harbour Group phone number?")
+    reply = await ask(runtime, phrase)
+    assert "551 3831" in reply and "665 9998" not in reply
+
+
+async def test_unresolved_company_selection_keeps_request_and_recovers(db, tenant, monkeypatch):
+    runtime, _ = await runtime_fixture(db, tenant, monkeypatch)
+    await ask(runtime, "List the leadership team.")
+    await ask(runtime, "I meant Unknown Company.")
+    reply = await ask(runtime, "What did I ask you before?")
+    assert "leadership" in reply
+    reply = await ask(runtime, "The company I asked about before.")
+    assert "leadership list" in reply
+
+
+async def test_clarification_resumes_non_phone_request(db, tenant, monkeypatch):
+    runtime, _ = await runtime_fixture(db, tenant, monkeypatch)
+    await ask(runtime, "Sun and Moon branches?")
+    reply = await ask(runtime, "Cosmetic Centre.")
+    assert "Cosmetic Medical Center" in reply and "branches" in reply
+    assert "567 8000" not in reply
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "What is annual revenue? Is it one billion?",
+        "What are its opening hours?",
+        "Is this service available tomorrow?",
+        "What is their cancellation policy?",
+    ],
+)
+async def test_pronoun_does_not_append_previous_topic(db, tenant, monkeypatch, question):
+    runtime, _ = await runtime_fixture(db, tenant, monkeypatch)
+    await ask(runtime, "List all the group's branches.")
+    retrieve = AsyncMock(return_value="NO_VERIFIED_KNOWLEDGE_MATCH")
+    monkeypatch.setattr(runtime, "_retrieve_approved_knowledge", retrieve)
+    await runtime.retrieve_single_pass_evidence(question)
+    assert retrieve.await_args.kwargs["query"] == question
+
+
+@pytest.mark.parametrize("reference", ["Victor Jay Kumar", "Victor Jaykumar", "Victor"])
+def test_person_spacing_is_normalization_not_fuzzy_permission(reference):
+    assert match_people(reference, {"Victor Jaykumar": ("Harbour Group",)}) == ("Victor Jaykumar",)
+    assert not match_people("Harbour", {"Cara Harbour": ("Harbour Group",)})
+
+
+def test_ambiguous_person_is_not_assigned_to_first_company():
+    scope = KnowledgeCompanyScope(
+        companies=[KnowledgeCompany(name="A Company"), KnowledgeCompany(name="B Company")]
+    )
+    state = ConversationState(company="A Company")
+    directory = {"Alex North": ("A Company",), "Alex South": ("B Company",)}
+    plan = state.plan("Who is Alex?", scope, directory)
+    assert (
+        plan.action == "clarify" and "Alex North" in plan.message and "Alex South" in plan.message
+    )
+    plan = state.plan("Alex South", scope, directory)
+    assert plan.company == "B Company" and plan.query == "Who is Alex South?"
+
+
+def test_person_with_two_approved_owners_requires_explicit_choice():
+    scope = KnowledgeCompanyScope(
+        companies=[KnowledgeCompany(name="A Company"), KnowledgeCompany(name="B Company")]
+    )
+    state = ConversationState(company="A Company")
+    directory = {"Alex North": ("A Company", "B Company")}
+    assert state.plan("Who is Alex North?", scope, directory).action == "clarify"
+    plan = state.plan("B Company", scope, directory)
+    assert plan.company == "B Company" and plan.query == "who is alex north"
+
+
+async def test_caller_claim_never_enters_directory_or_becomes_a_fact(db, tenant, monkeypatch):
+    runtime, _ = await runtime_fixture(db, tenant, monkeypatch)
+    await ask(runtime, "It's Cara Harbour.")
+    assert runtime._conversation_state.company == "Harbour Group"
+    reply = await ask(runtime, "Who is Cara Harbour?")
+    assert "President" in reply
+    await ask(runtime, "The chairman is Unknown Person.")
+    assert "Unknown Person" not in runtime._person_company_directory
+
+
+async def test_negated_company_never_selects_forbidden_or_negated_subject(db, tenant, monkeypatch):
+    runtime, _ = await runtime_fixture(db, tenant, monkeypatch)
+    result = await ask(runtime, "Not Harbour Trading.")
+    assert "Please name" in result and runtime._single_pass_active_subject == "Harbour Group"
+    assert "configured companies" in await ask(runtime, "I meant Private Company.")
+    assert runtime._single_pass_active_subject == "Harbour Group"
+
+
+async def test_partial_list_continues_from_last_completed_entry(db, tenant, monkeypatch):
+    runtime, _ = await runtime_fixture(db, tenant, monkeypatch)
+    evidence = await runtime.retrieve_single_pass_evidence("List the leadership team.")
+    first = decode_collection(evidence)
+    commit = runtime.prepare_spoken_response("List the leadership team.", evidence)
+    assert runtime._collection_playback is not None
+    spoken = collection_reply(first).split(";")[0] + "; Beth"
+    commit(spoken)
+    second = decode_collection(await runtime.retrieve_single_pass_evidence("Next."))
+    assert second.offset == 1 and second.items[0].name == "Beth Brown"
+    assert all(i.name != "Alice Jaykumar" for i in second.items)
+
+
+async def test_next_before_commit_conservatively_repeats_not_skips(db, tenant, monkeypatch):
+    runtime, _ = await runtime_fixture(db, tenant, monkeypatch)
+    evidence = await runtime.retrieve_single_pass_evidence("List the leadership team.")
+    old_commit = runtime.prepare_spoken_response("List the leadership team.", evidence)
+    second_evidence = await runtime.retrieve_single_pass_evidence("Next.")
+    second = decode_collection(second_evidence)
+    assert second.offset == 0
+    runtime.prepare_spoken_response("Next.", second_evidence)
+    old_commit(collection_reply(decode_collection(evidence)))
+    assert runtime._collection_playback.confirmed_offset == 0
+
+
+async def test_start_again_and_repeat_are_scoped_list_controls(db, tenant, monkeypatch):
+    runtime, _ = await runtime_fixture(db, tenant, monkeypatch)
+    await ask(runtime, "List the leadership team.")
+    assert "Victor" in await ask(runtime, "Next.")
+    assert "Alice" not in await ask(runtime, "Repeat.")
+    assert "Alice" in await ask(runtime, "Start again.")
+
+
+@pytest.mark.parametrize(
+    "replacement", ["What is the phone number?", "Harbour Trading phone number?"]
+)
+async def test_late_list_callback_cannot_restore_abandoned_topic(
+    db, tenant, monkeypatch, replacement
+):
+    runtime, _ = await runtime_fixture(db, tenant, monkeypatch)
+    evidence = await runtime.retrieve_single_pass_evidence("List the leadership team.")
+    commit = runtime.prepare_spoken_response("List the leadership team.", evidence)
+    await ask(runtime, replacement)
+    commit(collection_reply(decode_collection(evidence)))
+    assert runtime._collection_playback is None
+    assert "Which list" in await ask(runtime, "Next.")
+
+
+async def test_controller_interrupted_handle_keeps_active_list(db, tenant, monkeypatch):
+    runtime, _ = await runtime_fixture(db, tenant, monkeypatch)
+    session = _FakeSession(auto_complete=False)
+    controller = InworldSinglePassController(
+        session=session,
+        retrieve_evidence=runtime.retrieve_single_pass_evidence,
+        prepare_spoken_response=runtime.prepare_spoken_response,
+    )
+    task = controller.on_final_transcript("List the leadership team.", turn_id="list")
+    await asyncio.wait_for(session.generated.wait(), 3)
+    handle = session.handles[-1]
+    page = runtime._collection_playback.page
+    handle.chat_items = [
+        SimpleNamespace(
+            role="assistant", text_content=collection_reply(page).split(";")[0] + "; Beth"
+        )
+    ]
+    handle.interrupt(force=True)
+    await task
+    await asyncio.sleep(0)
+    result = decode_collection(await runtime.retrieve_single_pass_evidence("Next."))
+    assert result.offset == 1
+    await controller.aclose()
+
+
+async def test_cold_company_selection_updates_both_routing_and_retrieval(db, tenant, monkeypatch):
+    runtime, _ = await runtime_fixture(db, tenant, monkeypatch)
+    runtime._conversation_state.company = None
+    runtime._single_pass_active_subject = None
+    assert "Okay, Harbour Trading" in await ask(runtime, "Harbour Trading.")
+    assert runtime._single_pass_active_subject == "Harbour Trading"
+    assert "551 3831" in await ask(runtime, "What is the phone number?")
+
+
+def test_clarification_loop_has_bounded_recovery_message():
+    state = ConversationState(company="A Company")
+    scope = KnowledgeCompanyScope(companies=[KnowledgeCompany(name="A Company")])
+    for _ in range(3):
+        plan = state.plan("I meant Unknown Company", scope, {})
+    assert "haven't been able to resolve" in plan.message
+    assert state.plan("What is A Company phone number?", scope, {}).action == "lookup"
+    assert state.clarification_count == 0

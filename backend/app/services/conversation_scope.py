@@ -73,7 +73,7 @@ def candidate_companies(
 
 
 def company_request_remainder(text: str, company: "KnowledgeCompany") -> str:
-    remainder = company_key(text)
+    remainder = company_key(re.sub(r"[’']s\b", "", text))
     for label in sorted([company.name, *company.aliases], key=len, reverse=True):
         remainder = re.sub(r"\b" + re.escape(company_key(label)) + r"\b", "", remainder)
     return " ".join(remainder.split())

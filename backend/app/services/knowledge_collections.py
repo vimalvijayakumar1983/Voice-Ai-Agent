@@ -82,14 +82,17 @@ _REQUEST_WORDS = set(
         "who what which where how many are is the a an all every complete full list show tell me "
         "give us your their our its of for at about and please do does you they have offer provide "
         "operate can could would like to know name names available currently current published "
-        "entire enumerate more"
+        "entire enumerate more this"
     ).split()
 )
 
 
 def collection_request(query: str, company: str) -> tuple[str | None, str | None]:
+    # Possession identifies the owner; it is not a geographic or content filter.
+    query = re.sub(r"[’']s\b", "", query)
     text = company_key(query)
     text = re.sub(r"\b" + re.escape(company_key(company)) + r"\b", "", text)
+    text = re.sub(r"\b(?:the )?(?:group|company|organisation|organization)\b", "", text)
     categories = [key for key, pattern in _CATEGORIES.items() if re.search(pattern, text)]
     if not categories or re.search(r"\b(?:not|except|without)\b", text):
         return None, None
@@ -134,6 +137,39 @@ class CollectionPage(BaseModel):
 
     def encode(self) -> str:
         return COLLECTION_PREFIX + self.model_dump_json()
+
+
+@dataclass
+class CollectionPlayback:
+    """An active page exists before speech completes; only heard entries advance.
+
+    If a late callback arrives after a new page was dispatched it must be ignored
+    by the owner. Repeating an uncertain entry is preferable to skipping it.
+    """
+
+    page: CollectionPage
+    confirmed_offset: int
+
+    def observe(self, content: str) -> None:
+        expected = collection_reply(self.page)
+        heard = company_key(content)
+        if heard == company_key(expected):
+            self.confirmed_offset = self.page.next_offset
+            return
+        end = 0
+        completed = 0
+        for item in self.page.items:
+            entry = item.name + (" — " + ", ".join(item.roles) if item.roles else "")
+            position = expected.find(entry, end)
+            if position < 0:
+                break
+            end = position + len(entry)
+            prefix = company_key(expected[:end])
+            if heard == prefix or heard.startswith(prefix + " "):
+                completed += 1
+            else:
+                break
+        self.confirmed_offset = max(self.confirmed_offset, self.page.offset + completed)
 
 
 def decode_collection(value: str | None) -> CollectionPage | None:

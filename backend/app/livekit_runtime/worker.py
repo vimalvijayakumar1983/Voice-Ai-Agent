@@ -79,6 +79,7 @@ from app.services.conversation_scope import (
     routing_text,
     scope_reply,
 )
+from app.services.conversation_state import ConversationState, person_reference
 from app.services.exact_fact_protocol import decode_exact_fact_evidence
 from app.services.exact_fact_retrieval import (
     ExactFactResponseAction,
@@ -93,6 +94,7 @@ from app.services.integration_security import (
 )
 from app.services.knowledge_collections import (
     CollectionPage,
+    CollectionPlayback,
     collection_reply,
     collection_request,
     decode_collection,
@@ -2120,6 +2122,13 @@ class VAVInworldAgent(Agent):
             (getattr(model, "agent_metadata", None) or {}).get("knowledge_collections_v1", False)
         )
         self._collection_cursor: CollectionPage | None = None
+        self._conversation_state_v3 = bool(
+            (getattr(model, "agent_metadata", None) or {}).get("conversation_state_v3", False)
+        )
+        self._conversation_state = ConversationState(
+            company=self._company_scope.default_company if self._company_scope else None
+        )
+        self._collection_playback: CollectionPlayback | None = None
         if self._company_scope:
             self._single_pass_active_subject = self._company_scope.default_company
         self._company_epoch = 0
@@ -2637,6 +2646,9 @@ Knowledge policy:
     async def retrieve_single_pass_evidence(self, transcript: str) -> str:
         """Plan one contextual lookup without modifying the provider transcript."""
 
+        if self._conversation_state_v3 and self._company_scope:
+            return await self._retrieve_conversation_state_evidence(transcript)
+
         text = str(transcript or "").strip()
         if self._conversation_routing_v2:
             text = routing_text(text)
@@ -2902,6 +2914,115 @@ Knowledge policy:
             query_variants=(active_subject_variant,) if active_subject_variant else (),
         )
 
+    async def _retrieve_conversation_state_evidence(self, transcript: str) -> str:
+        """Separate topic, company, identity and playback state on the opt-in lane."""
+        text = routing_text(str(transcript or ""))
+        text = re.sub(r"^stop[—,\s-]+(?:just\s+)?(?=give|tell|what|who|list)", "", text, flags=re.I)
+        normalized = _normalized_utterance(text)
+        if not normalized or _is_courtesy_utterance(text):
+            return NO_KNOWLEDGE_REQUIRED
+        if _is_bare_hold_utterance(text) or _is_silent_stop_utterance(text):
+            return NO_KNOWLEDGE_REQUIRED
+        state = self._conversation_state
+        if self._person_company_directory is None and (
+            person_reference(text) or state.pending_people
+        ):
+            # Same tenant/agent/revision fence as normal retrieval. Reuse the
+            # cached index; never infer an employee's company from page co-occurrence.
+            async with async_session_factory() as db:
+                index = await load_agent_exact_fact_index(
+                    db,
+                    tenant_id=self._tenant_id,
+                    agent_id=self._agent_id,
+                    serving_revision_id=self._knowledge_serving_revision_id,
+                    knowledge_base_id=self._knowledge_base_id,
+                )
+                profiles = []
+                if self._knowledge_serving_revision_id and self._knowledge_base_id:
+                    profiles = (
+                        await db.scalars(
+                            select(KnowledgeServingRevisionSource.structured_content)
+                            .where(
+                                KnowledgeServingRevisionSource.tenant_id == self._tenant_id,
+                                KnowledgeServingRevisionSource.knowledge_base_id
+                                == self._knowledge_base_id,
+                                KnowledgeServingRevisionSource.serving_revision_id
+                                == self._knowledge_serving_revision_id,
+                            )
+                            .limit(500)
+                        )
+                    ).all()
+            directory = person_company_directory(list(profiles), self._company_scope)
+            allowed = {c.name for c in self._company_scope.companies}
+            for record in index.collection_records if index else ():
+                if record.category == "leadership" and record.subject in allowed:
+                    directory[record.name] = tuple(
+                        dict.fromkeys((*directory.get(record.name, ()), record.subject))
+                    )
+            if index is not None:
+                self._person_company_directory = directory
+
+        continuation = normalized in {
+            "next",
+            "next please",
+            "continue",
+            "go on",
+            "the rest",
+            "show more",
+            "more",
+            "remaining",
+            "remaining entries",
+            "start again",
+            "start over",
+            "from the beginning",
+            "repeat",
+            "repeat that",
+            "say again",
+            "repeat slowly",
+        }
+        if continuation and not state.pending_companies:
+            progress = self._collection_playback
+            if progress and progress.page.company == self._single_pass_active_subject:
+                if normalized in {"start again", "start over", "from the beginning"}:
+                    offset = 0
+                elif normalized.startswith("repeat") or normalized == "say again":
+                    offset = progress.page.offset
+                else:
+                    offset = progress.confirmed_offset
+                return await self._retrieve_approved_knowledge(
+                    query=progress.page.query, collection_offset=offset
+                )
+            if normalized.startswith("repeat") or normalized == "say again":
+                if self._last_spoken_answer and self._last_spoken_answer[0] == state.company:
+                    return repeat_spoken(self._last_spoken_answer[1], slow="slow" in normalized)
+            return scope_reply("Which list or detail would you like me to continue?")
+
+        if normalized in _BACKCHANNEL_UTTERANCES:
+            return NO_KNOWLEDGE_REQUIRED
+        plan = state.plan(text, self._company_scope, self._person_company_directory or {})
+        if self._telemetry:
+            self._telemetry.runtime_metrics["conversation_state_version"] = "v3"
+            trace = self._telemetry._trace()
+            trace.update(
+                {
+                    "conversation_route_action": plan.action,
+                    "conversation_company": plan.company,
+                    "conversation_pending_company": bool(state.pending_companies),
+                }
+            )
+        if plan.action != "lookup":
+            if plan.action == "selection":
+                self._switch_company(plan.company)
+            return scope_reply(plan.message)
+        self._switch_company(plan.company)
+        # Any new question ends the active list. This also fences late speech
+        # callbacks from bringing an abandoned list back into a new topic.
+        self._collection_playback = None
+        self._collection_cursor = None
+        self._single_pass_previous_explicit_query = plan.query
+        self._requested_detail = classify_exact_fact_intents(plan.query)
+        return await self._retrieve_approved_knowledge(query=plan.query)
+
     def observe_single_pass_assistant_content(self, content: str) -> None:
         """Remember only explicit offers that make a later "yes" meaningful."""
 
@@ -2924,6 +3045,7 @@ Knowledge policy:
         self._single_pass_active_subject = subject
         self._company_epoch += 1
         self._collection_cursor = None
+        self._collection_playback = None
         self._single_pass_previous_explicit_query = None
         self._single_pass_last_verified_evidence = None
         self._single_pass_verified_evidence_by_type.clear()
@@ -2939,6 +3061,11 @@ Knowledge policy:
         intents = classify_exact_fact_intents(query)
         envelope = decode_exact_fact_evidence(evidence or "")
         collection = decode_collection(evidence)
+        playback = None
+        if self._conversation_state_v3 and collection is not None:
+            if not collection.blocked and not collection.count_only:
+                playback = CollectionPlayback(collection, collection.offset)
+                self._collection_playback = playback
         if not intents and envelope is not None and envelope.response_action == "answer":
             # A paraphrase such as "ring your office" need not contain the
             # word "phone". The retrieved typed fact supplies the repeat slot;
@@ -2967,6 +3094,8 @@ Knowledge policy:
             ):
                 return
             self._last_committed_response_sequence = sequence
+            if playback is not None and self._collection_playback is playback:
+                playback.observe(content)
             if collection is not None and not collection.blocked and not collection.count_only:
                 # A cancelled/partial answer must not advance the page cursor.
                 if _normalized_utterance(content) == _normalized_utterance(
