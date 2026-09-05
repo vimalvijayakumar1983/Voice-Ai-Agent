@@ -231,6 +231,7 @@ class ConversationState:
         scope: KnowledgeCompanyScope,
         directory: dict[str, tuple[str, ...]],
         person_hint: str | None = None,
+        allow_natural_selection: bool = False,
     ) -> TurnPlan:
         text = routing_text(text)
         normalized = company_key(text)
@@ -319,7 +320,7 @@ class ConversationState:
         remainder = selection
         for label in labels:
             remainder = company_request_remainder(remainder, label)
-        selection_only = bool(companies) and set(company_key(remainder).split()) <= {
+        selection_vocabulary = {
             "what",
             "how",
             "about",
@@ -343,6 +344,13 @@ class ConversationState:
             "could",
             "be",
         }
+        if allow_natural_selection:
+            # Only neutral selection framing is accepted. A new requested detail,
+            # person's name, action or negation remains substantive input.
+            selection_vocabulary |= {"am", "m", "talking", "referring", "to", "yeah"}
+        selection_only = (
+            bool(companies) and set(company_key(remainder).split()) <= selection_vocabulary
+        )
         if len(labels) > 1:
             common = set.intersection(*(set(company_key(c.name).split()) for c in labels))
             selection_only |= selection_words <= common | {

@@ -3053,7 +3053,11 @@ Knowledge policy:
                 person_hint = resolution.canonical
         proposed_state = replace(state) if self._structured_intent_enabled else state
         plan = proposed_state.plan(
-            text, self._company_scope, self._person_company_directory or {}, person_hint=person_hint
+            text,
+            self._company_scope,
+            self._person_company_directory or {},
+            person_hint=person_hint,
+            allow_natural_selection=self._structured_intent_enabled,
         )
         interpreted = False
         if self._structured_intent_enabled:
@@ -3077,7 +3081,7 @@ Knowledge policy:
                 or (
                     plan.action == "lookup"
                     and (
-                        (bool(typed) and not state.pending_companies)
+                        bool(typed)
                         or (proposed_state.person is not None and plan.query.startswith("Who is "))
                         or bool(collection_request(plan.query, plan.company or "")[0])
                     )

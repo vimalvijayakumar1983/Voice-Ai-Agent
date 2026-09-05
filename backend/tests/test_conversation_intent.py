@@ -289,8 +289,16 @@ def test_clear_identity_with_missing_company_evidence_is_lookup_not_entity_clari
     assert result.query != "Who is Cara Harbour?"
 
 
-async def test_runtime_routes_natural_selection_before_lookup_without_second_model_pass(
-    db, tenant, monkeypatch
+@pytest.mark.parametrize(
+    "selection",
+    [
+        "Yeah, I'm talking about Sun & Moon Cosmetic Medical Center.",
+        "I am referring to Sun & Moon Cosmetic Medical Center.",
+        "Sun & Moon Cosmetic Medical Center, please.",
+    ],
+)
+async def test_runtime_routes_known_selection_without_any_model_pass(
+    db, tenant, monkeypatch, selection
 ):
     runtime, _ = await runtime_fixture(db, tenant, monkeypatch)
     runtime._structured_intent_enabled = True
@@ -315,10 +323,32 @@ async def test_runtime_routes_natural_selection_before_lookup_without_second_mod
     monkeypatch.setattr(worker, "interpret_conversation_turn", interpreter)
     repair = AsyncMock(side_effect=AssertionError("no second model pass"))
     monkeypatch.setattr(worker, "interpret_knowledge_question", repair)
-    reply = await ask(runtime, "Yeah, I'm talking about Sun & Moon Cosmetic Medical Center.")
+    reply = await ask(runtime, selection)
     assert "567 8000" in reply and "treatment" not in reply
-    assert interpreter.await_count == 1
-    assert runtime._telemetry.runtime_metrics["knowledge_interpretation_input_tokens"] == 300
+    assert interpreter.await_count == 0
+    assert not runtime._telemetry.runtime_metrics.get("knowledge_interpretation_requests")
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "I'm talking about Sun & Moon Cosmetic Medical Center prices.",
+        "I'm talking about Sun & Moon Cosmetic Medical Center, cancel tomorrow.",
+        "I'm not talking about Sun & Moon Cosmetic Medical Center.",
+    ],
+)
+def test_natural_selection_never_swallows_new_detail_action_or_negation(question):
+    state = ConversationState(
+        company="Harbour Trading",
+        topic_query="What is the phone number?",
+        pending_companies=(
+            "Sun & Moon Cosmetic Medical Center",
+            "Sun & Moon Specialized Medical Center",
+        ),
+        pending_query="What is the phone number?",
+    )
+    result = state.plan(question, SCOPE, PEOPLE, allow_natural_selection=True)
+    assert result.query != "What is the phone number?"
 
 
 async def test_runtime_person_question_after_other_company(db, tenant, monkeypatch):
