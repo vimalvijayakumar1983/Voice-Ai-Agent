@@ -5,7 +5,9 @@ from dataclasses import dataclass, field
 
 from app.services.conversation_scope import (
     KnowledgeCompanyScope,
+    candidate_companies,
     company_key,
+    company_request_remainder,
     mentioned_companies,
 )
 from app.services.conversation_state import ConversationState, TurnPlan, match_people
@@ -70,10 +72,53 @@ def person_mentions(text: str, directory: dict[str, tuple[str, ...]]) -> tuple[s
     return tuple(dict.fromkeys(matches))
 
 
-def incomplete_request(text: str, people: tuple[str, ...] = ()) -> bool:
+def negative_company_prefix(text: str, scope: KnowledgeCompanyScope) -> bool:
+    normalized = company_key(text).replace("centre", "center")
+    match = re.fullmatch(r"not (?:the )?(.+)", normalized)
+    if not match:
+        return False
+    candidates = candidate_companies(match[1], scope, tuple(c.name for c in scope.companies))
+    return any(
+        set(match[1].split()) <= set(company_key(c.name).replace("centre", "center").split())
+        for c in scope.companies
+        if c.name in candidates
+    )
+
+
+def negative_detail_control(text: str) -> str | None:
+    match = re.fullmatch(
+        r"(?:not|no) (?:the )?(phone number|telephone number|address|email|price|role|position)",
+        company_key(text),
+    )
+    if not match:
+        return None
+    return {"phone number": "phone", "telephone number": "phone", "position": "role"}.get(
+        match[1], match[1]
+    )
+
+
+def named_identity_request(text: str, scope: KnowledgeCompanyScope, company: str) -> bool:
+    label = next((c for c in scope.companies if c.name == company), None)
+    if label is None:
+        return False
+    match = re.fullmatch(r"who is (.+)", company_request_remainder(text, label))
+    if not match:
+        return False
+    words = set(match[1].split()) - set(
+        "he she it they this that the person one someone man woman leader doctor dr "
+        "at in of for".split()
+    )
+    return bool(words)
+
+
+def incomplete_request(
+    text: str, people: tuple[str, ...] = (), scope: KnowledgeCompanyScope | None = None
+) -> bool:
     normalized = company_key(text)
     if not normalized or spoken_control(text):
         return False
+    if scope and negative_company_prefix(text, scope):
+        return True
     if normalized in {
         "what about",
         "how about",
@@ -110,7 +155,9 @@ def fragment_continues(previous: str, current: str) -> bool:
 
 def positive_correction(text: str, scope: KnowledgeCompanyScope) -> str:
     # Accept the explicit positive side of a correction, never the negated side.
-    match = re.search(r"^\s*not\b.+?[.,;]\s*(?:i mean|instead|actually)\s+(.+)$", text, re.I)
+    match = re.search(
+        r"^\s*not\b.+?(?:[.,;]\s*|\s+)(?:i mean|instead|actually)\s+(.+)$", text, re.I
+    )
     if (
         match
         and len(mentioned_companies(match[1], scope)) == 1
@@ -274,7 +321,7 @@ class RequestLedger:
         return self.active
 
     def complete(self, request_id: int | None, status: str) -> None:
-        if request_id in self.states:
+        if request_id in self.states and self.states[request_id] != "cancelled":
             self.states[request_id] = status
 
     def metrics(self) -> dict:
@@ -286,4 +333,5 @@ class RequestLedger:
             "conversation_requests_answered": sum(
                 s in {"answered", "refused"} for s in self.states.values()
             ),
+            "conversation_requests_cancelled": sum(s == "cancelled" for s in self.states.values()),
         }

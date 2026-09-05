@@ -313,3 +313,63 @@ async def test_generic_role_query_stays_the_requested_role(db, tenant, monkeypat
     r, _ = await foundation(db, tenant, monkeypatch)
     await ask(r, "Who is the president of Harbour Group?")
     assert "Dan Jones" in await ask(r, "Who is the chairman?")
+
+
+async def test_fragmented_role_correction_keeps_current_requested_detail(db, tenant, monkeypatch):
+    r, _ = await foundation(db, tenant, monkeypatch)
+    await ask(r, "Who is the president of Harbour Group?")
+    await ask(r, "Does he also work for Harbour Trading?")
+    assert await r.retrieve_single_pass_evidence("No.") == "SUPPRESS_REPLY"
+    assert "President" in await ask(r, "I mean Harbour Group. Tell me his role.")
+    assert "President" in await ask(r, "Not the phone number.")
+    assert "Which detail" in await ask(r, "Not the role.")
+
+
+async def test_negative_company_fragment_preserves_detail_until_positive_choice(
+    db, tenant, monkeypatch
+):
+    r, medical = await foundation(db, tenant, monkeypatch)
+    await ask(r, f"Give me the phone number for {medical[1]}.")
+    prior = r._conversation_state.topic_query
+    assert r.is_incomplete_request("Not the cosmetic center.")
+    assert await r.retrieve_single_pass_evidence("Not the cosmetic center.") == "SUPPRESS_REPLY"
+    assert r._conversation_state.topic_query == prior
+    assert "123 4000" in await ask(r, f"Not the cosmetic center I mean {medical[0]}.")
+
+
+async def test_clear_unknown_identity_after_search_repair_is_not_an_unknown_detail(
+    db, tenant, monkeypatch
+):
+    from unittest.mock import AsyncMock
+
+    from app.livekit_runtime import worker
+    from app.services.knowledge_query_interpreter import SearchRepair, SearchRepairResult
+
+    r, _ = await foundation(db, tenant, monkeypatch)
+    r._company_scope.semantic_retrieval_enabled = True
+    monkeypatch.setattr(worker, "load_provider_config", AsyncMock(return_value={"api_key": "test"}))
+    monkeypatch.setattr(
+        worker,
+        "interpret_knowledge_question",
+        AsyncMock(
+            return_value=SearchRepairResult(
+                SearchRepair(action="clarify", query=""), "completed", 1, 10, 5, True
+            )
+        ),
+    )
+    reply = await ask(r, "Who is Dr. Noura Example at Harbour Group?")
+    assert "don't have verified" in reply and "clarify" not in reply
+
+
+async def test_explicit_stop_cancels_request_without_hiding_other_unanswered_requests(
+    db, tenant, monkeypatch
+):
+    r, _ = await foundation(db, tenant, monkeypatch)
+    q = "List the leadership team of Harbour Group."
+    e = await r.retrieve_single_pass_evidence(q)
+    late_commit = r.prepare_spoken_response(q, e)
+    await r.retrieve_single_pass_evidence("Stop.")
+    late_commit("The published leadership list")
+    await ask(r, "Just tell me the chairman name.")
+    assert r._request_ledger.metrics()["conversation_requests_unresolved"] == 0
+    assert r._request_ledger.metrics()["conversation_requests_cancelled"] == 1

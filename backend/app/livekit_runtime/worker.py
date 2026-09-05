@@ -75,6 +75,9 @@ from app.services.conversation_foundation import (
     capability_question,
     contextual_plan,
     incomplete_request,
+    named_identity_request,
+    negative_company_prefix,
+    negative_detail_control,
     person_mentions,
     plural_companies,
     positive_correction,
@@ -2645,8 +2648,13 @@ Knowledge policy:
                 trace["conversation_recovery_failure"] = result.status
             return scope_reply("I couldn't resolve that question. Could you rephrase it briefly?")
         if result.plan.action == "clarify":
-            if is_clear_pricing_request(query, company=company) or (
-                self._conversation_state_v3 and explicit_attribute_request(query, company)
+            if (
+                is_clear_pricing_request(query, company=company)
+                or (self._conversation_state_v3 and explicit_attribute_request(query, company))
+                or (
+                    self._foundation_enabled
+                    and named_identity_request(query, self._company_scope, company)
+                )
             ):
                 return "NO_VERIFIED_KNOWLEDGE_MATCH"
             return scope_reply("Could you clarify which detail you would like me to check?")
@@ -2966,6 +2974,13 @@ Knowledge policy:
         """Separate topic, company, identity and playback state on the opt-in lane."""
         self._intent_sequence += 1
         intent_sequence = self._intent_sequence
+        if re.match(r"^(?:please )?stop\b", _normalized_utterance(str(transcript))):
+            self.cancel_explicit_request()
+        if self._foundation_enabled and (
+            _normalized_utterance(str(transcript)) == "no"
+            or negative_company_prefix(str(transcript), self._company_scope)
+        ):
+            return SUPPRESS_REPLY
         control = conversation_control(str(transcript or ""))
         if control == "hold":
             return scope_reply("Of course. Take your time.")
@@ -3003,6 +3018,7 @@ Knowledge policy:
             return NO_KNOWLEDGE_REQUIRED
         state = self._conversation_state
         if self._foundation_enabled:
+            excluded_detail = negative_detail_control(text)
             resumes = bool(
                 (state.pending_companies or state.pending_people)
                 and (
@@ -3011,10 +3027,28 @@ Knowledge policy:
                 )
                 and not re.search(r"\b(?:who|what|where|when|how|give|tell)\b", text, re.I)
             )
+            resumes = resumes or bool(excluded_detail and state.topic_query)
             self._request_ids[str(transcript)] = self._request_ledger.begin(resumes=resumes)
             if len(self._request_ids) > 256:
                 self._request_ids.pop(next(iter(self._request_ids)))
             self._record_request_ledger()
+            if excluded_detail:
+                prior_types = {
+                    item.value for item in classify_exact_fact_intents(state.topic_query or "")
+                }
+                if state.person and company_key(state.topic_query or "") == company_key(
+                    f"Who is {state.person}?"
+                ):
+                    prior_types = {"role"}
+                if (
+                    prior_types
+                    and excluded_detail not in prior_types
+                    and not (excluded_detail == "role" and "leadership" in prior_types)
+                ):
+                    return await self._retrieve_approved_knowledge(
+                        query=state.topic_query, allow_semantic_repair=False
+                    )
+                return scope_reply("Which detail would you like instead?")
             if capability_question(text):
                 # This lane registers search_approved_knowledge only. Do not claim
                 # actions from a business prompt or from booking-related KB text.
@@ -3264,13 +3298,20 @@ Knowledge policy:
         if self._foundation_enabled and self._telemetry:
             self._telemetry.runtime_metrics.update(self._request_ledger.metrics())
 
+    def cancel_explicit_request(self) -> None:
+        if self._foundation_enabled:
+            ledger = self._request_ledger
+            if ledger.states.get(ledger.active) in {"pending", "clarification"}:
+                ledger.complete(ledger.active, "cancelled")
+                self._record_request_ledger()
+
     def is_incomplete_request(self, text: str) -> bool:
         people = tuple(self._person_company_directory or {}) or tuple(
             entry.canonical
             for entry in self._speech_lexicon_entries
             if entry.entity_type == "person"
         )
-        return incomplete_request(text, people)
+        return incomplete_request(text, people, self._company_scope)
 
     def record_fragment_event(self, event: str) -> None:
         if self._telemetry and event in {"held", "joined", "expired", "discarded"}:
@@ -6196,6 +6237,8 @@ async def vav_inworld_session(ctx: JobContext) -> None:
                     return
                 if single_pass_controller is not None:
                     if _is_bare_hold_utterance(transcript) or _is_silent_stop_utterance(transcript):
+                        if _is_silent_stop_utterance(transcript):
+                            runtime_agent.cancel_explicit_request()
                         _cancel_stale_generation()
                         single_pass_controller.on_suppressed_final_transcript(cancel_active=True)
                         return

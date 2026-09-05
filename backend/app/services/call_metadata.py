@@ -214,6 +214,7 @@ def public_call_metadata(value: Any) -> dict[str, Any] | None:
             "conversation_requests_total",
             "conversation_requests_unresolved",
             "conversation_requests_answered",
+            "conversation_requests_cancelled",
             "conversation_fragments_held",
             "conversation_fragments_joined",
             "conversation_fragments_expired",
