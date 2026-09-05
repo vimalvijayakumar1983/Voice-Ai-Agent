@@ -83,6 +83,7 @@ def public_call_metadata(value: Any) -> dict[str, Any] | None:
             "llm_provider",
             "llm_model",
             "voice_runtime",
+            "conversation_ledger_version",
             "knowledge_turn_mode",
             "stt_model",
             "stt_language",
@@ -210,6 +211,13 @@ def public_call_metadata(value: Any) -> dict[str, Any] | None:
             "external_tts_request_count",
             "external_tts_characters",
             "greeting_provider_tts_request_count",
+            "conversation_requests_total",
+            "conversation_requests_unresolved",
+            "conversation_requests_answered",
+            "conversation_fragments_held",
+            "conversation_fragments_joined",
+            "conversation_fragments_expired",
+            "conversation_fragments_discarded",
         }
         for field in string_fields:
             if isinstance(runtime.get(field), str):

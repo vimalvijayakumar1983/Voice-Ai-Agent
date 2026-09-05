@@ -1,0 +1,263 @@
+"""Product acceptance: generic counterparts of failed live exploratory requests."""
+
+import asyncio
+
+import pytest
+
+from app.livekit_runtime.inworld_single_pass import InworldSinglePassController
+from app.services.call_disposition import (
+    apply_grounding_quality_guard,
+    normalize_call_analysis,
+    summarize_runtime_grounding,
+)
+from app.services.call_metadata import public_call_metadata
+from app.services.conversation_foundation import (
+    RequestLedger,
+    capability_question,
+    contextual_plan,
+    incomplete_request,
+)
+from tests.test_conversation_state import ask, runtime_fixture
+from tests.test_inworld_single_pass import _FakeSession
+
+
+async def foundation(db, tenant, monkeypatch):
+    runtime, medical = await runtime_fixture(db, tenant, monkeypatch)
+    runtime._foundation_enabled = True
+    return runtime, medical
+
+
+async def test_verified_person_pronoun_and_field_correction(db, tenant, monkeypatch):
+    r, _ = await foundation(db, tenant, monkeypatch)
+    assert "Cara" in await ask(r, "Who is the president of Harbour Group?")
+    assert r._conversation_state.person == "Cara Harbour", (
+        r._person_company_directory,
+        r._conversation_state,
+    )
+    answer = await ask(r, "Does he also work for Harbour Trading?")
+    assert "don't have verified" in answer and "phone" not in answer
+    answer = await ask(r, "No, I mean Harbour Group. Tell me his role, not the phone number.")
+    assert "President" in answer and "phone" not in answer
+
+
+async def test_positive_company_correction_repeat_and_both(db, tenant, monkeypatch):
+    r, medical = await foundation(db, tenant, monkeypatch)
+    assert "567 8000" in await ask(r, f"Give me the phone number for {medical[1]}.")
+    answer = await ask(r, f"Not the Cosmetic centre. I mean {medical[0]}.")
+    assert medical[0] in answer and "567 8000" not in answer
+    slow = await ask(r, "Repeat that number slowly, please.")
+    assert medical[0] in slow and "clarify" not in slow
+    both = await ask(
+        r, "Can you give me the phone numbers of both medical centres and say which is which?"
+    )
+    assert all(company in both for company in medical)
+    assert "567 8000" in both
+
+
+async def test_false_role_claim_uses_current_company_not_shared_person_surname(
+    db, tenant, monkeypatch
+):
+    r, _ = await foundation(db, tenant, monkeypatch)
+    first = await ask(r, "Who is the chairman of Harbour Group?")
+    assert "Dan Jones" in first, first
+    assert "Cara Harbour" in r._person_company_directory, r._person_company_directory
+    answer = await ask(r, "I was told Cara Harbour is the chairman. Is that correct?")
+    assert "Dan Jones" in answer and "Which company" not in answer, (
+        r._conversation_state,
+        r._company_scope,
+        r._telemetry.runtime_metrics,
+    )
+
+
+async def test_capability_is_not_a_knowledge_gap_or_booking(db, tenant, monkeypatch):
+    r, _ = await foundation(db, tenant, monkeypatch)
+    answer = await ask(
+        r,
+        "Please do not book anything. Can you make an actual appointment, "
+        "or only provide information?",
+    )
+    assert "cannot" in answer.lower() and "book" in answer.lower()
+    assert "clarify" not in answer and "confirmed" not in answer
+
+
+async def test_incomplete_question_never_reaches_retrieval_and_joins_continuation():
+    retrieved = []
+
+    async def retrieve(text):
+        retrieved.append(text)
+        return "NO_VERIFIED_KNOWLEDGE_MATCH"
+
+    session = _FakeSession()
+    controller = InworldSinglePassController(
+        session=session,
+        retrieve_evidence=retrieve,
+        incomplete_request=lambda t: t.strip(" .?!") == "Is Cara Harbour",
+        fragment_wait_seconds=0.1,
+    )
+    first = controller.on_final_transcript("Is Cara Harbour.", turn_id="a")
+    await asyncio.sleep(0.02)
+    assert not retrieved and not session.say_calls
+    controller.on_user_speech_started()
+    controller.on_meaningful_user_speech()
+    last = controller.on_final_transcript("in Harbour Trading?", turn_id="b")
+    await last
+    assert retrieved == ["Is Cara Harbour in Harbour Trading?"]
+    assert len(session.say_calls) == 1
+    assert first.cancelled()
+    await controller.aclose()
+
+
+async def test_fragment_expiry_clarifies_without_mutating_scope_or_query():
+    retrieved = []
+
+    async def retrieve(text):
+        retrieved.append(text)
+
+    session = _FakeSession()
+    c = InworldSinglePassController(
+        session=session,
+        retrieve_evidence=retrieve,
+        incomplete_request=lambda t: True,
+        fragment_wait_seconds=0.01,
+    )
+    await c.on_final_transcript("What about")
+    assert not retrieved
+    assert "finish" in session.say_calls[0]["text"]
+    await c.aclose()
+
+
+async def test_complete_question_does_not_wait_for_fragment_window():
+    event = asyncio.Event()
+
+    async def retrieve(text):
+        event.set()
+        return "NO_VERIFIED_KNOWLEDGE_MATCH"
+
+    c = InworldSinglePassController(
+        session=_FakeSession(),
+        retrieve_evidence=retrieve,
+        incomplete_request=lambda t: False,
+        fragment_wait_seconds=5,
+    )
+    task = c.on_final_transcript("Who is the chairman?")
+    await asyncio.wait_for(event.wait(), 0.2)
+    await task
+    await c.aclose()
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("Is Cara Harbour", True),
+        ("Who is Cara Harbour?", False),
+        ("Is Cara Harbour the president?", False),
+        ("What is the phone number?", False),
+        ("What is the phone number of", True),
+        ("Thank you and goodbye", False),
+    ],
+)
+def test_only_incomplete_requests_wait(text, expected):
+    assert incomplete_request(text, ("Cara Harbour",)) is expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "What is the appointment policy?",
+        "Can you tell me the appointment cancellation policy?",
+        "Can you give me the phone number?",
+    ],
+)
+def test_information_question_is_not_an_action_capability_question(text):
+    assert not capability_question(text)
+
+
+async def test_new_question_does_not_join_abandoned_fragment():
+    retrieved = []
+
+    async def retrieve(text):
+        retrieved.append(text)
+        return "NO_VERIFIED_KNOWLEDGE_MATCH"
+
+    c = InworldSinglePassController(
+        session=_FakeSession(),
+        retrieve_evidence=retrieve,
+        incomplete_request=lambda t: t == "What about",
+        fragment_wait_seconds=1,
+    )
+    first = c.on_final_transcript("What about", turn_id="a")
+    assert c.on_final_transcript("What about", turn_id="a") is None
+    await c.on_final_transcript("Who is the president?", turn_id="b")
+    assert retrieved == ["Who is the president?"]
+    assert first.cancelled()
+    await c.aclose()
+
+
+def test_ledger_clarification_is_resolved_only_by_its_own_answer():
+    ledger = RequestLedger()
+    a = ledger.begin()
+    ledger.complete(a, "clarification")
+    b = ledger.begin()
+    ledger.complete(b, "answered")
+    assert ledger.metrics()["conversation_requests_unresolved"] == 1
+    ledger.complete(a, "answered")
+    assert ledger.metrics()["conversation_requests_unresolved"] == 0
+    c = ledger.begin()
+    ledger.complete(c, "clarification")
+    assert ledger.begin(resumes=True) == c
+    ledger.complete(c, "refused")
+    assert ledger.metrics()["conversation_requests_unresolved"] == 0
+
+
+def test_unresolved_ledger_survives_public_metadata_and_caps_disposition_without_traces():
+    runtime = RequestLedger()
+    runtime.begin()
+    metadata = public_call_metadata({"agent_configuration": {}, "runtime": runtime.metrics()})
+    grounding = summarize_runtime_grounding(metadata)
+    assert grounding["unresolved_requests"] == 1
+    analysis = normalize_call_analysis(
+        {
+            "summary": "Caller left.",
+            "disposition": "information_provided",
+            "resolution": "resolved",
+            "confidence": 0.95,
+        },
+        profile="receptionist",
+    )
+    details = apply_grounding_quality_guard(analysis, grounding=grounding)["disposition_details"]
+    assert details["resolution"] == "partially_resolved" and details["needs_review"]
+
+
+async def test_clarification_then_choice_resolves_request_but_courtesy_does_not(
+    db, tenant, monkeypatch
+):
+    r, _ = await foundation(db, tenant, monkeypatch)
+    await ask(r, "What is the phone number for Sun and Moon?")
+    assert r._request_ledger.metrics()["conversation_requests_unresolved"] == 1
+    await ask(r, "Thank you")
+    assert r._request_ledger.metrics()["conversation_requests_unresolved"] == 1
+    await ask(r, "The Cosmetic centre")
+    assert r._request_ledger.metrics()["conversation_requests_unresolved"] == 0
+
+
+async def test_new_constraints_cannot_be_discarded_by_role_correction(db, tenant, monkeypatch):
+    r, _ = await foundation(db, tenant, monkeypatch)
+    await ask(r, "Who is the president of Harbour Group?")
+    assert (
+        contextual_plan(
+            "Tell me his role and salary",
+            r._conversation_state,
+            r._company_scope,
+            r._person_company_directory,
+        )
+        is None
+    )
+
+
+async def test_interrupted_answer_and_new_topic_remain_distinct_requests(db, tenant, monkeypatch):
+    r, _ = await foundation(db, tenant, monkeypatch)
+    query = "Who is the president of Harbour Group?"
+    evidence = await r.retrieve_single_pass_evidence(query)
+    r.prepare_spoken_response(query, evidence)("The president")
+    await ask(r, "What is the phone number of Harbour Group?")
+    assert r._request_ledger.metrics()["conversation_requests_unresolved"] == 1

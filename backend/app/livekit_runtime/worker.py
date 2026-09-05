@@ -69,6 +69,17 @@ from app.models.agent import (
 from app.models.call import Call, CallTranscript
 from app.models.provider_credential import ProviderCredential
 from app.services.call_metadata import agent_configuration_snapshot
+from app.services.conversation_foundation import (
+    FOUNDATION_FLAG,
+    RequestLedger,
+    capability_question,
+    contextual_plan,
+    incomplete_request,
+    person_mentions,
+    plural_companies,
+    positive_correction,
+    spoken_control,
+)
 from app.services.conversation_intent import apply_intent, interpret_conversation_turn
 from app.services.conversation_scope import (
     KnowledgeCompanyScope,
@@ -88,7 +99,7 @@ from app.services.conversation_state import (
     explicit_attribute_request,
     person_reference,
 )
-from app.services.exact_fact_protocol import decode_exact_fact_evidence
+from app.services.exact_fact_protocol import decode_exact_fact_evidence, encode_exact_fact_evidence
 from app.services.exact_fact_retrieval import (
     ExactFactResponseAction,
     ExactFactType,
@@ -2144,6 +2155,12 @@ class VAVInworldAgent(Agent):
             (getattr(model, "agent_metadata", None) or {}).get("conversation_intent_v1", False)
         )
         self._intent_sequence = 0
+        self._foundation_enabled = (getattr(model, "agent_metadata", None) or {}).get(
+            FOUNDATION_FLAG
+        ) is True and self._conversation_state_v3
+        self._request_ledger = RequestLedger()
+        self._request_ids: dict[str, int] = {}
+        self._recent_companies: tuple[str, ...] = ()
         self._collection_playback: CollectionPlayback | None = None
         if self._company_scope:
             self._single_pass_active_subject = self._company_scope.default_company
@@ -2985,8 +3002,41 @@ Knowledge policy:
         if _is_bare_hold_utterance(text) or _is_silent_stop_utterance(text):
             return NO_KNOWLEDGE_REQUIRED
         state = self._conversation_state
+        if self._foundation_enabled:
+            resumes = bool(
+                (state.pending_companies or state.pending_people)
+                and (
+                    candidate_companies(text, self._company_scope, state.pending_companies)
+                    or person_mentions(text, self._person_company_directory or {})
+                )
+                and not re.search(r"\b(?:who|what|where|when|how|give|tell)\b", text, re.I)
+            )
+            self._request_ids[str(transcript)] = self._request_ledger.begin(resumes=resumes)
+            if len(self._request_ids) > 256:
+                self._request_ids.pop(next(iter(self._request_ids)))
+            self._record_request_ledger()
+            if capability_question(text):
+                # This lane registers search_approved_knowledge only. Do not claim
+                # actions from a business prompt or from booking-related KB text.
+                return scope_reply(
+                    "I can provide information, but I cannot book or change appointments "
+                    "in this call."
+                )
+            natural_repeat = spoken_control(text)
+            if (
+                natural_repeat
+                and self._last_spoken_answer
+                and self._last_spoken_answer[0] == state.company
+            ):
+                return repeat_spoken(
+                    self._last_spoken_answer[1], slow=natural_repeat == "repeat_slow"
+                )
+            text = positive_correction(text, self._company_scope)
         if self._person_company_directory is None and (
-            person_reference(text) or state.pending_people or self._structured_intent_enabled
+            person_reference(text)
+            or state.pending_people
+            or self._structured_intent_enabled
+            or self._foundation_enabled
         ):
             # Same tenant/agent/revision fence as normal retrieval. Reuse the
             # cached index; never infer an employee's company from page co-occurrence.
@@ -3023,6 +3073,69 @@ Knowledge policy:
             if index is not None:
                 self._person_company_directory = directory
 
+        if self._foundation_enabled:
+            companies = plural_companies(text, self._company_scope, self._recent_companies)
+            typed = classify_exact_fact_intents(text)
+            if (
+                companies
+                and len(typed) == 1
+                and typed[0] in {ExactFactType.PHONE, ExactFactType.ADDRESS}
+            ):
+                # Fetch each governed company separately. Never use one company's
+                # cached answer for another, or silently omit an uncovered company.
+                facts = []
+                started = time.perf_counter()
+                async with async_session_factory() as db:
+                    for company in companies:
+                        resolution = await retrieve_exact_fact(
+                            db,
+                            tenant_id=self._tenant_id,
+                            agent_id=self._agent_id,
+                            query=f"What is the {typed[0].value} for {company}?",
+                            serving_revision_id=self._knowledge_serving_revision_id,
+                            knowledge_base_id=self._knowledge_base_id,
+                            company_subject=company,
+                            prefer_primary_phone=True,
+                        )
+                        envelope = decode_exact_fact_evidence(resolution.evidence_context or "")
+                        if (
+                            not envelope
+                            or envelope.response_action != "answer"
+                            or not envelope.facts
+                        ):
+                            return scope_reply(
+                                "I couldn't verify all those details. "
+                                f"Please ask about {company} separately."
+                            )
+                        if any(
+                            company_key(f.subject) != company_key(company) for f in envelope.facts
+                        ):
+                            return scope_reply(
+                                "I couldn't safely match every company. "
+                                "Please ask about one company at a time."
+                            )
+                        facts.extend(envelope.facts)
+                if len(facts) > 4:
+                    return scope_reply(
+                        "There are multiple locations. Which location do you want for each company?"
+                    )
+                evidence = encode_exact_fact_evidence(
+                    response_action="answer", facts=facts, max_chars=4000
+                )
+                if self._telemetry:
+                    self._telemetry.record_knowledge_lookup(
+                        elapsed_ms=round((time.perf_counter() - started) * 1000),
+                        result="verified",
+                        evidence_chars=len(evidence),
+                        query_variant_count=len(companies),
+                        fallback_used=False,
+                        details={
+                            "knowledge_retrieval_path": "multi_company_exact_fact",
+                            "exact_fact_action": "answer",
+                        },
+                    )
+                return evidence
+
         continuation = normalized in LIST_CONTROLS
         if continuation and not state.pending_companies:
             progress = self._collection_playback
@@ -3051,13 +3164,23 @@ Knowledge policy:
             )
             if resolution.safe_to_apply and resolution.entity_type == "person":
                 person_hint = resolution.canonical
-        proposed_state = replace(state) if self._structured_intent_enabled else state
-        plan = proposed_state.plan(
+        proposed_state = (
+            replace(state) if self._structured_intent_enabled or self._foundation_enabled else state
+        )
+        plan = (
+            contextual_plan(
+                text, proposed_state, self._company_scope, self._person_company_directory or {}
+            )
+            if self._foundation_enabled
+            else None
+        )
+        foundation_plan = plan is not None
+        plan = plan or proposed_state.plan(
             text,
             self._company_scope,
             self._person_company_directory or {},
             person_hint=person_hint,
-            allow_natural_selection=self._structured_intent_enabled,
+            allow_natural_selection=self._structured_intent_enabled or self._foundation_enabled,
         )
         interpreted = False
         if self._structured_intent_enabled:
@@ -3087,12 +3210,14 @@ Knowledge policy:
                     )
                 )
             )
-            if not fast:
+            if not fast and not foundation_plan:
                 interpreted = True
                 proposed_state = replace(state)
                 plan = await self._interpret_turn_plan(text, proposed_state)
             if intent_sequence != self._intent_sequence:
                 raise asyncio.CancelledError
+            self._conversation_state = state = proposed_state
+        elif self._foundation_enabled:
             self._conversation_state = state = proposed_state
         if self._telemetry:
             self._telemetry.runtime_metrics["conversation_state_version"] = "v3"
@@ -3124,6 +3249,24 @@ Knowledge policy:
         return await self._retrieve_approved_knowledge(
             query=plan.query, **({"allow_semantic_repair": False} if interpreted else {})
         )
+
+    def _record_request_ledger(self) -> None:
+        if self._foundation_enabled and self._telemetry:
+            self._telemetry.runtime_metrics.update(self._request_ledger.metrics())
+
+    def is_incomplete_request(self, text: str) -> bool:
+        people = tuple(self._person_company_directory or {}) or tuple(
+            entry.canonical
+            for entry in self._speech_lexicon_entries
+            if entry.entity_type == "person"
+        )
+        return incomplete_request(text, people)
+
+    def record_fragment_event(self, event: str) -> None:
+        if self._telemetry and event in {"held", "joined", "expired", "discarded"}:
+            key = f"conversation_fragments_{event}"
+            metrics = self._telemetry.runtime_metrics
+            metrics[key] = int(metrics.get(key, 0)) + 1
 
     async def _interpret_turn_plan(self, text: str, state: ConversationState):
         """Interpret before lookup; share the existing repair budget, never chain two LLM passes."""
@@ -3241,6 +3384,8 @@ Knowledge policy:
     def _switch_company(self, subject: str | None) -> None:
         if subject == self._single_pass_active_subject:
             return
+        if self._foundation_enabled and subject:
+            self._recent_companies = tuple(dict.fromkeys((*self._recent_companies, subject)))[-2:]
         self._single_pass_active_subject = subject
         self._company_epoch += 1
         self._collection_cursor = None
@@ -3282,8 +3427,46 @@ Knowledge policy:
             and evidence not in {NO_KNOWLEDGE_REQUIRED, "NO_VERIFIED_KNOWLEDGE_MATCH"}
             and not evidence.startswith("VAV_SCOPE_REPLY:")
         )
+        request_id = self._request_ids.get(query) if self._foundation_enabled else None
 
         def remember(content: str) -> None:
+            if request_id is not None and content:
+                from app.livekit_runtime.inworld_single_pass import deterministic_grounded_reply
+
+                expected = deterministic_grounded_reply(evidence, query=query)
+                if expected and _normalized_utterance(expected) != _normalized_utterance(content):
+                    status = "pending"  # Interrupted output is not a completed answer.
+                elif evidence and evidence.startswith("VAV_SCOPE_REPLY:"):
+                    status = (
+                        "clarification"
+                        if (
+                            "?" in content
+                            or re.search(
+                                r"\b(?:please ask|couldn't verify|couldn't safely|"
+                                r"finish your question)\b",
+                                content,
+                                re.I,
+                            )
+                        )
+                        else "answered"
+                    )
+                elif not evidence or evidence == "NO_VERIFIED_KNOWLEDGE_MATCH":
+                    status = (
+                        "refused"
+                        if _no_match_response_outcome(content) == "no_match_correctly_refused"
+                        else "clarification"
+                    )
+                else:
+                    outcome = _no_match_response_outcome(content)
+                    status = (
+                        "clarification"
+                        if outcome == "no_match_clarification"
+                        else "failed"
+                        if outcome == "no_match_correctly_refused" and expected is None
+                        else "answered"
+                    )
+                self._request_ledger.complete(request_id, status)
+                self._record_request_ledger()
             if (
                 not usable
                 or not subject
@@ -3293,6 +3476,23 @@ Knowledge policy:
             ):
                 return
             self._last_committed_response_sequence = sequence
+            if self._foundation_enabled and envelope and envelope.response_action == "answer":
+                names = tuple(
+                    dict.fromkeys(
+                        name
+                        for fact in envelope.facts
+                        if fact.fact_type == "leadership"
+                        for name in person_mentions(
+                            fact.predicate.split(":", 1)[1]
+                            if fact.predicate.casefold().startswith("person profile:")
+                            else fact.value,
+                            self._person_company_directory or {},
+                        )
+                        if company_key(name) in company_key(content)
+                    )
+                )
+                if len(names) == 1:
+                    self._conversation_state.person = names[0]
             if playback is not None and self._collection_playback is playback:
                 playback.observe(content)
             if collection is not None and not collection.blocked and not collection.count_only:
@@ -5508,6 +5708,12 @@ async def vav_inworld_session(ctx: JobContext) -> None:
                 record_error=_record_single_pass_error,
                 prepare_spoken_response=runtime_agent.prepare_spoken_response,
                 settle_interrupted_lists=runtime_agent._conversation_state_v3,
+                incomplete_request=runtime_agent.is_incomplete_request
+                if runtime_agent._foundation_enabled
+                else None,
+                record_fragment_event=runtime_agent.record_fragment_event
+                if runtime_agent._foundation_enabled
+                else None,
             )
 
         def _cancel_stale_generation() -> None:
@@ -5947,6 +6153,7 @@ async def vav_inworld_session(ctx: JobContext) -> None:
                     telemetry.commit_suspended_interruption()
                 if (
                     native_barge_in
+                    and not runtime_agent._foundation_enabled
                     and not (
                         single_pass_controller is not None
                         and _normalized_utterance(transcript) in _PASSIVE_SINGLE_PASS_BACKCHANNELS

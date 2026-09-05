@@ -26,6 +26,7 @@ GROUNDING_QUALITY_FLAGS = frozenset(
         "refused_despite_verified_evidence",
         "clarified_despite_verified_exact_fact",
         "conversation_recovery_failure",
+        "unresolved_requests",
     }
 )
 
@@ -340,6 +341,9 @@ def summarize_runtime_grounding(call_metadata: object) -> dict[str, int]:
     runtime = call_metadata.get("runtime")
     if not isinstance(runtime, dict):
         return counts
+    unresolved = runtime.get("conversation_requests_unresolved")
+    if runtime.get("conversation_ledger_version") == "v1" and type(unresolved) is int:
+        counts["unresolved_requests"] = max(0, unresolved)
     traces = runtime.get("turn_diagnostics")
     if not isinstance(traces, list):
         return counts
@@ -392,6 +396,7 @@ def apply_grounding_quality_guard(
     verified_refusal_count = safe_counts["refused_despite_verified_evidence"]
     verified_exact_clarification_count = safe_counts["clarified_despite_verified_exact_fact"]
     recovery_failure_count = safe_counts["conversation_recovery_failure"]
+    unresolved_count = safe_counts["unresolved_requests"]
     grounding_issue_count = (
         unsupported_count
         + knowledge_error_count
@@ -399,6 +404,7 @@ def apply_grounding_quality_guard(
         + verified_refusal_count
         + verified_exact_clarification_count
         + recovery_failure_count
+        + unresolved_count
     )
     if grounding_issue_count <= 0:
         return analysis
@@ -414,6 +420,10 @@ def apply_grounding_quality_guard(
     if not isinstance(evidence, list):
         evidence = []
     warning_parts: list[str] = []
+    if unresolved_count:
+        warning_parts.append(
+            f"{unresolved_count} request(s) remained unanswered or awaiting clarification"
+        )
     if recovery_failure_count:
         warning_parts.append(
             f"{recovery_failure_count} conversation recovery failure(s) require review"

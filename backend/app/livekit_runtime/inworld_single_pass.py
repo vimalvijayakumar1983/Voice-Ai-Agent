@@ -27,7 +27,8 @@ from typing import Any, Protocol
 from livekit.agents import AgentSession
 from openai.types.realtime.realtime_audio_input_turn_detection import SemanticVad
 
-from app.services.conversation_scope import SCOPE_REPLY_PREFIX, SPOKEN_REPEAT_PREFIX
+from app.services.conversation_foundation import fragment_continues
+from app.services.conversation_scope import SCOPE_REPLY_PREFIX, SPOKEN_REPEAT_PREFIX, scope_reply
 from app.services.conversation_state import LIST_CONTROLS
 from app.services.exact_fact_protocol import decode_exact_fact_evidence
 from app.services.knowledge_collections import collection_reply, decode_collection
@@ -494,6 +495,9 @@ class InworldSinglePassController:
         clock: Callable[[], float] = perf_counter,
         prepare_spoken_response: Callable[[str, str | None], Callable[[str], None]] | None = None,
         settle_interrupted_lists: bool = False,
+        incomplete_request: Callable[[str], bool] | None = None,
+        fragment_wait_seconds: float = 1.4,
+        record_fragment_event: Callable[[str], None] | None = None,
     ) -> None:
         self._session = session
         self._retrieve_evidence = retrieve_evidence
@@ -502,6 +506,10 @@ class InworldSinglePassController:
         self._clock = clock
         self._prepare_spoken_response = prepare_spoken_response
         self._settle_interrupted_lists = settle_interrupted_lists
+        self._incomplete_request = incomplete_request
+        self._fragment_wait_seconds = max(0.01, min(5.0, fragment_wait_seconds))
+        self._pending_fragment: tuple[str, float] | None = None
+        self._record_fragment_event = record_fragment_event
         self._speech_commit_pending: asyncio.Event | None = None
         self._sequence = 0
         self._turn_task: asyncio.Task[None] | None = None
@@ -531,6 +539,13 @@ class InworldSinglePassController:
             self._record_error(error)
         except Exception:
             logger.exception("inworld_single_pass_error_recorder_failed")
+
+    def _fragment_event(self, event: str) -> None:
+        if self._record_fragment_event:
+            try:
+                self._record_fragment_event(event)
+            except Exception:
+                logger.exception("fragment_event_recorder_failed")
 
     def _consume_interrupt(self, result: Any) -> None:
         if result is None:
@@ -602,6 +617,8 @@ class InworldSinglePassController:
 
         if self._closed:
             return
+        if cancel_active:
+            self._pending_fragment = None
         if cancel_active and not self._preempted_for_current_utterance:
             self._invalidate_active_turn()
         self._preempted_for_current_utterance = False
@@ -635,8 +652,27 @@ class InworldSinglePassController:
 
         self._invalidate_active_turn()
         sequence = self._sequence
+        # Assemble only the search input. Provider transcript items remain verbatim.
+        pending = self._pending_fragment
+        self._pending_fragment = None
+        if (
+            pending
+            and self._clock() - pending[1] <= 8.0
+            and fragment_continues(pending[0], transcript)
+            and len(pending[0]) + len(transcript) <= 800
+        ):
+            transcript = pending[0].rstrip(" .?!") + " " + transcript.lstrip()
+            self._fragment_event("joined")
+        elif pending:
+            self._fragment_event("discarded")
+        incomplete = self._incomplete_request and self._incomplete_request(transcript)
+        if incomplete:
+            self._pending_fragment = (transcript, self._clock())
+            self._fragment_event("held")
         task = asyncio.create_task(
-            self._run_turn(sequence=sequence, transcript=transcript),
+            self._wait_for_fragment(sequence, transcript)
+            if incomplete
+            else self._run_turn(sequence=sequence, transcript=transcript),
             name=f"inworld-single-pass-{sequence}",
         )
         self._turn_task = task
@@ -656,7 +692,33 @@ class InworldSinglePassController:
         task.add_done_callback(completed)
         return task
 
-    async def _run_turn(self, *, sequence: int, transcript: str) -> None:
+    async def _wait_for_fragment(self, sequence: int, transcript: str) -> None:
+        await asyncio.sleep(self._fragment_wait_seconds)
+        if self._closed or sequence != self._sequence:
+            return
+        # Do not expire the buffer while the caller is already continuing it.
+        # The next meaningful/final transcript cancels this waiter and joins the
+        # preserved fragment. A missing provider event remains bounded.
+        if not self._user_speech_resolved.is_set():
+            try:
+                await asyncio.wait_for(self._user_speech_resolved.wait(), timeout=8.0)
+            except TimeoutError:
+                self._pending_fragment = None
+                self._fragment_event("discarded")
+                return
+        if self._closed or sequence != self._sequence:
+            return
+        self._pending_fragment = None
+        self._fragment_event("expired")
+        await self._run_turn(
+            sequence=sequence,
+            transcript=transcript,
+            evidence_override=scope_reply("Please finish your question so I can check it."),
+        )
+
+    async def _run_turn(
+        self, *, sequence: int, transcript: str, evidence_override: str | None = None
+    ) -> None:
         started_at = self._clock()
         retrieval_started_at: float | None = None
         generation_started_at: float | None = None
@@ -682,7 +744,11 @@ class InworldSinglePassController:
                     # pagination conservatively resumes at the last known item.
                     pass
             retrieval_started_at = self._clock()
-            evidence = await self._retrieve_evidence(transcript)
+            evidence = (
+                evidence_override
+                if evidence_override is not None
+                else await self._retrieve_evidence(transcript)
+            )
             retrieval_ms = max(0.0, (self._clock() - retrieval_started_at) * 1000)
             if evidence is not None and not isinstance(evidence, str):
                 raise TypeError("approved evidence retriever must return text or None")
@@ -817,6 +883,7 @@ class InworldSinglePassController:
         if self._closed:
             return
         self._closed = True
+        self._pending_fragment = None
         self._user_speech_resolved.set()
         task = self._turn_task
         self._invalidate_active_turn()
