@@ -77,6 +77,7 @@ from app.services.conversation_foundation import (
     capability_question,
     company_alias_scope,
     contextual_plan,
+    implicit_contact_numbers,
     incomplete_request,
     named_identity_request,
     negative_company_prefix,
@@ -3164,7 +3165,7 @@ Knowledge policy:
                 companies
                 and not typed
                 and state.requested_detail == "phone"
-                and re.search(r"\bnumbers?\b", text, re.I)
+                and implicit_contact_numbers(text, self._company_scope)
             ):
                 typed = (ExactFactType.PHONE,)
             if companies:

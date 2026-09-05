@@ -96,6 +96,23 @@ async def test_multi_company_detail_clarification_preserves_both_targets(db, ten
     assert r._request_ledger.metrics()["conversation_requests_unresolved"] == 0
 
 
+async def test_both_centers_does_not_include_recent_trading_company(db, tenant, monkeypatch):
+    r, medical = await foundation(db, tenant, monkeypatch)
+    await ask(r, "What is the phone number for Harbour Trading?")
+    await ask(r, f"What is the phone number for {medical[0]}?")
+    reply = await ask(r, "Give me both centers' numbers.")
+    assert "123 4000" in reply and "567 8000" in reply and "551 3831" not in reply
+
+
+async def test_other_numeric_identifiers_do_not_inherit_phone_slot(db, tenant, monkeypatch):
+    from app.services.conversation_foundation import implicit_contact_numbers
+
+    r, medical = await foundation(db, tenant, monkeypatch)
+    assert not implicit_contact_numbers(
+        f"Give me both {medical[0]} and {medical[1]} invoice numbers", r._company_scope
+    )
+
+
 async def test_interpreter_timeout_preserves_slots_and_next_correction_works(
     db, tenant, monkeypatch
 ):

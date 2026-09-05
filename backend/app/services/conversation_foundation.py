@@ -424,9 +424,32 @@ def plural_companies(
     )
     if 1 < len(matched) <= 4:
         return matched
-    if not descriptors and "both" in words and len(recent) == 2:
-        return recent
+    if not descriptors and "both" in words:
+        choices = recent
+        if words & {"center", "centers"}:
+            centers = tuple(
+                c.name
+                for c in scope.companies
+                if "center" in company_key(c.name).replace("centre", "center").split()
+            )
+            choices = tuple(c for c in recent if c in centers)
+            if len(choices) != 2 and len(centers) == 2:
+                choices = centers
+        if len(choices) == 2:
+            return choices
     return ()
+
+
+def implicit_contact_numbers(text: str, scope: KnowledgeCompanyScope) -> bool:
+    """Inherit phone only for an unqualified number request, not invoice/account IDs."""
+    for label in scope.companies:
+        text = company_request_remainder(text, label)
+    words = set(company_key(text).split())
+    return bool(words & {"number", "numbers"}) and words <= set(
+        "can could you give me the number numbers of both each all and say which is are "
+        "what please companies company centers center centres centre medical for their "
+        "tell just them".split()
+    )
 
 
 @dataclass
