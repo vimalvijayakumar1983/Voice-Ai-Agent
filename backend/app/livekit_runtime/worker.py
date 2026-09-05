@@ -48,6 +48,7 @@ from app.livekit_runtime.greeting_cache import (
 from app.livekit_runtime.inworld_realtime import InworldRealtimeModel
 from app.livekit_runtime.inworld_single_pass import (
     NO_KNOWLEDGE_REQUIRED,
+    SUPPRESS_REPLY,
     InworldSinglePassController,
     InworldTurnMode,
     SinglePassTurnTiming,
@@ -2929,6 +2930,23 @@ Knowledge policy:
         text = routing_text(str(transcript or ""))
         text = re.sub(r"^stop[—,\s-]+(?:just\s+)?(?=give|tell|what|who|list)", "", text, flags=re.I)
         normalized = _normalized_utterance(text)
+        if normalized in {
+            "sorry",
+            "i mean",
+            "i meant",
+            "actually",
+            "well",
+            "uh",
+            "um",
+            "okay",
+            "ok",
+            "so",
+            "please",
+            "just",
+        }:
+            # STT can finalize a discourse prefix before the real correction.
+            # It must not replace the requested detail or trigger search repair.
+            return SUPPRESS_REPLY
         if not normalized or _is_courtesy_utterance(text):
             return NO_KNOWLEDGE_REQUIRED
         if _is_bare_hold_utterance(text) or _is_silent_stop_utterance(text):
@@ -5311,6 +5329,7 @@ async def vav_inworld_session(ctx: JobContext) -> None:
                 record_timing=telemetry.record_single_pass_timing,
                 record_error=_record_single_pass_error,
                 prepare_spoken_response=runtime_agent.prepare_spoken_response,
+                settle_interrupted_lists=runtime_agent._conversation_state_v3,
             )
 
         def _cancel_stale_generation() -> None:

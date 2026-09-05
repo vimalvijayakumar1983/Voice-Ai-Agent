@@ -28,6 +28,7 @@ from livekit.agents import AgentSession
 from openai.types.realtime.realtime_audio_input_turn_detection import SemanticVad
 
 from app.services.conversation_scope import SCOPE_REPLY_PREFIX, SPOKEN_REPEAT_PREFIX
+from app.services.conversation_state import LIST_CONTROLS
 from app.services.exact_fact_protocol import decode_exact_fact_evidence
 from app.services.knowledge_collections import collection_reply, decode_collection
 
@@ -492,6 +493,7 @@ class InworldSinglePassController:
         record_error: ErrorRecorder | None = None,
         clock: Callable[[], float] = perf_counter,
         prepare_spoken_response: Callable[[str, str | None], Callable[[str], None]] | None = None,
+        settle_interrupted_lists: bool = False,
     ) -> None:
         self._session = session
         self._retrieve_evidence = retrieve_evidence
@@ -499,6 +501,8 @@ class InworldSinglePassController:
         self._record_error = record_error
         self._clock = clock
         self._prepare_spoken_response = prepare_spoken_response
+        self._settle_interrupted_lists = settle_interrupted_lists
+        self._speech_commit_pending: asyncio.Event | None = None
         self._sequence = 0
         self._turn_task: asyncio.Task[None] | None = None
         self._speech_handle: _SpeechHandle | None = None
@@ -558,6 +562,12 @@ class InworldSinglePassController:
             self._report_error(exc)
         handle = self._speech_handle
         self._speech_handle = None
+        if handle is not None and self._settle_interrupted_lists:
+            pending = asyncio.Event()
+            self._speech_commit_pending = pending
+            # Registered after the speech-memory callback. Wait for committed
+            # text, not merely the cancellation request or audio-stop signal.
+            handle.add_done_callback(lambda _: pending.set())
         if handle is not None and not handle.done():
             try:
                 handle.interrupt(force=True)
@@ -658,6 +668,19 @@ class InworldSinglePassController:
         error_type: str | None = None
         remember_spoken = None
         try:
+            pending = self._speech_commit_pending
+            if (
+                self._settle_interrupted_lists
+                and " ".join(re.findall(r"[^\W_]+", transcript.casefold())) in LIST_CONTROLS
+                and pending is not None
+                and not pending.is_set()
+            ):
+                try:
+                    await asyncio.wait_for(pending.wait(), timeout=0.2)
+                except TimeoutError:
+                    # Missing provider confirmation never blocks the call:
+                    # pagination conservatively resumes at the last known item.
+                    pass
             retrieval_started_at = self._clock()
             evidence = await self._retrieve_evidence(transcript)
             retrieval_ms = max(0.0, (self._clock() - retrieval_started_at) * 1000)

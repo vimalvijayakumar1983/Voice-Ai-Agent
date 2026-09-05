@@ -9,6 +9,7 @@ from sqlalchemy import select
 
 from app.livekit_runtime import worker
 from app.livekit_runtime.inworld_single_pass import (
+    SUPPRESS_REPLY,
     InworldSinglePassController,
     deterministic_grounded_reply,
 )
@@ -365,3 +366,69 @@ async def test_interpreter_timeout_is_not_called_a_missing_fact(db, tenant, monk
     )
     reply = await ask(runtime, "What is the annual revenue?")
     assert "couldn't resolve" in reply and "don't have verified" not in reply
+
+
+@pytest.mark.parametrize("prefix", ["Sorry.", "I meant.", "Well.", "Actually.", "Please."])
+async def test_split_discourse_prefix_never_overwrites_phone_request(
+    db, tenant, monkeypatch, prefix
+):
+    runtime, _ = await runtime_fixture(db, tenant, monkeypatch)
+    await ask(runtime, "What is the phone number?")
+    assert await runtime.retrieve_single_pass_evidence(prefix) == SUPPRESS_REPLY
+    assert "551 3831" in await ask(runtime, "I meant about Harbour Trading.")
+    assert "Which company" in await ask(runtime, "What about Sun and Moon?")
+    assert "567 8000" in await ask(runtime, "Cosmetic Center.")
+
+
+async def test_split_confirmation_is_bound_to_current_attribute_not_old_list(
+    db, tenant, monkeypatch
+):
+    runtime, _ = await runtime_fixture(db, tenant, monkeypatch)
+    await ask(runtime, "List all branches.")
+    retrieve = AsyncMock(return_value="NO_VERIFIED_KNOWLEDGE_MATCH")
+    monkeypatch.setattr(runtime, "_retrieve_approved_knowledge", retrieve)
+    await ask(runtime, "What is the annual revenue?")
+    reply = await ask(runtime, "Is it one billion dirhams?")
+    query = retrieve.await_args.kwargs["query"]
+    assert "annual revenue" in query and "one billion" in query and "branches" not in query
+    assert "don't have verified" in reply
+
+
+@pytest.mark.parametrize("callback_delay,expected_offset", [(0.04, 1), (0.35, 0)])
+async def test_next_waits_boundedly_for_delayed_speech_commit(
+    db, tenant, monkeypatch, callback_delay, expected_offset
+):
+    runtime, _ = await runtime_fixture(db, tenant, monkeypatch)
+    session = _FakeSession(auto_complete=False)
+    controller = InworldSinglePassController(
+        session=session,
+        retrieve_evidence=runtime.retrieve_single_pass_evidence,
+        prepare_spoken_response=runtime.prepare_spoken_response,
+        settle_interrupted_lists=True,
+    )
+    task = controller.on_final_transcript("List the leadership team.", turn_id="list")
+    await asyncio.wait_for(session.generated.wait(), 3)
+    old = session.handles[-1]
+    old.chat_items = [
+        SimpleNamespace(
+            role="assistant",
+            text_content=collection_reply(runtime._collection_playback.page).split(";")[0]
+            + "; Beth",
+        )
+    ]
+
+    def delayed_interrupt(*, force=False):
+        old.interrupted = True
+        asyncio.get_running_loop().call_later(callback_delay, old.complete)
+
+    old.interrupt = delayed_interrupt
+    session.generated.clear()
+    next_task = controller.on_final_transcript("Next.", turn_id="next")
+    await asyncio.wait_for(session.generated.wait(), 3)
+    assert runtime._collection_playback.page.offset == expected_offset
+    session.handles[-1].complete()
+    await next_task
+    await asyncio.gather(task, return_exceptions=True)
+    await asyncio.sleep(callback_delay)
+    assert runtime._collection_playback.page.offset == expected_offset
+    await controller.aclose()

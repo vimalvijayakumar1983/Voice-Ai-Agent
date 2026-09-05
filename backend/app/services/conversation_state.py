@@ -326,6 +326,14 @@ class ConversationState:
             if self.topic_query:
                 return self._lookup(self.topic_query, self.company)
             return self._clarify("Which topic would you like me to look up?")
+        if re.fullmatch(r"(?:is|was|are|were|does|do) (?:it|they) .+", normalized):
+            if self.topic_query:
+                # STT may finalize "What is annual revenue?" separately from
+                # "Is it one billion?". This is a grammatical confirmation,
+                # not a new topic and not evidence that the claim is true.
+                topic = self.topic_query.split("?", 1)[0].rstrip(" .!")
+                return self._lookup(f"{topic}? {text}", self.company)
+            return self._clarify("Which detail are you asking me to verify?")
         if (
             self.pending_companies
             and len(normalized.split()) <= 3
