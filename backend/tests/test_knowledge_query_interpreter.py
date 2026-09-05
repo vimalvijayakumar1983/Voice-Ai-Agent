@@ -187,6 +187,44 @@ async def test_tool_loop_does_not_activate_single_pass_repair(db, tenant, monkey
     planner.assert_not_awaited()
 
 
+@pytest.mark.parametrize(
+    "utterance",
+    [
+        "Thank you and goodbye",
+        "Thanks, and goodbye!",
+        "Thank you very much and goodbye",
+        "Okay, great, thank you so much, bye",
+        "Well, thanks again and goodbye",
+    ],
+)
+async def test_compound_courtesy_after_miss_never_becomes_another_search(
+    db, tenant, monkeypatch, utterance
+):
+    from app.livekit_runtime.inworld_single_pass import deterministic_grounded_reply
+
+    runtime = await enabled_runtime(db, tenant, monkeypatch)
+    runtime._single_pass_previous_explicit_query = "What is the annual revenue?"
+    planner = AsyncMock()
+    monkeypatch.setattr(worker, "interpret_knowledge_question", planner)
+    evidence = await runtime.retrieve_single_pass_evidence(utterance)
+    assert evidence == worker.NO_KNOWLEDGE_REQUIRED
+    assert deterministic_grounded_reply(evidence, query=utterance) == "You're welcome. Goodbye."
+    planner.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "utterance",
+    [
+        "Thanks and what is the price?",
+        "Thank you, who is the chairman?",
+        "Goodbye, but first give me the phone number",
+        "Thanks, cancel my booking please",
+    ],
+)
+def test_courtesy_must_not_hide_a_factual_question_or_action(utterance):
+    assert not worker._is_courtesy_utterance(utterance)
+
+
 async def test_repaired_no_match_cannot_loop(db, tenant, monkeypatch):
     runtime = await enabled_runtime(db, tenant, monkeypatch)
     planner = AsyncMock(return_value=repaired("What is the annual revenue?"))

@@ -206,14 +206,19 @@ _COURTESY_UTTERANCE_WORDS = frozenset(
     {
         "again",
         "alright",
+        "and",
         "bye",
         "goodbye",
         "great",
+        "much",
         "oh",
         "ok",
         "okay",
+        "please",
+        "so",
         "thanks",
         "thank",
+        "very",
         "well",
         "you",
     }
@@ -465,7 +470,7 @@ def _is_courtesy_utterance(value: str) -> bool:
     words = _normalized_utterance(value).split()
     return bool(
         words
-        and len(words) <= 5
+        and len(words) <= 12
         and set(words) <= _COURTESY_UTTERANCE_WORDS
         and ({"thank", "thanks", "bye", "goodbye"} & set(words))
     )
