@@ -15,6 +15,7 @@ from app.livekit_runtime.inworld_single_pass import (
 from app.models.agent import KnowledgeSource
 from app.services.conversation_scope import KnowledgeCompany, KnowledgeCompanyScope
 from app.services.conversation_state import (
+    LIST_CONTROLS,
     ConversationState,
     explicit_attribute_request,
     match_people,
@@ -259,9 +260,21 @@ async def test_controller_interrupted_handle_keeps_active_list(db, tenant, monke
     handle.interrupt(force=True)
     await task
     await asyncio.sleep(0)
+    assert not worker._is_incomplete_barge_in_fragment("Next.", allow_list_controls=True)
     result = decode_collection(await runtime.retrieve_single_pass_evidence("Next."))
     assert result.offset == 1
     await controller.aclose()
+
+
+@pytest.mark.parametrize("command", sorted(LIST_CONTROLS))
+def test_complete_list_commands_survive_transcript_fragment_gate(command):
+    assert not worker._is_incomplete_barge_in_fragment(command, allow_list_controls=True)
+
+
+def test_list_control_exception_does_not_disable_fragment_guard_or_change_legacy_lane():
+    assert worker._is_incomplete_barge_in_fragment("Next.")
+    for fragment in ["The", "I want to", "Can you"]:
+        assert worker._is_incomplete_barge_in_fragment(fragment, allow_list_controls=True)
 
 
 async def test_cold_company_selection_updates_both_routing_and_retrieval(db, tenant, monkeypatch):

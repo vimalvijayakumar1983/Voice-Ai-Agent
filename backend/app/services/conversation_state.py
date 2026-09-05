@@ -17,6 +17,29 @@ from app.services.conversation_scope import (
     routing_text,
 )
 
+# Shared by routing and the upstream transcript-fragment filter. A complete
+# control command must not be cancelled as an incomplete one-word question.
+LIST_CONTROLS = frozenset(
+    {
+        "next",
+        "next please",
+        "continue",
+        "go on",
+        "the rest",
+        "show more",
+        "more",
+        "remaining",
+        "remaining entries",
+        "start again",
+        "start over",
+        "from the beginning",
+        "repeat",
+        "repeat that",
+        "say again",
+        "repeat slowly",
+    }
+)
+
 
 @dataclass(frozen=True)
 class TurnPlan:

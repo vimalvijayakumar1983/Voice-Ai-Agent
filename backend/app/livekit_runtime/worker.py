@@ -80,6 +80,7 @@ from app.services.conversation_scope import (
     scope_reply,
 )
 from app.services.conversation_state import (
+    LIST_CONTROLS,
     ConversationState,
     explicit_attribute_request,
     person_reference,
@@ -560,10 +561,13 @@ def _is_incomplete_barge_in_fragment(
     value: str,
     *,
     terminology: tuple[str, ...] = (),
+    allow_list_controls: bool = False,
 ) -> bool:
     """Identify a truncated interruption without hard-coding business vocabulary."""
 
     normalized = _normalized_utterance(value)
+    if allow_list_controls and normalized in LIST_CONTROLS:
+        return False
     if not normalized:
         return True
     if (
@@ -2968,24 +2972,7 @@ Knowledge policy:
             if index is not None:
                 self._person_company_directory = directory
 
-        continuation = normalized in {
-            "next",
-            "next please",
-            "continue",
-            "go on",
-            "the rest",
-            "show more",
-            "more",
-            "remaining",
-            "remaining entries",
-            "start again",
-            "start over",
-            "from the beginning",
-            "repeat",
-            "repeat that",
-            "say again",
-            "repeat slowly",
-        }
+        continuation = normalized in LIST_CONTROLS
         if continuation and not state.pending_companies:
             progress = self._collection_playback
             if progress and progress.page.company == self._single_pass_active_subject:
@@ -5770,6 +5757,7 @@ async def vav_inworld_session(ctx: JobContext) -> None:
                     and _is_incomplete_barge_in_fragment(
                         transcript,
                         terminology=knowledge_terminology,
+                        allow_list_controls=runtime_agent._conversation_state_v3,
                     )
                 ):
                     telemetry.record_suppressed_fragment(transcript)
