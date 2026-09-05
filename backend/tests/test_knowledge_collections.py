@@ -191,6 +191,8 @@ async def test_collection_telemetry_records_page_and_source_ids(db, tenant, monk
         ("Where are your branches?", "branches"),
         ("What services do you offer?", "services"),
         ("How many divisions?", "divisions"),
+        ("What are the business divisions?", "divisions"),
+        ("List the board of directors", "directors"),
         ("Who is the chairman?", ""),
         ("Tell me about healthcare services", ""),
     ],

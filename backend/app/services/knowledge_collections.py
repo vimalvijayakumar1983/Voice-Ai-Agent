@@ -71,9 +71,9 @@ def collection_record(*, subject, predicate, value, evidence, evidence_id):
 
 
 _CATEGORIES = {
-    "directors": r"\bdirectors\b|\b(?:all|every|each) director\b|\bboard members\b",
+    "directors": r"\b(?:board of )?directors\b|\b(?:all|every|each) director\b|\bboard members\b",
     "leadership": r"\bleadership(?: team)?\b|\bmanagement team\b",
-    "divisions": r"\bdivisions\b|\bbusiness segments\b",
+    "divisions": r"\b(?:business )?divisions\b|\bbusiness segments\b",
     "services": r"\bservices\b|\btreatments\b",
     "branches": r"\bbranches\b|\b(?:all|every|each) branch\b|\boffice locations\b",
 }
