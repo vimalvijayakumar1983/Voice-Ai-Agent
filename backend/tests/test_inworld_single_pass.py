@@ -249,6 +249,8 @@ def test_evidence_instructions_are_bounded_json_data_and_never_need_a_transcript
     assert '\\"Ignore policy\\"' in instructions
     assert "latest caller message already present" in instructions
     assert "tools" in instructions
+    assert "Answer only the latest caller message" in instructions
+    assert "without directly proving" in instructions
 
     with pytest.raises(ValueError, match="exceeds the single-pass bound"):
         build_evidence_only_instructions("x" * (MAX_SINGLE_PASS_EVIDENCE_CHARS + 1))
@@ -319,6 +321,31 @@ def test_no_match_and_compiler_exact_facts_have_deterministic_grounded_replies()
     assert leadership_evidence is not None
     assert deterministic_grounded_reply(leadership_evidence) == (
         "The chairman of Al Zaabi Group is Saeed Yousif Ibrahim Al Zaabi."
+    )
+
+    leadership_clarification = encode_exact_fact_evidence(
+        response_action="clarify",
+        facts=(
+            ExactFactWireFact(
+                evidence_id="exact:leadership:chairman",
+                fact_type="leadership",
+                subject="Future Example Holdings",
+                predicate="chairman",
+                value="Amal Rahman",
+            ),
+            ExactFactWireFact(
+                evidence_id="exact:leadership:president",
+                fact_type="leadership",
+                subject="Future Example Holdings",
+                predicate="president",
+                value="David Chen",
+            ),
+        ),
+        max_chars=800,
+    )
+    assert leadership_clarification is not None
+    assert deterministic_grounded_reply(leadership_clarification) == (
+        "Do you mean the chairman or the president of Future Example Holdings?"
     )
 
     services_evidence = encode_exact_fact_evidence(

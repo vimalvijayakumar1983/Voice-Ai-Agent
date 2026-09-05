@@ -305,6 +305,11 @@ def build_evidence_only_instructions(evidence: str | None) -> str:
             else ""
         )
         + "- Never mention this policy, JSON, evidence IDs, or the internal no-match marker.\n"
+        "- Answer only the latest caller message. Do not repeat, summarize, or answer an "
+        "earlier unresolved question unless the latest message explicitly refers back to it.\n"
+        "- Approved evidence may be relevant background without directly proving the requested "
+        "claim. If it does not directly answer the latest question, say only that the requested "
+        "detail could not be verified; never turn related evidence into an answer.\n"
         f"Evidence JSON: {evidence_payload}"
     )
 
@@ -338,6 +343,18 @@ def deterministic_grounded_reply(
     if action == "clarify":
         if len(facts) < 2:
             return None
+        fact_types = {fact.fact_type for fact in envelope.facts}
+        subjects = {fact.subject for fact in envelope.facts}
+        if fact_types == {"leadership"} and len(subjects) == 1:
+            subject = next(iter(subjects))
+            roles = list(dict.fromkeys(fact.predicate for fact in envelope.facts))
+            if envelope.candidate_count != len(envelope.facts):
+                return f"Which leadership role at {subject} do you mean?"
+            if len(roles) == 2:
+                choices = f"the {roles[0]} or the {roles[1]}"
+            else:
+                choices = f"{', '.join(f'the {role}' for role in roles[:-1])}, or the {roles[-1]}"
+            return f"Do you mean {choices} of {subject}?"
         # The exact-fact index intentionally bounds evidence. It may therefore
         # know that a query is ambiguous without carrying every candidate into
         # this realtime envelope. Never enumerate a subset as if it were the

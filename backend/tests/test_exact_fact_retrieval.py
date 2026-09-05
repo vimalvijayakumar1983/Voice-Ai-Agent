@@ -315,6 +315,58 @@ def test_role_message_heading_projects_a_grounded_company_leadership_fact():
     ]
 
 
+def test_broad_leadership_wording_clarifies_roles_for_any_company():
+    company = "Future Example Holdings"
+    index = build_exact_fact_index(
+        (
+            ExactFactSource(
+                source_id="future-company-leadership",
+                source_name="Approved leadership directory",
+                structured_content={
+                    "schema_version": "compiler-test-v1",
+                    "facts": [
+                        {
+                            "fact_type": "leadership",
+                            "subject": company,
+                            "predicate": "chairman",
+                            "value": "Amal Rahman",
+                            "evidence": f"The chairman of {company} is Amal Rahman.",
+                        },
+                        {
+                            "fact_type": "leadership",
+                            "subject": company,
+                            "predicate": "president",
+                            "value": "David Chen",
+                            "evidence": f"The president of {company} is David Chen.",
+                        },
+                    ],
+                },
+            ),
+        )
+    )
+
+    result = resolve_exact_fact(index, query=f"Who is in charge of {company}?")
+
+    assert result.response_action == ExactFactResponseAction.CLARIFY
+    assert {(item.predicate, item.value) for item in result.evidence} == {
+        ("chairman", "Amal Rahman"),
+        ("president", "David Chen"),
+    }
+
+
+@pytest.mark.parametrize(
+    "query",
+    (
+        "Who oversees Future Example Holdings?",
+        "Who heads Future Example Holdings?",
+        "Who is responsible for Future Example Holdings?",
+        "Who is the decision-maker at Future Example Holdings?",
+    ),
+)
+def test_leadership_paraphrases_enter_the_verified_fact_route(query):
+    assert classify_exact_fact_intents(query) == (ExactFactType.LEADERSHIP,)
+
+
 def test_llm_claimed_complete_but_omitted_fact_never_creates_refusal_boundary():
     # The raw source could contain a chairman or phone value that a generative
     # compiler failed to return. Even a stale/self-reported complete flag must
