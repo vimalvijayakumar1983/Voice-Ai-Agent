@@ -415,3 +415,47 @@ async def test_superseded_interpreter_cannot_revert_new_company(db, tenant, monk
     with pytest.raises(asyncio.CancelledError):
         await old
     assert runtime._conversation_state.company == "Harbour Trading"
+
+
+async def test_timeout_keeps_literal_company_lookup_without_inventing_affiliation(
+    db, tenant, monkeypatch
+):
+    runtime, _ = await runtime_fixture(db, tenant, monkeypatch)
+    runtime._structured_intent_enabled = True
+    monkeypatch.setattr(worker, "load_provider_config", AsyncMock(return_value={"api_key": "test"}))
+    monkeypatch.setattr(
+        worker,
+        "interpret_conversation_turn",
+        AsyncMock(return_value=IntentResult(None, "timeout", 2000, attempted=True)),
+    )
+    monkeypatch.setattr(
+        worker,
+        "interpret_knowledge_question",
+        AsyncMock(side_effect=AssertionError("No second model pass")),
+    )
+    answer = await ask(runtime, "Is Cara Harbour in Harbour Trading?")
+    assert "don't have verified" in answer and "President" not in answer
+    assert runtime._conversation_state.company == "Harbour Trading"
+    trace = runtime._telemetry._trace()
+    assert trace["conversation_intent_status"] == "intent_timeout"
+    assert trace["conversation_intent_action"] == "literal_company_lookup"
+    assert not trace.get("conversation_recovery_failure")
+    assert runtime._telemetry.runtime_metrics["knowledge_interpretation_usage_incomplete"]
+
+
+@pytest.mark.parametrize(
+    "text", ["Not Harbour Trading, please.", "Harbour Group or Harbour Trading?"]
+)
+async def test_timeout_fallback_never_guesses_negated_or_multiple_companies(
+    db, tenant, monkeypatch, text
+):
+    runtime, _ = await runtime_fixture(db, tenant, monkeypatch)
+    monkeypatch.setattr(worker, "load_provider_config", AsyncMock(return_value={"api_key": "test"}))
+    monkeypatch.setattr(
+        worker,
+        "interpret_conversation_turn",
+        AsyncMock(return_value=IntentResult(None, "timeout", 2000, attempted=True)),
+    )
+    state = ConversationState(company="Harbour Group")
+    result = await runtime._interpret_turn_plan(text, state)
+    assert result.action == "clarify" and state.company == "Harbour Group"

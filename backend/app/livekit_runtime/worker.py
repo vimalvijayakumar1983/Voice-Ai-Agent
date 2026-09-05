@@ -3136,6 +3136,26 @@ Knowledge policy:
         def unavailable(status):
             if trace is not None:
                 trace["conversation_intent_status"] = status
+            explicit = mentioned_companies(text, self._company_scope)
+            if (
+                status
+                in {
+                    "intent_timeout",
+                    "intent_error",
+                    "intent_budget_exhausted",
+                    "intent_configuration_unavailable",
+                    "intent_unavailable",
+                }
+                and len(explicit) == 1
+                and not re.search(r"\b(?:not|never|except|without)\b", text, re.I)
+            ):
+                # A provider failure must not prevent a literal, scoped search.
+                # Use the original request, not an unvalidated model rewrite.
+                # Retrieval is still evidence-gated and no second repair pass runs.
+                if trace is not None:
+                    trace["conversation_intent_action"] = "literal_company_lookup"
+                return state._lookup(text, explicit[0])
+            if trace is not None:
                 trace["conversation_recovery_failure"] = status
             return state._clarify(
                 "I couldn't reliably interpret that. Please state the company or person's name "
