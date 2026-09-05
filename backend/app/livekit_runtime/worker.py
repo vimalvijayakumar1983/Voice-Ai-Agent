@@ -3028,6 +3028,15 @@ Knowledge policy:
                 and self._last_spoken_answer
                 and self._last_spoken_answer[0] == state.company
             ):
+                if natural_repeat == "repeat_slow" and "number" in normalized:
+                    phone_answer = self._spoken_answers.get((state.company, ExactFactType.PHONE))
+                    if phone_answer:
+                        spoken = re.sub(
+                            r"\+\d[\d ()-]{6,}\d",
+                            lambda m: "plus " + ", ".join(c for c in m[0] if c.isdigit()),
+                            phone_answer,
+                        )
+                        return repeat_spoken(spoken, slow=False)
                 return repeat_spoken(
                     self._last_spoken_answer[1], slow=natural_repeat == "repeat_slow"
                 )
@@ -3247,7 +3256,8 @@ Knowledge policy:
                 self._requested_detail[0].value if len(self._requested_detail) == 1 else "other"
             )
         return await self._retrieve_approved_knowledge(
-            query=plan.query, **({"allow_semantic_repair": False} if interpreted else {})
+            query=plan.query,
+            **({"allow_semantic_repair": False} if interpreted or foundation_plan else {}),
         )
 
     def _record_request_ledger(self) -> None:

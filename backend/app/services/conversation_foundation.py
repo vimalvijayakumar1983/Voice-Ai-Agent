@@ -11,6 +11,10 @@ from app.services.conversation_scope import (
 from app.services.conversation_state import ConversationState, TurnPlan, match_people
 
 FOUNDATION_FLAG = "conversation_foundation_v1"
+ROLE_PATTERN = (
+    r"chairman|chairperson|president|ceo|cfo|chief executive officer|"
+    r"chief financial officer|managing director|executive director|director"
+)
 
 
 def spoken_control(text: str) -> str | None:
@@ -126,6 +130,9 @@ def contextual_plan(
     if len(explicit) > 1:
         return None
     company = explicit[0] if explicit else state.company
+    office = re.fullmatch(rf"who is (?:the )?({ROLE_PATTERN})", company_key(text))
+    if office and company:
+        return state._lookup(f"Who is the {office[1]} of {company}?", company)
     for label in scope.companies:
         if label.name in explicit and any(
             re.search(r"\bnot (?:the )?" + re.escape(company_key(alias)) + r"\b", company_key(text))
@@ -149,7 +156,8 @@ def contextual_plan(
     framing = set(
         "i was told heard think believe is that correct right really please no mean tell me "
         "his her their he she the a an of at in for role position not phone telephone number "
-        "chairman chairperson president".split()
+        "chairman chairperson president ceo cfo chief executive financial officer "
+        "managing director".split()
     )
     safe_slot = remaining <= framing
     # Role correction is a new detail, not a negated company. Never drop other
@@ -159,7 +167,7 @@ def contextual_plan(
         state.person = person
         state.requested_detail = "person_role"
         return result
-    role = re.search(r"\bis (?:the )?(chairman|chairperson|president)\b", text, re.I)
+    role = re.search(rf"\bis (?:the )?({ROLE_PATTERN})\b", text, re.I)
     if safe_slot and role and not re.search(r"\b(?:not|never|phone)\b", text, re.I):
         # Retrieve the asserted office, not a generic biography that might hide
         # a caller's incorrect claim. Only the evidence may name its holder.

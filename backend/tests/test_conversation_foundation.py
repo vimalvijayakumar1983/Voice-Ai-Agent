@@ -47,6 +47,7 @@ async def test_positive_company_correction_repeat_and_both(db, tenant, monkeypat
     assert medical[0] in answer and "567 8000" not in answer
     slow = await ask(r, "Repeat that number slowly, please.")
     assert medical[0] in slow and "clarify" not in slow
+    assert "plus 9, 7, 1, 2, 1, 2, 3, 4, 0, 0, 0" in slow
     both = await ask(
         r, "Can you give me the phone numbers of both medical centres and say which is which?"
     )
@@ -261,3 +262,54 @@ async def test_interrupted_answer_and_new_topic_remain_distinct_requests(db, ten
     r.prepare_spoken_response(query, evidence)("The president")
     await ask(r, "What is the phone number of Harbour Group?")
     assert r._request_ledger.metrics()["conversation_requests_unresolved"] == 1
+
+
+async def test_continuing_speech_preserves_fragment_after_initial_wait():
+    seen = []
+
+    async def retrieve(text):
+        seen.append(text)
+        return "NO_VERIFIED_KNOWLEDGE_MATCH"
+
+    c = InworldSinglePassController(
+        session=_FakeSession(),
+        retrieve_evidence=retrieve,
+        incomplete_request=lambda t: t == "Is Cara Harbour",
+        fragment_wait_seconds=0.01,
+    )
+    c.on_final_transcript("Is Cara Harbour")
+    c.on_user_speech_started()
+    await asyncio.sleep(0.03)
+    assert not seen
+    await c.on_final_transcript("in Harbour Trading?")
+    assert seen == ["Is Cara Harbour in Harbour Trading?"]
+    await c.aclose()
+
+
+async def test_negated_company_and_extra_affiliation_constraint_are_not_dropped(
+    db, tenant, monkeypatch
+):
+    r, _ = await foundation(db, tenant, monkeypatch)
+    await ask(r, "Who is the president of Harbour Group?")
+    assert (
+        contextual_plan(
+            "Not Harbour Group. Tell me his role.",
+            r._conversation_state,
+            r._company_scope,
+            r._person_company_directory,
+        )
+        is None
+    )
+    plan = contextual_plan(
+        "Where does Cara Harbour work and what is his salary?",
+        r._conversation_state,
+        r._company_scope,
+        r._person_company_directory,
+    )
+    assert "salary" in plan.query
+
+
+async def test_generic_role_query_stays_the_requested_role(db, tenant, monkeypatch):
+    r, _ = await foundation(db, tenant, monkeypatch)
+    await ask(r, "Who is the president of Harbour Group?")
+    assert "Dan Jones" in await ask(r, "Who is the chairman?")
