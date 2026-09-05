@@ -2225,6 +2225,29 @@ async def test_single_pass_backchannel_expands_only_after_an_explicit_offer(monk
 
 
 @pytest.mark.asyncio
+async def test_single_pass_keeps_governed_subject_for_unqualified_followups(monkeypatch):
+    model = Agent(
+        tenant_id=uuid4(),
+        name="Reusable production QA agent",
+        system_prompt="Answer from approved knowledge.",
+        voice_provider="inworld",
+        voice_id="inworld:Ashley",
+        language="en-GB",
+    )
+    agent = livekit_worker.VAVInworldRealtimeAgent(model=model, single_pass=True)
+    agent._single_pass_active_subject = "Future Example Holdings"
+    retrieval = AsyncMock(return_value="Approved evidence")
+    monkeypatch.setattr(agent, "_retrieve_approved_knowledge", retrieval)
+
+    await agent.retrieve_single_pass_evidence("What about the chairman?")
+
+    retrieval.assert_awaited_once_with(
+        query="What about the chairman?",
+        query_variants=("Future Example Holdings. What about the chairman?",),
+    )
+
+
+@pytest.mark.asyncio
 async def test_livekit_agent_stays_silent_for_bare_hold_and_skips_control_search(monkeypatch):
     model = Agent(
         tenant_id=uuid4(),

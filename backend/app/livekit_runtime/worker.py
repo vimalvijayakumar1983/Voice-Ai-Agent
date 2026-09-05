@@ -342,6 +342,7 @@ _GROUNDING_REFUSAL_PATTERNS = (
     "couldn’t verify",
     "do not have that information",
     "don't have that information",
+    "don't have verified information",
     "not available in",
     "unable to confirm",
     "unable to find",
@@ -351,6 +352,7 @@ _GROUNDING_CLARIFICATION_PATTERNS = (
     "can you clarify",
     "could you clarify",
     "could you repeat",
+    "what would you like me to check",
     "which one",
     "which location",
     "which service",
@@ -2014,6 +2016,13 @@ class VAVInworldAgent(Agent):
         self._knowledge_base_id = knowledge_base_id
         self._telemetry = telemetry
         self._single_pass_previous_explicit_query: str | None = None
+        # Keep the governed subject returned by the exact-fact index as the
+        # durable topic for the current call.  Raw caller turns are a poor
+        # topic store: a sequence such as "the president" -> "what about the
+        # chairman?" otherwise loses the company name and can fall into broad
+        # document retrieval.  This value is evidence-derived, never inferred
+        # from a caller assertion.
+        self._single_pass_active_subject: str | None = None
         self._single_pass_follow_up_offered = False
         call_variables = variables or {}
         rendered_prompt = _render_call_template(model.system_prompt, call_variables)
@@ -2191,6 +2200,13 @@ Knowledge policy:
                 )
                 trace_details = _exact_fact_trace_details(exact_fact)
                 if exact_fact.response_action != ExactFactResponseAction.FALLBACK:
+                    exact_subjects = {
+                        str(item.subject or "").strip()
+                        for item in exact_fact.evidence
+                        if str(item.subject or "").strip()
+                    }
+                    if len(exact_subjects) == 1:
+                        self._single_pass_active_subject = next(iter(exact_subjects))
                     exact_context = exact_fact.evidence_context
                     verified = bool(
                         exact_context
@@ -2320,6 +2336,12 @@ Knowledge policy:
             text
         ):
             return NO_KNOWLEDGE_REQUIRED
+        active_subject = str(self._single_pass_active_subject or "").strip()
+        active_subject_variant = (
+            f"{active_subject}. {text}"
+            if active_subject and _normalized_utterance(active_subject) not in normalized
+            else None
+        )
         if referential_follow_up or affirmative_follow_up:
             if previous is None:
                 return NO_KNOWLEDGE_REQUIRED
@@ -2327,12 +2349,17 @@ Knowledge policy:
             contextual_query = f"{previous.rstrip(' .!?')}. {text}"
             return await self._retrieve_approved_knowledge(
                 query=contextual_query,
-                query_variants=(previous, text),
+                query_variants=tuple(
+                    variant for variant in (active_subject_variant, previous, text) if variant
+                ),
             )
 
         self._single_pass_previous_explicit_query = text
         self._single_pass_follow_up_offered = False
-        return await self._retrieve_approved_knowledge(query=text)
+        return await self._retrieve_approved_knowledge(
+            query=text,
+            query_variants=(active_subject_variant,) if active_subject_variant else (),
+        )
 
     def observe_single_pass_assistant_content(self, content: str) -> None:
         """Remember only explicit offers that make a later "yes" meaningful."""

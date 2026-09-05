@@ -354,6 +354,67 @@ def test_broad_leadership_wording_clarifies_roles_for_any_company():
     }
 
 
+def _future_company_leadership_index():
+    company = "Future Example Holdings"
+    return build_exact_fact_index(
+        (
+            ExactFactSource(
+                source_id="future-company-leadership-corrections",
+                source_name="Approved leadership directory",
+                structured_content={
+                    "schema_version": "compiler-test-v1",
+                    "facts": [
+                        {
+                            "fact_type": "leadership",
+                            "subject": company,
+                            "predicate": "chairman",
+                            "value": "Amal Rahman",
+                            "evidence": f"The chairman of {company} is Amal Rahman.",
+                        },
+                        {
+                            "fact_type": "leadership",
+                            "subject": company,
+                            "predicate": "president",
+                            "value": "David Chen",
+                            "evidence": f"The president of {company} is David Chen.",
+                        },
+                    ],
+                },
+            ),
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    "query",
+    (
+        "So who is the chairman of Future Example Holdings?",
+        "The chairman of Future Example Holdings is John Smith, right?",
+        "I heard John Smith is the chairman of Future Example Holdings, is that correct?",
+    ),
+)
+def test_leadership_followups_and_false_claims_return_the_governed_fact(query):
+    result = resolve_exact_fact(_future_company_leadership_index(), query=query)
+
+    assert result.response_action == ExactFactResponseAction.ANSWER
+    assert [(item.predicate, item.value) for item in result.evidence] == [
+        ("chairman", "Amal Rahman")
+    ]
+
+
+def test_multi_role_caller_claim_returns_both_governed_roles():
+    result = resolve_exact_fact(
+        _future_company_leadership_index(),
+        query=("The chairman and president of Future Example Holdings are both John Smith, right?"),
+    )
+
+    assert result.response_action == ExactFactResponseAction.ANSWER
+    assert {(item.predicate, item.value) for item in result.evidence} == {
+        ("chairman", "Amal Rahman"),
+        ("president", "David Chen"),
+    }
+
+
 @pytest.mark.parametrize(
     "query",
     (

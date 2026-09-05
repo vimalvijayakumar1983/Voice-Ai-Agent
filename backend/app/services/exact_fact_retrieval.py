@@ -208,8 +208,10 @@ _QUERY_STOP_WORDS = {
     "are",
     "at",
     "been",
+    "both",
     "can",
     "could",
+    "correct",
     "did",
     "do",
     "does",
@@ -218,6 +220,7 @@ _QUERY_STOP_WORDS = {
     "give",
     "has",
     "have",
+    "heard",
     "how",
     "i",
     "in",
@@ -230,6 +233,8 @@ _QUERY_STOP_WORDS = {
     "our",
     "or",
     "please",
+    "right",
+    "so",
     "tell",
     "that",
     "the",
@@ -1208,15 +1213,25 @@ def _leadership_claim_tokens(query: str) -> set[str]:
 
     normalized = _normalized(query)
     patterns = (
-        re.compile(rf"\bis\s+(.{{2,80}}?)\s+(?:the\s+)?{_LEADERSHIP_ROLE_PATTERN}\b"),
-        re.compile(rf"\b(.{{2,80}}?)\s+is\s+(?:the\s+)?{_LEADERSHIP_ROLE_PATTERN}\b"),
+        re.compile(rf"\bis\s+(?P<name>.{{2,80}}?)\s+(?:the\s+)?{_LEADERSHIP_ROLE_PATTERN}\b"),
+        re.compile(rf"\b(?P<name>.{{2,80}}?)\s+is\s+(?:the\s+)?{_LEADERSHIP_ROLE_PATTERN}\b"),
+        re.compile(
+            rf"\b{_LEADERSHIP_ROLE_PATTERN}(?:\s+of\s+.{{2,80}}?)?\s+is\s+"
+            r"(?P<name>.{2,80}?)(?:\s+(?:right|correct))?(?:[?.!]|$)"
+        ),
+        re.compile(
+            rf"\b(?:{_LEADERSHIP_ROLE_PATTERN})\s+and\s+"
+            rf"(?:{_LEADERSHIP_ROLE_PATTERN})(?:\s+of\s+.{{2,80}}?)?\s+are\s+"
+            r"(?:both\s+)?"
+            r"(?P<name>.{2,80}?)(?:\s+(?:right|correct))?(?:[?.!]|$)"
+        ),
     )
     for pattern in patterns:
         match = pattern.search(normalized)
         if match is None:
             continue
         tokens = (
-            _tokens(match.group(1))
+            _tokens(match.group("name"))
             - _QUERY_STOP_WORDS
             - {
                 "heard",
@@ -1228,7 +1243,9 @@ def _leadership_claim_tokens(query: str) -> set[str]:
         # A confirmation claim with a long preamble should use only the most
         # recent name-sized suffix rather than treating the whole sentence as
         # an entity.
-        ordered = [token for token in _TOKEN_RE.findall(match.group(1)) if token in tokens]
+        ordered = [token for token in _TOKEN_RE.findall(match.group("name")) if token in tokens]
+        if not ordered:
+            continue
         return set(ordered[-5:])
     return set()
 
@@ -1265,8 +1282,11 @@ def _fact_score(
     requested = _requested_tokens(query, intents)
     if fact.fact_type == ExactFactType.LEADERSHIP:
         claimed_name = _leadership_claim_tokens(query)
-        if claimed_name and not claimed_name <= fact_tokens:
-            return None
+        # A caller's proposed name is not a retrieval constraint or evidence.
+        # Remove it from the semantic request so the governed role fact can
+        # correct a false confirmation claim instead of returning an opaque
+        # no-match.  A matching name still receives the value-match score below.
+        requested -= claimed_name
     direct_alias = _direct_alias_match(query, fact)
     if fact.fact_type == ExactFactType.FOUNDING and requested:
         identity_tokens = _tokens(" ".join((fact.subject, *fact.aliases)))
@@ -1546,6 +1566,15 @@ def resolve_exact_fact(
                 selected.extend((concrete or top_facts)[:MAX_RESPONSE_FACTS])
                 continue
         if len(top_facts) > 1:
+            if intent == ExactFactType.LEADERSHIP:
+                explicit_role_count = sum(
+                    1
+                    for role in {_grounding_normalized(fact.predicate) for fact in top_facts}
+                    if role and any(role in _grounding_normalized(query) for query in queries)
+                )
+                if explicit_role_count > 1:
+                    selected.extend(top_facts[:MAX_RESPONSE_FACTS])
+                    continue
             ambiguous.extend(top_facts)
         else:
             selected.extend(top_facts)

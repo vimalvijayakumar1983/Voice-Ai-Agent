@@ -16,6 +16,7 @@ import asyncio
 import inspect
 import json
 import logging
+import re
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
@@ -328,7 +329,36 @@ def deterministic_grounded_reply(
     """
 
     if not evidence or evidence == NO_VERIFIED_KNOWLEDGE_MATCH:
-        return "I couldn't verify that detail in the approved information."
+        raw_query = " ".join(str(query or "").split())
+        normalized_query = raw_query.casefold()
+        query_words = normalized_query.rstrip(".?!").split()
+        question_markers = {
+            "can",
+            "could",
+            "do",
+            "does",
+            "how",
+            "is",
+            "what",
+            "when",
+            "where",
+            "which",
+            "who",
+            "why",
+        }
+        raw_words = re.findall(r"[^\W_]+", raw_query, re.UNICODE)
+        looks_like_name_fragment = bool(raw_words) and (
+            len(raw_words) == 1
+            or (
+                len(raw_words) <= 4
+                and all(word[:1].isupper() for word in raw_words if word.casefold() != "al")
+            )
+        )
+        if looks_like_name_fragment and not (
+            set(query_words) & question_markers or "?" in normalized_query
+        ):
+            return "What would you like me to check about that?"
+        return "I don't have verified information about that."
     if evidence == NO_KNOWLEDGE_REQUIRED:
         return None
 
@@ -400,6 +430,12 @@ def deterministic_grounded_reply(
         else:
             joined = f"{', '.join(values[:-1])}, and {values[-1]}"
         return f"Verified services and divisions for {subject} include {joined}."
+    if fact_types == {"leadership"} and len(subjects) == 1:
+        subject = next(iter(subjects))
+        role_values = list(dict.fromkeys((fact.predicate, fact.value) for fact in envelope.facts))
+        if len(role_values) == 2:
+            first, second = role_values
+            return f"The {first[0]} of {subject} is {first[1]}, and the {second[0]} is {second[1]}."
 
     details = "; ".join(
         f"{predicate} for {subject} is {value}" for subject, predicate, value in facts[:4]

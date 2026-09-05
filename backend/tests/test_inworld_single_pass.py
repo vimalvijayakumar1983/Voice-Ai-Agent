@@ -257,7 +257,16 @@ def test_evidence_instructions_are_bounded_json_data_and_never_need_a_transcript
 
 
 def test_no_match_and_compiler_exact_facts_have_deterministic_grounded_replies():
-    assert "couldn't verify" in deterministic_grounded_reply(NO_VERIFIED_KNOWLEDGE_MATCH)
+    assert deterministic_grounded_reply(NO_VERIFIED_KNOWLEDGE_MATCH) == (
+        "I don't have verified information about that."
+    )
+    assert (
+        deterministic_grounded_reply(
+            NO_VERIFIED_KNOWLEDGE_MATCH,
+            query="Saeed Yousif Ibrahim",
+        )
+        == "What would you like me to check about that?"
+    )
     assert deterministic_grounded_reply(NO_KNOWLEDGE_REQUIRED) is None
     evidence = encode_exact_fact_evidence(
         response_action="answer",
@@ -761,7 +770,7 @@ async def test_no_match_is_spoken_deterministically_without_a_model_generation()
     assert session.generate_calls == []
     assert session.say_calls == [
         {
-            "text": "I couldn't verify that detail in the approved information.",
+            "text": "I don't have verified information about that.",
             "add_to_chat_ctx": True,
             "allow_interruptions": False,
         }
