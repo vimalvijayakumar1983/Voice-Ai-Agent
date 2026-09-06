@@ -39,3 +39,18 @@ status refresh, retry visibility and disabled approval. No customer calls occur.
 Production rollout requires both API and worker on this commit. Verify an actual
 text submission saves promptly, reaches completed/failed through the worker, and
 preserves exact source text. Approval/binding remain explicit user decisions.
+
+## Production follow-up
+
+PR #24 passed 1,662 PostgreSQL-backed tests and deployed at main 34b2e1d.
+The source retry returned HTTP 200 in 138 ms, with visible queued/processing and
+disabled approval. The previous request had eventually saved the original after
+the browser disconnected; the retry reused that source instead of duplicating it.
+The 2,614-character persisted original exactly matches the trimmed user input.
+
+The background run then exposed the compiler's separate 45-second provider
+timeout: two short attempts expired. Background jobs now request one 120-second
+attempt, retaining the task deadline and watchdog. Synchronous callers retain
+their original timeout/retry policy. Timeout failures get a specific safe message
+instead of implying incorrect credentials. Regression tests verify the default
+and background client budgets, client cleanup, one attempt, and timeout handling.
