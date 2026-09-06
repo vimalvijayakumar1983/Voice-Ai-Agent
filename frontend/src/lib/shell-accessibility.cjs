@@ -8,6 +8,7 @@ const PAGE_TITLES = Object.freeze({
   '/calls': 'Conversations',
   '/workflows': 'Workflows',
   '/campaigns': 'Campaigns',
+  '/dialer': 'AI Dialer',
   '/compliance': 'Compliance',
   '/integrations': 'Integrations',
   '/billing': 'Cost & call reports',

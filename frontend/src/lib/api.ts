@@ -2068,6 +2068,17 @@ class ApiClient {
     });
   }
 
+  // AI dialer: preserve the same authenticated session boundary as other workspace APIs.
+  async dialer<T>(path: string, data?: unknown, method = 'POST') {
+    return this.request<T>(`/api/v1/dialer/${path}`, data === undefined ? {} : {
+      method, body: data instanceof FormData ? data : JSON.stringify(data),
+    });
+  }
+
+  async downloadDialerReport(campaignId: string) {
+    return this.requestBlob(`/api/v1/dialer/campaigns/${campaignId}/export`);
+  }
+
   // Billing
   async getUsage(days = 30) {
     return this.request<UsageSummary>(`/api/v1/billing/usage?days=${days}`);

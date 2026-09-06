@@ -1,0 +1,41 @@
+/* Scoped layout: the application uses plain CSS, not a Tailwind runtime. */
+.root { max-width: 1320px; margin: 0 auto; padding-bottom: 48px; color: #182139; font-size: 14px; }
+.root > * + * { margin-top: 24px; }
+.root h1 { margin: 0 0 8px; font-size: 30px; letter-spacing: -0.7px; }
+.root h2 { margin: 0; font-size: 18px; letter-spacing: -0.3px; }
+.root h3 { margin: 0 0 12px; }
+.root p { margin: 6px 0 0; line-height: 1.6; }
+.root section, .root form { padding: 24px; border: 1px solid #dfe4ee; border-radius: 16px; background: #fff; box-shadow: 0 3px 14px #25305405; min-width: 0; }
+.root :global(.space-y-4) > * + * { margin-top: 16px; }
+.root :global(.grid) { display: grid; gap: 16px; }
+.root :global(.flex) { display: flex; gap: 10px; align-items: center; }
+.root :global(.flex-wrap) { flex-wrap: wrap; }
+.root :global(.justify-between) { justify-content: space-between; }
+.root label { display: block; font-size: 13px; font-weight: 600; color: #475570; }
+.root input:not([type=checkbox]), .root select, .root textarea { display: block; width: 100%; min-width: 0; margin-top: 7px; padding: 10px 12px; border: 1px solid #d7deeb; border-radius: 8px; background: #fff; color: #182139; font: inherit; font-weight: 400; }
+.root textarea { min-height: 82px; resize: vertical; }
+.root input[type=checkbox] { width: 16px; height: 16px; accent-color: #6752e8; flex-shrink: 0; }
+.root button { display: inline-flex; justify-content: center; align-items: center; min-height: 38px; border: 1px solid #d7deeb; border-radius: 8px; background: white; color: #33415e; padding: 8px 13px; font-size: 13px; font-weight: 600; cursor: pointer; }
+.root button:hover { background: #f3f4fc; }
+.root button:disabled { opacity: .45; cursor: not-allowed; }
+.root :global(.bg-indigo-600) { background: #6752e8; border-color: #6752e8; color: white; }
+.root :global(.bg-indigo-600):hover { background: #5542c9; }
+.root :global(.bg-amber-50) { padding: 16px 20px; border: 1px solid #ead391; border-radius: 12px; background: #fffaf0; color: #715217; }
+.root :global(.bg-red-50) { padding: 14px; border-radius: 10px; background: #fff0f1; color: #a82839; }
+.root :global(.bg-green-50) { padding: 14px; border-radius: 10px; background: #ecfaf3; color: #176846; }
+.root :global(.bg-slate-50) { padding: 16px; border-radius: 10px; background: #f6f8fc; }
+.root :global(.border-indigo-200) { padding: 16px; border: 1px solid #dcd7fb; border-radius: 10px; background: #faf9ff; }
+.root :global(.text-slate-600), .root :global(.text-slate-500) { color: #64718b; }
+.root :global(.text-xs) { font-size: 12px; }
+.root :global(.text-red-700) { color: #a82839; }
+.root :global(.overflow-x-auto) { overflow-x: auto; }
+.root :global(.overflow-auto) { max-height: 200px; overflow: auto; }
+.root table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.root th { text-align: left; padding: 12px 8px; font-size: 11px; text-transform: uppercase; color: #64718b; white-space: nowrap; }
+.root td { border-top: 1px solid #e4e8f0; padding: 12px 8px; vertical-align: top; }
+.root td button { margin: 0 6px 6px 0; }
+.root a { color: #6752e8; text-decoration: underline; }
+.root button:focus-visible, .root input:focus-visible, .root select:focus-visible, .root textarea:focus-visible { outline: 3px solid #bbb0ff; outline-offset: 2px; }
+@media (min-width: 640px) { .root :global(.sm\:grid-cols-2) { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (min-width: 1200px) { .root :global(.lg\:grid-cols-2) { grid-template-columns: .85fr 1.15fr; align-items: start; gap: 24px; } }
+@media (max-width: 639px) { .root section, .root form { padding: 16px; } .root :global(.flex) { flex-wrap: wrap; } }

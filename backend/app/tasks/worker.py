@@ -50,12 +50,17 @@ celery_app.conf.update(
     ),
     task_create_missing_queues=False,
     task_routes={
+        "app.tasks.dialer_tasks.*": {"queue": "campaigns"},
         "app.tasks.campaign_tasks.*": {"queue": "campaigns"},
         "app.tasks.call_tasks.*": {"queue": "calls"},
         "app.tasks.knowledge_tasks.*": {"queue": "knowledge"},
         "app.tasks.webhook_tasks.*": {"queue": "webhooks"},
     },
     beat_schedule={
+        "sweep-ai-dialer": {
+            "task": "app.tasks.dialer_tasks.sweep",
+            "schedule": 30.0,
+        },
         "sweep-stale-call-dispatches": {
             "task": "app.tasks.call_tasks.sweep_stale_call_dispatches",
             "schedule": 300.0,
@@ -93,6 +98,7 @@ celery_app.conf.update(
     # ``tasks.py``. These application tasks are split by domain, so list them
     # explicitly to ensure they are registered when the worker starts.
     imports=(
+        "app.tasks.dialer_tasks",
         "app.tasks.campaign_tasks",
         "app.tasks.call_tasks",
         "app.tasks.knowledge_tasks",
