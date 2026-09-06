@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from datetime import UTC, datetime, timedelta
 from pathlib import PurePath
 from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
 import structlog
-from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile, status
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -38,8 +39,11 @@ from app.schemas.knowledge import (
     KnowledgeBaseUpdate,
     KnowledgeCrawlCreate,
     KnowledgeCrawlResponse,
+    KnowledgeProcessingMode,
     KnowledgeReleaseReactivationRequest,
     KnowledgeServingRevisionResponse,
+    KnowledgeSourceCompileRequest,
+    KnowledgeSourcePreviewResponse,
     KnowledgeSourceResponse,
     KnowledgeSpeechLexiconResponse,
     SitemapDiscoveryRequest,
@@ -51,6 +55,12 @@ from app.services.audit import record_audit_event
 from app.services.knowledge_ai_wizard import (
     KnowledgeAIWizardError,
     generate_knowledge_ai_draft,
+)
+from app.services.knowledge_compiler import (
+    COMPILER_VERSION,
+    CompiledKnowledge,
+    KnowledgeCompilerError,
+    compile_source_knowledge,
 )
 from app.services.knowledge_serving import (
     KnowledgeServingError,
@@ -90,6 +100,54 @@ PROVIDER_INDEXED_STATUSES = {
     "success",
     "succeeded",
 }
+
+
+async def _compile_uploaded_content(
+    db: AsyncSession,
+    tenant_id: UUID,
+    *,
+    name: str,
+    text: str,
+    processing_mode: KnowledgeProcessingMode,
+) -> CompiledKnowledge:
+    """Compile before publication locks or remote uploads; failures leave drafts intact."""
+    api_key = None
+    if processing_mode != "fast":
+        try:
+            config = await load_provider_config(db, tenant_id, "openai")
+        except ProviderCredentialError as exc:
+            if processing_mode == "ai_verified":
+                raise HTTPException(
+                    status_code=503, detail="The OpenAI credential is unavailable."
+                ) from exc
+            config = None
+        api_key = str((config or {}).get("api_key") or settings.openai_api_key).strip() or None
+    try:
+        return await compile_source_knowledge(
+            title=name,
+            url="",
+            text=text,
+            requested_mode=processing_mode,
+            api_key=api_key,
+            require_structured_facts=True,
+        )
+    except KnowledgeCompilerError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+def _apply_uploaded_compilation(
+    source: KnowledgeSource, *, raw_text: str, compiled: CompiledKnowledge
+) -> None:
+    source.raw_content = raw_text
+    source.content = compiled.content
+    source.structured_content = compiled.structured
+    source.content_sha256 = hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
+    source.compiled_at = datetime.now(UTC)
+    source.source_metadata = {
+        **(source.source_metadata or {}),
+        "compiler": compiled.structured.get("compiler") or {},
+        "processing_mode": (compiled.structured.get("compiler") or {}).get("requested_mode"),
+    }
 
 
 async def _tenant_smallest_client(db: AsyncSession, tenant_id: UUID) -> SmallestAIClient:
@@ -1353,7 +1411,7 @@ async def add_text_source(
     current_user: CurrentUser = Depends(require_role("owner", "admin", "member")),
     db: AsyncSession = Depends(get_db),
 ):
-    kb = await _get_knowledge_base(db, current_user.tenant_id, kb_id)
+    kb = await _get_knowledge_base(db, current_user.tenant_id, kb_id, for_update=False)
     _ensure_bound_agents_accept_knowledge_change(kb)
     smallest_bindings = [
         binding.agent.name
@@ -1368,13 +1426,52 @@ async def add_text_source(
                 "Smallest.ai agent before adding it: " + ", ".join(sorted(smallest_bindings))
             ),
         )
+    for existing in kb.sources:
+        metadata = (existing.structured_content or {}).get("compiler") or {}
+        if (
+            existing.source_type == "text"
+            and existing.name.casefold() == data.name.casefold()
+            and existing.raw_content == data.content
+            and metadata.get("version") == COMPILER_VERSION
+            and metadata.get("requested_mode") == data.processing_mode
+            and not metadata.get("warning")
+        ):
+            return _knowledge_response(kb)
+    compiled = await _compile_uploaded_content(
+        db,
+        current_user.tenant_id,
+        name=data.name,
+        text=data.content,
+        processing_mode=data.processing_mode,
+    )
+    # Recheck authorization/bindings after external inference, under the same
+    # publication barrier used by approval. Never hold that lock during inference.
+    kb = await _get_knowledge_base(db, current_user.tenant_id, kb_id)
+    _ensure_bound_agents_accept_knowledge_change(kb)
+    if any(
+        binding.agent.voice_provider not in VAV_NATIVE_KNOWLEDGE_PROVIDERS
+        for binding in kb.agent_bindings
+    ):
+        raise HTTPException(status_code=409, detail="Pasted text requires VAV-native bindings.")
     approval_invalidated = invalidate_knowledge_approval(kb)
-    kb.sources.append(
-        KnowledgeSource(
+    # Retries/double-clicks must not create a second copy of an identical source.
+    # Different content with the same name is not silently overwritten.
+    source = next(
+        (
+            item
+            for item in kb.sources
+            if item.source_type == "text"
+            and item.name.casefold() == data.name.casefold()
+            and (item.raw_content or (item.content if not item.structured_content else None))
+            == data.content
+        ),
+        None,
+    )
+    if source is None:
+        source = KnowledgeSource(
             tenant_id=current_user.tenant_id,
             source_type="text",
             name=data.name,
-            content=data.content,
             size_bytes=len(data.content.encode()),
             status="indexed",
             source_metadata={
@@ -1382,7 +1479,8 @@ async def add_text_source(
                 "provider_note": "Available to VAV-native runtimes; not published to Smallest.ai",
             },
         )
-    )
+        kb.sources.append(source)
+    _apply_uploaded_compilation(source, raw_text=data.content, compiled=compiled)
     _recount(kb)
     affected_agent_ids = _invalidate_bound_agent_deployments(kb)
     await db.flush()
@@ -1398,6 +1496,105 @@ async def add_text_source(
             "bytes": len(data.content.encode()),
             "approval_invalidated": approval_invalidated,
             "agents_requiring_sync": [str(agent_id) for agent_id in affected_agent_ids],
+        },
+    )
+    return _knowledge_response(kb)
+
+
+@router.get(
+    "/{kb_id}/sources/{source_id}/preview",
+    response_model=KnowledgeSourcePreviewResponse,
+)
+async def preview_knowledge_source(
+    kb_id: UUID,
+    source_id: UUID,
+    current_user: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    kb = await _get_knowledge_base(db, current_user.tenant_id, kb_id, for_update=False)
+    source = next((item for item in kb.sources if item.id == source_id), None)
+    if source is None:
+        raise HTTPException(status_code=404, detail="Knowledge source not found")
+    return KnowledgeSourcePreviewResponse(
+        source_id=source.id,
+        raw_text=source.raw_content or (source.content if not source.structured_content else None),
+        structured_content=source.structured_content or {},
+        compiled_at=source.compiled_at,
+    )
+
+
+@router.post(
+    "/{kb_id}/sources/{source_id}/compile",
+    response_model=KnowledgeBaseResponse,
+)
+async def compile_existing_uploaded_source(
+    kb_id: UUID,
+    source_id: UUID,
+    data: KnowledgeSourceCompileRequest,
+    current_user: CurrentUser = Depends(require_role("owner", "admin", "member")),
+    db: AsyncSession = Depends(get_db),
+):
+    """Upgrade an existing PDF/text draft in place, never its approved snapshot.
+
+    Provider artifacts retain the original extracted information. This operation
+    structures VAV's retrieval representation and does not mutate remote files.
+    """
+    kb = await _get_knowledge_base(db, current_user.tenant_id, kb_id, for_update=False)
+    _ensure_bound_agents_accept_knowledge_change(kb)
+    source = next((item for item in kb.sources if item.id == source_id), None)
+    if source is None:
+        raise HTTPException(status_code=404, detail="Knowledge source not found")
+    if source.source_type not in {"file", "text"}:
+        raise HTTPException(status_code=422, detail="Use Refresh page for website sources.")
+    # Legacy local sources stored extracted text directly in content. Never
+    # recursively compile an already generated document if its original is lost.
+    raw_text = source.raw_content or (source.content if not source.structured_content else None)
+    if not raw_text or not raw_text.strip():
+        raise HTTPException(
+            status_code=422,
+            detail="No extracted original text is available. Re-upload the PDF or add its text.",
+        )
+    previous_updated_at = source.updated_at
+    source_name = source.name
+    compiler = (source.structured_content or {}).get("compiler") or {}
+    if (
+        source.content_sha256 == hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
+        and source.raw_content
+        and source.content
+        and compiler.get("version") == COMPILER_VERSION
+        and compiler.get("requested_mode") == data.processing_mode
+        and not compiler.get("warning")
+    ):
+        return _knowledge_response(kb)
+    compiled = await _compile_uploaded_content(
+        db,
+        current_user.tenant_id,
+        name=source_name,
+        text=raw_text,
+        processing_mode=data.processing_mode,
+    )
+    kb = await _get_knowledge_base(db, current_user.tenant_id, kb_id)
+    _ensure_bound_agents_accept_knowledge_change(kb)
+    source = next((item for item in kb.sources if item.id == source_id), None)
+    if source is None or source.updated_at != previous_updated_at:
+        raise HTTPException(status_code=409, detail="The source changed. Refresh and retry.")
+    approval_invalidated = invalidate_knowledge_approval(kb)
+    _apply_uploaded_compilation(source, raw_text=raw_text, compiled=compiled)
+    affected_agent_ids = _invalidate_bound_agent_deployments(kb)
+    _recount(kb)
+    await db.flush()
+    await record_audit_event(
+        db,
+        tenant_id=current_user.tenant_id,
+        actor_user_id=current_user.id,
+        action="knowledge_source.compiled",
+        resource_type="knowledge_source",
+        resource_id=str(source.id),
+        details={
+            "processing_mode": data.processing_mode,
+            "compiler": compiled.structured.get("compiler"),
+            "approval_invalidated": approval_invalidated,
+            "agents_requiring_sync": [str(item) for item in affected_agent_ids],
         },
     )
     return _knowledge_response(kb)
@@ -1499,6 +1696,7 @@ async def repair_website_source(
 async def upload_pdf_source(
     kb_id: UUID,
     media: UploadFile = File(...),
+    processing_mode: KnowledgeProcessingMode = Form("automatic"),
     current_user: CurrentUser = Depends(require_role("owner", "admin", "member")),
     db: AsyncSession = Depends(get_db),
 ):
@@ -1524,6 +1722,14 @@ async def upload_pdf_source(
         )
     except PdfIngestionError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    compiled = await _compile_uploaded_content(
+        db,
+        current_user.tenant_id,
+        name=filename,
+        text=prepared.extracted_text,
+        processing_mode=processing_mode,
+    )
 
     kb = await _get_knowledge_base(db, current_user.tenant_id, kb_id)
     _ensure_bound_agents_accept_knowledge_change(kb)
@@ -1704,7 +1910,6 @@ async def upload_pdf_source(
             )
             kb.sources.append(source)
         source.name = filename
-        source.content = prepared.extracted_text
         source.file_content = content
         source.mime_type = "application/pdf"
         source.size_bytes = len(content)
@@ -1714,6 +1919,7 @@ async def upload_pdf_source(
         if stale_provider_ids:
             source_metadata["provider_cleanup_pending_ids"] = sorted(stale_provider_ids)
         source.source_metadata = source_metadata
+        _apply_uploaded_compilation(source, raw_text=prepared.extracted_text, compiled=compiled)
         source.last_synced_at = datetime.now(UTC)
         await db.flush()
 

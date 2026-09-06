@@ -477,16 +477,17 @@ export default function KnowledgeStudio() {
   const uploadPdf = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (!selected) return;
-    const input = event.currentTarget.elements.namedItem('media') as HTMLInputElement;
+    const formElement = event.currentTarget;
+    const form = new FormData(formElement);
+    const input = formElement.elements.namedItem('media') as HTMLInputElement;
     const file = input.files?.[0];
     if (!file) return;
     await runAction(
       'upload-pdf',
-      () => api.uploadKnowledgePdf(selected.id, file),
-      `${file.name} passed VAV extraction and was sent for provider indexing. Re-uploading the same filename updates it in place.`,
+      () => api.uploadKnowledgePdf(selected.id, file, String(form.get('processing_mode') || 'automatic') as KnowledgeProcessingMode),
+      `${file.name} was extracted and compiled for review, then sent for provider indexing. Check any compiler warnings and approve the draft before agents use it.`,
       { syncPendingBindings: true },
     );
-    event.currentTarget.reset();
   };
 
   const addText = async (event: FormEvent<HTMLFormElement>) => {
@@ -495,10 +496,18 @@ export default function KnowledgeStudio() {
     const form = new FormData(event.currentTarget);
     await runAction(
       'add-text',
-      () => api.addKnowledgeText(selected.id, String(form.get('text_name') || ''), String(form.get('text_content') || '')),
-      'The text source is searchable and ready for VAV-native agents. Smallest.ai bindings do not support pasted text.',
+      () => api.addKnowledgeText(selected.id, String(form.get('text_name') || ''), String(form.get('text_content') || ''), String(form.get('processing_mode') || 'automatic') as KnowledgeProcessingMode),
+      'Text compiled for review. Check any warnings, then approve the draft for VAV-native agents. Smallest.ai bindings do not support pasted text.',
     );
-    event.currentTarget.reset();
+  };
+
+  const compileSource = async (source: KnowledgeSource) => {
+    if (!selected || !window.confirm(`Structure ${source.name} with AI? This uses your configured OpenAI account and may incur extraction charges. The original and live approved release stay unchanged until you approve the draft.`)) return;
+    await runAction(
+      `compile-source-${source.id}`,
+      () => api.compileKnowledgeSource(selected.id, source.id),
+      'Source compiled in place. Review the facts and warnings, then approve the draft; no duplicate document was created.',
+    );
   };
 
   const removeSource = async (source: KnowledgeSource) => {
@@ -756,6 +765,7 @@ export default function KnowledgeStudio() {
                 canRemove={canGovernKnowledge}
                 busy={working !== null}
                 onRepair={repairSource}
+                onCompile={compileSource}
                 onRemove={removeSource}
               />
 
@@ -870,14 +880,18 @@ function SitemapForm({ busy, onSubmit, urls, selected, onToggle, onToggleAll, on
 }
 
 function PdfForm({ busy, onSubmit }: { busy: boolean; onSubmit: (event: FormEvent<HTMLFormElement>) => void }) {
-  return <form onSubmit={onSubmit} className={styles.uploadForm}><div className={styles.uploadDrop}><Upload size={22} /><div><label htmlFor="knowledge-pdf">Choose an approved PDF</label><p>VAV extracts text automatically and OCRs scanned pages · same filename safely updates one document · maximum 8 MB</p></div><input id="knowledge-pdf" name="media" type="file" accept="application/pdf,.pdf" required /></div><button type="submit" className="btn btn-primary" disabled={busy}>{busy ? <Loader2 className="spin" size={14} /> : <CloudUpload size={14} />} Validate and index</button></form>;
+  return <form onSubmit={onSubmit} className={styles.uploadForm}><div className={styles.uploadDrop}><Upload size={22} /><div><label htmlFor="knowledge-pdf">Choose an approved PDF</label><p>VAV extracts text, OCRs scanned pages and compiles source-backed knowledge · original PDF preserved · same filename updates one document · maximum 8 MB</p></div><input id="knowledge-pdf" name="media" type="file" accept="application/pdf,.pdf" required /></div><ProcessingModeField /><button type="submit" className="btn btn-primary" disabled={busy}>{busy ? <Loader2 className="spin" size={14} /> : <CloudUpload size={14} />} {busy ? 'Extracting, compiling and indexing…' : 'Validate and index'}</button>{busy && <p role="status">OCR and AI compilation can take time for large documents. Keep this page open; the approved release is unchanged.</p>}</form>;
+}
+
+function ProcessingModeField() {
+  return <label><span>Knowledge processing</span><select name="processing_mode" defaultValue="automatic"><option value="automatic">Automatic · AI with safe text fallback</option><option value="fast">Fast · searchable text, no AI facts</option><option value="ai_verified">AI · source-checked facts</option></select><small>AI uses your configured OpenAI account. Review warnings and approve before publishing.</small></label>;
 }
 
 function CrawlForm({ busy, onSubmit }: { busy: boolean; onSubmit: (event: FormEvent<HTMLFormElement>) => void }) {
   return <form onSubmit={onSubmit} className={styles.crawlForm}>
     <div className={styles.crawlIntro}><label htmlFor="homepage-url">Website homepage</label><p>VAV follows sitemaps and same-site links, respects robots.txt, renders JavaScript when needed, and keeps a repair ledger for every page.</p></div>
     <input id="homepage-url" name="homepage_url" type="url" required placeholder="https://www.example.com/" />
-    <label><span>Knowledge processing</span><select name="processing_mode" defaultValue="automatic"><option value="automatic">Automatic · recommended</option><option value="fast">Fast · deterministic</option><option value="ai_verified">AI-verified · highest quality</option></select></label>
+    <ProcessingModeField />
     <label><span>Page limit</span><input name="max_pages" type="number" min="1" max="500" defaultValue="100" /></label>
     <label><span>Link depth</span><input name="max_depth" type="number" min="0" max="8" defaultValue="3" /></label>
     <label className={styles.crawlCheckbox}><input name="include_subdomains" type="checkbox" /> Include subdomains</label>
@@ -912,10 +926,43 @@ function CrawlRuns({ crawls, busy, canRepair, onRetry }: { crawls: KnowledgeCraw
 }
 
 function TextForm({ busy, onSubmit }: { busy: boolean; onSubmit: (event: FormEvent<HTMLFormElement>) => void }) {
-  return <form onSubmit={onSubmit} className={styles.builderForm}><div><label htmlFor="text-name">Approved searchable text</label><p>Immediately usable by Inworld, Sarvam, and ElevenLabs VAV runtimes. Smallest.ai agents require provider-indexed sources.</p></div><input id="text-name" name="text_name" required maxLength={255} placeholder="Approved returns FAQ" /><textarea id="text-content" name="text_content" required minLength={20} maxLength={100000} placeholder="Paste approved question-and-answer content here…" /><button type="submit" className="btn btn-secondary" disabled={busy}>{busy ? <Loader2 className="spin" size={14} /> : <Plus size={14} />} Add searchable text</button></form>;
+  return <form onSubmit={onSubmit} className={styles.builderForm}><div><label htmlFor="text-name">Approved searchable text</label><p>Compiled for review before Inworld, Sarvam, and ElevenLabs VAV runtimes use it. Smallest.ai agents require provider-indexed sources.</p></div><input id="text-name" name="text_name" required maxLength={255} placeholder="Approved returns FAQ" /><textarea id="text-content" name="text_content" required minLength={20} maxLength={100000} placeholder="Paste approved question-and-answer content here…" /><ProcessingModeField /><button type="submit" className="btn btn-secondary" disabled={busy}>{busy ? <Loader2 className="spin" size={14} /> : <Plus size={14} />} {busy ? 'Compiling and validating…' : 'Add searchable text'}</button>{busy && <p role="status">Preparing source-backed knowledge. Your text and the approved release remain unchanged.</p>}</form>;
 }
 
-function SourcesSection({ sources, canRepair, canRemove, busy, onRepair, onRemove }: { sources: KnowledgeSource[]; canRepair: boolean; canRemove: boolean; busy: boolean; onRepair: (source: KnowledgeSource) => void; onRemove: (source: KnowledgeSource) => void }) {
+function SourceReview({ source }: { source: KnowledgeSource }) {
+  const [preview, setPreview] = useState<Awaited<ReturnType<typeof api.previewKnowledgeSource>> | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const loadPreview = async () => {
+    if (preview || loading) return;
+    setLoading(true);
+    setError(null);
+    try {
+      setPreview(await api.previewKnowledgeSource(source.knowledge_base_id, source.id));
+    } catch (err) {
+      setError(errorMessage(err, 'Could not load source. Close and reopen to retry.'));
+    } finally {
+      setLoading(false);
+    }
+  };
+  return <details onToggle={(event) => { if (event.currentTarget.open) void loadPreview(); }}>
+    <summary>Review extracted content and facts</summary>
+    {loading && <p role="status">Loading source evidence…</p>}
+    {error && <p role="alert">{error}</p>}
+    {preview && <div style={{ maxHeight: 360, overflow: 'auto' }}>
+      <p>Editable source preview. Pending changes require approval; calls use the approved release. Source checking does not guarantee that every fact was extracted.</p>
+      {(preview.structured_content.facts || []).map((fact, index) => <div key={index}>
+        <strong>{fact.subject} — {fact.predicate}: {fact.value}</strong>
+        <blockquote>{fact.evidence}</blockquote>
+      </div>)}
+      {!(preview.structured_content.facts || []).length && <p>No structured facts. Check extraction and company attribution before approval.</p>}
+      <h4>Original extracted text</h4>
+      <pre style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>{preview.raw_text || 'Original extraction unavailable; re-upload this source.'}</pre>
+    </div>}
+  </details>;
+}
+
+function SourcesSection({ sources, canRepair, canRemove, busy, onRepair, onCompile, onRemove }: { sources: KnowledgeSource[]; canRepair: boolean; canRemove: boolean; busy: boolean; onRepair: (source: KnowledgeSource) => void; onCompile: (source: KnowledgeSource) => void; onRemove: (source: KnowledgeSource) => void }) {
   const readyCount = sources.filter((source) => source.retrieval_ready && source.status === 'indexed' && (source.company_fact_count ?? 0) > 0).length;
   return <section className={styles.section} aria-labelledby="sources-heading"><div className={styles.sectionHeading}><div><span className={styles.sectionIcon}><Layers3 size={15} /></span><div><h3 id="sources-heading">Source inventory</h3><p>Text extraction and company attribution are checked separately. Scoped agents need approved facts for their configured company.</p></div></div><span className="badge badge-neutral">{sources.length} documents · {readyCount} with company facts</span></div>{sources.length === 0 ? <div className={styles.sourceEmpty}><FileText size={20} /><div><strong>No sources yet</strong><p>Add curated web pages, searchable text, or an approved PDF to begin.</p></div></div> : <div className={styles.sourceList}>{sources.map((source) => {
     const method = typeof source.source_metadata?.extraction_method === 'string' ? source.source_metadata.extraction_method : null;
@@ -937,7 +984,7 @@ function SourcesSection({ sources, canRepair, canRemove, busy, onRepair, onRemov
       ? 'Text is readable, but no company-attributed facts are compiled. This source is unavailable to company-scoped agents. Refresh it with AI-verified extraction, then review and approve the compiled knowledge.' : null].filter(Boolean).join(' ');
     const recoveryActive = recovery?.status === 'queued' || recovery?.status === 'processing';
     const refreshLabel = isReady ? 'Refresh page' : 'Repair page';
-    return <article className={styles.sourceRow} key={source.id}><span className={styles.sourceTypeIcon}>{source.source_type === 'file' ? <FileText size={16} /> : source.source_type === 'text' ? <Layers3 size={16} /> : <Globe2 size={16} />}</span><div className={styles.sourceIdentity}><strong>{source.name}</strong><span>{source.location || (source.size_bytes ? formatBytes(source.size_bytes) : source.source_type)} · {source.retrieval_ready ? `${source.extracted_character_count.toLocaleString()} searchable characters${method ? ` · ${method === 'native' ? 'text extracted' : method === 'static_html' ? 'HTML extracted' : method === 'javascript_render' ? 'JavaScript rendered' : method}` : ''}${compiler ? ` · ${compilerLabel(compiler)}` : ''}` : 'no voice-searchable text'}</span>{compiler?.warning && <p>{compiler.warning}</p>}{detail && <p className={recoveryActive ? styles.recoveryProgress : undefined}>{detail}</p>}{source.error_message && source.error_message !== detail && <p>{source.error_message}</p>}</div><span className={`badge ${isReady ? 'badge-success' : sourceBadge(source.status)}`}>{isReady ? 'Company facts available' : recoveryActive ? recoveryStageLabel(recovery.stage) : source.retrieval_ready && source.status === 'indexed' ? 'Text searchable' : source.status.replace('_', ' ')}</span><time>{formatDate(source.last_synced_at || source.updated_at)}</time><span className={styles.sourceActions}>{canRepair && repairable && <button type="button" className="btn btn-secondary btn-sm" disabled={busy || recoveryActive} onClick={() => onRepair(source)} aria-label={`${refreshLabel} ${source.name} and re-index its searchable content`} title="Download, render, extract, index and verify the latest page content"><RefreshCw size={12} className={recoveryActive ? 'spin' : undefined} /> {refreshLabel}</button>}{canRemove && <button type="button" className="icon-button" disabled={busy} onClick={() => onRemove(source)} aria-label={`Stage removal of ${source.name}`} title="Stage removal for the next approved VAV release"><Trash2 size={14} /></button>}</span></article>;
+    return <article className={styles.sourceRow} key={source.id}><span className={styles.sourceTypeIcon}>{source.source_type === 'file' ? <FileText size={16} /> : source.source_type === 'text' ? <Layers3 size={16} /> : <Globe2 size={16} />}</span><div className={styles.sourceIdentity}><strong>{source.name}</strong><span>{source.location || (source.size_bytes ? formatBytes(source.size_bytes) : source.source_type)} · {source.retrieval_ready ? `${source.extracted_character_count.toLocaleString()} searchable characters${method ? ` · ${method === 'native' ? 'text extracted' : method === 'static_html' ? 'HTML extracted' : method === 'javascript_render' ? 'JavaScript rendered' : method}` : ''}${compiler ? ` · ${compilerLabel(compiler)}` : ''}` : 'no voice-searchable text'}</span>{compiler?.warning && <p>{compiler.warning}</p>}{detail && <p className={recoveryActive ? styles.recoveryProgress : undefined}>{detail}</p>}{source.error_message && source.error_message !== detail && <p>{source.error_message}</p>}<SourceReview key={`${source.id}:${source.updated_at}`} source={source} /></div><span className={`badge ${isReady ? 'badge-success' : sourceBadge(source.status)}`}>{isReady ? 'Company facts available' : recoveryActive ? recoveryStageLabel(recovery.stage) : source.retrieval_ready && source.status === 'indexed' ? 'Text searchable' : source.status.replace('_', ' ')}</span><time>{formatDate(source.last_synced_at || source.updated_at)}</time><span className={styles.sourceActions}>{canRepair && repairable && <button type="button" className="btn btn-secondary btn-sm" disabled={busy || recoveryActive} onClick={() => onRepair(source)} aria-label={`${refreshLabel} ${source.name} and re-index its searchable content`} title="Download, render, extract, index and verify the latest page content"><RefreshCw size={12} className={recoveryActive ? 'spin' : undefined} /> {refreshLabel}</button>}{canRepair && !isWebsite && source.retrieval_ready && <button type="button" className="btn btn-secondary btn-sm" disabled={busy} onClick={() => onCompile(source)} aria-label={`Structure ${source.name} with AI`} title="Compile the original into source-checked VAV facts; review before approval">{busy ? 'Working…' : 'Structure with AI'}</button>}{canRemove && <button type="button" className="icon-button" disabled={busy} onClick={() => onRemove(source)} aria-label={`Stage removal of ${source.name}`} title="Stage removal for the next approved VAV release"><Trash2 size={14} /></button>}</span></article>;
   })}</div>}</section>;
 }
 

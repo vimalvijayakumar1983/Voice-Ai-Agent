@@ -288,11 +288,25 @@ class KnowledgeCrawlCreate(BaseModel):
 class TextSourceCreate(BaseModel):
     name: Annotated[str, Field(min_length=1, max_length=255)]
     content: Annotated[str, Field(min_length=20, max_length=100_000)]
+    processing_mode: KnowledgeProcessingMode = "automatic"
+
+    model_config = {"str_strip_whitespace": True}
 
     @field_validator("name", "content")
     @classmethod
     def clean_text(cls, value: str) -> str:
         return value.strip()
+
+
+class KnowledgeSourceCompileRequest(BaseModel):
+    processing_mode: KnowledgeProcessingMode = "automatic"
+
+
+class KnowledgeSourcePreviewResponse(BaseModel):
+    source_id: UUID
+    raw_text: str | None
+    structured_content: dict
+    compiled_at: datetime | None
 
 
 class AgentKnowledgeBindRequest(BaseModel):
