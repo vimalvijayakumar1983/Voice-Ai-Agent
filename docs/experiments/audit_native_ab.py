@@ -41,6 +41,8 @@ async def main():
                     s in k
                     for s in [
                         "provider_native_turns_qa",
+                        "native_qa_tool_requests",
+                        "native_request_ledger_available",
                         "serialized_model",
                         "serialized_language",
                         "knowledge_turn_mode",

@@ -80,6 +80,12 @@ if "--focused-v2" in sys.argv:
     ]
 
 
+if "--conversation-check" in sys.argv:
+    cases = [
+        case for case in CASES if case[0] in {"simple", "date_correction", "closing"}
+    ]
+
+
 def voiced(data):
     values = array("h", data)
     return bool(values) and sum(v * v for v in values) / len(values) > 200**2
@@ -231,7 +237,13 @@ async def main():
         await room.local_participant.publish_track(
             track, rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_MICROPHONE)
         )
-        await asyncio.sleep(2)
+        # Initial listening may precede the scheduled greeting. Wait for the
+        # greeting itself, not an initial state snapshot, before caller audio.
+        async with asyncio.timeout(35):
+            while not any(item["agent"] for item in transcripts):
+                await asyncio.sleep(0.05)
+        await state.wait_until_listening(35)
+        await asyncio.sleep(0.7)
         for index, ((label, segments, gap), pcm) in enumerate(zip(cases, clips)):
             if label != "interrupt":
                 await state.wait_until_listening(35)
