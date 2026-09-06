@@ -945,6 +945,9 @@ async def _process_completed_call_async(
         return None
 
     logger.info("call_processed", call_id=call_id)
+    if (call.call_metadata or {}).get("staff_browser_only") is True:
+        # No external webhook delivery of internal browser conversation outcomes.
+        return None
     return {
         "call_id": call_id,
         "status": call.status,

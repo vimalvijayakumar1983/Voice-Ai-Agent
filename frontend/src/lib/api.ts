@@ -178,6 +178,8 @@ export interface WorkspaceCredentialStatuses {
 }
 
 export interface RuntimeProfile {
+  staff_browser_only: boolean;
+  knowledge_source_mode: 'knowledge_base' | 'tools_only';
   id: string | null;
   agent_id: string;
   enabled: boolean;

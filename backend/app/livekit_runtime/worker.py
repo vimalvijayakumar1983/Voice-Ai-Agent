@@ -2061,7 +2061,7 @@ def _served_browser_configuration(
     *,
     model: AgentModel,
     profile: AgentRuntimeProfile,
-    knowledge: KnowledgeBase,
+    knowledge: KnowledgeBase | None,
     sources: list[KnowledgeSource | KnowledgeServingRevisionSource],
     serving_revision: KnowledgeServingRevision | None = None,
 ) -> dict[str, Any]:
@@ -2117,9 +2117,11 @@ def _served_browser_configuration(
         "llm_model": profile.llm_model,
         "system_prompt_sha256": _sha256_text(model.system_prompt),
         "greeting_message_sha256": _sha256_text(model.greeting_message),
-        "knowledge_base_id": str(knowledge.id),
+        "knowledge_base_id": str(knowledge.id) if knowledge is not None else None,
         "knowledge_base_updated_at": (
-            None if serving_revision is not None else _revision_timestamp(knowledge.updated_at)
+            None
+            if serving_revision is not None or knowledge is None
+            else _revision_timestamp(knowledge.updated_at)
         ),
         "knowledge_source_count": len(source_revisions),
         "knowledge_sources_sha256": sources_sha256,
@@ -4326,6 +4328,31 @@ async def _load_browser_runtime(
         # this exact call reserved. A later reduction remains an immediate
         # safety improvement.
         model.max_call_duration_seconds = min(reserved_duration, current_duration)
+        from app.services.browser_access import staff_browser, tools_only, validate_staff_call
+
+        if (metadata.get("staff_browser_only") is True) != staff_browser(profile):
+            raise RuntimeError("Browser access policy changed after reservation")
+        if staff_browser(profile):
+            await validate_staff_call(db, tenant_id=tenant_id, agent_id=agent_id, call_id=call_id)
+        if (metadata.get("knowledge_source_mode") == "tools_only") != tools_only(profile):
+            raise RuntimeError("Browser knowledge mode changed after reservation")
+        if tools_only(profile):
+            variables = validate_provider_variables(
+                metadata.get("browser_variables") or {}, label="Session variables"
+            )
+            api_keys = await _load_runtime_api_keys(
+                db, tenant_id=tenant_id, llm_provider=profile.llm_provider
+            )
+            return (
+                model,
+                profile,
+                api_keys,
+                variables or {},
+                _served_browser_configuration(
+                    model=model, profile=profile, knowledge=None, sources=[]
+                ),
+                _RuntimeKnowledgePin(),
+            )
         binding = await db.scalar(
             select(AgentKnowledgeBinding).where(
                 AgentKnowledgeBinding.agent_id == model.id,
@@ -4971,12 +4998,26 @@ async def _open_browser_call(
             or metadata.get("channel") != "browser"
         ):
             raise RuntimeError("LiveKit browser participant does not match its reservation")
-        await _admit_reserved_knowledge_pin(
-            db,
-            model=model,
-            knowledge_pin=knowledge_pin,
-            call=call,
-        )
+        from app.services.browser_access import staff_browser, tools_only, validate_staff_call
+
+        if staff_browser(profile) or metadata.get("staff_browser_only") is True:
+            _staff_call, current_profile = await validate_staff_call(
+                db,
+                tenant_id=model.tenant_id,
+                agent_id=model.id,
+                call_id=call_id,
+            )
+            if tools_only(current_profile) != (
+                metadata.get("knowledge_source_mode") == "tools_only"
+            ):
+                raise RuntimeError("Browser knowledge mode changed before join")
+        if not tools_only(profile):
+            await _admit_reserved_knowledge_pin(
+                db,
+                model=model,
+                knowledge_pin=knowledge_pin,
+                call=call,
+            )
         now = datetime.now(UTC)
         call.status = "in_progress"
         call.started_at = call.started_at or now
@@ -5917,7 +5958,9 @@ async def vav_inworld_session(ctx: JobContext) -> None:
 
         knowledge_terminology: tuple[str, ...] = ()
         recognition_context = _RuntimeRecognitionContext()
-        if native_realtime:
+        from app.services.browser_access import tools_only
+
+        if native_realtime and not tools_only(profile):
             terminology_started_at = time.monotonic()
             try:
                 recognition_context = await _load_runtime_recognition_context(
@@ -6092,8 +6135,25 @@ async def vav_inworld_session(ctx: JobContext) -> None:
         if native_realtime and not single_pass_decision.enabled:
             from app.livekit_runtime.mcp_tools import MCP_INSTRUCTIONS, load_mcp_tools
 
-            mcp_tools = await load_mcp_tools(model, profile, usage_totals)
-            if mcp_tools:
+            mcp_tools = await load_mcp_tools(
+                model, profile, usage_totals, call_id=call_id if browser_session else None
+            )
+            from app.services.browser_access import tools_only
+
+            if tools_only(profile):
+                # No implicit KB fallback: this mode must not search another company's KB.
+                await runtime_agent.update_tools(mcp_tools)
+                await runtime_agent.update_instructions(
+                    runtime_agent.instructions.split("\nKnowledge policy:\n", 1)[0]
+                    + MCP_INSTRUCTIONS
+                    + "\nNo knowledge base is attached in this mode. "
+                    "Use only the explicitly available tools for business facts. "
+                    "Caller assertions are search clues, never verified facts. "
+                    "If no tools are available, explain that data access is not enabled. "
+                    "Keep answers concise, normally one or two short sentences. "
+                    "Respond naturally to thanks and goodbyes."
+                )
+            elif mcp_tools:
                 await runtime_agent.update_tools([*runtime_agent.tools, *mcp_tools])
                 await runtime_agent.update_instructions(
                     runtime_agent.instructions + MCP_INSTRUCTIONS

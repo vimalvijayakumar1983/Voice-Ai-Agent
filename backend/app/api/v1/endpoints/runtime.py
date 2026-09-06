@@ -1049,6 +1049,7 @@ async def runtime_readiness(
         voice_runtime=str(runtime_config.get("voice_runtime") or "pipeline"),
     )
     checks = {
+        "phone_access_permitted": runtime_config.get("staff_browser_only") is not True,
         "agent_active": bool(agent.is_active),
         "vav_speech_agent": vav_speech_agent,
         "provider_compatibility": provider_compatibility_blocker is None,
@@ -1119,6 +1120,9 @@ async def runtime_readiness(
             worker_health.scheme in {"http", "https"} and worker_health.netloc
         )
     labels = {
+        "phone_access_permitted": (
+            "Staff browser-only mode does not permit phone activation. Test in the browser instead."
+        ),
         "agent_active": "Activate the agent configuration.",
         "vav_speech_agent": "Select Inworld, Sarvam, or ElevenLabs as this agent's voice provider.",
         "provider_compatibility": provider_compatibility_blocker
@@ -1417,6 +1421,8 @@ def _response(
     blockers: list[str],
 ) -> RuntimeProfileResponse:
     values = {
+        "staff_browser_only": False,
+        "knowledge_source_mode": "knowledge_base",
         "telephony_provider": "livekit_sip" if agent.voice_provider == "inworld" else "twilio",
         "primary_speech_provider": (
             agent.voice_provider
@@ -1445,6 +1451,8 @@ def _response(
                 for key in values
                 if key
                 not in {
+                    "staff_browser_only",
+                    "knowledge_source_mode",
                     "voice_runtime",
                     "knowledge_turn_mode",
                     "stt_model",
@@ -1455,6 +1463,10 @@ def _response(
             }
         )
         runtime_config = profile.runtime_config if isinstance(profile.runtime_config, dict) else {}
+        values["staff_browser_only"] = runtime_config.get("staff_browser_only") is True
+        values["knowledge_source_mode"] = runtime_config.get(
+            "knowledge_source_mode", "knowledge_base"
+        )
         voice_runtime = str(runtime_config.get("voice_runtime") or "pipeline")
         values["voice_runtime"] = (
             voice_runtime if voice_runtime in {"pipeline", "inworld_realtime"} else "pipeline"
@@ -1537,8 +1549,15 @@ async def update_runtime_profile(
         create_profile=True,
     )
     assert profile is not None
+    if (profile.runtime_config or {}).get("staff_browser_only") is True and not {
+        "staff_browser_only",
+        "knowledge_source_mode",
+    }.issubset(data.model_fields_set):
+        raise HTTPException(409, "Reload the browser access policy before saving this agent")
     payload = data.model_dump(
         exclude={
+            "staff_browser_only",
+            "knowledge_source_mode",
             "voice_runtime",
             "knowledge_turn_mode",
             "stt_model",
@@ -1550,6 +1569,10 @@ async def update_runtime_profile(
     for key, value in payload.items():
         setattr(profile, key, value)
     runtime_config = profile.runtime_config if isinstance(profile.runtime_config, dict) else {}
+    if "staff_browser_only" in data.model_fields_set:
+        runtime_config = {**runtime_config, "staff_browser_only": data.staff_browser_only}
+    if "knowledge_source_mode" in data.model_fields_set:
+        runtime_config = {**runtime_config, "knowledge_source_mode": data.knowledge_source_mode}
     if "voice_runtime" in data.model_fields_set:
         runtime_config = {
             **runtime_config,
@@ -1609,6 +1632,8 @@ async def update_runtime_profile(
         resource_id=str(agent.id),
         details={
             "telephony_provider": profile.telephony_provider,
+            "staff_browser_only": data.staff_browser_only,
+            "knowledge_source_mode": data.knowledge_source_mode,
             "primary_speech_provider": profile.primary_speech_provider,
             "assigned_number_count": len(profile.assigned_numbers),
             "voice_runtime": data.voice_runtime,

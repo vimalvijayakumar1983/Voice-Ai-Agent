@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import Link from 'next/link';
 import {
   Activity,
   CheckCircle2,
@@ -35,6 +36,8 @@ export default function RuntimeControlPanel({ agent, profile, onClose, onChange 
   const [notice, setNotice] = useState<{ type: 'success' | 'error' | 'info'; text: string } | null>(null);
 
   const payload = () => ({
+    staff_browser_only: form.staff_browser_only ?? false,
+    knowledge_source_mode: form.knowledge_source_mode ?? 'knowledge_base',
     telephony_provider: form.telephony_provider,
     primary_speech_provider: speechProvider,
     fallback_speech_provider: form.fallback_speech_provider,
@@ -53,6 +56,8 @@ export default function RuntimeControlPanel({ agent, profile, onClose, onChange 
     assigned_numbers: numbers.split(/[,\n]/).map((value) => value.trim()).filter(Boolean),
   });
   const persistedPayload = {
+    staff_browser_only: profile.staff_browser_only ?? false,
+    knowledge_source_mode: profile.knowledge_source_mode ?? 'knowledge_base',
     telephony_provider: profile.telephony_provider,
     primary_speech_provider: profile.primary_speech_provider,
     fallback_speech_provider: profile.fallback_speech_provider,
@@ -79,7 +84,7 @@ export default function RuntimeControlPanel({ agent, profile, onClose, onChange 
       let next: RuntimeProfile;
       if (action === 'save') {
         next = await api.updateRuntimeProfile(agent.id, payload());
-        setNotice({ type: 'success', text: 'Runtime policy saved. Run readiness before activation.' });
+        setNotice({ type: 'success', text: next.staff_browser_only ? 'Staff browser policy saved. Open the browser test to check the serving dependencies.' : 'Runtime policy saved. Run readiness before activation.' });
       } else if (action === 'test') {
         if (hasUnsavedChanges) {
           await api.updateRuntimeProfile(agent.id, payload());
@@ -135,6 +140,33 @@ export default function RuntimeControlPanel({ agent, profile, onClose, onChange 
       ) : null}
 
       <div className={styles.grid}>
+        {inworldRuntime ? <div className="form-group">
+          <label htmlFor="runtime-staff-browser">Browser access policy</label>
+          <select id="runtime-staff-browser" value={form.staff_browser_only ? 'staff' : 'standard'} onChange={(event) => {
+            const staff = event.target.value === 'staff';
+            if (staff && numbers.trim()) {
+              setNotice({ type: 'error', text: 'Remove assigned phone numbers before selecting staff browser-only mode.' });
+              return;
+            }
+            setForm({ ...form, staff_browser_only: staff,
+              knowledge_source_mode: staff ? form.knowledge_source_mode : 'knowledge_base',
+              ...(staff ? { voice_runtime: 'inworld_realtime' as const, knowledge_turn_mode: 'tool_loop' as const,
+                llm_provider: 'inworld' as const, llm_model: 'openai/gpt-4o-mini', diagnostic_recording_mode: 'off' as const } : {}),
+            });
+          }}>
+            <option value="standard">Standard workspace browser + separate phone activation</option>
+            <option value="staff">Staff browser only · owners and administrators</option>
+          </select>
+          <p className="form-hint">Staff mode requires a signed-in owner/admin, forbids phone activation and recording, and grants no MCP tools automatically. Private ERP data is not enabled by this setting.</p>
+        </div> : null}
+        {form.staff_browser_only ? <div className="form-group">
+          <label htmlFor="runtime-knowledge-source">Knowledge source</label>
+          <select id="runtime-knowledge-source" value={form.knowledge_source_mode} onChange={(event) => setForm({ ...form, knowledge_source_mode: event.target.value as RuntimeProfile['knowledge_source_mode'] })}>
+            <option value="knowledge_base">Approved knowledge base + optional MCP tools</option>
+            <option value="tools_only">MCP tools only · no knowledge base required</option>
+          </select>
+          <p className="form-hint">Only explicitly approved tools can answer. With no grants, the agent can test voice but cannot retrieve ERP data.</p>
+        </div> : null}
         {inworldRuntime ? (
           <div className="form-group">
             <label htmlFor="runtime-architecture">Voice architecture</label>
@@ -316,14 +348,14 @@ export default function RuntimeControlPanel({ agent, profile, onClose, onChange 
       </div>
 
       <div className={styles.readiness}>
-        <div><strong>Readiness gates</strong><span>{profile.blockers.length ? `${profile.blockers.length} action${profile.blockers.length === 1 ? '' : 's'} required` : 'All serving dependencies passed'}</span></div>
-        {profile.blockers.length ? <ul>{profile.blockers.map((blocker) => <li key={blocker}>{blocker}</li>)}</ul> : <CheckCircle2 size={20} />}
+        <div><strong>{profile.staff_browser_only ? 'Browser testing' : 'Phone readiness gates'}</strong></div>
+        {profile.staff_browser_only ? <p>Phone activation is intentionally disabled. Browser start checks Inworld, LiveKit worker, your current staff role, capacity and budget. An MCP-only agent does not require a knowledge base. Passing a browser test does not enable ERP permissions.</p> : profile.blockers.length ? <ul>{profile.blockers.map((blocker) => <li key={blocker}>{blocker}</li>)}</ul> : <CheckCircle2 size={20} />}
       </div>
 
       <footer className={styles.actions}>
         <button type="button" className="btn btn-secondary" disabled={Boolean(working)} onClick={() => void run('save')}>{working === 'save' ? <Loader2 className="spin" size={14} /> : <Save size={14} />} Save policy</button>
-        <button type="button" className="btn btn-secondary" disabled={Boolean(working)} onClick={() => void run('test')}>{working === 'test' ? <Loader2 className="spin" size={14} /> : <Phone size={14} />} {hasUnsavedChanges ? 'Save & test readiness' : 'Test readiness'}</button>
-        {profile.enabled ? (
+        {profile.staff_browser_only ? (!hasUnsavedChanges && <Link className="btn btn-primary" href={`/playground?agent=${agent.id}`}>Open browser test</Link>) : <button type="button" className="btn btn-secondary" disabled={Boolean(working)} onClick={() => void run('test')}>{working === 'test' ? <Loader2 className="spin" size={14} /> : <Phone size={14} />} {hasUnsavedChanges ? 'Save & test readiness' : 'Test readiness'}</button>}
+        {profile.staff_browser_only ? (profile.status !== 'inactive' && <button type="button" className="btn btn-danger" disabled={Boolean(working)} onClick={() => void run('deactivate')}><Power size={14} /> Disable browser access</button>) : profile.enabled ? (
           <button type="button" className="btn btn-danger" disabled={Boolean(working)} onClick={() => void run('deactivate')}><Power size={14} /> Deactivate</button>
         ) : (
           <button type="button" className="btn btn-primary" disabled={Boolean(working) || !profile.ready} onClick={() => void run('activate')}><Power size={14} /> Activate runtime</button>

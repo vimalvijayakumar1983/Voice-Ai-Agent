@@ -29,6 +29,8 @@ KnowledgeTurnMode = Literal["tool_loop", "single_pass_experimental"]
 
 
 class RuntimeProfileUpdate(BaseModel):
+    staff_browser_only: bool = False
+    knowledge_source_mode: Literal["knowledge_base", "tools_only"] = "knowledge_base"
     telephony_provider: Literal["twilio", "livekit_sip"] = "twilio"
     primary_speech_provider: Literal["sarvam", "elevenlabs", "inworld"] = "sarvam"
     fallback_speech_provider: Literal["smallest", "sarvam", "elevenlabs", "inworld"] | None = None
@@ -66,6 +68,19 @@ class RuntimeProfileUpdate(BaseModel):
 
     @model_validator(mode="after")
     def validate_llm_route(self):
+        if self.staff_browser_only and (
+            self.telephony_provider != "livekit_sip"
+            or self.primary_speech_provider != "inworld"
+            or self.voice_runtime != "inworld_realtime"
+            or self.knowledge_turn_mode != "tool_loop"
+            or self.assigned_numbers
+            or self.diagnostic_recording_mode != "off"
+        ):
+            raise ValueError(
+                "Staff browser mode requires Inworld tool loop, no phone numbers and recording off"
+            )
+        if self.knowledge_source_mode == "tools_only" and not self.staff_browser_only:
+            raise ValueError("MCP-only knowledge is restricted to staff browser mode")
         model = self.llm_model.strip()
         allowed = PRODUCTION_LLM_MODELS[self.llm_provider]
         if model not in allowed:
@@ -89,6 +104,8 @@ class RuntimeProfileUpdate(BaseModel):
 
 
 class RuntimeProfileResponse(BaseModel):
+    staff_browser_only: bool = False
+    knowledge_source_mode: Literal["knowledge_base", "tools_only"] = "knowledge_base"
     id: UUID | None = None
     agent_id: UUID
     enabled: bool

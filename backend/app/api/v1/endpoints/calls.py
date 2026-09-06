@@ -26,6 +26,7 @@ from app.schemas.call import (
     ProviderHistorySyncResponse,
 )
 from app.services.audit import record_audit_event
+from app.services.browser_access import STAFF_ROLES, require_call_access
 from app.services.call_metadata import agent_configuration_snapshot
 from app.services.campaign_lifecycle import TERMINAL_CALL_STATUSES
 from app.services.compliance_policy import (
@@ -227,6 +228,8 @@ async def list_calls(
     page_size: int = Query(50, ge=1, le=200),
 ):
     query = select(Call).where(Call.tenant_id == current_user.tenant_id)
+    if current_user.role not in STAFF_ROLES:
+        query = query.where(Call.call_metadata["staff_browser_only"].as_boolean().is_not(True))
 
     if agent_id:
         query = query.where(Call.agent_id == agent_id)
@@ -476,6 +479,7 @@ async def get_call(
     current_user: CurrentUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    await require_call_access(db, current_user, call_id)
     result = await db.execute(
         select(Call).where(Call.id == call_id, Call.tenant_id == current_user.tenant_id)
     )
@@ -1349,6 +1353,7 @@ async def get_call_transcript(
     current_user: CurrentUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    await require_call_access(db, current_user, call_id)
     result = await db.execute(
         select(CallTranscript).where(
             CallTranscript.call_id == call_id,
@@ -1382,6 +1387,7 @@ async def get_call_recording(
     db: AsyncSession = Depends(get_db),
 ):
     """Return bounded audio without revealing the provider's recording URL."""
+    await require_call_access(db, current_user, call_id)
     result = await db.execute(
         select(Call).where(Call.id == call_id, Call.tenant_id == current_user.tenant_id)
     )
@@ -1468,6 +1474,7 @@ async def get_call_summary(
     current_user: CurrentUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    await require_call_access(db, current_user, call_id)
     result = await db.execute(
         select(CallSummary).where(
             CallSummary.call_id == call_id,
@@ -1487,6 +1494,7 @@ async def reanalyze_call(
     db: AsyncSession = Depends(get_db),
 ):
     """Queue safe post-call outcome analysis for one tenant-owned call."""
+    await require_call_access(db, current_user, call_id)
     call = await db.scalar(
         select(Call).where(
             Call.id == call_id,
