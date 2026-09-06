@@ -748,7 +748,7 @@ export interface Integration {
   is_active: boolean;
 }
 
-export type IntegrationType = 'webhook' | 'his_api' | 'vav_crm' | 'google_sheets';
+export type IntegrationType = 'webhook' | 'his_api' | 'vav_crm' | 'google_sheets' | 'mcp';
 
 export interface IntegrationCreateRequest {
   name: string;
@@ -1995,6 +1995,14 @@ class ApiClient {
   }
 
   // Integrations
+  async testMcpConnection(id: string) {
+    return this.request<Integration>(`/api/v1/integrations/${id}/mcp/test`, { method: 'POST' });
+  }
+
+  async listMcpAgents() {
+    return this.request<Array<{ id: string; name: string; eligible: boolean; reason: string }>>('/api/v1/integrations/mcp/agents');
+  }
+
   async listIntegrations() {
     return this.request<Integration[]>('/api/v1/integrations');
   }

@@ -509,6 +509,23 @@ def public_integration_config(
                 capabilities.append(capability)
         public_config["capabilities"] = capabilities
 
+    elif normalized_type == "mcp":
+        if full_config.get("url"):
+            public_config["url"] = PUBLIC_URL_REDACTION_PLACEHOLDER
+            secret_paths.append("url")
+        for key in (
+            "auth_type",
+            "timeout_seconds",
+            "company_label",
+            "allowed_tools",
+            "agent_ids",
+            "public_data_approved",
+            "tools",
+            "last_test",
+        ):
+            if key in full_config:
+                public_config[key] = copy.deepcopy(full_config[key])
+
     elif normalized_type == "google_sheets":
         sheet_name = full_config.get("sheet_name")
         if isinstance(sheet_name, str) and sheet_name:
