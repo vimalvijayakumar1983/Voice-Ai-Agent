@@ -73,3 +73,67 @@ with the earlier LiveKit user-state transition used by the call dashboard.
 Production endpointing remains unchanged. Lower-level provider tuning or a
 separately evaluated recognition path is needed; blindly raising eagerness is
 not a safe fix. Reference: https://dev.docs.inworld.ai/realtime/usage/using-realtime-models
+
+## Initial production integration checks
+
+QA agent only, same nine synthetic questions and identical cached PCM hashes.
+Ten response samples per call because the goodbye fixture finalized in two parts.
+The baseline was rerun because the previous API deployment had cleared its
+ephemeral synthetic-fixture cache; do not claim byte identity with older reports.
+
+| Call | First reply request to server audio ms | First response total ms | Greeting ms | P50 / P95 ms |
+| --- | ---: | ---: | ---: | --- |
+| Baseline 7481b9c2-c8d0-5a9a-a4f4-0ffe6a8d6154 | 729 | 2504 | 450 | 870 / 2504 |
+| Initial ac53c417-ee08-536a-914e-f73330818957 | 332 | 2178 | 610 | 968 / 2973 |
+| Repeat bde408df-e05a-5310-8a0e-fa781a1f0f6d | 351 | 2225 | 632 | 869 / 2225 |
+
+Both candidates confirmed transport preconnect completed with zero text sent.
+They retained chairman/year answers, interrupted phone lookup, slow digits,
+paused question handling, company correction, unsupported-revenue refusal and
+goodbye. Both retained the same seven answered / one unresolved ledger counters
+as the baseline; this patch does not claim all conversation-quality issues solved.
+No live customer calls, PSTN dialing, bookings or production recording were used.
+
+The transport boundary improved consistently, but the overall P50/P95 did not
+show a consistent improvement. Final-transcript waits and semantic recovery
+still dominate slow turns. The initial candidates also had slower greetings;
+the final scheduling adjustment starts preconnect only after the first greeting
+audio frame, avoiding startup competition. That adjustment is checked separately
+below. Do not silently drop the initial results or treat this sample as an SLA.
+
+## Final production validation
+
+Runtime `01f36cb`; deployment `17cfc7fd-f408-4e3e-970f-052b49db3e3d` SUCCESS.
+Worker and preconnect module SHA-256 matched the committed archive before replay.
+Final call `0a548e98-db4c-57f9-9aeb-597d735e63a4`, completed, 100 seconds,
+ten response samples. Same cached PCM hashes as the baseline and initial trials.
+
+| Server-side metric | Fresh baseline | Final |
+| --- | ---: | ---: |
+| First reply request to server audio ms | 729 | 349 |
+| First response total ms | 2504 | 2261 |
+| Greeting ms | 450 | 580 |
+| P50 ms | 870 | 959 |
+| P90 ms | 2012 | 2134 |
+| P95 ms | 2504 | 2261 |
+
+The target transport interval improved by 52%, while median and greeting latency
+did not improve in this sample. These are server observation points, not a
+browser mouth-to-ear measurement. Sub-600ms overall latency has NOT been achieved.
+The first response still includes 1685 ms before final transcription and 224 ms
+of controller retrieval/preparation, followed by 349 ms to server audio. The
+leadership final transcript waited 1666 ms. Unsupported revenue was safely refused
+but still used 1193 ms of retrieval/recovery. No recovery timeout occurred in this
+final replay; the timeout mechanism itself was not changed by this patch.
+
+Preconnect completed in 511 ms during greeting/first-question time and sent zero
+text. All tested answer, correction, paused-name, interrupted-number, slow-repeat
+and farewell behaviors were preserved. Request counters remain seven answered /
+one unresolved, matching baseline; no claim that the entire product is error-free.
+
+Final-code validation: 1520 passed, 31 skipped. Ruff check and formatting passed
+for app/tests/migrations, 246 files. Only synthetic audio was received; recordings
+remain disabled, so subjective listening quality and production SIP were not
+audited. Existing knowledge, voice/model/rate, endpointing, and repair rules remain
+unchanged. Next work is the provider finalization delay and the meaning-preserving
+recovery path, not more broad exact-fact retrieval optimization.
