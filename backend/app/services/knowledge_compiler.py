@@ -28,7 +28,9 @@ _MODEL_PRICES_PER_MILLION = {
 _PRICING_SNAPSHOT_DATE = "2026-09-03"
 _AED_PER_USD = 3.6725
 _PHONE_RE = re.compile(r"(?<!\w)(?:\+?\d[\d\s().-]{6,}\d)(?!\w)")
-_EMAIL_RE = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.I)
+# Do not restart the greedy local-part scan at every position inside a long
+# unbroken token (common in extracted/OCR text). That makes a no-match quadratic.
+_EMAIL_RE = re.compile(r"(?<![A-Z0-9._%+-])[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.I)
 _SPACE_RE = re.compile(r"\s+")
 _GROUNDING_SEPARATOR_RE = re.compile(r"[^\w]+", re.UNICODE)
 _PARAGRAPH_RE = re.compile(r"\n\s*\n+")
@@ -590,7 +592,14 @@ async def _compile_complete_source(**kwargs) -> tuple[dict, int, int]:
     text = kwargs["text"]
     if len(text) <= 120_000:
         return await _compile_ai(**kwargs)
-    segments = [text[start : start + 110_000] for start in range(0, len(text), 108_500)]
+    segments = []
+    start = 0
+    while start < len(text):
+        end = min(start + 110_000, len(text))
+        segments.append(text[start:end])
+        if end == len(text):
+            break
+        start = end - 1_500
     semaphore = asyncio.Semaphore(3)
 
     async def compile_segment(segment: str):

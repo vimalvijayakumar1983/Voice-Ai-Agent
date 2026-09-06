@@ -21,6 +21,11 @@ latency settings, agent scope, or approved live knowledge is changed by this rel
 - Both uploaded paths use the configured tenant OpenAI credential, with the existing
   platform fallback policy. AI work runs before taking the KB publication lock;
   mutation preconditions are rechecked afterwards.
+- All three synchronous AI routes share a production Redis-backed limit of six
+  compilations per tenant per minute, independent of route or caller IP. The
+  limiter fails closed if unavailable. Deterministic Fast mode and successful
+  no-op reuse do not consume AI admission. Read transactions are released before
+  inference so slow provider calls do not occupy database connections.
 
 The shared mode selector is available for website, PDF, and text:
 
@@ -37,7 +42,9 @@ AI does not prove semantic correctness or exhaustive coverage: review remains ne
 
 Large extracted documents are passed through bounded, overlapping AI segments
 rather than truncating the input after 120,000 characters. All original text is
-retained. Returned facts are still not an exhaustive inventory, and missing facts
+retained. Segmentation stops when the previous segment covers the source end;
+overlap alone cannot create a redundant trailing AI request. Returned facts are
+still not an exhaustive inventory, and missing facts
 must not be treated as authoritative proof that information does not exist.
 
 ## Existing sources and review

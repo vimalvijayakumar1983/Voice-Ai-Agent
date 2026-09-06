@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
+from fastapi import HTTPException
 from sqlalchemy import select, update
 
 from app.api.v1.endpoints import knowledge as endpoint
@@ -430,3 +431,116 @@ async def test_pdf_compiler_failure_precedes_remote_upload(
     assert response.status_code == 422
     current = await client.get(f"/api/v1/knowledge/{kb.id}", headers=auth_headers)
     assert current.json()["source_count"] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "length,expected", [(120_001, 2), (217_001, 2), (218_500, 2), (325_501, 3)]
+)
+async def test_segment_overlap_never_creates_an_already_covered_tail(monkeypatch, length, expected):
+    segments = []
+
+    async def compile_segment(**kwargs):
+        segments.append(kwargs["text"])
+        return compiler._deterministic_structure(title="Large", url="", text=kwargs["text"]), 1, 1
+
+    monkeypatch.setattr(compiler, "_compile_ai", compile_segment)
+    source = "x" * (length - 4) + "TAIL"
+    await compiler._compile_complete_source(
+        title="Large", url="", text=source, api_key="fake", model="fake", client=None
+    )
+    assert len(segments) == expected
+    assert segments[-1].endswith("TAIL")
+    assert all(len(segment) > 1_500 for segment in segments)
+    reconstructed = segments[0] + "".join(segment[1_500:] for segment in segments[1:])
+    assert reconstructed == source
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["text", "pdf", "compile"])
+async def test_all_ai_ingestion_routes_share_tenant_limit_before_inference(
+    client,
+    auth_headers,
+    tenant,
+    db,
+    monkeypatch,
+    fake_ai,
+    route,
+):
+    kb = await create_kb(db, tenant)
+    source = KnowledgeSource(
+        tenant_id=tenant.id,
+        knowledge_base_id=kb.id,
+        source_type="text",
+        name="Legacy",
+        content=RAW,
+        status="indexed",
+    )
+    db.add(source)
+    await db.commit()
+    limits = []
+
+    async def deny(request, **kwargs):
+        limits.append(kwargs)
+        raise HTTPException(status_code=429, detail="Compilation rate exceeded")
+
+    monkeypatch.setattr(endpoint, "enforce_rate_limit", deny)
+    monkeypatch.setattr(
+        endpoint,
+        "prepare_pdf",
+        lambda *args, **kwargs: PreparedPdf(
+            provider_content=b"%PDF-searchable",
+            extracted_text=RAW,
+            extraction_method="native",
+            page_count=1,
+            sha256="a" * 64,
+            ocr_page_count=0,
+        ),
+    )
+    root = f"/api/v1/knowledge/{kb.id}/sources"
+    if route == "pdf":
+        response = await client.post(
+            f"{root}/pdf",
+            headers=auth_headers,
+            files={"media": ("clinic.pdf", b"%PDF-original", "application/pdf")},
+        )
+    elif route == "text":
+        response = await client.post(
+            f"{root}/text", headers=auth_headers, json={"name": "New FAQ", "content": RAW}
+        )
+    else:
+        response = await client.post(f"{root}/{source.id}/compile", headers=auth_headers, json={})
+    assert response.status_code == 429
+    assert fake_ai.requests == []
+    assert len(limits) == 1
+    assert limits[0]["scope"] == "knowledge-source-compile"
+    assert limits[0]["subject"] == str(tenant.id)
+    assert limits[0]["bind_to_client"] is False
+    assert limits[0]["limit"] == 6
+    assert limits[0]["window_seconds"] == 60
+
+
+@pytest.mark.asyncio
+async def test_inference_does_not_hold_a_database_transaction(
+    client, auth_headers, tenant, db, monkeypatch
+):
+    kb = await create_kb(db, tenant)
+    original = endpoint._compile_uploaded_content
+
+    async def inspect_compile(session, *args, **kwargs):
+        async def check(**compile_kwargs):
+            assert not session.in_transaction()
+            return await compiler.compile_source_knowledge(
+                **{**compile_kwargs, "requested_mode": "fast"}
+            )
+
+        monkeypatch.setattr(endpoint, "compile_source_knowledge", check)
+        return await original(session, *args, **kwargs)
+
+    monkeypatch.setattr(endpoint, "_compile_uploaded_content", inspect_compile)
+    response = await client.post(
+        f"/api/v1/knowledge/{kb.id}/sources/text",
+        headers=auth_headers,
+        json={"name": "FAQ", "content": RAW, "processing_mode": "fast"},
+    )
+    assert response.status_code == 200, response.text

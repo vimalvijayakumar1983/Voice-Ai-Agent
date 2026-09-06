@@ -106,6 +106,7 @@ async def _compile_uploaded_content(
     db: AsyncSession,
     tenant_id: UUID,
     *,
+    request: Request,
     name: str,
     text: str,
     processing_mode: KnowledgeProcessingMode,
@@ -113,6 +114,18 @@ async def _compile_uploaded_content(
     """Compile before publication locks or remote uploads; failures leave drafts intact."""
     api_key = None
     if processing_mode != "fast":
+        # One tenant-wide budget across text, PDF and in-place compilation;
+        # changing routes or client addresses cannot multiply the allowance.
+        await enforce_rate_limit(
+            request,
+            scope="knowledge-source-compile",
+            limit=6,
+            window_seconds=60,
+            subject=str(tenant_id),
+            bind_to_client=False,
+            limit_detail="Too many knowledge compilations. Please retry in a minute.",
+            unavailable_detail="Knowledge compilation is temporarily unavailable. Retry shortly.",
+        )
         try:
             config = await load_provider_config(db, tenant_id, "openai")
         except ProviderCredentialError as exc:
@@ -122,6 +135,9 @@ async def _compile_uploaded_content(
                 ) from exc
             config = None
         api_key = str((config or {}).get("api_key") or settings.openai_api_key).strip() or None
+    # These routes have performed only reads so far. Release their connection
+    # before slow provider inference; publication reacquires and rechecks later.
+    await db.rollback()
     try:
         return await compile_source_knowledge(
             title=name,
@@ -1408,6 +1424,7 @@ async def add_url_sources(
 async def add_text_source(
     kb_id: UUID,
     data: TextSourceCreate,
+    request: Request,
     current_user: CurrentUser = Depends(require_role("owner", "admin", "member")),
     db: AsyncSession = Depends(get_db),
 ):
@@ -1440,6 +1457,7 @@ async def add_text_source(
     compiled = await _compile_uploaded_content(
         db,
         current_user.tenant_id,
+        request=request,
         name=data.name,
         text=data.content,
         processing_mode=data.processing_mode,
@@ -1531,6 +1549,7 @@ async def compile_existing_uploaded_source(
     kb_id: UUID,
     source_id: UUID,
     data: KnowledgeSourceCompileRequest,
+    request: Request,
     current_user: CurrentUser = Depends(require_role("owner", "admin", "member")),
     db: AsyncSession = Depends(get_db),
 ):
@@ -1569,6 +1588,7 @@ async def compile_existing_uploaded_source(
     compiled = await _compile_uploaded_content(
         db,
         current_user.tenant_id,
+        request=request,
         name=source_name,
         text=raw_text,
         processing_mode=data.processing_mode,
@@ -1695,6 +1715,7 @@ async def repair_website_source(
 @router.post("/{kb_id}/sources/pdf", response_model=KnowledgeBaseResponse)
 async def upload_pdf_source(
     kb_id: UUID,
+    request: Request,
     media: UploadFile = File(...),
     processing_mode: KnowledgeProcessingMode = Form("automatic"),
     current_user: CurrentUser = Depends(require_role("owner", "admin", "member")),
@@ -1726,6 +1747,7 @@ async def upload_pdf_source(
     compiled = await _compile_uploaded_content(
         db,
         current_user.tenant_id,
+        request=request,
         name=filename,
         text=prepared.extracted_text,
         processing_mode=processing_mode,
