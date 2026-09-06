@@ -1282,6 +1282,7 @@ class _LiveKitRuntimeTelemetry:
     last_user_speech_end_at: float | None = None
     last_final_transcript_at: float | None = None
     first_agent_audio_seen: bool = False
+    single_pass_reply_requested_at: dict[int, float] = field(default_factory=dict)
     barge_in_active: bool = False
     pending_barge_in_transcript: bool = False
     user_speech_started_at: float | None = None
@@ -1462,6 +1463,40 @@ class _LiveKitRuntimeTelemetry:
                 "single_pass_sequence": max(0, int(sequence)),
             }
         )
+
+    def record_single_pass_stage(self, sequence: int, stage: str, elapsed_ms: float) -> None:
+        """Content-free offsets from controller scheduling, not physical speech end."""
+        if stage not in {
+            "task_started",
+            "retrieval_started",
+            "retrieval_completed",
+            "speech_gate_released",
+            "reply_requested",
+            "reply_dispatched",
+        } or not 0 <= elapsed_ms < float("inf"):
+            return
+        trace = (
+            self.current_turn_trace
+            if self.current_turn_trace is not None
+            and self.current_turn_trace.get("single_pass_sequence") == sequence
+            else next(
+                (
+                    item
+                    for item in reversed(self.turn_diagnostics)
+                    if item.get("single_pass_sequence") == sequence
+                ),
+                None,
+            )
+        )
+        if trace is None:
+            return
+        trace[f"single_pass_{stage}_offset_ms"] = round(elapsed_ms, 3)
+        if stage == "reply_requested":
+            self.single_pass_reply_requested_at[sequence] = time.monotonic()
+            if len(self.single_pass_reply_requested_at) > 256:
+                self.single_pass_reply_requested_at.pop(
+                    next(iter(self.single_pass_reply_requested_at))
+                )
 
     def record_single_pass_timing(self, timing: SinglePassTurnTiming) -> None:
         """Record deterministic retrieval/generation stages without transcript text."""
@@ -1767,6 +1802,13 @@ class _LiveKitRuntimeTelemetry:
                     (now - self.participant_active_at) * 1000
                 )
 
+        if capture_end_to_end and self.current_turn_trace is not None:
+            sequence = self.current_turn_trace.get("single_pass_sequence")
+            requested_at = self.single_pass_reply_requested_at.pop(sequence, None)
+            if requested_at is not None:
+                self.current_turn_trace["single_pass_reply_request_to_server_speaking_ms"] = round(
+                    max(0.0, (now - requested_at) * 1000), 3
+                )
         if self.last_final_transcript_at is not None:
             transcript_latency = round((now - self.last_final_transcript_at) * 1000)
             self.runtime_metrics["last_transcript_to_first_audio_ms"] = transcript_latency
@@ -2197,6 +2239,7 @@ class VAVInworldAgent(Agent):
         self._spoken_response_sequence = 0
         self._last_committed_response_sequence = 0
         self._spoken_answers: dict[tuple[str, ExactFactType], str] = {}
+        self._spoken_answer_queries: dict[tuple[str, ExactFactType], str] = {}
         self._last_spoken_answer: tuple[str, str] | None = None
         self._semantic_repairs: dict[tuple[str, str, str], Any] = {}
         self._semantic_attempts: dict[tuple[str, str, str], int] = {}
@@ -3155,23 +3198,75 @@ Knowledge policy:
                     "in this call."
                 )
             natural_repeat = spoken_control(text)
-            if (
-                natural_repeat
-                and self._last_spoken_answer
-                and self._last_spoken_answer[0] == state.company
-            ):
-                if natural_repeat == "repeat_slow" and "number" in normalized:
-                    phone_answer = self._spoken_answers.get((state.company, ExactFactType.PHONE))
-                    if phone_answer:
-                        spoken = re.sub(
-                            r"\+\d[\d ()-]{6,}\d",
-                            lambda m: "plus " + ", ".join(c for c in m[0] if c.isdigit()),
-                            phone_answer,
+            if natural_repeat:
+                requested_types = classify_exact_fact_intents(text)
+                # A bare "number" needs a known phone topic; it must not select
+                # a phone merely because an earlier list happened to contain one.
+                if not requested_types and "number" in normalized.split():
+                    if state.requested_detail == "phone":
+                        requested_types = (ExactFactType.PHONE,)
+                    else:
+                        return scope_reply("Which number would you like me to check?")
+                if requested_types:
+                    if not state.company or state.pending_companies:
+                        return scope_reply("Which company should I check that detail for?")
+                    remembered = [
+                        self._spoken_answers.get((state.company, kind)) for kind in requested_types
+                    ]
+                    prior = state.pending_query or state.topic_query
+                    prior_is_typed = bool(
+                        prior and classify_exact_fact_intents(prior) == requested_types
+                    )
+                    matches_request = not prior_is_typed or all(
+                        self._spoken_answer_queries.get((state.company, kind))
+                        == company_key(routing_text(prior))
+                        for kind in requested_types
+                    )
+                    if all(remembered) and matches_request:
+                        content = " ".join(dict.fromkeys(remembered))
+                        if (
+                            ExactFactType.PHONE in requested_types
+                            and natural_repeat == "repeat_slow"
+                        ):
+                            content = re.sub(
+                                r"\+\d[\d ()-]{6,}\d",
+                                lambda m: "plus " + ", ".join(c for c in m[0] if c.isdigit()),
+                                content,
+                            )
+                            return repeat_spoken(content, slow=False)
+                        return repeat_spoken(content, slow=natural_repeat == "repeat_slow")
+                    # A failed or absent typed answer is never replaced with an
+                    # unrelated last-spoken response. Re-fetch the same request,
+                    # preserving branch/person qualifiers when its type matches.
+                    if prior_is_typed:
+                        lookup = prior
+                    else:
+                        labels = {
+                            ExactFactType.PHONE: "phone number",
+                            ExactFactType.ADDRESS: "address",
+                            ExactFactType.HOURS: "opening hours",
+                            ExactFactType.FOUNDING: "founding year",
+                        }
+                        if any(kind not in labels for kind in requested_types):
+                            return scope_reply("Which specific detail would you like me to repeat?")
+                        lookup = (
+                            "What is the "
+                            + " and ".join(labels[kind] for kind in requested_types)
+                            + "?"
                         )
-                        return repeat_spoken(spoken, slow=False)
-                return repeat_spoken(
-                    self._last_spoken_answer[1], slow=natural_repeat == "repeat_slow"
-                )
+                    state.topic_query = lookup
+                    state.requested_detail = (
+                        requested_types[0].value if len(requested_types) == 1 else "other"
+                    )
+                    self._collection_playback = None
+                    self._collection_cursor = None
+                    return await self._retrieve_approved_knowledge(
+                        query=lookup, allow_semantic_repair=False
+                    )
+                if self._last_spoken_answer and self._last_spoken_answer[0] == state.company:
+                    return repeat_spoken(
+                        self._last_spoken_answer[1], slow=natural_repeat == "repeat_slow"
+                    )
             text = positive_correction(text, self._company_scope)
             text = canonical_company_text(text, self._company_scope)
         if self._person_company_directory is None and (
@@ -3743,6 +3838,7 @@ Knowledge policy:
             self._last_spoken_answer = (subject, content)
             for intent in intents:
                 self._spoken_answers[(subject, intent)] = content
+                self._spoken_answer_queries[(subject, intent)] = company_key(routing_text(query))
 
         return remember
 
@@ -5944,6 +6040,7 @@ async def vav_inworld_session(ctx: JobContext) -> None:
                 session=session,
                 retrieve_evidence=runtime_agent.retrieve_single_pass_evidence,
                 record_timing=telemetry.record_single_pass_timing,
+                record_stage=telemetry.record_single_pass_stage,
                 record_error=_record_single_pass_error,
                 prepare_spoken_response=runtime_agent.prepare_spoken_response,
                 recover_untranscribed_speech=runtime_agent._foundation_enabled,

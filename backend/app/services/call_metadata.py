@@ -329,6 +329,14 @@ def public_call_metadata(value: Any) -> dict[str, Any] | None:
                 "single_pass_generation_dispatch_ms",
                 "single_pass_generation_ms",
                 "single_pass_total_ms",
+                "single_pass_task_started_offset_ms",
+                "single_pass_retrieval_started_offset_ms",
+                "single_pass_retrieval_completed_offset_ms",
+                "single_pass_speech_gate_released_offset_ms",
+                "single_pass_reply_requested_offset_ms",
+                "single_pass_reply_dispatched_offset_ms",
+                "single_pass_reply_request_to_server_speaking_ms",
+                "knowledge_entity_resolution_ms",
             }
             for trace in turn_diagnostics[-50:]:
                 if not isinstance(trace, dict):

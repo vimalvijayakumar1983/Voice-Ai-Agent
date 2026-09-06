@@ -128,6 +128,7 @@ class _ManualReplySession(Protocol):
 
 EvidenceRetriever = Callable[[str], Awaitable[str | None]]
 TimingRecorder = Callable[[SinglePassTurnTiming], None]
+StageRecorder = Callable[[int, str, float], None]
 ErrorRecorder = Callable[[BaseException], None]
 
 
@@ -501,10 +502,12 @@ class InworldSinglePassController:
         fragment_wait_seconds: float = 1.4,
         record_fragment_event: Callable[[str], None] | None = None,
         recover_untranscribed_speech: bool = False,
+        record_stage: StageRecorder | None = None,
     ) -> None:
         self._session = session
         self._retrieve_evidence = retrieve_evidence
         self._record_timing = record_timing
+        self._record_stage = record_stage
         self._record_error = record_error
         self._clock = clock
         self._prepare_spoken_response = prepare_spoken_response
@@ -553,6 +556,14 @@ class InworldSinglePassController:
                 self._record_fragment_event(event)
             except Exception:
                 logger.exception("fragment_event_recorder_failed")
+
+    def _stage(self, sequence: int, name: str, started_at: float) -> None:
+        if self._record_stage is not None:
+            try:
+                self._record_stage(sequence, name, max(0.0, (self._clock() - started_at) * 1000))
+            except Exception:
+                # Diagnostics must never fail or delay a caller response.
+                logger.exception("single_pass_stage_recorder_failed")
 
     def _consume_interrupt(self, result: Any) -> None:
         if result is None:
@@ -691,7 +702,7 @@ class InworldSinglePassController:
         task = asyncio.create_task(
             self._wait_for_fragment(sequence, transcript)
             if incomplete
-            else self._run_turn(sequence=sequence, transcript=transcript),
+            else self._run_turn(sequence=sequence, transcript=transcript, queued_at=self._clock()),
             name=f"inworld-single-pass-{sequence}",
         )
         self._turn_task = task
@@ -736,9 +747,16 @@ class InworldSinglePassController:
         )
 
     async def _run_turn(
-        self, *, sequence: int, transcript: str, evidence_override: str | None = None
+        self,
+        *,
+        sequence: int,
+        transcript: str,
+        evidence_override: str | None = None,
+        queued_at: float | None = None,
     ) -> None:
         started_at = self._clock()
+        stage_origin = started_at if queued_at is None else queued_at
+        self._stage(sequence, "task_started", stage_origin)
         retrieval_started_at: float | None = None
         generation_started_at: float | None = None
         retrieval_ms = 0.0
@@ -763,12 +781,14 @@ class InworldSinglePassController:
                     # pagination conservatively resumes at the last known item.
                     pass
             retrieval_started_at = self._clock()
+            self._stage(sequence, "retrieval_started", stage_origin)
             evidence = (
                 evidence_override
                 if evidence_override is not None
                 else await self._retrieve_evidence(transcript)
             )
             retrieval_ms = max(0.0, (self._clock() - retrieval_started_at) * 1000)
+            self._stage(sequence, "retrieval_completed", stage_origin)
             if evidence is not None and not isinstance(evidence, str):
                 raise TypeError("approved evidence retriever must return text or None")
             evidence_chars = len(evidence or "")
@@ -819,10 +839,12 @@ class InworldSinglePassController:
                 outcome = SinglePassTurnOutcome.STALE
                 return
 
+            self._stage(sequence, "speech_gate_released", stage_origin)
             generation_started_at = self._clock()
             if self._prepare_spoken_response:
                 remember_spoken = self._prepare_spoken_response(transcript, evidence)
             deterministic_reply = deterministic_grounded_reply(evidence, query=transcript)
+            self._stage(sequence, "reply_requested", stage_origin)
             if deterministic_reply is not None:
                 handle = self._session.say(
                     deterministic_reply,
@@ -841,6 +863,7 @@ class InworldSinglePassController:
                 0.0,
                 (self._clock() - generation_started_at) * 1000,
             )
+            self._stage(sequence, "reply_dispatched", stage_origin)
             if remember_spoken is not None:
 
                 def commit_spoken(completed_handle: Any) -> None:

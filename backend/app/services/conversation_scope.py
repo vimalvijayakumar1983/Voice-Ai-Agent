@@ -16,6 +16,22 @@ def routing_text(value: str) -> str:
     value = re.sub(r"\b(?:uh|um|erm)\b[,\s]*", "", value, flags=re.I)
     value = re.sub(r"^(?:(?:sorry|okay|ok|well|so|please)[,\s]+)+", "", value, flags=re.I)
     value = re.sub(r"^and\s+(?=(?:who|what|how|where|when)\b)", "", value, flags=re.I)
+    # Separate playback/presentation framing from the substantive request.
+    # Never remove these words inside names, filters, negations or actions
+    # (e.g. 'Just Medical Centre', 'just outside Dubai', 'stop calling me').
+    value = re.sub(
+        r"^stop[.!,;:—\s-]+(?=(?:(?:please|just|only)\s+)*"
+        r"(?:give|tell|show|list|what|who|where|when|how)\b)",
+        "",
+        value,
+        flags=re.I,
+    )
+    value = re.sub(
+        r"^(?:(?:please|just|only)\s+)+(?=(?:give|tell|show|list)\b)",
+        "",
+        value,
+        flags=re.I,
+    )
     value = re.sub(
         r"^(?:i (?:want|wanted|would like) to (?:know|get)|i'd like to know)\s+",
         "",
