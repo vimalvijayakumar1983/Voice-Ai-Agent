@@ -2486,6 +2486,7 @@ async def test_pasted_text_can_be_approved_bound_and_retrieved_by_inworld(
         headers=auth_headers,
         json={
             "name": "Approved clinic FAQ",
+            "processing_mode": "fast",
             "content": "PRP consultations are available after a doctor completes an assessment.",
         },
     )
@@ -2552,7 +2553,11 @@ async def test_native_agent_can_bind_last_live_release_while_new_draft_is_pendin
     first = await client.post(
         f"/api/v1/knowledge/{knowledge.id}/sources/text",
         headers=auth_headers,
-        json={"name": "Published FAQ", "content": "The published answer is blue."},
+        json={
+            "name": "Published FAQ",
+            "content": "The published answer is blue.",
+            "processing_mode": "fast",
+        },
     )
     assert first.status_code == 200
     approved = await client.post(
@@ -2612,7 +2617,11 @@ async def test_explicit_unapproval_increments_revocation_generation_once_for_liv
     added = await client.post(
         f"/api/v1/knowledge/{knowledge_id}/sources/text",
         headers=auth_headers,
-        json={"name": "Published FAQ", "content": "The approved answer is blue."},
+        json={
+            "name": "Published FAQ",
+            "content": "The approved answer is blue.",
+            "processing_mode": "fast",
+        },
     )
     assert added.status_code == 200
     approved = await client.post(

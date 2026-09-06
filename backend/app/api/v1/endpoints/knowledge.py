@@ -164,6 +164,46 @@ def _apply_uploaded_compilation(
         "compiler": compiled.structured.get("compiler") or {},
         "processing_mode": (compiled.structured.get("compiler") or {}).get("requested_mode"),
     }
+    if source.source_metadata.get("upload_compile"):
+        source.source_metadata = {
+            **source.source_metadata,
+            "upload_compile": {**source.source_metadata["upload_compile"], "status": "completed"},
+        }
+
+
+async def _stage_background_compilation(db, kb, source, *, raw_text, mode, actor, request):
+    from app.tasks.knowledge_compile_tasks import job_for, queue_source
+
+    if job_for(source).get("status") in {"queued", "processing"}:
+        return _knowledge_response(kb)
+    await enforce_rate_limit(
+        request,
+        scope="knowledge-source-compile",
+        limit=6,
+        window_seconds=60,
+        subject=str(actor.tenant_id),
+        bind_to_client=False,
+        limit_detail="Too many knowledge compilations. Please retry in a minute.",
+        unavailable_detail="Knowledge compilation is temporarily unavailable. Retry shortly.",
+    )
+    source.raw_content = raw_text
+    queue_source(source, actor_id=actor.id, mode=mode)
+    invalidate_knowledge_approval(kb)
+    _recount(kb)
+    await db.flush()
+    await record_audit_event(
+        db,
+        tenant_id=actor.tenant_id,
+        actor_user_id=actor.id,
+        action="knowledge_source.compilation_queued",
+        resource_type="knowledge_source",
+        resource_id=str(source.id),
+        details={"processing_mode": mode},
+    )
+    # The source row is the durable outbox. Beat dispatches it; no provider or
+    # broker I/O can make this HTTP request wait for AI or lose the original.
+    await db.commit()
+    return _knowledge_response(kb)
 
 
 async def _tenant_smallest_client(db: AsyncSession, tenant_id: UUID) -> SmallestAIClient:
@@ -553,6 +593,11 @@ def _recount(kb: KnowledgeBase) -> None:
     # is immediately searchable by VAV-native runtimes. Promote them lazily so an
     # existing workspace is repaired the next time it is governed or refreshed.
     for source in kb.sources:
+        compilation_status = (
+            (getattr(source, "source_metadata", None) or {}).get("upload_compile") or {}
+        ).get("status")
+        if compilation_status in {"queued", "processing", "failed"}:
+            source.status = "failed" if compilation_status == "failed" else "processing"
         if (
             source.source_type == "text"
             and source.status == "local_only"
@@ -729,6 +774,14 @@ def _reconcile_provider_sources(
 
     for source in kb.sources:
         item = None
+        if ((getattr(source, "source_metadata", None) or {}).get("upload_compile") or {}).get(
+            "status"
+        ) in {
+            "queued",
+            "processing",
+            "failed",
+        }:
+            continue  # Provider indexing cannot mark an unfinished AI draft ready.
         if source.provider_item_id:
             item = items_by_id.get(source.provider_item_id)
         if item is None and source.location:
@@ -1428,7 +1481,7 @@ async def add_text_source(
     current_user: CurrentUser = Depends(require_role("owner", "admin", "member")),
     db: AsyncSession = Depends(get_db),
 ):
-    kb = await _get_knowledge_base(db, current_user.tenant_id, kb_id, for_update=False)
+    kb = await _get_knowledge_base(db, current_user.tenant_id, kb_id)
     _ensure_bound_agents_accept_knowledge_change(kb)
     smallest_bindings = [
         binding.agent.name
@@ -1447,6 +1500,7 @@ async def add_text_source(
         metadata = (existing.structured_content or {}).get("compiler") or {}
         if (
             existing.source_type == "text"
+            and existing.status == "indexed"
             and existing.name.casefold() == data.name.casefold()
             and existing.raw_content == data.content
             and metadata.get("version") == COMPILER_VERSION
@@ -1454,6 +1508,40 @@ async def add_text_source(
             and not metadata.get("warning")
         ):
             return _knowledge_response(kb)
+    from app.tasks.knowledge_compile_tasks import job_for
+
+    existing = next(
+        (
+            s
+            for s in kb.sources
+            if s.source_type == "text"
+            and s.name.casefold() == data.name.casefold()
+            and (s.raw_content or s.content) == data.content
+        ),
+        None,
+    )
+    if existing is not None and job_for(existing).get("status") in {"queued", "processing"}:
+        return _knowledge_response(kb)
+    if data.processing_mode != "fast":
+        if existing is None:
+            existing = KnowledgeSource(
+                tenant_id=current_user.tenant_id,
+                source_type="text",
+                name=data.name,
+                size_bytes=len(data.content.encode()),
+                status="pending",
+                source_metadata={"retrieval_content_source": "vav_text"},
+            )
+            kb.sources.append(existing)
+        return await _stage_background_compilation(
+            db,
+            kb,
+            existing,
+            raw_text=data.content,
+            mode=data.processing_mode,
+            actor=current_user,
+            request=request,
+        )
     compiled = await _compile_uploaded_content(
         db,
         current_user.tenant_id,
@@ -1558,7 +1646,7 @@ async def compile_existing_uploaded_source(
     Provider artifacts retain the original extracted information. This operation
     structures VAV's retrieval representation and does not mutate remote files.
     """
-    kb = await _get_knowledge_base(db, current_user.tenant_id, kb_id, for_update=False)
+    kb = await _get_knowledge_base(db, current_user.tenant_id, kb_id)
     _ensure_bound_agents_accept_knowledge_change(kb)
     source = next((item for item in kb.sources if item.id == source_id), None)
     if source is None:
@@ -1573,11 +1661,16 @@ async def compile_existing_uploaded_source(
             status_code=422,
             detail="No extracted original text is available. Re-upload the PDF or add its text.",
         )
+    from app.tasks.knowledge_compile_tasks import job_for
+
+    if job_for(source).get("status") in {"queued", "processing"}:
+        return _knowledge_response(kb)
     previous_updated_at = source.updated_at
     source_name = source.name
     compiler = (source.structured_content or {}).get("compiler") or {}
     if (
         source.content_sha256 == hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
+        and source.status == "indexed"
         and source.raw_content
         and source.content
         and compiler.get("version") == COMPILER_VERSION
@@ -1585,6 +1678,22 @@ async def compile_existing_uploaded_source(
         and not compiler.get("warning")
     ):
         return _knowledge_response(kb)
+    if data.processing_mode != "fast":
+        if any(
+            b.agent.voice_provider not in VAV_NATIVE_KNOWLEDGE_PROVIDERS for b in kb.agent_bindings
+        ):
+            raise HTTPException(
+                status_code=409, detail="AI compilation requires VAV-native bindings."
+            )
+        return await _stage_background_compilation(
+            db,
+            kb,
+            source,
+            raw_text=raw_text,
+            mode=data.processing_mode,
+            actor=current_user,
+            request=request,
+        )
     compiled = await _compile_uploaded_content(
         db,
         current_user.tenant_id,

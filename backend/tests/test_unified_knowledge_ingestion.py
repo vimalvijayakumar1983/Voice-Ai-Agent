@@ -2,18 +2,38 @@
 
 import hashlib
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
 from fastapi import HTTPException
 from sqlalchemy import select, update
+from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.api.v1.endpoints import knowledge as endpoint
 from app.models.agent import KnowledgeBase, KnowledgeSource
 from app.services import knowledge_compiler as compiler
 from app.services.pdf_ingestion import PreparedPdf
+from app.tasks import knowledge_compile_tasks as jobs
+
+
+@pytest.fixture(autouse=True)
+def background_sessions(db, monkeypatch):
+    monkeypatch.setattr(
+        jobs, "async_session_factory", async_sessionmaker(db.bind, expire_on_commit=False)
+    )
+
+
+async def finish_upload(body, db):
+    source = body["sources"][0]
+    job = source["source_metadata"]["upload_compile"]
+    tenant_id = await db.scalar(
+        select(KnowledgeBase.tenant_id).where(KnowledgeBase.id == UUID(body["id"]))
+    )
+    await db.commit()
+    await jobs._compile(str(tenant_id), body["id"], source["id"], job["run_id"])
+
 
 RAW = "Example Clinic offers PRP consultations for AED 300 after a doctor assessment."
 FACT = {
@@ -69,6 +89,7 @@ def fake_ai(monkeypatch):
         )
 
     monkeypatch.setattr(endpoint, "compile_source_knowledge", compile_with_fake)
+    monkeypatch.setattr(jobs, "compile_source_knowledge", compile_with_fake)
     return ai
 
 
@@ -104,6 +125,9 @@ async def test_text_uses_grounding_compiler_and_preserves_original(
         json={"name": "Clinic FAQ", "content": RAW},
     )
     assert response.status_code == 200, response.text
+    assert response.json()["sync_status"] == "processing"
+    assert fake_ai.requests == []  # The request saves first; no inline provider inference.
+    await finish_upload(response.json(), db)
     source = await get_source(db, response.json()["sources"][0]["id"])
     assert source.raw_content == RAW
     assert source.content.endswith(RAW)
@@ -197,6 +221,7 @@ async def test_existing_text_recompile_stages_in_place_and_keeps_live_snapshot(
     assert body["serving_revision"] == revision
     assert body["has_pending_changes"] is True
     assert body["approval_status"] == "draft"
+    await finish_upload(body, db)
     persisted = await get_source(db, str(source.id))
     assert persisted.structured_content["facts"] == [FACT]
     assert persisted.raw_content == RAW
@@ -225,14 +250,17 @@ async def test_ai_failure_leaves_approved_source_untouched(
         raise compiler.KnowledgeCompilerError("AI unavailable; retry later.")
 
     monkeypatch.setattr(endpoint, "compile_source_knowledge", fail)
+    monkeypatch.setattr(jobs, "compile_source_knowledge", fail)
     response = await client.post(
         f"/api/v1/knowledge/{kb.id}/sources/{source.id}/compile",
         headers=auth_headers,
         json={"processing_mode": "ai_verified"},
     )
-    assert response.status_code == 422
+    assert response.status_code == 200
+    await finish_upload(response.json(), db)
     current = await client.get(f"/api/v1/knowledge/{kb.id}", headers=auth_headers)
-    assert current.json()["approval_status"] == "approved"
+    assert current.json()["approval_status"] == "draft"
+    assert current.json()["sources"][0]["status"] == "failed"
     assert current.json()["serving_revision"] == approved.json()["serving_revision"]
     assert (await get_source(db, str(source.id))).content == RAW
 
@@ -342,6 +370,7 @@ async def test_preview_requires_auth_and_checks_source_ownership(
     )
     source_id = added.json()["sources"][0]["id"]
     preview_url = f"/api/v1/knowledge/{kb.id}/sources/{source_id}/preview"
+    await finish_upload(added.json(), db)
     response = await client.get(preview_url, headers=auth_headers)
     assert response.status_code == 200
     assert response.json()["raw_text"] == RAW
@@ -388,7 +417,9 @@ async def test_recompile_cannot_overwrite_concurrent_source_edit(
 
     monkeypatch.setattr(endpoint, "compile_source_knowledge", concurrent_edit)
     response = await client.post(
-        f"/api/v1/knowledge/{kb.id}/sources/{source_id}/compile", headers=auth_headers, json={}
+        f"/api/v1/knowledge/{kb.id}/sources/{source_id}/compile",
+        headers=auth_headers,
+        json={"processing_mode": "fast"},
     )
     assert response.status_code == 409
     assert (
@@ -544,3 +575,177 @@ async def test_inference_does_not_hold_a_database_transaction(
         json={"name": "FAQ", "content": RAW, "processing_mode": "fast"},
     )
     assert response.status_code == 200, response.text
+
+
+@pytest.mark.asyncio
+async def test_background_submission_deduplicates_and_blocks_early_approval(
+    client,
+    auth_headers,
+    tenant,
+    db,
+    fake_ai,
+):
+    kb = await create_kb(db, tenant)
+    payload = {"name": "FAQ", "content": RAW, "processing_mode": "ai_verified"}
+    url = f"/api/v1/knowledge/{kb.id}/sources/text"
+    first = await client.post(url, headers=auth_headers, json=payload)
+    second = await client.post(url, headers=auth_headers, json=payload)
+    assert first.status_code == second.status_code == 200
+    assert second.json()["source_count"] == 1
+    assert first.json()["sources"][0]["id"] == second.json()["sources"][0]["id"]
+    assert (
+        first.json()["sources"][0]["source_metadata"]
+        == second.json()["sources"][0]["source_metadata"]
+    )
+    assert fake_ai.requests == []
+    source = await get_source(db, first.json()["sources"][0]["id"])
+    assert source.raw_content == RAW and source.content is None
+    blocked = await client.post(
+        f"/api/v1/knowledge/{kb.id}/approval", headers=auth_headers, json={"approved": True}
+    )
+    assert blocked.status_code == 409
+    await finish_upload(first.json(), db)
+    await finish_upload(first.json(), db)  # Duplicate broker delivery is a no-op.
+    assert len(fake_ai.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_background_job_retries_in_place_and_fences_old_completion(
+    client,
+    auth_headers,
+    tenant,
+    db,
+    fake_ai,
+    monkeypatch,
+):
+    kb = await create_kb(db, tenant)
+    url = f"/api/v1/knowledge/{kb.id}/sources/text"
+    payload = {"name": "FAQ", "content": RAW}
+    first = await client.post(url, headers=auth_headers, json=payload)
+    compile_ok = jobs.compile_source_knowledge
+
+    async def fail(**kwargs):
+        raise RuntimeError("secret-provider-response-must-not-be-exposed")
+
+    monkeypatch.setattr(jobs, "compile_source_knowledge", fail)
+    await finish_upload(first.json(), db)
+    failed = await client.get(f"/api/v1/knowledge/{kb.id}", headers=auth_headers)
+    assert failed.json()["sources"][0]["status"] == "failed"
+    assert "secret-provider" not in failed.text
+    second = await client.post(url, headers=auth_headers, json=payload)
+    assert second.json()["source_count"] == 1
+    old = first.json()["sources"][0]
+    current = second.json()["sources"][0]
+    assert old["id"] == current["id"]
+    old_run = old["source_metadata"]["upload_compile"]["run_id"]
+    assert old_run != current["source_metadata"]["upload_compile"]["run_id"]
+    await jobs._finish(str(tenant.id), str(kb.id), old["id"], old_run, error="old failure")
+    assert (await get_source(db, old["id"])).status == "processing"
+    monkeypatch.setattr(jobs, "compile_source_knowledge", compile_ok)
+    await finish_upload(second.json(), db)
+    assert (await get_source(db, old["id"])).status == "indexed"
+
+
+@pytest.mark.asyncio
+async def test_upload_outbox_retries_lost_enqueue_and_marks_stale_processing(
+    client,
+    auth_headers,
+    tenant,
+    db,
+    fake_ai,
+    monkeypatch,
+):
+    kb = await create_kb(db, tenant)
+    added = await client.post(
+        f"/api/v1/knowledge/{kb.id}/sources/text",
+        headers=auth_headers,
+        json={"name": "FAQ", "content": RAW},
+    )
+    source_id = added.json()["sources"][0]["id"]
+    published = []
+
+    def unavailable(**kwargs):
+        published.append(kwargs)
+        raise ConnectionError("broker offline")
+
+    monkeypatch.setattr(jobs.compile_upload, "apply_async", unavailable)
+    await jobs._sweep()
+    assert len(published) == 1
+    assert published[0]["retry"] is False
+    await jobs._sweep()
+    assert len(published) == 1  # Enqueue lease suppresses hot-loop duplicates.
+    source = await get_source(db, source_id)
+    job = jobs.job_for(source)
+    job["enqueued_at"] = (datetime.now(UTC) - timedelta(minutes=2)).isoformat()
+    jobs.set_job(source, job)
+    await db.commit()
+    await jobs._sweep()
+    assert len(published) == 2
+    source = await get_source(db, source_id)
+    job = jobs.job_for(source)
+    job.update(
+        status="processing", started_at=(datetime.now(UTC) - timedelta(minutes=6)).isoformat()
+    )
+    jobs.set_job(source, job)
+    await db.commit()
+    await jobs._sweep()
+    source = await get_source(db, source_id)
+    assert source.status == "failed"
+    assert source.raw_content == RAW
+    assert "timed out" in source.error_message
+    assert fake_ai.requests == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["delete", "revoke_editor", "wrong_tenant"])
+async def test_background_job_rechecks_access_and_deletion(
+    client,
+    auth_headers,
+    tenant,
+    user,
+    db,
+    fake_ai,
+    change,
+):
+    kb = await create_kb(db, tenant)
+    added = await client.post(
+        f"/api/v1/knowledge/{kb.id}/sources/text",
+        headers=auth_headers,
+        json={"name": "FAQ", "content": RAW},
+    )
+    source = await get_source(db, added.json()["sources"][0]["id"])
+    if change == "delete":
+        await db.delete(source)
+        await db.commit()
+    elif change == "revoke_editor":
+        user.is_active = False
+        await db.commit()
+    if change == "wrong_tenant":
+        job = jobs.job_for(source)
+        await db.commit()
+        await jobs._compile(str(uuid4()), str(kb.id), str(source.id), job["run_id"])
+    else:
+        await finish_upload(added.json(), db)
+    assert fake_ai.requests == []
+
+
+@pytest.mark.asyncio
+async def test_background_original_preview_available_before_compilation(
+    client,
+    auth_headers,
+    tenant,
+    db,
+):
+    kb = await create_kb(db, tenant)
+    added = await client.post(
+        f"/api/v1/knowledge/{kb.id}/sources/text",
+        headers=auth_headers,
+        json={"name": "FAQ", "content": RAW},
+    )
+    source_id = added.json()["sources"][0]["id"]
+    preview = await client.get(
+        f"/api/v1/knowledge/{kb.id}/sources/{source_id}/preview", headers=auth_headers
+    )
+    assert preview.status_code == 200
+    assert preview.json()["raw_text"] == RAW
+    assert preview.json()["compiled_at"] is None
