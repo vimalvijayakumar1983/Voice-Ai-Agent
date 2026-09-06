@@ -57,6 +57,7 @@ from app.livekit_runtime.inworld_single_pass import (
     single_pass_semantic_vad,
     single_pass_turn_handling,
 )
+from app.livekit_runtime.native_ab import native_ab_enabled
 from app.livekit_runtime.repair_transport import REPAIR_TRANSPORT_FLAG, RepairTransport
 from app.livekit_runtime.tts_preconnect import start_preconnect_after_first_audio
 from app.models.agent import Agent as AgentModel
@@ -3877,12 +3878,14 @@ class VAVInworldRealtimeAgent(VAVInworldAgent):
         model: AgentModel,
         variables: ProviderVariables | None = None,
         single_pass: bool = False,
+        provider_native_turns_qa: bool = False,
         knowledge_terminology: tuple[str, ...] = (),
         speech_lexicon_entries: tuple[SpeechLexiconEntry, ...] = (),
         knowledge_serving_revision_id: UUID | None = None,
         knowledge_base_id: UUID | None = None,
         telemetry: _LiveKitRuntimeTelemetry | None = None,
     ):
+        self._provider_native_turns_qa = provider_native_turns_qa
         super().__init__(
             model=model,
             variables=variables,
@@ -3908,6 +3911,8 @@ class VAVInworldRealtimeAgent(VAVInworldAgent):
         """
 
         text = (new_message.text_content or "").strip()
+        if self._provider_native_turns_qa:
+            return
         if _is_bare_hold_utterance(text) or _is_silent_stop_utterance(text):
             raise llm.StopResponse()
 
@@ -5820,6 +5825,12 @@ async def vav_inworld_session(ctx: JobContext) -> None:
         )
         raw_runtime_config = getattr(profile, "runtime_config", None)
         runtime_config = raw_runtime_config if isinstance(raw_runtime_config, dict) else {}
+        provider_native_turns_qa = native_ab_enabled(
+            runtime_config,
+            getattr(model, "agent_metadata", None) or {},
+            voice_runtime=voice_runtime,
+        )
+        usage_totals["provider_native_turns_qa"] = provider_native_turns_qa
         single_pass_decision = decide_single_pass_runtime(
             runtime_config,
             voice_runtime=voice_runtime,
@@ -5963,7 +5974,9 @@ async def vav_inworld_session(ctx: JobContext) -> None:
                 llm=realtime_model,
                 tts=tts_engine,
                 turn_handling=(
-                    single_pass_turn_handling()
+                    {"turn_detection": "realtime_llm"}
+                    if provider_native_turns_qa
+                    else single_pass_turn_handling()
                     if single_pass_decision.enabled
                     else {
                         "turn_detection": "realtime_llm",
@@ -6036,6 +6049,7 @@ async def vav_inworld_session(ctx: JobContext) -> None:
                 model=model,
                 variables=variables,
                 single_pass=single_pass_decision.enabled,
+                provider_native_turns_qa=provider_native_turns_qa,
                 knowledge_terminology=knowledge_terminology,
                 speech_lexicon_entries=recognition_context.entries,
                 knowledge_serving_revision_id=knowledge_pin.revision_id,
@@ -6187,6 +6201,7 @@ async def vav_inworld_session(ctx: JobContext) -> None:
                 single_pass_controller.on_user_speech_stopped()
             if (
                 native_realtime
+                and not provider_native_turns_qa
                 and new_state == "speaking"
                 and agent_state
                 in {
@@ -6469,6 +6484,11 @@ async def vav_inworld_session(ctx: JobContext) -> None:
                 raw_transcript = str(getattr(event, "transcript", "") or "")
                 transcript = raw_transcript.strip()
                 telemetry.on_final_transcript(transcript)
+                if provider_native_turns_qa:
+                    # Keep telemetry, retrieval authorization and grounding tools;
+                    # leave transcript repair, cancellation and turn control to
+                    # the realtime provider for this explicitly isolated QA lane.
+                    return
                 expected_language = _effective_stt_language(model=model, profile=profile)
                 if native_realtime:
                     allowed_languages = resolved_stt_script_languages(
