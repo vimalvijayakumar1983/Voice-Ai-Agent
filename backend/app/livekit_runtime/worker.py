@@ -57,6 +57,7 @@ from app.livekit_runtime.inworld_single_pass import (
     single_pass_semantic_vad,
     single_pass_turn_handling,
 )
+from app.livekit_runtime.repair_transport import REPAIR_TRANSPORT_FLAG, RepairTransport
 from app.livekit_runtime.tts_preconnect import start_preconnect_after_first_audio
 from app.models.agent import Agent as AgentModel
 from app.models.agent import (
@@ -2244,6 +2245,7 @@ class VAVInworldAgent(Agent):
         self._last_spoken_answer: tuple[str, str] | None = None
         self._semantic_repairs: dict[tuple[str, str, str], Any] = {}
         self._semantic_attempts: dict[tuple[str, str, str], int] = {}
+        self._repair_transport: RepairTransport | None = None
         self._requested_detail: tuple[ExactFactType, ...] = ()
         self._pending_company_choices: tuple[str, ...] = ()
         self._person_company_directory: dict[str, tuple[str, ...]] | None = None
@@ -2621,6 +2623,15 @@ Knowledge policy:
             )
         return context or "NO_VERIFIED_KNOWLEDGE_MATCH"
 
+    async def load_repair_transport_key(self) -> str:
+        async with async_session_factory() as db:
+            config = await load_provider_config(db, self._tenant_id, "openai")
+        return (
+            str((config or {}).get("api_key") or "").strip()
+            if config is not None
+            else str(settings.openai_api_key or "").strip()
+        )
+
     async def _repair_knowledge_search(self, *, query: str, company: str, trace) -> str:
         """One optional meaning-preserving retry, with the same company/KB/revision fence."""
         epoch = self._company_epoch
@@ -2702,6 +2713,11 @@ Knowledge policy:
                     company=company,
                     previous_answer=previous,
                     search_vocabulary=tuple(vocabulary),
+                    **(
+                        {"client": self._repair_transport.client_for(key)}
+                        if self._repair_transport is not None
+                        else {}
+                    ),
                 )
             except asyncio.CancelledError:
                 if will_attempt:
@@ -5666,6 +5682,7 @@ async def vav_inworld_session(ctx: JobContext) -> None:
     prepared_greeting: Any | None = None
     prepared_greeting_usage_task: asyncio.Task[None] | None = None
     tts_preconnect_task: asyncio.Task[None] | None = None
+    repair_transport: RepairTransport | None = None
     prepared_greeting_cache_key: str | None = None
     shared_greeting_cache_enabled = settings.is_production
     shared_greeting_cache_lookup_status = "disabled"
@@ -5752,6 +5769,8 @@ async def vav_inworld_session(ctx: JobContext) -> None:
                 if not tts_preconnect_task.done():
                     tts_preconnect_task.cancel()
                 await asyncio.gather(tts_preconnect_task, return_exceptions=True)
+            if repair_transport is not None:
+                await repair_transport.aclose()
             await _finalize_prepared_greeting_usage()
             await _finish_call(
                 call_id,
@@ -6032,6 +6051,15 @@ async def vav_inworld_session(ctx: JobContext) -> None:
                 telemetry=telemetry,
             )
         )
+        if (
+            single_pass_decision.enabled
+            and runtime_config.get(REPAIR_TRANSPORT_FLAG) is True
+            and runtime_agent._company_scope is not None
+            and runtime_agent._company_scope.semantic_retrieval_enabled
+        ):
+            repair_transport = RepairTransport(usage_totals)
+            runtime_agent._repair_transport = repair_transport
+            usage_totals["knowledge_repair_transport_status"] = "waiting_for_first_audio"
         if single_pass_decision.enabled:
 
             def _record_single_pass_error(error: BaseException) -> None:
@@ -6568,6 +6596,8 @@ async def vav_inworld_session(ctx: JobContext) -> None:
                 new_state=getattr(event, "new_state", None),
                 task=tts_preconnect_task,
             )
+            if repair_transport is not None and getattr(event, "new_state", None) == "speaking":
+                repair_transport.start(runtime_agent.load_repair_transport_key)
 
         telemetry.mark_session_started()
         await session.start(
