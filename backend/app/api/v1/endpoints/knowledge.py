@@ -165,9 +165,20 @@ def _apply_uploaded_compilation(
         "processing_mode": (compiled.structured.get("compiler") or {}).get("requested_mode"),
     }
     if source.source_metadata.get("upload_compile"):
+        previous_job = source.source_metadata["upload_compile"]
+        source.status = (
+            "indexed"
+            if source.source_type == "text"
+            else previous_job.get("provider_status", source.status)
+        )
+        source.error_message = None
         source.source_metadata = {
             **source.source_metadata,
-            "upload_compile": {**source.source_metadata["upload_compile"], "status": "completed"},
+            "upload_compile": {
+                **previous_job,
+                "status": "completed",
+                "message": "Processing complete. Review facts before approval.",
+            },
         }
 
 

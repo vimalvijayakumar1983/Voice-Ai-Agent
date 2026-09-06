@@ -14,7 +14,7 @@ from app.models.agent import KnowledgeSource
 from app.models.user import User
 from app.services.knowledge_compiler import compile_source_knowledge
 from app.services.knowledge_sources import VAV_NATIVE_KNOWLEDGE_PROVIDERS
-from app.services.provider_credentials import load_provider_config
+from app.services.provider_credentials import ProviderCredentialError, load_provider_config
 from app.tasks.async_runner import run_async
 from app.tasks.worker import celery_app
 
@@ -40,7 +40,9 @@ def queue_source(source, *, actor_id, mode):
             "mode": mode,
             "actor_id": str(actor_id),
             "queued_at": datetime.now(UTC).isoformat(),
-            "provider_status": previous.get("provider_status", source.status),
+            "provider_status": previous.get("provider_status", source.status)
+            if previous.get("status") == "failed"
+            else source.status,
             "message": "Original saved. Waiting for background AI processing.",
         },
     )
@@ -144,7 +146,12 @@ async def _compile(tenant_id, kb_id, source_id, run_id):
             text, title = source.raw_content, source.name
             await db.commit()  # Claim before inference; duplicate deliveries do no paid work.
             await _authorized(db, kb, job)
-            config = await load_provider_config(db, kb.tenant_id, "openai")
+            try:
+                config = await load_provider_config(db, kb.tenant_id, "openai")
+            except ProviderCredentialError:
+                if job["mode"] == "ai_verified":
+                    raise
+                config = None
             api_key = str((config or {}).get("api_key") or settings.openai_api_key).strip() or None
             await db.rollback()  # Do not hold a DB connection or publication lock during AI.
         compiled = await compile_source_knowledge(

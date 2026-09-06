@@ -749,3 +749,96 @@ async def test_background_original_preview_available_before_compilation(
     assert preview.status_code == 200
     assert preview.json()["raw_text"] == RAW
     assert preview.json()["compiled_at"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["automatic", "ai_verified"])
+async def test_background_credential_error_preserves_mode_contract(
+    client,
+    auth_headers,
+    tenant,
+    db,
+    monkeypatch,
+    mode,
+):
+    kb = await create_kb(db, tenant)
+
+    async def unavailable(*args, **kwargs):
+        raise jobs.ProviderCredentialError("cannot decrypt")
+
+    monkeypatch.setattr(jobs, "load_provider_config", unavailable)
+    monkeypatch.setattr(jobs.settings, "openai_api_key", "")
+    added = await client.post(
+        f"/api/v1/knowledge/{kb.id}/sources/text",
+        headers=auth_headers,
+        json={"name": "FAQ", "content": RAW, "processing_mode": mode},
+    )
+    await finish_upload(added.json(), db)
+    source = await get_source(db, added.json()["sources"][0]["id"])
+    assert source.raw_content == RAW
+    if mode == "automatic":
+        assert source.status == "indexed"
+        assert source.structured_content["compiler"]["warning"]
+        assert source.structured_content["compiler"]["effective_mode"] == "fast"
+    else:
+        assert source.status == "failed"
+        assert source.content is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["add", "compile"])
+async def test_fast_retry_recovers_failed_background_source(
+    client,
+    auth_headers,
+    tenant,
+    db,
+    monkeypatch,
+    route,
+):
+    kb = await create_kb(db, tenant)
+
+    async def fail(**kwargs):
+        raise RuntimeError("failed AI")
+
+    monkeypatch.setattr(jobs, "compile_source_knowledge", fail)
+    payload = {"name": "FAQ", "content": RAW}
+    added = await client.post(
+        f"/api/v1/knowledge/{kb.id}/sources/text", headers=auth_headers, json=payload
+    )
+    await finish_upload(added.json(), db)
+    source_id = added.json()["sources"][0]["id"]
+    if route == "add":
+        url, body = (
+            f"/api/v1/knowledge/{kb.id}/sources/text",
+            {**payload, "processing_mode": "fast"},
+        )
+    else:
+        url, body = (
+            f"/api/v1/knowledge/{kb.id}/sources/{source_id}/compile",
+            {"processing_mode": "fast"},
+        )
+    retried = await client.post(url, headers=auth_headers, json=body)
+    assert retried.status_code == 200
+    result = retried.json()
+    assert result["source_count"] == 1
+    assert result["sync_status"] == "ready"
+    assert result["sources"][0]["status"] == "indexed"
+    assert result["sources"][0]["error_message"] is None
+
+
+def test_later_pdf_compilation_snapshots_current_provider_status():
+    source = KnowledgeSource(
+        source_type="file",
+        status="indexed",
+        source_metadata={
+            "upload_compile": {"status": "completed", "provider_status": "processing"},
+        },
+    )
+    jobs.queue_source(source, actor_id=uuid4(), mode="ai_verified")
+    assert jobs.job_for(source)["provider_status"] == "indexed"
+    failed_job = jobs.job_for(source)
+    failed_job["status"] = "failed"
+    jobs.set_job(source, failed_job)
+    source.status = "failed"
+    jobs.queue_source(source, actor_id=uuid4(), mode="ai_verified")
+    assert jobs.job_for(source)["provider_status"] == "indexed"
