@@ -321,6 +321,15 @@ export interface KnowledgeAgentBinding {
   last_synced_at: string | null;
 }
 
+export interface KnowledgeSourcePreview {
+  source_id: string;
+  raw_text: string | null;
+  structured_content: {
+    facts?: { subject: string; predicate: string; value: string; evidence: string }[];
+  };
+  compiled_at: string | null;
+}
+
 export interface KnowledgeCrawlPage {
   id: string;
   knowledge_source_id: string | null;
@@ -1749,20 +1758,32 @@ class ApiClient {
     });
   }
 
-  async addKnowledgeText(id: string, name: string, content: string) {
+  async addKnowledgeText(id: string, name: string, content: string, processingMode: KnowledgeProcessingMode = 'automatic') {
     return this.request<KnowledgeBase>(`/api/v1/knowledge/${id}/sources/text`, {
       method: 'POST',
-      body: JSON.stringify({ name, content }),
+      body: JSON.stringify({ name, content, processing_mode: processingMode }),
     });
   }
 
-  async uploadKnowledgePdf(id: string, file: File) {
+  async uploadKnowledgePdf(id: string, file: File, processingMode: KnowledgeProcessingMode = 'automatic') {
     const form = new FormData();
     form.append('media', file);
+    form.append('processing_mode', processingMode);
     return this.request<KnowledgeBase>(`/api/v1/knowledge/${id}/sources/pdf`, {
       method: 'POST',
       body: form,
     });
+  }
+
+  async compileKnowledgeSource(id: string, sourceId: string) {
+    return this.request<KnowledgeBase>(`/api/v1/knowledge/${id}/sources/${sourceId}/compile`, {
+      method: 'POST',
+      body: JSON.stringify({ processing_mode: 'ai_verified' }),
+    });
+  }
+
+  async previewKnowledgeSource(id: string, sourceId: string) {
+    return this.request<KnowledgeSourcePreview>(`/api/v1/knowledge/${id}/sources/${sourceId}/preview`);
   }
 
   async deleteKnowledgeSource(id: string, sourceId: string) {

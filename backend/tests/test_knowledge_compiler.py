@@ -254,7 +254,7 @@ async def test_ai_compilation_projects_explicit_role_message_heading():
         and fact["value"] == "T.R. Vijayakumar"
         for fact in result.structured["facts"]
     )
-    assert result.structured["compiler"]["version"] == "vav-knowledge-compiler-12"
+    assert result.structured["compiler"]["version"] == "vav-knowledge-compiler-13"
 
 
 @pytest.mark.asyncio
