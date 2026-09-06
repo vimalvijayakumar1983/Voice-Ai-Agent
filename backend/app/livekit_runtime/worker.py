@@ -57,6 +57,7 @@ from app.livekit_runtime.inworld_single_pass import (
     single_pass_semantic_vad,
     single_pass_turn_handling,
 )
+from app.livekit_runtime.tts_preconnect import preconnect_tts_transport
 from app.models.agent import Agent as AgentModel
 from app.models.agent import (
     AgentKnowledgeBinding,
@@ -5664,6 +5665,7 @@ async def vav_inworld_session(ctx: JobContext) -> None:
     single_pass_controller: InworldSinglePassController | None = None
     prepared_greeting: Any | None = None
     prepared_greeting_usage_task: asyncio.Task[None] | None = None
+    tts_preconnect_task: asyncio.Task[None] | None = None
     prepared_greeting_cache_key: str | None = None
     shared_greeting_cache_enabled = settings.is_production
     shared_greeting_cache_lookup_status = "disabled"
@@ -5746,6 +5748,10 @@ async def vav_inworld_session(ctx: JobContext) -> None:
         async with finalization_lock:
             if finalized:
                 return
+            if tts_preconnect_task is not None:
+                if not tts_preconnect_task.done():
+                    tts_preconnect_task.cancel()
+                await asyncio.gather(tts_preconnect_task, return_exceptions=True)
             await _finalize_prepared_greeting_usage()
             await _finish_call(
                 call_id,
@@ -5815,6 +5821,17 @@ async def vav_inworld_session(ctx: JobContext) -> None:
             profile=profile,
         )
         tts_engine = inworld.TTS(**tts_options)
+        usage_totals["tts_transport_preconnect_status"] = "disabled"
+        if (
+            single_pass_decision.enabled
+            and runtime_config.get("tts_transport_preconnect_enabled", True) is True
+        ):
+            # Use the provider SDK's public stream lifecycle, not its pool internals.
+            # Independent of greeting-cache hits, non-blocking for call opening.
+            tts_preconnect_task = asyncio.create_task(
+                preconnect_tts_transport(tts_engine, usage_totals),
+                name="vav_tts_transport_preconnect",
+            )
         greeting = _render_greeting(model.greeting_message, variables)
         prepared_greeting_cache_key = (
             greeting_cache_key(
@@ -5837,10 +5854,8 @@ async def vav_inworld_session(ctx: JobContext) -> None:
         shared_greeting_cache_lookup_status = shared_greeting.status
         usage_totals["greeting_shared_cache_lookup_status"] = shared_greeting.status
         usage_totals["greeting_shared_cache_lookup_ms"] = shared_greeting.elapsed_ms
-        # A shared PCM hit removes the greeting provider request and therefore
-        # does not warm Inworld's TTS transport. Keep that trade-off explicit in
-        # telemetry; ordinary turn diagnostics continue measuring answer TTS
-        # first-byte time, without relying on an undocumented empty synthesis.
+        # Greeting PCM and the separately metered transport setup are independent.
+        # A cache hit generates no speech; preconnect sends no synthesis text.
         prepared_greeting = prepare_greeting_audio(
             tts_engine=tts_engine,
             text=greeting,
