@@ -133,7 +133,7 @@ export default function McpConnections({ canManage }: { canManage: boolean }) {
               <p>{tool.description}</p><details><summary>Input schema</summary><pre style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>{JSON.stringify(tool.input_schema, null, 2)}</pre></details>
             </div>)}
             <h4>Allowed voice agents</h4>
-            <p>The accepted single-pass receptionist remains unchanged. Only enabled LiveKit/Inworld realtime tool-loop agents can use these tools. Start a new call after granting access.</p>
+            <p>The accepted single-pass receptionist remains unchanged. LiveKit/Inworld realtime tool-loop agents need either phone activation or an explicit staff browser-only policy. Staff browser testing does not require SIP. Start a new call after granting access.</p>
             {agents.map((agent) => <label key={agent.id} style={{ display: 'block' }}><input type="checkbox" name="agent_ids" value={agent.id} defaultChecked={granted.includes(agent.id) && agent.eligible} disabled={!agent.eligible} /> {agent.name}{!agent.eligible && ` — ${agent.reason}`}</label>)}
             <label style={{ display: 'block', marginTop: 12 }}><input type="checkbox" name="public_data_approved" defaultChecked={connection.config.public_data_approved === true} /> I have reviewed the selected tools and confirm they expose only public-safe company information, not private customer/patient/account data.</label>
             {canManage && <button className="btn btn-primary" type="submit">Save permissions</button>}

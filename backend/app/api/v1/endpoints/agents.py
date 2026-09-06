@@ -997,8 +997,13 @@ async def _validate_livekit_browser_knowledge(
     tenant_id: UUID,
     agent: Agent,
     for_update: bool,
+    profile: AgentRuntimeProfile | None = None,
 ) -> None:
     """Validate searchable knowledge in the global KB -> binding -> source order."""
+    from app.services.browser_access import tools_only
+
+    if tools_only(profile):
+        return
 
     binding_query = (
         select(AgentKnowledgeBinding)
@@ -1147,6 +1152,7 @@ async def _livekit_browser_runtime(
             tenant_id=tenant_id,
             agent=agent,
             for_update=for_update,
+            profile=profile,
         )
     return agent, profile
 
@@ -3796,6 +3802,9 @@ async def create_livekit_browser_session(
         agent_id=agent_id,
         for_update=False,
     )
+    from app.services.browser_access import check_browser_actor, staff_browser, tools_only
+
+    check_browser_actor(preflight_profile, current_user)
     runtime_config = (
         preflight_profile.runtime_config
         if isinstance(preflight_profile.runtime_config, dict)
@@ -3859,6 +3868,7 @@ async def create_livekit_browser_session(
         for_update=True,
         validate_knowledge=False,
     )
+    check_browser_actor(profile, current_user)
     existing_call = await _lock_livekit_browser_call(
         db,
         tenant_id=current_user.tenant_id,
@@ -3869,11 +3879,16 @@ async def create_livekit_browser_session(
         tenant_id=current_user.tenant_id,
         agent=agent,
         for_update=True,
+        profile=profile,
     )
     if existing_call is not None:
         metadata = (
             existing_call.call_metadata if isinstance(existing_call.call_metadata, dict) else {}
         )
+        if (metadata.get("staff_browser_only") is True) != staff_browser(profile) or metadata.get(
+            "knowledge_source_mode", "knowledge_base"
+        ) != ("tools_only" if tools_only(profile) else "knowledge_base"):
+            raise HTTPException(409, "Browser access policy changed; start a new session")
         stored_fingerprint = metadata.get("browser_session_request_fingerprint")
         if not isinstance(stored_fingerprint, str) or not hmac.compare_digest(
             stored_fingerprint,
@@ -4000,7 +4015,7 @@ async def create_livekit_browser_session(
             )
         )
     ).one_or_none()
-    if serving_identity is None:
+    if serving_identity is None and not tools_only(profile):
         await db.rollback()
         raise HTTPException(
             status_code=409,
@@ -4009,6 +4024,8 @@ async def create_livekit_browser_session(
                 "an immutable serving revision is required"
             ),
         )
+    if tools_only(profile):
+        serving_identity = None
     room_name = f"vav-browser-{call_id}"
     participant_identity = f"browser-{call_id}"
     issued_at = datetime.now(UTC)
@@ -4025,6 +4042,9 @@ async def create_livekit_browser_session(
         provider_call_sid=room_name,
         call_metadata={
             "agent_configuration": agent_configuration_snapshot(agent),
+            "browser_user_id": str(current_user.id),
+            "staff_browser_only": staff_browser(profile),
+            "knowledge_source_mode": "tools_only" if tools_only(profile) else "knowledge_base",
             "conversation_type": "webcall",
             "channel": "browser",
             # Variables remain server-side. The worker reads them only from
@@ -4113,6 +4133,11 @@ async def create_livekit_browser_session(
             agent_id=agent_id,
             for_update=False,
         )
+        check_browser_actor(_current_profile, current_user)
+        if staff_browser(_current_profile) != staff_browser(profile) or tools_only(
+            _current_profile
+        ) != tools_only(profile):
+            raise HTTPException(409, "Browser access policy changed; start a new session")
         current_agent_id = current_agent.id
         # Do not retain a read transaction while waiting for LiveKit. The
         # signed durable reservation and worker join-time validation close the

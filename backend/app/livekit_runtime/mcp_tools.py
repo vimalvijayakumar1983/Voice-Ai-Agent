@@ -26,7 +26,17 @@ MCP_INSTRUCTIONS = (
 )
 
 
-def _make_tool(tenant_id, agent_id, integration_id, company, descriptor, metrics):
+def _make_tool(
+    tenant_id,
+    agent_id,
+    integration_id,
+    company,
+    descriptor,
+    metrics,
+    *,
+    staff_call_id=None,
+    call_id=None,
+):
     async def lookup(raw_arguments: dict):
         if metrics.get("mcp_lookup_count", 0) >= 50:
             return json.dumps({"status": "unavailable", "reason": "Call lookup limit reached"})
@@ -37,7 +47,15 @@ def _make_tool(tenant_id, agent_id, integration_id, company, descriptor, metrics
             # Fresh authorization on every execution: disabling/deleting a connection
             # or removing the grant prevents subsequent calls in an existing session.
             async with async_session_factory() as db:
-                config = await authorized_runtime_config(db, tenant_id, agent_id, integration_id)
+                if staff_call_id is not None:
+                    from app.services.browser_access import validate_staff_call
+
+                    await validate_staff_call(
+                        db, tenant_id=tenant_id, agent_id=agent_id, call_id=staff_call_id
+                    )
+                config = await authorized_runtime_config(
+                    db, tenant_id, agent_id, integration_id, call_id=call_id
+                )
                 approved = next(
                     (
                         tool
@@ -51,7 +69,13 @@ def _make_tool(tenant_id, agent_id, integration_id, company, descriptor, metrics
                     raise MCPError("MCP tool changed; start a new call after review")
             result = await call_read_tool(config, approved, raw_arguments)
             async with async_session_factory() as db:
-                current = await authorized_runtime_config(db, tenant_id, agent_id, integration_id)
+                if staff_call_id is not None:
+                    await validate_staff_call(
+                        db, tenant_id=tenant_id, agent_id=agent_id, call_id=staff_call_id
+                    )
+                current = await authorized_runtime_config(
+                    db, tenant_id, agent_id, integration_id, call_id=call_id
+                )
                 if current != config:
                     raise MCPError("MCP permission or connection changed during lookup")
             status = "ok"
@@ -88,11 +112,19 @@ def _make_tool(tenant_id, agent_id, integration_id, company, descriptor, metrics
     )
 
 
-async def load_mcp_tools(model, profile, metrics):
+async def load_mcp_tools(model, profile, metrics, *, call_id=None):
+    from app.services.browser_access import staff_browser, validate_staff_call
+
     if not runtime_compatible(profile):
         return []
     tools = []
     async with async_session_factory() as db:
+        if staff_browser(profile):
+            if call_id is None:
+                return []
+            await validate_staff_call(
+                db, tenant_id=model.tenant_id, agent_id=model.id, call_id=call_id
+            )
         rows = (
             await db.scalars(
                 select(Integration).where(
@@ -109,7 +141,7 @@ async def load_mcp_tools(model, profile, metrics):
                 continue
             try:
                 config = await authorized_runtime_config(
-                    db, model.tenant_id, model.id, integration.id
+                    db, model.tenant_id, model.id, integration.id, call_id=call_id
                 )
             except Exception:
                 metrics["mcp_setup_unavailable"] = True
@@ -130,6 +162,8 @@ async def load_mcp_tools(model, profile, metrics):
                             config["company_label"],
                             descriptor,
                             metrics,
+                            staff_call_id=call_id if staff_browser(profile) else None,
+                            call_id=call_id,
                         )
                     )
     metrics["mcp_enabled_tool_count"] = len(tools)

@@ -249,6 +249,9 @@ export default function Agents() {
       } else {
         const created = await api.createAgent(values);
         setAgents((current) => [created, ...current]);
+        void api.getRuntimeProfile(created.id).then((runtime) => {
+          setRuntimeProfiles((current) => ({ ...current, [created.id]: runtime }));
+        }).catch(() => { /* Creation succeeded; runtime controls can be reloaded separately. */ });
         setShowCreate(false);
         setGeneratedDraft(null);
         setNotice({ type: 'success', text: `${created.name} was created as a local draft.` });
@@ -617,7 +620,9 @@ export default function Agents() {
                 {agent.sync_status === 'publish_unknown' && (
                   <button className="btn btn-secondary btn-sm" disabled={working === `resolve-${agent.id}`} onClick={() => resolveProviderOperation(agent)}><RefreshCw size={12} /> Resolve unknown</button>
                 )}
-                {isAgentCallReady(agent, runtimeProfiles[agent.id]) ? (
+                {agent.voice_provider === 'inworld' && runtimeProfiles[agent.id]?.id && runtimeProfiles[agent.id]?.status !== 'inactive' ? (
+                  <Link href={`/playground?agent=${agent.id}`} className="btn btn-secondary btn-sm"><FlaskConical size={12} /> Browser test</Link>
+                ) : isAgentCallReady(agent, runtimeProfiles[agent.id]) ? (
                   <Link href={`/playground?agent=${agent.id}`} className="btn btn-secondary btn-sm"><FlaskConical size={12} /> Test</Link>
                 ) : (
                   <button className="btn btn-secondary btn-sm" disabled title={agentTestReadinessMessage(agent, runtimeProfiles[agent.id])}><FlaskConical size={12} /> Test</button>

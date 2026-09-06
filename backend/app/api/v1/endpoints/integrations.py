@@ -302,7 +302,10 @@ async def mcp_agent_options(
             "eligible": agent.is_active and runtime_compatible(profile),
             "reason": ""
             if agent.is_active and runtime_compatible(profile)
-            else "Requires enabled LiveKit + Inworld realtime tool-loop (not single-pass)",
+            else (
+                "Requires LiveKit + Inworld realtime tool-loop with phone activation "
+                "or a staff browser-only policy (not single-pass)"
+            ),
         }
         for agent, profile in rows
     ]

@@ -117,10 +117,12 @@ def prepare_mcp_update(previous: dict, updates: dict) -> dict:
 
 
 def runtime_compatible(profile: AgentRuntimeProfile | None) -> bool:
+    from app.services.browser_access import staff_browser
+
     config = (profile.runtime_config or {}) if profile else {}
     return bool(
         profile
-        and profile.enabled
+        and (profile.enabled or (staff_browser(profile) and profile.status != "inactive"))
         and profile.telephony_provider == "livekit_sip"
         and profile.primary_speech_provider == "inworld"
         and config.get("voice_runtime") == "inworld_realtime"
@@ -347,7 +349,21 @@ async def call_read_tool(config: dict, tool: dict, arguments: dict) -> dict:
         ) from exc
 
 
-async def authorized_runtime_config(db, tenant_id, agent_id, integration_id):
+async def authorized_runtime_config(db, tenant_id, agent_id, integration_id, *, call_id=None):
+    from app.services.browser_access import staff_browser, validate_staff_call
+
+    profile = await db.scalar(
+        select(AgentRuntimeProfile)
+        .where(
+            AgentRuntimeProfile.agent_id == agent_id,
+            AgentRuntimeProfile.tenant_id == tenant_id,
+        )
+        .execution_options(populate_existing=True)
+    )
+    if staff_browser(profile):
+        if call_id is None:
+            raise MCPError("Staff browser reservation required")
+        await validate_staff_call(db, tenant_id=tenant_id, agent_id=agent_id, call_id=call_id)
     integration = await db.scalar(
         select(Integration).where(
             Integration.id == integration_id,
