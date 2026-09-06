@@ -152,10 +152,10 @@ export default function RuntimeControlPanel({ agent, profile, onClose, onChange 
                   : form.llm_model,
               });
             }}>
-              <option value="inworld_realtime">Native Inworld Realtime · production pilot</option>
+              <option value="inworld_realtime">Inworld Realtime · VAV production</option>
               <option value="pipeline">Classic component pipeline · rollback</option>
             </select>
-            <p className="form-hint">Native mode uses one persistent Inworld speech-to-speech session for transcription, semantic turn-taking, reasoning, interruptions, and TTS. Choose the grounded knowledge policy separately below.</p>
+            <p className="form-hint">Uses persistent Inworld speech connections through LiveKit. The selected knowledge policy determines whether VAV or Inworld controls response generation and knowledge-tool calls.</p>
           </div>
         ) : null}
         {inworldRuntime && form.voice_runtime === 'inworld_realtime' ? (
@@ -169,12 +169,12 @@ export default function RuntimeControlPanel({ agent, profile, onClose, onChange 
                 knowledge_turn_mode: event.target.value as RuntimeProfile['knowledge_turn_mode'],
               })}
             >
-              <option value="tool_loop">Grounded tool loop · control</option>
-              <option value="single_pass_experimental">Single pass · experimental canary</option>
+              <option value="tool_loop">Provider tool loop · previous mode</option>
+              <option value="single_pass_experimental">VAV grounded single pass · production baseline</option>
             </select>
-            <p className="form-hint">The control lets Inworld invoke approved knowledge tools. The canary waits for the final transcript, performs one approved evidence lookup, then requests one tool-free reply.</p>
+            <p className="form-hint">The production baseline uses VAV’s approved knowledge retrieval and conversation handling with Inworld speech. The previous mode lets Inworld invoke knowledge tools.</p>
             {form.knowledge_turn_mode === 'single_pass_experimental' ? (
-              <p className="form-hint" role="note">Agent-level A/B warning: this is not a per-call split. Every new call for this agent uses the experimental single-pass path until you switch back to the tool-loop control. Save and pass readiness before activation.</p>
+              <p className="form-hint" role="note">Applies to every new call for this agent; this is not a per-call split. Save, attach approved knowledge and test in the browser. Phone activation separately requires SIP readiness. Latency improvements remain under evaluation.</p>
             ) : null}
           </div>
         ) : null}

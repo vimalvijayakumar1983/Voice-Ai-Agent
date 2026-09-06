@@ -117,6 +117,7 @@ from app.services.integration_security import (
     IntegrationConfigUnavailableError,
     decrypt_integration_config,
 )
+from app.services.production_voice_preset import new_inworld_profile
 from app.services.provider_credentials import (
     ProviderCredentialError,
     invalidate_active_runtimes_for_credential,
@@ -2619,6 +2620,9 @@ async def create_agent(
     agent = Agent(tenant_id=current_user.tenant_id, **data.model_dump())
     db.add(agent)
     await db.flush()
+    if agent.voice_provider == "inworld":
+        db.add(new_inworld_profile(agent))
+        await db.flush()
     return AgentResponse.model_validate(agent)
 
 

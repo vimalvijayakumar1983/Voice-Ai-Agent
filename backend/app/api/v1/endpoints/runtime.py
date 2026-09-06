@@ -63,6 +63,10 @@ from app.services.knowledge_serving import (
     load_durably_admitted_serving_revision,
     validate_call_speech_lexicon_reservation,
 )
+from app.services.production_voice_preset import (
+    PRODUCTION_VOICE_PRESET,
+    apply_conversation_baseline,
+)
 from app.services.provider_credentials import (
     ProviderCredentialError,
     get_provider_credential,
@@ -1574,6 +1578,18 @@ async def update_runtime_profile(
         runtime_config = {
             **runtime_config,
             "diagnostic_recording_mode": data.diagnostic_recording_mode,
+        }
+    if (
+        agent.voice_provider == "inworld"
+        and runtime_config.get("voice_runtime") == "inworld_realtime"
+        and runtime_config.get("inworld_single_pass") is True
+    ):
+        apply_conversation_baseline(agent)
+        runtime_config = {
+            **runtime_config,
+            "production_voice_preset": PRODUCTION_VOICE_PRESET,
+            "knowledge_repair_transport_enabled": True,
+            "provider_native_turns_qa": False,
         }
     profile.runtime_config = runtime_config
     delivery_mode = str(runtime_config.get("tts_delivery_mode") or "balanced").lower()

@@ -99,15 +99,15 @@ test('knowledge release rollback is audited compare-and-swap, not a pointer rewr
   assert.match(knowledgeSource, /matching voice-recognition artifact move together/);
 });
 
-test('native Inworld runtime exposes a typed agent-level single-pass canary', () => {
+test('Inworld exposes the accepted baseline without bypassing phone readiness', () => {
   assert.match(apiSource, /knowledge_turn_mode: 'tool_loop' \| 'single_pass_experimental'/);
   assert.match(runtimeSource, /id="runtime-knowledge-turn-mode"/);
-  assert.match(runtimeSource, /Grounded tool loop · control/);
-  assert.match(runtimeSource, /Single pass · experimental canary/);
-  assert.match(runtimeSource, /Agent-level A\/B warning/);
+  assert.match(runtimeSource, /Provider tool loop · previous mode/);
+  assert.match(runtimeSource, /VAV grounded single pass · production baseline/);
+  assert.match(runtimeSource, /Phone activation separately requires SIP readiness/);
   assert.match(runtimeSource, /this is not a per-call split/);
-  assert.match(runtimeSource, /one approved evidence lookup/);
-  assert.match(runtimeSource, /one tool-free reply/);
+  assert.match(runtimeSource, /approved knowledge retrieval and conversation handling/);
+  assert.match(runtimeSource, /selected knowledge policy determines whether VAV or Inworld controls/);
   assert.match(runtimeSource, /knowledge_turn_mode: voiceRuntime === 'inworld_realtime'/);
 });
 

@@ -1,5 +1,13 @@
 # Realtime quality production rollout
 
+September 6 browser-release update: the owner accepted the current grounded
+single-pass baseline for production-hosted browser testing and new companies.
+See `PRODUCTION_BROWSER_RELEASE_20260906.md` for that bounded promotion. The
+historical staged rollout below still governs schema, immutable knowledge,
+phone activation, recording and rollback; browser acceptance does not waive SIP
+or regulated-workflow gates. The API mode name `single_pass_experimental` is
+retained for compatibility, not as the current UI label for this baseline.
+
 This is the operator runbook for releasing immutable knowledge, speech-quality
 artifacts, greeting prewarm, truthful call diagnostics, and the experimental
 native Inworld single-pass path. The existing `tool_loop` path remains the
