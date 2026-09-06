@@ -88,6 +88,8 @@ async def test_native_shared_router_selects_correct_company_evidence(db, tenant,
         runtime, f"Not the cosmetic centre. I mean {medical[0]}."
     )
     assert "123 4000" in second and "567 8000" not in second
+    assert runtime._telemetry.runtime_metrics["native_request_ledger_available"] is False
+    assert "conversation_requests_unresolved" not in runtime._telemetry.runtime_metrics
 
 
 def test_barge_in_observer_consumed_once():

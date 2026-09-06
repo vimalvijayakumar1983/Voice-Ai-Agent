@@ -3591,6 +3591,13 @@ Knowledge policy:
         )
 
     def _record_request_ledger(self) -> None:
+        if getattr(self, "_provider_native_turns_qa", False):
+            # The shared router tracks pending context, but native speech has
+            # no single-pass completion callback. Do not publish partial ledger
+            # counts as a complete assessment of native call resolution.
+            if self._telemetry:
+                self._telemetry.runtime_metrics["native_request_ledger_available"] = False
+            return
         if self._foundation_enabled and self._telemetry:
             self._telemetry.runtime_metrics.update(self._request_ledger.metrics())
 
