@@ -15,6 +15,7 @@ import {
   X,
 } from 'lucide-react';
 import Layout from '@/components/Layout';
+import McpConnections from '@/components/McpConnections';
 import { api, Integration, IntegrationDelivery } from '@/lib/api';
 import {
   webhookReplayAvailability,
@@ -188,7 +189,7 @@ export default function Integrations() {
         if (!active) return;
         const webhookIntegrations = items.filter((item) => item.integration_type === 'webhook');
         setIntegrations(webhookIntegrations);
-        setAppointmentIntegrations(items.filter((item) => item.integration_type !== 'webhook'));
+        setAppointmentIntegrations(items.filter((item) => ['his_api', 'vav_crm', 'google_sheets'].includes(item.integration_type)));
         setCanManage(user.role === 'owner' || user.role === 'admin');
         setLoadError('');
         void Promise.allSettled(webhookIntegrations.map((integration) => (
@@ -596,6 +597,8 @@ export default function Integrations() {
           <span>You can review destinations. An owner or admin can create, edit, or delete them.</span>
         </div>
       )}
+
+      {!loading && !loadError && <McpConnections canManage={canManage} />}
 
       {showAppointmentForm && canManage && (
         <section className="card integration-form-panel" aria-labelledby="appointment-form-title">

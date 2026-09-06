@@ -1,4 +1,5 @@
 import Head from 'next/head';
+import Link from 'next/link';
 import type { FormEvent } from 'react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
@@ -626,6 +627,12 @@ export default function Settings() {
                 </table>
               </div>
             ) : <div className="settings-empty-row"><MailPlus size={18} /><span>No invitations have been created.</span></div>}
+          </section>
+
+          <section className="settings-section" aria-labelledby="mcp-settings-heading">
+            <h2 id="mcp-settings-heading">Business systems &amp; MCP</h2>
+            <p>Manage encrypted MCP connections, test tool discovery and approve read-only access for compatible voice agents.</p>
+            <Link className="btn btn-secondary" href="/integrations#mcp-connections">Manage MCP connections</Link>
           </section>
 
           <section className="settings-section" aria-labelledby="provider-credentials-heading">

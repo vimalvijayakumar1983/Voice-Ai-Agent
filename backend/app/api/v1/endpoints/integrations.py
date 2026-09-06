@@ -2,10 +2,11 @@
 
 import json
 import re
+from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -35,7 +36,7 @@ from app.services.integration_security import (
 router = APIRouter(prefix="/integrations", tags=["Integrations"])
 logger = structlog.get_logger()
 
-SUPPORTED_INTEGRATION_TYPES = {"webhook", "his_api", "vav_crm", "google_sheets"}
+SUPPORTED_INTEGRATION_TYPES = {"webhook", "his_api", "vav_crm", "google_sheets", "mcp"}
 _API_AUTH_TYPES = {"bearer", "api_key"}
 _API_PATH_FIELDS = ("availability_path", "create_path", "reschedule_path", "cancel_path")
 _SPREADSHEET_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{20,128}$")
@@ -191,7 +192,15 @@ def _integration_response(integration: Integration, config: dict) -> Integration
 
 def _validate_config(config: dict, integration_type: str) -> None:
     try:
-        validate_integration_config_urls(config)
+        # Discovered MCP schemas are inert data, not outbound configuration.
+        # A property named "url" is a schema object and must not be treated as
+        # a destination. Catalogs are server-managed and checked by the MCP SDK.
+        url_config = (
+            {key: value for key, value in config.items() if key != "tools"}
+            if integration_type == "mcp"
+            else config
+        )
+        validate_integration_config_urls(url_config, mcp_endpoint=integration_type == "mcp")
     except IntegrationConfigError as exc:
         # Do not include the submitted config in validation responses; it can
         # contain credentials that are intentionally write-only.
@@ -221,6 +230,13 @@ def _validate_config(config: dict, integration_type: str) -> None:
         _validate_api_connector(config, integration_type)
     elif integration_type == "google_sheets":
         _validate_google_sheets_connector(config)
+    elif integration_type == "mcp":
+        from app.services.mcp_connections import validate_mcp_config
+
+        try:
+            validate_mcp_config(config)
+        except IntegrationConfigError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @router.post(
@@ -260,6 +276,38 @@ async def list_integrations(
     ]
 
 
+@router.get("/mcp/agents")
+async def mcp_agent_options(
+    current_user: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    from app.models.agent import Agent, AgentRuntimeProfile
+    from app.services.mcp_connections import runtime_compatible
+
+    rows = (
+        await db.execute(
+            select(Agent, AgentRuntimeProfile)
+            .outerjoin(
+                AgentRuntimeProfile,
+                (AgentRuntimeProfile.agent_id == Agent.id)
+                & (AgentRuntimeProfile.tenant_id == Agent.tenant_id),
+            )
+            .where(Agent.tenant_id == current_user.tenant_id)
+        )
+    ).all()
+    return [
+        {
+            "id": str(agent.id),
+            "name": agent.name,
+            "eligible": agent.is_active and runtime_compatible(profile),
+            "reason": ""
+            if agent.is_active and runtime_compatible(profile)
+            else "Requires enabled LiveKit + Inworld realtime tool-loop (not single-pass)",
+        }
+        for agent, profile in rows
+    ]
+
+
 @router.post("", response_model=IntegrationResponse, status_code=status.HTTP_201_CREATED)
 async def create_integration(
     data: IntegrationCreate,
@@ -268,6 +316,14 @@ async def create_integration(
 ):
     config = merge_integration_config({}, data.config)
     integration_type = data.integration_type.strip().lower()
+    if integration_type == "mcp":
+        from app.services.mcp_connections import prepare_mcp_update, validate_agent_grants
+
+        try:
+            config = prepare_mcp_update({}, data.config)
+            await validate_agent_grants(db, current_user.tenant_id, config)
+        except IntegrationConfigError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
     _validate_config(config, integration_type)
     integration = Integration(
         tenant_id=current_user.tenant_id,
@@ -304,7 +360,20 @@ async def update_integration(
         setattr(integration, key, value)
 
     if data.config is not None or data.clear_secrets:
-        config = merge_integration_config(config, data.config)
+        if integration.integration_type == "mcp":
+            from app.services.mcp_connections import prepare_mcp_update, validate_agent_grants
+
+            try:
+                if data.clear_secrets:
+                    raise IntegrationConfigError(
+                        "Change MCP authentication or replace the credential"
+                    )
+                config = prepare_mcp_update(config, data.config or {})
+                await validate_agent_grants(db, current_user.tenant_id, config)
+            except IntegrationConfigError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+        else:
+            config = merge_integration_config(config, data.config)
         try:
             config = clear_integration_secrets(config, data.clear_secrets)
         except IntegrationConfigError as exc:
@@ -322,6 +391,72 @@ async def update_integration(
         _validate_config(config, integration.integration_type)
         _store_config_or_fail(integration, config)
 
+    await db.flush()
+    return _integration_response(integration, config)
+
+
+@router.post("/{integration_id}/mcp/test", response_model=IntegrationResponse)
+async def test_mcp_connection(
+    integration_id: UUID,
+    request: Request,
+    current_user: CurrentUser = Depends(require_role("owner", "admin")),
+    db: AsyncSession = Depends(get_db),
+):
+    """Only initialize/list tools. Never execute a remote business operation."""
+    from app.services.mcp_connections import MCPError, discover_tools
+    from app.services.rate_limit import enforce_rate_limit
+
+    await enforce_rate_limit(
+        request,
+        scope="mcp-discovery",
+        limit=6,
+        window_seconds=60,
+        subject=str(current_user.tenant_id),
+        bind_to_client=False,
+        limit_detail="Too many MCP connection tests; try again in a minute",
+        unavailable_detail="MCP connection testing is temporarily unavailable",
+    )
+    integration = await db.scalar(
+        select(Integration).where(
+            Integration.id == integration_id,
+            Integration.tenant_id == current_user.tenant_id,
+            Integration.integration_type == "mcp",
+        )
+    )
+    if integration is None:
+        raise HTTPException(status_code=404, detail="MCP connection not found")
+    config = _load_config_or_fail(integration)
+    observed_envelope = integration.encrypted_config
+    await db.rollback()  # No DB connection/row lock held across remote networking.
+    try:
+        result = await discover_tools(config)
+        old = {tool["name"]: tool["schema_hash"] for tool in config.get("tools", [])}
+        config["tools"] = result["tools"]
+        config["allowed_tools"] = [
+            tool["name"]
+            for tool in result["tools"]
+            if tool["read_only"]
+            and tool["name"] in config.get("allowed_tools", [])
+            and old.get(tool["name"]) == tool["schema_hash"]
+        ]
+        config["last_test"] = {
+            "status": "connected",
+            "checked_at": datetime.now(UTC).isoformat(),
+            "latency_ms": result["latency_ms"],
+        }
+    except MCPError as exc:
+        config.update(allowed_tools=[], agent_ids=[])
+        config["last_test"] = {
+            "status": "failed",
+            "checked_at": datetime.now(UTC).isoformat(),
+            "error": str(exc),
+        }
+    integration = await db.scalar(
+        _locked_tenant_integration_statement(integration_id, current_user.tenant_id)
+    )
+    if integration is None or integration.encrypted_config != observed_envelope:
+        raise HTTPException(status_code=409, detail="Connection changed while testing; retry")
+    _store_config_or_fail(integration, config)
     await db.flush()
     return _integration_response(integration, config)
 

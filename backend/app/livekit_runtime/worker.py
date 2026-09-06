@@ -6088,6 +6088,16 @@ async def vav_inworld_session(ctx: JobContext) -> None:
                 telemetry=telemetry,
             )
         )
+        # Never change the accepted single-pass runtime merely to enable MCP.
+        if native_realtime and not single_pass_decision.enabled:
+            from app.livekit_runtime.mcp_tools import MCP_INSTRUCTIONS, load_mcp_tools
+
+            mcp_tools = await load_mcp_tools(model, profile, usage_totals)
+            if mcp_tools:
+                await runtime_agent.update_tools([*runtime_agent.tools, *mcp_tools])
+                await runtime_agent.update_instructions(
+                    runtime_agent.instructions + MCP_INSTRUCTIONS
+                )
         if (
             single_pass_decision.enabled
             and runtime_config.get(REPAIR_TRANSPORT_FLAG) is True
