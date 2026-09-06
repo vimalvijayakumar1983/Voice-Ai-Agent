@@ -57,7 +57,7 @@ from app.livekit_runtime.inworld_single_pass import (
     single_pass_semantic_vad,
     single_pass_turn_handling,
 )
-from app.livekit_runtime.tts_preconnect import preconnect_tts_transport
+from app.livekit_runtime.tts_preconnect import start_preconnect_after_first_audio
 from app.models.agent import Agent as AgentModel
 from app.models.agent import (
     AgentKnowledgeBinding,
@@ -5821,17 +5821,13 @@ async def vav_inworld_session(ctx: JobContext) -> None:
             profile=profile,
         )
         tts_engine = inworld.TTS(**tts_options)
-        usage_totals["tts_transport_preconnect_status"] = "disabled"
-        if (
+        tts_preconnect_enabled = (
             single_pass_decision.enabled
             and runtime_config.get("tts_transport_preconnect_enabled", True) is True
-        ):
-            # Use the provider SDK's public stream lifecycle, not its pool internals.
-            # Independent of greeting-cache hits, non-blocking for call opening.
-            tts_preconnect_task = asyncio.create_task(
-                preconnect_tts_transport(tts_engine, usage_totals),
-                name="vav_tts_transport_preconnect",
-            )
+        )
+        usage_totals["tts_transport_preconnect_status"] = (
+            "waiting_for_first_audio" if tts_preconnect_enabled else "disabled"
+        )
         greeting = _render_greeting(model.greeting_message, variables)
         prepared_greeting_cache_key = (
             greeting_cache_key(
@@ -6555,12 +6551,22 @@ async def vav_inworld_session(ctx: JobContext) -> None:
 
         @session.on("agent_state_changed")
         def _on_agent_state_changed(event: Any) -> None:
+            nonlocal tts_preconnect_task
             telemetry.on_agent_state(
                 new_state=getattr(event, "new_state", None),
                 # Pipeline sessions publish LiveKit's ChatMessage e2e metric;
                 # native realtime does not, so only that lane uses this
                 # server-side speaking-state observation. Never count both.
                 capture_end_to_end=native_realtime,
+            )
+            # Reserve startup resources for the first greeting frame, then
+            # overlap socket setup with playout and the caller's first question.
+            tts_preconnect_task = start_preconnect_after_first_audio(
+                tts_engine,
+                usage_totals,
+                enabled=tts_preconnect_enabled,
+                new_state=getattr(event, "new_state", None),
+                task=tts_preconnect_task,
             )
 
         telemetry.mark_session_started()

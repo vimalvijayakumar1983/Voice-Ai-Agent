@@ -2,7 +2,10 @@ import asyncio
 
 import pytest
 
-from app.livekit_runtime.tts_preconnect import preconnect_tts_transport
+from app.livekit_runtime.tts_preconnect import (
+    preconnect_tts_transport,
+    start_preconnect_after_first_audio,
+)
 
 
 class Stream:
@@ -47,6 +50,30 @@ class Engine:
     def stream(self, *, conn_options):
         self.options = conn_options
         return self.test_stream
+
+
+async def test_first_audio_latch_never_delays_greeting_or_restarts_on_later_turns():
+    engine = Engine(Stream())
+    metrics = {}
+    for enabled, state in [(True, "listening"), (True, "thinking"), (False, "speaking")]:
+        assert (
+            start_preconnect_after_first_audio(
+                engine, metrics, enabled=enabled, new_state=state, task=None
+            )
+            is None
+        )
+    assert engine.options is None
+    task = start_preconnect_after_first_audio(
+        engine, metrics, enabled=True, new_state="speaking", task=None
+    )
+    assert task is not None
+    await task
+    assert (
+        start_preconnect_after_first_audio(
+            engine, metrics, enabled=True, new_state="speaking", task=task
+        )
+        is task
+    )
 
 
 async def test_preconnect_only_opens_and_closes_public_stream():

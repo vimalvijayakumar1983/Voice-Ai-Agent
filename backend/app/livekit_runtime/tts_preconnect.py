@@ -14,6 +14,22 @@ from typing import Any
 from livekit.agents.types import APIConnectOptions
 
 
+def start_preconnect_after_first_audio(
+    engine: Any,
+    metrics: dict[str, Any],
+    *,
+    enabled: bool,
+    new_state: object,
+    task: asyncio.Task[None] | None,
+) -> asyncio.Task[None] | None:
+    """A per-call latch: never start before first audio or restart on later turns."""
+    if enabled and task is None and new_state == "speaking":
+        return asyncio.create_task(
+            preconnect_tts_transport(engine, metrics), name="vav_tts_transport_preconnect"
+        )
+    return task
+
+
 async def preconnect_tts_transport(
     engine: Any,
     metrics: dict[str, Any],
