@@ -59,6 +59,13 @@ without references or regex constraints; schema depth/size and argument size are
 bounded. A bounded operation timeout includes discovery, result reading and
 session cleanup. There is no automatic retry of tools/call.
 
+One operator-reviewed MCP-only exception allows exactly
+`https://mcp-trading.13-232-147-135.sslip.io/mcp`. Its entire DNS answer set must
+remain `13.232.147.135`; a changed answer fails closed for operator review.
+Other sslip.io hosts, paths, ports, query strings and webhook/HIS/CRM uses remain
+blocked. TLS verification, address pinning and redirect rejection still apply.
+This exception does not grant tools or supply a bearer credential.
+
 Configuration/credential/company changes invalidate discovery and grants. Discovery
 failure clears grants. Changed tool descriptions, annotations or schemas remove
 approval and are rejected at execution until reviewed again. Concurrent edits

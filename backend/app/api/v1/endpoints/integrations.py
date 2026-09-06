@@ -192,7 +192,7 @@ def _integration_response(integration: Integration, config: dict) -> Integration
 
 def _validate_config(config: dict, integration_type: str) -> None:
     try:
-        validate_integration_config_urls(config)
+        validate_integration_config_urls(config, mcp_endpoint=integration_type == "mcp")
     except IntegrationConfigError as exc:
         # Do not include the submitted config in validation responses; it can
         # contain credentials that are intentionally write-only.

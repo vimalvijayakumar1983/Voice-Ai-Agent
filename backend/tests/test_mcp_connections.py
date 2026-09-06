@@ -115,6 +115,88 @@ def test_unsafe_mcp_urls(url):
         mcp.validate_mcp_config(config() | {"url": url})
 
 
+REVIEWED_URL = "https://mcp-trading.13-232-147-135.sslip.io/mcp"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        REVIEWED_URL + "/",
+        REVIEWED_URL + "?token=anything",
+        REVIEWED_URL + "#fragment",
+        REVIEWED_URL.replace("/mcp", "/other"),
+        REVIEWED_URL.replace(".io/", ".io:443/"),
+        REVIEWED_URL.replace(".io/", ".io:8443/"),
+        REVIEWED_URL.replace("135", "136"),
+        REVIEWED_URL.replace("mcp-trading.", "other."),
+        REVIEWED_URL.replace("https://", "http://"),
+        REVIEWED_URL.replace("https://", "https://user:pass@"),
+    ],
+)
+def test_reviewed_mcp_exception_is_exact(url):
+    with pytest.raises(IntegrationConfigError):
+        mcp.validate_mcp_config(config() | {"url": url})
+
+
+async def test_reviewed_url_only_accepted_for_mcp(client, auth_headers):
+    from app.services.integration_security import validate_integration_config_urls
+
+    mcp.validate_mcp_config(config() | {"url": REVIEWED_URL})
+    with pytest.raises(IntegrationConfigError):
+        validate_integration_config_urls({"url": REVIEWED_URL})
+    with pytest.raises(IntegrationConfigError):
+        validate_integration_config_urls({"nested": {"url": REVIEWED_URL}}, mcp_endpoint=True)
+    for kind, expected in (("mcp", 201), ("webhook", 422), ("his_api", 422), ("vav_crm", 422)):
+        response = await client.post(
+            "/api/v1/integrations",
+            headers=auth_headers,
+            json={
+                "name": "Reviewed endpoint",
+                "integration_type": kind,
+                "config": config() | {"url": REVIEWED_URL},
+            },
+        )
+        assert response.status_code == expected, response.text
+
+
+@pytest.mark.parametrize("addresses", [("93.184.216.34",), ("13.232.147.135", "1.1.1.1")])
+async def test_reviewed_endpoint_rejects_dns_change(monkeypatch, addresses):
+    from app.tasks import webhook_tasks
+
+    monkeypatch.setattr(
+        webhook_tasks, "_resolve_public_destination", AsyncMock(return_value=addresses)
+    )
+    transport = AsyncMock()
+    monkeypatch.setattr(webhook_tasks, "_PinnedAsyncHTTPTransport", transport)
+    with pytest.raises(mcp.MCPError):
+        async with mcp.mcp_session(config() | {"url": REVIEWED_URL}):
+            pytest.fail("DNS change must not open a session")
+    transport.assert_not_called()
+
+
+async def test_reviewed_endpoint_still_checks_public_dns_and_tls_transport(monkeypatch):
+    from app.tasks import webhook_tasks
+
+    calls = []
+
+    def transport(host, address):
+        calls.append((host, address))
+        return httpx.MockTransport(lambda request: httpx.Response(401))
+
+    resolver = AsyncMock(return_value=("13.232.147.135",))
+    monkeypatch.setattr(webhook_tasks, "_resolve_public_destination", resolver)
+    monkeypatch.setattr(webhook_tasks, "_PinnedAsyncHTTPTransport", transport)
+    with pytest.raises(mcp.MCPError):
+        await mcp.discover_tools(config() | {"url": REVIEWED_URL})
+    resolver.assert_awaited_once_with(REVIEWED_URL)
+    assert calls == [("mcp-trading.13-232-147-135.sslip.io", "13.232.147.135")]
+    resolver.side_effect = IntegrationConfigError("non-public DNS")
+    calls.clear()
+    with pytest.raises(mcp.MCPError):
+        await mcp.discover_tools(config() | {"url": REVIEWED_URL})
+    assert not calls
+
+
 async def test_permissions_binding_and_revocation(client, auth_headers, tenant, db, monkeypatch):
     agent = Agent(tenant_id=tenant.id, name="Tool-loop QA", system_prompt="Test")
     db.add(agent)
@@ -123,7 +205,7 @@ async def test_permissions_binding_and_revocation(client, auth_headers, tenant, 
         tenant_id=tenant.id,
         agent_id=agent.id,
         enabled=True,
-        telephony_provider="livekit",
+        telephony_provider="livekit_sip",
         primary_speech_provider="inworld",
         runtime_config={"voice_runtime": "inworld_realtime"},
     )

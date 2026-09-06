@@ -27,9 +27,10 @@ from sqlalchemy import select
 from app.models.agent import Agent, AgentRuntimeProfile
 from app.models.integration import Integration
 from app.services.integration_security import (
+    REVIEWED_MCP_DESTINATIONS,
     IntegrationConfigError,
     load_integration_config,
-    validate_public_https_url,
+    validate_mcp_https_url,
 )
 
 CLIENT_FIELDS = {
@@ -52,7 +53,7 @@ class MCPError(ValueError):
 
 
 def validate_mcp_config(config: dict) -> None:
-    validate_public_https_url(config.get("url", ""))
+    validate_mcp_https_url(config.get("url", ""))
     if urlsplit(config["url"]).query:
         raise IntegrationConfigError("MCP URLs cannot contain query parameters; use bearer auth")
     if config.get("auth_type", "none") not in {"none", "bearer"}:
@@ -120,7 +121,7 @@ def runtime_compatible(profile: AgentRuntimeProfile | None) -> bool:
     return bool(
         profile
         and profile.enabled
-        and profile.telephony_provider == "livekit"
+        and profile.telephony_provider == "livekit_sip"
         and profile.primary_speech_provider == "inworld"
         and config.get("voice_runtime") == "inworld_realtime"
         and config.get("inworld_single_pass") is not True
@@ -175,6 +176,9 @@ async def mcp_session(config: dict):
     timeout = config.get("timeout_seconds", 10)
     async with asyncio.timeout(timeout):
         addresses = await _resolve_public_destination(url)
+        reviewed_address = REVIEWED_MCP_DESTINATIONS.get(url)
+        if reviewed_address and set(addresses) != {reviewed_address}:
+            raise MCPError("Reviewed MCP destination DNS changed; operator review required")
         transport = _PinnedAsyncHTTPTransport(urlsplit(url).hostname, addresses[0])
 
         class BoundedTransport(httpx.AsyncBaseTransport):

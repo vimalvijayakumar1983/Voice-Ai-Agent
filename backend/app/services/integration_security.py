@@ -228,6 +228,12 @@ _BLOCKED_HOST_SUFFIXES = (
     ".vcap.me",
 )
 _NORMALIZE_KEY_PATTERN = re.compile(r"[^a-z0-9]+")
+# Operator-reviewed MCP exception, not a wildcard or a client-editable allowlist.
+# Network callers must still resolve/check DNS, pin this address, verify TLS and
+# refuse redirects. This does not permit webhook/HIS/CRM destinations.
+REVIEWED_MCP_DESTINATIONS = {
+    "https://mcp-trading.13-232-147-135.sslip.io/mcp": "13.232.147.135",
+}
 
 
 def normalize_config_key(key: object) -> str:
@@ -338,7 +344,16 @@ def validate_public_https_url(value: str) -> str:
     return value
 
 
-def validate_integration_config_urls(config: Mapping[str, Any]) -> None:
+def validate_mcp_https_url(value: str) -> str:
+    """Permit only an exact reviewed MCP endpoint in addition to normal HTTPS URLs."""
+    if isinstance(value, str) and value in REVIEWED_MCP_DESTINATIONS:
+        return value
+    return validate_public_https_url(value)
+
+
+def validate_integration_config_urls(
+    config: Mapping[str, Any], *, mcp_endpoint: bool = False
+) -> None:
     """Recursively validate URL and base-URL fields in an integration config."""
 
     def visit(value: object, path: str = "config") -> None:
@@ -349,7 +364,10 @@ def validate_integration_config_urls(config: Mapping[str, Any]) -> None:
                     if not isinstance(child, str):
                         raise IntegrationConfigError(f"{child_path} must be a URL string")
                     try:
-                        validate_public_https_url(child)
+                        if mcp_endpoint and path == "config" and key == "url":
+                            validate_mcp_https_url(child)
+                        else:
+                            validate_public_https_url(child)
                     except IntegrationConfigError as exc:
                         raise IntegrationConfigError(f"{child_path}: {exc}") from exc
                 elif isinstance(child, (Mapping, list, tuple)):
