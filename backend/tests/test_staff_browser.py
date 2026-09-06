@@ -192,6 +192,38 @@ async def test_old_client_cannot_silently_remove_staff_policy(
     assert response.status_code == 409, response.text
 
 
+async def test_staff_policy_save_and_mcp_eligibility_roundtrip(
+    client, auth_headers, tenant, db, monkeypatch
+):
+    _configure_platform(monkeypatch)
+    agent = await _configured_browser_agent(db, tenant)
+    values = {
+        "staff_browser_only": True,
+        "knowledge_source_mode": "tools_only",
+        "telephony_provider": "livekit_sip",
+        "primary_speech_provider": "inworld",
+        "llm_provider": "inworld",
+        "llm_model": "openai/gpt-4o-mini",
+        "voice_runtime": "inworld_realtime",
+        "knowledge_turn_mode": "tool_loop",
+    }
+    response = await client.put(
+        f"/api/v1/runtime/agents/{agent.id}",
+        headers=auth_headers,
+        json=values,
+    )
+    assert response.status_code == 200, response.text
+    saved = response.json()
+    assert saved["staff_browser_only"] is True
+    assert saved["knowledge_source_mode"] == "tools_only"
+    assert saved["enabled"] is False and saved["assigned_numbers"] == []
+    fetched = await client.get(f"/api/v1/runtime/agents/{agent.id}", headers=auth_headers)
+    assert fetched.json()["staff_browser_only"] is True
+    options = await client.get("/api/v1/integrations/mcp/agents", headers=auth_headers)
+    assert options.status_code == 200, options.text
+    assert next(item for item in options.json() if item["id"] == str(agent.id))["eligible"]
+
+
 @pytest.mark.parametrize("change", ["disabled", "standard", "knowledge", "foreign_actor"])
 async def test_reservation_rechecked_before_worker_join(
     client, auth_headers, tenant, db, monkeypatch, change
