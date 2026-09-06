@@ -3,6 +3,7 @@
 import asyncio
 import hashlib
 import json
+import re
 import sys
 import time
 import uuid
@@ -71,6 +72,12 @@ assert lane in IDS
 cases = CASES[:2] if "--smoke" in sys.argv else CASES
 if "--knowledge-smoke" in sys.argv:
     cases = CASES[1:2]
+if "--focused-v2" in sys.argv:
+    cases = [
+        case
+        for case in CASES
+        if case[0] not in {"paused_name", "follow_up", "unsupported"}
+    ]
 
 
 def voiced(data):
@@ -229,7 +236,10 @@ async def main():
             if label != "interrupt":
                 await state.wait_until_listening(35)
                 await asyncio.sleep(0.7)
-            state.arm(list(room.remote_participants.values()))
+            tail = " ".join(re.findall(r"\w+", segments[-1].casefold())[-3:])
+            state.arm(
+                list(room.remote_participants.values()), expected_caller_tail=tail
+            )
             text_index = len(transcripts)
             turn_start = time.monotonic()
             last_voiced = 0
@@ -286,6 +296,9 @@ async def main():
                 if eligible
                 else None,
                 "overlap_case": label == "interrupt",
+                "measurement_version": "caller-tail-v2",
+                "complete_caller_boundary_observed": state.caller_final_observed,
+                "useful_answer_audio_ms": None,
                 "transcripts": transcripts[text_index:],
             }
             result["observation_error"] = observation_error

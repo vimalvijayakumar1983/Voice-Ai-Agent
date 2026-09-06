@@ -286,6 +286,7 @@ class _AgentResponseQuiescence:
     caller_final_observed: bool = False
     agent_final_observed: bool = False
     response_started: bool = False
+    expected_caller_tail: tuple[str, ...] = ()
     agent_listening: asyncio.Event = field(default_factory=asyncio.Event)
     response_completed: asyncio.Event = field(default_factory=asyncio.Event)
 
@@ -324,10 +325,11 @@ class _AgentResponseQuiescence:
         if _AGENT_STATE_ATTRIBUTE in changed_attributes:
             self.observe_state(changed_attributes[_AGENT_STATE_ATTRIBUTE])
 
-    def arm(self, participants: Sequence[Any]) -> None:
+    def arm(self, participants: Sequence[Any], *, expected_caller_tail: str = "") -> None:
         """Start correlating a response immediately before caller audio begins."""
 
         self.caller_final_observed = False
+        self.expected_caller_tail = tuple(re.findall(r"\w+", expected_caller_tail.casefold()))
         self.agent_final_observed = False
         self.response_started = False
         self.response_completed.clear()
@@ -352,7 +354,17 @@ class _AgentResponseQuiescence:
                 return
             self.agent_final_observed = True
         else:
-            self.caller_final_observed = True
+            # Optional synthetic-fixture boundary: a reply to the first half
+            # of a split utterance cannot complete the entire test question.
+            # A misrecognized/missing tail remains unobserved, never a fast pass.
+            words = tuple(
+                word
+                for segment in segments
+                if getattr(segment, "final", False)
+                for word in re.findall(r"\w+", str(getattr(segment, "text", "")).casefold())
+            )
+            tail = self.expected_caller_tail
+            self.caller_final_observed = not tail or words[-len(tail) :] == tail
             # Discard every pre-caller greeting edge. The response must begin
             # or finalize after this explicit caller boundary.
             self.agent_final_observed = False
@@ -376,7 +388,8 @@ class _AgentResponseQuiescence:
         if state == "speaking":
             self.response_started = True
         elif self.response_started and state in _AGENT_RESPONSE_COMPLETE_STATES:
-            self.response_completed.set()
+            if not self.expected_caller_tail or self.agent_final_observed:
+                self.response_completed.set()
 
     async def wait_until_listening(self, timeout_seconds: float) -> None:
         """Do not let a greeting be mistaken for the fixture's response."""

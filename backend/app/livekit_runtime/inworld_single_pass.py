@@ -308,7 +308,12 @@ def build_evidence_only_instructions(evidence: str | None) -> str:
         + (
             "- Its value is NO_KNOWLEDGE_REQUIRED because this is a conversational or "
             "call-control turn. Respond directly and naturally, but make no new business "
-            "fact claims.\n"
+            "fact claims. When asked what the caller said or selected, recall their latest "
+            "explicit statement from conversation, including corrections. Attribute it as "
+            "'You said' or 'You asked for', not as a verified business fact. If missing, ask "
+            "for clarification. This exception permits recalling caller-stated dates or "
+            "numbers, but never confirms availability, a booking, payment, or any action. "
+            "Do not offer or start an action when only asked to recall a statement.\n"
             if conversation_only
             else ""
         )

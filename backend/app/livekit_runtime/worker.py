@@ -81,6 +81,7 @@ from app.services.conversation_foundation import (
     capability_question,
     company_alias_scope,
     contextual_plan,
+    conversational_request,
     implicit_contact_numbers,
     incomplete_request,
     named_identity_request,
@@ -2807,6 +2808,11 @@ Knowledge policy:
     async def retrieve_single_pass_evidence(self, transcript: str) -> str:
         """Plan one contextual lookup without modifying the provider transcript."""
 
+        conversational = conversational_request(str(transcript or ""))
+        if conversational == "audio_check":
+            return scope_reply("Yes, I can hear you. Please go ahead.")
+        if conversational == "caller_memory":
+            return NO_KNOWLEDGE_REQUIRED
         if self._conversation_state_v3 and self._company_scope:
             return await self._retrieve_conversation_state_evidence(transcript)
 
@@ -3938,6 +3944,16 @@ class VAVInworldRealtimeAgent(VAVInworldAgent):
 
         semantic_variant = " ".join(semantic_query.split()).strip()
         query_variants = (semantic_variant,) if semantic_variant else ()
+        if self._provider_native_turns_qa and self._company_scope:
+            # Share authorised company/reference resolution, not turn control.
+            # Direct retrieval otherwise keeps the default company when the
+            # native model asks for another company in the same approved KB.
+            if self._telemetry is not None:
+                metrics = self._telemetry.runtime_metrics
+                metrics["native_qa_tool_requests"] = (
+                    int(metrics.get("native_qa_tool_requests", 0)) + 1
+                )
+            return await self.retrieve_single_pass_evidence(query)
         return await self._retrieve_approved_knowledge(
             query=query,
             query_variants=query_variants,
@@ -6485,6 +6501,7 @@ async def vav_inworld_session(ctx: JobContext) -> None:
                 transcript = raw_transcript.strip()
                 telemetry.on_final_transcript(transcript)
                 if provider_native_turns_qa:
+                    telemetry.consume_barge_in_transcript()
                     # Keep telemetry, retrieval authorization and grounding tools;
                     # leave transcript repair, cancellation and turn control to
                     # the realtime provider for this explicitly isolated QA lane.

@@ -230,11 +230,34 @@ def named_identity_request(text: str, scope: KnowledgeCompanyScope, company: str
     return bool(words)
 
 
+def conversational_request(text: str) -> str | None:
+    """Recognize bounded call checks and caller-memory questions, not business facts.
+
+    Full matches deliberately exclude appended factual or action requests. Caller
+    recollections are not verified company facts and never authorize a booking.
+    """
+    normalized = company_key(text)
+    if re.fullmatch(
+        r"(?:(?:hello|hi|please) )*(?:can|could) you hear me(?: (?:now|clearly|okay|ok))?",
+        normalized,
+    ):
+        return "audio_check"
+    if re.fullmatch(
+        r"(?:no |actually )?(?:(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)"
+        r"(?: (?:morning|afternoon|evening))? )?"
+        r"(?:what|which) (?:day|date|time|name|number|option) did i "
+        r"(?:say|mention|choose|select|request|ask for)",
+        normalized,
+    ) or re.fullmatch(r"what did i (?:say|mention|choose|select|request|ask for)", normalized):
+        return "caller_memory"
+    return None
+
+
 def incomplete_request(
     text: str, people: tuple[str, ...] = (), scope: KnowledgeCompanyScope | None = None
 ) -> bool:
     normalized = company_key(text)
-    if not normalized or spoken_control(text):
+    if not normalized or spoken_control(text) or conversational_request(text):
         return False
     if scope and negative_company_prefix(text, scope):
         return True
