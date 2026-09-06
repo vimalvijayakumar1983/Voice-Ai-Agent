@@ -22,6 +22,7 @@ from app.models.campaign import (
 )
 from app.models.commerce import CommerceAction, CommerceSession
 from app.models.compliance import ConsentRecord, DncEntry
+from app.models.dialer import DialerCampaign, DialerCustomer, DialerJob
 from app.models.integration import Integration, WebhookEvent
 from app.models.provider_credential import ProviderCredential
 from app.models.tenant import Tenant
@@ -31,6 +32,9 @@ from app.models.workflow import Workflow, WorkflowNode
 
 __all__ = [
     "Tenant",
+    "DialerCustomer",
+    "DialerCampaign",
+    "DialerJob",
     "User",
     "ApiKey",
     "RefreshSession",

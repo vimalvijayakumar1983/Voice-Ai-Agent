@@ -9,6 +9,9 @@ from app.core.identity import normalize_email
 
 
 class Settings(BaseSettings):
+    # A code deployment alone must never authorize a new bulk calling engine.
+    dialer_live_enabled: bool = False
+    dialer_tenant_concurrency: int = Field(10, ge=1, le=100)
     # App
     app_name: str = "Voice AI Agent"
     app_env: str = "development"

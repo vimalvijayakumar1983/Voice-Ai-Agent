@@ -1,6 +1,7 @@
 """Call management endpoints - logs, transcripts, summaries, and outbound calls."""
 
 import re
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from typing import Annotated
 from uuid import UUID, uuid5
@@ -587,6 +588,17 @@ async def initiate_outbound_call(
     ],
     current_user: CurrentUser = Depends(require_role("owner", "admin", "member")),
     db: AsyncSession = Depends(get_db),
+):
+    return await dispatch_outbound_call(data, idempotency_key, current_user, db)
+
+
+async def dispatch_outbound_call(
+    data: CallOutbound,
+    idempotency_key: str,
+    current_user: CurrentUser,
+    db: AsyncSession,
+    *,
+    dispatch_guard: Callable[[AsyncSession], Awaitable[bool]] | None = None,
 ):
     """Initiate at most one outbound call for a tenant idempotency key."""
     call_id = uuid5(
@@ -1204,6 +1216,12 @@ async def initiate_outbound_call(
                 reason = "twilio_route_changed"
             call.status = "failed"
             call.call_metadata = {**(call.call_metadata or {}), "dispatch_error": reason}
+            await db.commit()
+            return CallResponse.model_validate(call)
+
+        if dispatch_guard is not None and not await dispatch_guard(db):
+            call.status = "cancelled"
+            call.call_metadata = {**(call.call_metadata or {}), "dispatch_error": "dialer_revoked"}
             await db.commit()
             return CallResponse.model_validate(call)
 

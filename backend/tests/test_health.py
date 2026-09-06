@@ -117,10 +117,10 @@ def test_readiness_revision_matches_alembic_heads():
 @pytest.mark.parametrize(
     ("revisions", "expected"),
     [
-        (["20260904_024"], True),
+        (list(EXPECTED_DATABASE_REVISIONS), True),
         ([], False),
         (["20260827_007"], False),
-        (["20260904_024", "unexpected_branch"], False),
+        ([*EXPECTED_DATABASE_REVISIONS, "unexpected_branch"], False),
     ],
 )
 async def test_database_readiness_requires_exact_migration_heads(

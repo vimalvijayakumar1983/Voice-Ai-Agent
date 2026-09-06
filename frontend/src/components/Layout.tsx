@@ -42,6 +42,7 @@ const navigation = [
     label: 'Operate',
     items: [
       { href: '/campaigns', label: 'Campaigns', icon: Megaphone },
+      { href: '/dialer', label: 'AI Dialer', icon: PhoneCall },
       { href: '/compliance', label: 'Compliance', icon: ShieldCheck },
       { href: '/integrations', label: 'Integrations', icon: Plug },
     ],

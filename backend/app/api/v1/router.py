@@ -11,6 +11,7 @@ from app.api.v1.endpoints import (
     calls,
     campaigns,
     compliance,
+    dialer,
     integrations,
     knowledge,
     realtime,
@@ -29,6 +30,7 @@ api_router.include_router(runtime.router)
 api_router.include_router(calls.router)
 api_router.include_router(workflows.router)
 api_router.include_router(campaigns.router)
+api_router.include_router(dialer.router)
 api_router.include_router(analytics.router)
 api_router.include_router(audit.router)
 api_router.include_router(integrations.router)
