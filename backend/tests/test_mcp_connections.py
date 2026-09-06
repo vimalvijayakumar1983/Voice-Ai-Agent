@@ -252,6 +252,26 @@ async def test_unknown_write_tool_and_foreign_agent_rejected(client, auth_header
         assert response.status_code == 422
 
 
+async def test_discovered_url_schema_is_not_outbound_config(client, auth_headers, monkeypatch):
+    connection = await create(client, auth_headers)
+    tool = read_tool()
+    tool.inputSchema["properties"] = {"url": {"type": "string"}}
+    monkeypatch.setattr(
+        mcp,
+        "discover_tools",
+        AsyncMock(return_value={"tools": [mcp.tool_descriptor(tool)], "latency_ms": 1}),
+    )
+    path = f"/api/v1/integrations/{connection['id']}"
+    response = await client.post(path + "/mcp/test", headers=auth_headers)
+    assert response.status_code == 200, response.text
+    response = await client.patch(
+        path,
+        headers=auth_headers,
+        json={"config": {"allowed_tools": [tool.name], "public_data_approved": True}},
+    )
+    assert response.status_code == 200, response.text
+
+
 async def test_failed_discovery_clears_grants_without_leaking_error(
     client, auth_headers, monkeypatch
 ):

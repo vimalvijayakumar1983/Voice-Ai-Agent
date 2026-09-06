@@ -192,7 +192,15 @@ def _integration_response(integration: Integration, config: dict) -> Integration
 
 def _validate_config(config: dict, integration_type: str) -> None:
     try:
-        validate_integration_config_urls(config, mcp_endpoint=integration_type == "mcp")
+        # Discovered MCP schemas are inert data, not outbound configuration.
+        # A property named "url" is a schema object and must not be treated as
+        # a destination. Catalogs are server-managed and checked by the MCP SDK.
+        url_config = (
+            {key: value for key, value in config.items() if key != "tools"}
+            if integration_type == "mcp"
+            else config
+        )
+        validate_integration_config_urls(url_config, mcp_endpoint=integration_type == "mcp")
     except IntegrationConfigError as exc:
         # Do not include the submitted config in validation responses; it can
         # contain credentials that are intentionally write-only.
