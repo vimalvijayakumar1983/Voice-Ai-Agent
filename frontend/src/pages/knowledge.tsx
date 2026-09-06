@@ -146,7 +146,9 @@ export default function KnowledgeStudio() {
   ) ? rollbackRevisionId : rollbackCandidates[0]?.revision_id || '';
   const selectedHasActiveRepair = Boolean(selected?.sources.some((source) => {
     const recovery = sourceRecovery(source);
-    return recovery?.status === 'queued' || recovery?.status === 'processing';
+    const compilation = sourceUploadCompilation(source);
+    return recovery?.status === 'queued' || recovery?.status === 'processing'
+      || compilation?.status === 'queued' || compilation?.status === 'processing';
   }) || selected?.crawls.some((crawl) => ['queued', 'discovering', 'indexing', 'retrying'].includes(crawl.status)));
 
   useEffect(() => {
@@ -497,7 +499,7 @@ export default function KnowledgeStudio() {
     await runAction(
       'add-text',
       () => api.addKnowledgeText(selected.id, String(form.get('text_name') || ''), String(form.get('text_content') || ''), String(form.get('processing_mode') || 'automatic') as KnowledgeProcessingMode),
-      'Text compiled for review. Check any warnings, then approve the draft for VAV-native agents. Smallest.ai bindings do not support pasted text.',
+      'Text saved. AI processing continues in the background; follow its status in Source inventory. Review the completed facts before approval.',
     );
   };
 
@@ -506,7 +508,7 @@ export default function KnowledgeStudio() {
     await runAction(
       `compile-source-${source.id}`,
       () => api.compileKnowledgeSource(selected.id, source.id),
-      'Source compiled in place. Review the facts and warnings, then approve the draft; no duplicate document was created.',
+      'Processing queued in place; no duplicate document was created. Follow Source inventory for progress, then review before approval.',
     );
   };
 
@@ -967,24 +969,26 @@ function SourcesSection({ sources, canRepair, canRemove, busy, onRepair, onCompi
   return <section className={styles.section} aria-labelledby="sources-heading"><div className={styles.sectionHeading}><div><span className={styles.sectionIcon}><Layers3 size={15} /></span><div><h3 id="sources-heading">Source inventory</h3><p>Text extraction and company attribution are checked separately. Scoped agents need approved facts for their configured company.</p></div></div><span className="badge badge-neutral">{sources.length} documents · {readyCount} with company facts</span></div>{sources.length === 0 ? <div className={styles.sourceEmpty}><FileText size={20} /><div><strong>No sources yet</strong><p>Add curated web pages, searchable text, or an approved PDF to begin.</p></div></div> : <div className={styles.sourceList}>{sources.map((source) => {
     const method = typeof source.source_metadata?.extraction_method === 'string' ? source.source_metadata.extraction_method : null;
     const compiler = sourceCompiler(source);
+    const compilation = sourceUploadCompilation(source);
+    const compilationActive = compilation?.status === 'queued' || compilation?.status === 'processing';
     const isReady = source.retrieval_ready && source.status === 'indexed' && (source.company_fact_count ?? 0) > 0;
     const recovery = sourceRecovery(source);
     const isWebsite = source.source_type === 'url' || source.source_type === 'website' || source.source_type === 'sitemap';
     // Ready web pages may still need a deliberate refresh when their website
     // changes or a better extraction strategy becomes available.
     const repairable = isWebsite;
-    const recoveryDetail = recovery?.status === 'queued' || recovery?.status === 'processing'
+    const recoveryDetail = compilation ? compilation.message : recovery?.status === 'queued' || recovery?.status === 'processing'
       ? recovery.message || `VAV is ${recoveryStageLabel(recovery.stage)}…`
       : recovery?.status === 'failed' && isReady
         ? recovery.message || 'Latest refresh failed; the previous approved content remains active.'
       : !source.retrieval_ready
         ? isWebsite ? 'VAV could not read this page yet. Use Repair page to recover it automatically.' : 'VAV cannot use this document yet. Re-upload it to run extraction and OCR repair.'
         : null;
-    const detail = [recoveryDetail, source.retrieval_ready && !(source.company_fact_count ?? 0)
+    const detail = [recoveryDetail, !compilationActive && source.retrieval_ready && !(source.company_fact_count ?? 0)
       ? 'Text is readable, but no company-attributed facts are compiled. This source is unavailable to company-scoped agents. Refresh it with AI-verified extraction, then review and approve the compiled knowledge.' : null].filter(Boolean).join(' ');
     const recoveryActive = recovery?.status === 'queued' || recovery?.status === 'processing';
     const refreshLabel = isReady ? 'Refresh page' : 'Repair page';
-    return <article className={styles.sourceRow} key={source.id}><span className={styles.sourceTypeIcon}>{source.source_type === 'file' ? <FileText size={16} /> : source.source_type === 'text' ? <Layers3 size={16} /> : <Globe2 size={16} />}</span><div className={styles.sourceIdentity}><strong>{source.name}</strong><span>{source.location || (source.size_bytes ? formatBytes(source.size_bytes) : source.source_type)} · {source.retrieval_ready ? `${source.extracted_character_count.toLocaleString()} searchable characters${method ? ` · ${method === 'native' ? 'text extracted' : method === 'static_html' ? 'HTML extracted' : method === 'javascript_render' ? 'JavaScript rendered' : method}` : ''}${compiler ? ` · ${compilerLabel(compiler)}` : ''}` : 'no voice-searchable text'}</span>{compiler?.warning && <p>{compiler.warning}</p>}{detail && <p className={recoveryActive ? styles.recoveryProgress : undefined}>{detail}</p>}{source.error_message && source.error_message !== detail && <p>{source.error_message}</p>}<SourceReview key={`${source.id}:${source.updated_at}`} source={source} /></div><span className={`badge ${isReady ? 'badge-success' : sourceBadge(source.status)}`}>{isReady ? 'Company facts available' : recoveryActive ? recoveryStageLabel(recovery.stage) : source.retrieval_ready && source.status === 'indexed' ? 'Text searchable' : source.status.replace('_', ' ')}</span><time>{formatDate(source.last_synced_at || source.updated_at)}</time><span className={styles.sourceActions}>{canRepair && repairable && <button type="button" className="btn btn-secondary btn-sm" disabled={busy || recoveryActive} onClick={() => onRepair(source)} aria-label={`${refreshLabel} ${source.name} and re-index its searchable content`} title="Download, render, extract, index and verify the latest page content"><RefreshCw size={12} className={recoveryActive ? 'spin' : undefined} /> {refreshLabel}</button>}{canRepair && !isWebsite && source.retrieval_ready && <button type="button" className="btn btn-secondary btn-sm" disabled={busy} onClick={() => onCompile(source)} aria-label={`Structure ${source.name} with AI`} title="Compile the original into source-checked VAV facts; review before approval">{busy ? 'Working…' : 'Structure with AI'}</button>}{canRemove && <button type="button" className="icon-button" disabled={busy} onClick={() => onRemove(source)} aria-label={`Stage removal of ${source.name}`} title="Stage removal for the next approved VAV release"><Trash2 size={14} /></button>}</span></article>;
+return <article className={styles.sourceRow} key={source.id}><span className={styles.sourceTypeIcon}>{source.source_type === 'file' ? <FileText size={16} /> : source.source_type === 'text' ? <Layers3 size={16} /> : <Globe2 size={16} />}</span><div className={styles.sourceIdentity}><strong>{source.name}</strong><span>{source.location || (source.size_bytes ? formatBytes(source.size_bytes) : source.source_type)} · {source.retrieval_ready ? `${source.extracted_character_count.toLocaleString()} searchable characters${method ? ` · ${method === 'native' ? 'text extracted' : method === 'static_html' ? 'HTML extracted' : method === 'javascript_render' ? 'JavaScript rendered' : method}` : ''}${compiler ? ` · ${compilerLabel(compiler)}` : ''}` : 'no voice-searchable text'}</span>{compiler?.warning && <p>{compiler.warning}</p>}{detail && <p className={recoveryActive || compilationActive ? styles.recoveryProgress : undefined}>{detail}</p>}{source.error_message && source.error_message !== detail && <p>{source.error_message}</p>}<SourceReview key={`${source.id}:${source.updated_at}`} source={source} /></div><span className={`badge ${isReady ? 'badge-success' : sourceBadge(source.status)}`}>{compilationActive ? (compilation?.status === 'queued' ? 'Queued' : 'Processing AI') : isReady ? 'Company facts available' : recoveryActive ? recoveryStageLabel(recovery.stage) : source.retrieval_ready && source.status === 'indexed' ? 'Text searchable' : source.status.replace('_', ' ')}</span><time>{formatDate(source.last_synced_at || source.updated_at)}</time><span className={styles.sourceActions}>{canRepair && repairable && <button type="button" className="btn btn-secondary btn-sm" disabled={busy || recoveryActive} onClick={() => onRepair(source)} aria-label={`${refreshLabel} ${source.name} and re-index its searchable content`} title="Download, render, extract, index and verify the latest page content"><RefreshCw size={12} className={recoveryActive ? 'spin' : undefined} /> {refreshLabel}</button>}{canRepair && !isWebsite && (source.retrieval_ready || Boolean(compilation)) && <button type="button" className="btn btn-secondary btn-sm" disabled={busy || compilationActive} onClick={() => onCompile(source)} aria-label={`Structure ${source.name} with AI`} title="Compile the original into source-checked VAV facts; review before approval">{compilationActive ? 'Processing…' : busy ? 'Working…' : compilation?.status === 'failed' ? 'Retry processing' : 'Structure with AI'}</button>}{canRemove && <button type="button" className="icon-button" disabled={busy} onClick={() => onRemove(source)} aria-label={`Stage removal of ${source.name}`} title="Stage removal for the next approved VAV release"><Trash2 size={14} /></button>}</span></article>;
   })}</div>}</section>;
 }
 
@@ -1007,6 +1011,7 @@ function StatusDot({ status }: { status: KnowledgeBase['sync_status'] }) { retur
 function scopeLabel(kb: KnowledgeBase) { return kb.scope_label || scopeOptions.find((scope) => scope.value === kb.scope_type)?.label || kb.scope_type; }
 function sourceBadge(status: KnowledgeSource['status']) { if (status === 'indexed') return 'badge-success'; if (status === 'failed') return 'badge-danger'; if (status === 'processing' || status === 'pending') return 'badge-warning'; return 'badge-neutral'; }
 type SourceRecovery = { status?: string; stage?: string; message?: string };
+function sourceUploadCompilation(source: KnowledgeSource): SourceRecovery | null { const value = source.source_metadata?.upload_compile; return value && typeof value === 'object' ? value as SourceRecovery : null; }
 type SourceCompiler = { effective_mode?: string; model?: string; input_tokens?: number; output_tokens?: number; estimated_cost_usd?: number; estimated_cost_aed?: number; reused?: boolean; warning?: string | null };
 function sourceRecovery(source: KnowledgeSource): SourceRecovery | null { const value = source.source_metadata?.recovery; return value && typeof value === 'object' ? value as SourceRecovery : null; }
 function sourceCompiler(source: KnowledgeSource): SourceCompiler | null { const value = source.source_metadata?.compiler; return value && typeof value === 'object' ? value as SourceCompiler : null; }
