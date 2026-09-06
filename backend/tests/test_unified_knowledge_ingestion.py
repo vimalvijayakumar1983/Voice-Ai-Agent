@@ -45,6 +45,99 @@ FACT = {
 }
 
 
+@pytest.mark.asyncio
+async def test_background_inference_has_one_longer_attempt(
+    client, auth_headers, tenant, db, fake_ai, monkeypatch
+):
+    kb = await create_kb(db, tenant)
+    response = await client.post(
+        f"/api/v1/knowledge/{kb.id}/sources/text",
+        headers=auth_headers,
+        json={"name": "Clinic FAQ", "content": RAW, "processing_mode": "ai_verified"},
+    )
+    assert response.status_code == 200
+    captured = {}
+    delegate = jobs.compile_source_knowledge
+
+    async def capture(**kwargs):
+        captured.update(kwargs)
+        return await delegate(**kwargs)
+
+    monkeypatch.setattr(jobs, "compile_source_knowledge", capture)
+    await finish_upload(response.json(), db)
+    assert captured["timeout_seconds"] == 120.0
+    assert captured["max_retries"] == 0
+    assert len(fake_ai.requests) == 1
+    source = await get_source(db, response.json()["sources"][0]["id"])
+    assert jobs.job_for(source)["status"] == "completed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("timeout_seconds,max_retries", [(45.0, 1), (120.0, 0)])
+async def test_compiler_passes_request_budget_to_owned_client(
+    monkeypatch, timeout_seconds, max_retries
+):
+    captured = {}
+    ai = FakeAI()
+
+    async def close():
+        captured["closed"] = True
+
+    ai.close = close
+
+    def factory(**kwargs):
+        captured.update(kwargs)
+        return ai
+
+    monkeypatch.setattr(compiler, "AsyncOpenAI", factory)
+    options = (
+        {}
+        if timeout_seconds == 45.0
+        else {"timeout_seconds": timeout_seconds, "max_retries": max_retries}
+    )
+    result = await compiler.compile_source_knowledge(
+        title="Clinic FAQ",
+        url="",
+        text=RAW,
+        requested_mode="ai_verified",
+        api_key="fake",
+        **options,
+    )
+    assert captured["timeout"] == timeout_seconds
+    assert captured["max_retries"] == max_retries
+    assert captured["closed"]
+    assert result.structured["facts"] == [FACT]
+
+
+@pytest.mark.asyncio
+async def test_background_timeout_is_not_reported_as_bad_credentials(
+    client, auth_headers, tenant, db, fake_ai, monkeypatch
+):
+    kb = await create_kb(db, tenant)
+    response = await client.post(
+        f"/api/v1/knowledge/{kb.id}/sources/text",
+        headers=auth_headers,
+        json={"name": "Clinic FAQ", "content": RAW, "processing_mode": "ai_verified"},
+    )
+    assert response.status_code == 200
+
+    async def timed_out(**kwargs):
+        try:
+            raise TimeoutError("secret provider response")
+        except TimeoutError as exc:
+            raise compiler.KnowledgeCompilerError("generic wrapper") from exc
+
+    monkeypatch.setattr(jobs, "compile_source_knowledge", timed_out)
+    await finish_upload(response.json(), db)
+    source = await get_source(db, response.json()["sources"][0]["id"])
+    assert source.status == "failed"
+    assert source.raw_content == RAW
+    assert "timed out" in source.error_message
+    assert "connection" not in source.error_message
+    assert "secret" not in source.error_message
+    assert jobs.job_for(source)["status"] == "failed"
+
+
 class FakeAI:
     def __init__(self):
         self.requests = []

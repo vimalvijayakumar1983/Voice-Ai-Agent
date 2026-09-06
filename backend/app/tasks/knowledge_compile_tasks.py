@@ -6,6 +6,7 @@ from uuid import UUID, uuid4
 
 import structlog
 from fastapi import HTTPException
+from openai import APITimeoutError
 from sqlalchemy import select
 
 from app.core.config import settings
@@ -161,18 +162,34 @@ async def _compile(tenant_id, kb_id, source_id, run_id):
             requested_mode=job["mode"],
             api_key=api_key,
             require_structured_facts=True,
+            # Background inference need not fit the old HTTP/proxy deadline.
+            # Use one longer attempt, not two potentially billed short attempts.
+            # The task deadline and stale-job watchdog still bound total work.
+            timeout_seconds=120.0,
+            max_retries=0,
         )
         await _finish(tenant_id, kb_id, source_id, run_id, compiled=compiled)
-    except Exception:
+    except Exception as exc:
         # Never expose provider response bodies, credentials or uploaded text in logs/UI.
         logger.warning("knowledge_compilation_failed", source_id=source_id, run_id=run_id)
+        cause = exc
+        timed_out = False
+        seen = set()
+        while cause is not None and id(cause) not in seen:
+            seen.add(id(cause))
+            timed_out |= isinstance(cause, (APITimeoutError, TimeoutError))
+            cause = cause.__cause__
         await _finish(
             tenant_id,
             kb_id,
             source_id,
             run_id,
-            error="AI processing could not complete. Your original is saved. "
-            "Check the OpenAI connection and retry processing.",
+            error=(
+                "AI processing timed out. Your original is saved. Retry processing."
+                if timed_out
+                else "AI processing could not complete. Your original is saved. "
+                "Check the OpenAI connection and retry processing."
+            ),
         )
 
 
