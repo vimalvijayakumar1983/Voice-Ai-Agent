@@ -2002,7 +2002,11 @@ class ApiClient {
   }
 
   async listMcpAgents() {
-    return this.request<Array<{ id: string; name: string; eligible: boolean; reason: string }>>('/api/v1/integrations/mcp/agents');
+    return this.request<Array<{ id: string; name: string; eligible: boolean; private_eligible: boolean; reason: string }>>('/api/v1/integrations/mcp/agents');
+  }
+
+  async listMcpStaff() {
+    return this.request<Array<{ id: string; name: string; email: string }>>('/api/v1/integrations/mcp/staff');
   }
 
   async listIntegrations() {

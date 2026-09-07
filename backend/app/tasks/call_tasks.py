@@ -774,7 +774,10 @@ async def _process_completed_call_async(
                 and call.call_metadata.get("smallest_analytics") is not None
             )
             needs_outcome = summary is None or not bool(summary.disposition_details)
-            if force_analysis:
+            if (call.call_metadata or {}).get("private_mcp") is True:
+                # Private ERP content is not sent to an additional summarizer provider.
+                should_generate_summary = False
+            elif force_analysis:
                 should_generate_summary = True
             elif post_call_analysis_mode == "disabled":
                 should_generate_summary = False

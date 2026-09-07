@@ -81,8 +81,13 @@ async def validate_staff_call(db, *, tenant_id, agent_id, call_id):
 
 
 async def require_call_access(db, user, call_id) -> None:
+    call = await db.scalar(select(Call).where(Call.id == call_id, Call.tenant_id == user.tenant_id))
+    if call and (call.call_metadata or {}).get("private_mcp") is True:
+        if user.role not in STAFF_ROLES or call.call_metadata.get("browser_user_id") != str(
+            user.id
+        ):
+            raise HTTPException(404, "Call not found")
     if user.role in STAFF_ROLES:
         return
-    call = await db.scalar(select(Call).where(Call.id == call_id, Call.tenant_id == user.tenant_id))
     if call and (call.call_metadata or {}).get("staff_browser_only") is True:
         raise HTTPException(404, "Call not found")
