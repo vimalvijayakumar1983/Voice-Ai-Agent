@@ -433,4 +433,31 @@ def public_call_metadata(value: Any) -> dict[str, Any] | None:
                 safe_runtime["turn_diagnostics"] = safe_turns
         if safe_runtime:
             result["runtime"] = safe_runtime
+    recording = value.get("private_recording")
+    if isinstance(recording, dict):
+        from datetime import UTC, datetime
+
+        from app.services.r2_recording import available, expires_at
+
+        expiry = expires_at(recording)
+        state = recording.get("state", "off")
+        if expiry and expiry <= datetime.now(UTC):
+            state = "expired"
+        safe_recording = {
+            "state": state,
+            "available": available(recording),
+            "expires_at": expiry.isoformat() if expiry else None,
+            "retention_days": 90,
+        }
+        result["recording"] = safe_recording
+        result.setdefault("runtime", {}).update(
+            {
+                "recording_state": state,
+                "recording_enabled": state in {"preparing", "recording", "processing"},
+                "recording_consent_observed": True,
+                "recording_artifact_available": safe_recording["available"],
+                "recording_effective_mode": "caller_controlled_private_r2",
+                "recording_blocker": "" if state not in {"failed", "unconfirmed"} else state,
+            }
+        )
     return result or None
