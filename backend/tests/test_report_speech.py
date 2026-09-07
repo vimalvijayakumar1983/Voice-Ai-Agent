@@ -208,18 +208,35 @@ def test_shared_policy_covers_exact_amounts_currency_units_and_analysis():
         assert rule in PRIVATE_MCP_INSTRUCTIONS
 
 
-def test_worker_keeps_financial_policy_in_tools_only_and_excludes_filler_latency():
+def test_worker_keeps_financial_policy_in_tools_only():
     from pathlib import Path
 
     source = (Path(__file__).parents[1] / "app/livekit_runtime/worker.py").read_text(
         encoding="utf-8"
     )
     assert "instructions=FINANCIAL_SPEECH_INSTRUCTIONS + instructions" in source
-    start = source.index("def _on_agent_state_changed(event:")
-    handler = source[start : source.index("telemetry.mark_session_started()", start)]
-    assert handler.index('usage_totals.get("mcp_filler_active")') < handler.index(
-        "telemetry.on_agent_state("
-    )
+
+
+def test_filler_does_not_consume_actual_answer_latency(monkeypatch):
+    from app.livekit_runtime import worker
+
+    metrics, samples = {"mcp_filler_active": True}, []
+    telemetry = worker._LiveKitRuntimeTelemetry(metrics, samples, 0)
+    telemetry.first_agent_audio_seen = True
+    telemetry.last_user_speech_end_at = 10.0
+    telemetry.last_final_transcript_at = 10.1
+    telemetry.current_turn_trace = {"turn": 1}
+    monkeypatch.setattr(worker.time, "monotonic", lambda: 11.5)
+    telemetry.on_agent_state(new_state="speaking")
+    assert samples == [] and telemetry.turn_diagnostics == []
+    assert telemetry.last_user_speech_end_at == 10.0
+    assert telemetry.last_final_transcript_at == 10.1
+    metrics["mcp_filler_active"] = False
+    monkeypatch.setattr(worker.time, "monotonic", lambda: 16.0)
+    telemetry.on_agent_state(new_state="speaking")
+    assert samples == [6000]
+    assert metrics["last_transcript_to_first_audio_ms"] == 5900
+    assert telemetry.turn_diagnostics[0]["outcome"] == "answered"
 
 
 async def test_concurrent_tools_share_one_cue_and_new_turn_can_speak():

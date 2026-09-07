@@ -1787,6 +1787,8 @@ class _LiveKitRuntimeTelemetry:
         self.last_user_speech_end_at = None
 
     def on_agent_state(self, *, new_state: object, capture_end_to_end: bool = True) -> None:
+        if self.runtime_metrics.get("mcp_filler_active"):
+            return  # Waiting cues must not finish a meaningful-answer latency trace.
         if new_state != "speaking":
             return
         now = time.monotonic()
@@ -6705,8 +6707,6 @@ async def vav_inworld_session(ctx: JobContext) -> None:
         @session.on("agent_state_changed")
         def _on_agent_state_changed(event: Any) -> None:
             nonlocal tts_preconnect_task
-            if usage_totals.get("mcp_filler_active"):
-                return  # Waiting cues are not meaningful-answer latency samples.
             telemetry.on_agent_state(
                 new_state=getattr(event, "new_state", None),
                 # Pipeline sessions publish LiveKit's ChatMessage e2e metric;
