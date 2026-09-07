@@ -106,7 +106,7 @@ class Settings(BaseSettings):
     recording_s3_region: str = "auto"
     # This release has one policy, coupled to the approved R2 lifecycle and consent notice.
     # Reject other values instead of silently promising a different retention period.
-    recording_retention_days: Literal[90] = 90
+    recording_retention_days: int = Field(default=90, ge=90, le=90)
     # Private HTTP origin of the always-on LiveKit Agents service. The API
     # probes both ``/`` and ``/worker`` before it permits activation.
     livekit_worker_health_url: str = ""
