@@ -10,7 +10,7 @@ from sqlalchemy import select
 
 from app.models.agent import Agent, AgentRuntimeProfile
 from app.models.audit import AuditEvent
-from app.models.call import Call
+from app.models.call import Call, CallTranscript
 from app.models.integration import Integration
 from app.models.user import User
 from app.services import mcp_connections as mcp
@@ -234,12 +234,18 @@ async def test_private_runtime_denies_before_network(db, tenant, user, change):
 async def test_private_lookup_success_and_midflight_revocation(
     db, tenant, user, monkeypatch, revoke
 ):
+    from livekit.agents import llm
+
     from app.livekit_runtime import mcp_tools
+    from tests.test_mcp_delivery import context
 
     agent, profile, integration, call, cfg = await setup_private(db, tenant, user)
     monkeypatch.setattr(mcp_tools, "async_session_factory", session_factory)
     metrics = {}
-    tools = await mcp_tools.load_mcp_tools(agent, profile, metrics, call_id=call.id)
+    source_turns = []
+    tools = await mcp_tools.load_mcp_tools(
+        agent, profile, metrics, call_id=call.id, source_turns=source_turns
+    )
     assert len(tools) == 1 and metrics["mcp_private_mode"] is True
     await db.refresh(call)
     assert call.call_metadata["private_mcp_integration_id"] == str(integration.id)
@@ -251,11 +257,19 @@ async def test_private_lookup_success_and_midflight_revocation(
                 new_cfg, "mcp"
             )
             await db.commit()
-        return {"status": "ok", "data": "confidential-test-answer"}
+        return {"status": "ok", "data": {"text": ["confidential-test-answer"]}}
 
     monkeypatch.setattr(mcp_tools, "call_read_tool", lookup)
-    result = await tools[0]({})
-    assert ("confidential-test-answer" in result) is not revoke
+    ctx = context()
+    if revoke:
+        result = await tools[0]({}, ctx)
+        assert "confidential-test-answer" not in result
+        assert not source_turns and not ctx.session.spoken
+    else:
+        with pytest.raises(llm.StopResponse):
+            await tools[0]({}, ctx)
+        assert source_turns[0]["content"] == "confidential-test-answer"
+        assert ctx.session.spoken[0][0] == "confidential-test-answer"
     events = (await db.scalars(select(AuditEvent))).all()
     assert "mcp.private_lookup.started" in [e.action for e in events]
     assert ("mcp.private_lookup.unavailable" if revoke else "mcp.private_lookup.succeeded") in [
@@ -306,6 +320,14 @@ async def test_private_multi_connection_isolation(db, tenant, user, monkeypatch)
 async def test_private_history_not_visible_to_other_admin(client, auth_headers, db, tenant, user):
     _, _, _, call, _ = await setup_private(db, tenant, user)
     call.call_metadata = {**call.call_metadata, "private_mcp": True}
+    db.add(
+        CallTranscript(
+            tenant_id=tenant.id,
+            call_id=call.id,
+            turns=[{"role": "source", "content": "Fixture private report AED 450.01"}],
+            full_text="source: Fixture private report AED 450.01",
+        )
+    )
     other = User(
         tenant_id=tenant.id,
         email="other@test.com",
@@ -326,6 +348,10 @@ async def test_private_history_not_visible_to_other_admin(client, auth_headers, 
     for suffix in ("", "/transcript", "/summary"):
         response = await client.get(f"/api/v1/calls/{call.id}{suffix}", headers=other_headers)
         assert response.status_code == 404, response.text
+        assert "Fixture private report" not in response.text
+    permitted = await client.get(f"/api/v1/calls/{call.id}/transcript", headers=auth_headers)
+    assert permitted.status_code == 200
+    assert permitted.json()["turns"][0]["content"] == "Fixture private report AED 450.01"
     listed = await client.get("/api/v1/calls", headers=other_headers)
     assert listed.status_code == 200 and not listed.json()
 

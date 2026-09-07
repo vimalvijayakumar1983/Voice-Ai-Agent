@@ -79,6 +79,8 @@ def public_call_metadata(value: Any) -> dict[str, Any] | None:
     if isinstance(runtime, dict):
         safe_runtime: dict[str, Any] = {}
         string_fields = {
+            "mcp_delivery_mode",
+            "mcp_source_delivery_state",
             "conversation_intent_version",
             "knowledge_interpretation_model",
             "knowledge_interpretation_last_status",
@@ -123,6 +125,7 @@ def public_call_metadata(value: Any) -> dict[str, Any] | None:
             "recording_blocker",
         }
         numeric_fields = {
+            "mcp_source_delivery_count",
             "knowledge_interpretation_requests",
             "knowledge_interpretation_input_tokens",
             "knowledge_interpretation_output_tokens",
