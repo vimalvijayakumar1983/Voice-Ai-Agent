@@ -28,3 +28,14 @@ test('MCP is separate from appointment connector cards', () => {
   assert.match(integrations, /<McpConnections canManage=\{canManage\}/);
   assert.match(integrations, /\['his_api', 'vav_crm', 'google_sheets'\]\.includes/);
 });
+
+test('private MCP requires explicit staff and upstream scope review without automatic grants', () => {
+  assert.match(source, /value="private_staff"/);
+  assert.match(source, /option\.private_eligible/);
+  assert.match(source, /name="allowed_user_ids"/);
+  assert.match(source, /name="upstream_scope_approved"/);
+  assert.match(source, /name="private_data_approved"/);
+  assert.match(source, /conversation text is stored in VAV/);
+  assert.match(source, /Changing mode clears existing permissions/);
+  assert.match(api, /integrations\/mcp\/staff/);
+});

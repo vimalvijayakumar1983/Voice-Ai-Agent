@@ -3803,8 +3803,16 @@ async def create_livekit_browser_session(
         for_update=False,
     )
     from app.services.browser_access import check_browser_actor, staff_browser, tools_only
+    from app.services.integration_security import IntegrationConfigError
+    from app.services.mcp_connections import private_browser_admission
 
     check_browser_actor(preflight_profile, current_user)
+    try:
+        await private_browser_admission(
+            db, tenant_id=current_user.tenant_id, agent_id=agent_id, user_id=current_user.id
+        )
+    except IntegrationConfigError as exc:
+        raise HTTPException(403, str(exc)) from exc
     runtime_config = (
         preflight_profile.runtime_config
         if isinstance(preflight_profile.runtime_config, dict)
@@ -3869,6 +3877,13 @@ async def create_livekit_browser_session(
         validate_knowledge=False,
     )
     check_browser_actor(profile, current_user)
+
+    try:
+        private_admission = await private_browser_admission(
+            db, tenant_id=current_user.tenant_id, agent_id=agent_id, user_id=current_user.id
+        )
+    except IntegrationConfigError as exc:
+        raise HTTPException(403, str(exc)) from exc
     existing_call = await _lock_livekit_browser_call(
         db,
         tenant_id=current_user.tenant_id,
@@ -3885,6 +3900,10 @@ async def create_livekit_browser_session(
         metadata = (
             existing_call.call_metadata if isinstance(existing_call.call_metadata, dict) else {}
         )
+        if metadata.get("private_mcp_integration_id") != private_admission.get(
+            "private_mcp_integration_id"
+        ):
+            raise HTTPException(409, "Private MCP policy changed; start a new session")
         if (metadata.get("staff_browser_only") is True) != staff_browser(profile) or metadata.get(
             "knowledge_source_mode", "knowledge_base"
         ) != ("tools_only" if tools_only(profile) else "knowledge_base"):
@@ -4041,6 +4060,7 @@ async def create_livekit_browser_session(
         provider="livekit_webrtc",
         provider_call_sid=room_name,
         call_metadata={
+            **private_admission,
             "agent_configuration": agent_configuration_snapshot(agent),
             "browser_user_id": str(current_user.id),
             "staff_browser_only": staff_browser(profile),

@@ -3,7 +3,7 @@
 Use the official MCP SDK over HTTPS Streamable HTTP. Destination pinning reuses
 the tested webhook network boundary; redirects and environment proxies stay off.
 Server annotations are hints, not authorization: an administrator must additionally
-approve each tool and attest that its data is safe for an unauthenticated caller.
+approve each tool under either public-safe or named-staff private read-only policy.
 """
 
 from __future__ import annotations
@@ -42,10 +42,18 @@ CLIENT_FIELDS = {
     "allowed_tools",
     "agent_ids",
     "public_data_approved",
+    "data_access_mode",
+    "private_data_approved",
+    "upstream_scope_approved",
+    "allowed_user_ids",
 }
 TOOL_NAME = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 MAX_TOOLS = 100
 MAX_BYTES = 1_000_000
+
+
+def private_mcp(config: dict) -> bool:
+    return config.get("data_access_mode", "public") == "private_staff"
 
 
 class MCPError(ValueError):
@@ -71,7 +79,9 @@ def validate_mcp_config(config: dict) -> None:
     label = config.get("company_label", "")
     if not isinstance(label, str) or not 1 <= len(label.strip()) <= 160:
         raise IntegrationConfigError("MCP company scope label is required (maximum 160 characters)")
-    for key in ("allowed_tools", "agent_ids"):
+    if config.get("data_access_mode", "public") not in ("public", "private_staff"):
+        raise IntegrationConfigError("Unsupported MCP data access mode")
+    for key in ("allowed_tools", "agent_ids", "allowed_user_ids"):
         values = config.get(key, [])
         if (
             not isinstance(values, list)
@@ -80,12 +90,27 @@ def validate_mcp_config(config: dict) -> None:
             or len(values) != len(set(values))
         ):
             raise IntegrationConfigError(f"Invalid MCP {key}")
-    if type(config.get("public_data_approved", False)) is not bool:
-        raise IntegrationConfigError("MCP public-data approval must be a boolean")
+    for key in ("public_data_approved", "private_data_approved", "upstream_scope_approved"):
+        if type(config.get(key, False)) is not bool:
+            raise IntegrationConfigError("MCP approval must be a boolean")
+    if private_mcp(config) and config.get("auth_type") != "bearer":
+        raise IntegrationConfigError(
+            "Private MCP access requires a company-scoped bearer credential"
+        )
     if config.get("allowed_tools") or config.get("agent_ids"):
         if config.get("last_test", {}).get("status") != "connected":
             raise IntegrationConfigError("Test and discover MCP tools before granting access")
-        if config.get("public_data_approved") is not True:
+        if private_mcp(config):
+            if not (
+                config.get("private_data_approved") is True
+                and config.get("upstream_scope_approved") is True
+                and config.get("allowed_user_ids")
+            ):
+                raise IntegrationConfigError(
+                    "Private MCP requires named staff, private-data approval and confirmation "
+                    "that the upstream credential enforces company scope and read-only access"
+                )
+        elif config.get("public_data_approved") is not True:
             raise IntegrationConfigError(
                 "Only approved public-safe data can be used in voice calls"
             )
@@ -93,11 +118,11 @@ def validate_mcp_config(config: dict) -> None:
         if not set(config.get("allowed_tools", [])).issubset(eligible):
             raise IntegrationConfigError("Only discovered read-only MCP tools may be approved")
     try:
-        for agent_id in config.get("agent_ids", []):
+        for agent_id in config.get("agent_ids", []) + config.get("allowed_user_ids", []):
             if str(UUID(agent_id)) != agent_id:
                 raise ValueError()
     except ValueError as exc:
-        raise IntegrationConfigError("Invalid MCP agent ID") from exc
+        raise IntegrationConfigError("Invalid MCP agent or user ID") from exc
 
 
 def prepare_mcp_update(previous: dict, updates: dict) -> dict:
@@ -107,11 +132,24 @@ def prepare_mcp_update(previous: dict, updates: dict) -> dict:
     from app.services.integration_security import merge_integration_config
 
     merged = merge_integration_config(previous, updates)
+    if merged.get("data_access_mode", "public") != previous.get("data_access_mode", "public"):
+        # Never reinterpret an existing public grant as a private grant, or vice versa.
+        merged.update(
+            allowed_tools=[],
+            agent_ids=[],
+            allowed_user_ids=[],
+            public_data_approved=False,
+            private_data_approved=False,
+            upstream_scope_approved=False,
+        )
     if any(
         merged.get(key) != previous.get(key)
         for key in ("url", "credential", "auth_type", "company_label")
     ):
         merged.update(tools=[], allowed_tools=[], agent_ids=[], last_test={"status": "untested"})
+        merged.update(
+            allowed_user_ids=[], private_data_approved=False, upstream_scope_approved=False
+        )
     validate_mcp_config(merged)
     return merged
 
@@ -131,6 +169,23 @@ def runtime_compatible(profile: AgentRuntimeProfile | None) -> bool:
 
 
 async def validate_agent_grants(db, tenant_id: UUID, config: dict) -> None:
+    from app.models.user import User
+    from app.services.browser_access import STAFF_ROLES, tools_only
+
+    user_ids = [UUID(value) for value in config.get("allowed_user_ids", [])]
+    if user_ids:
+        users = (
+            await db.scalars(
+                select(User.id).where(
+                    User.tenant_id == tenant_id,
+                    User.id.in_(user_ids),
+                    User.is_active.is_(True),
+                    User.role.in_(STAFF_ROLES),
+                )
+            )
+        ).all()
+        if len(users) != len(user_ids):
+            raise IntegrationConfigError("Choose active workspace owners or administrators")
     ids = [UUID(value) for value in config.get("agent_ids", [])]
     if not ids:
         return
@@ -150,6 +205,43 @@ async def validate_agent_grants(db, tenant_id: UUID, config: dict) -> None:
             "Choose tenant-owned LiveKit/Inworld tool-loop agents. Single-pass and other "
             "runtimes cannot call MCP tools; their settings have not been changed."
         )
+    if private_mcp(config) and any(
+        not tools_only(profile)
+        or profile.enabled
+        or profile.assigned_numbers
+        or (profile.runtime_config or {}).get("diagnostic_recording_mode", "off") != "off"
+        for _, profile in rows
+    ):
+        raise IntegrationConfigError(
+            "Private MCP requires staff browser-only, MCP-only agents with recording off "
+            "and no phone activation"
+        )
+
+
+async def private_browser_admission(db, *, tenant_id, agent_id, user_id) -> dict:
+    """Pin private scope before issuing a browser token; never upgrade an existing call."""
+    rows = (
+        await db.scalars(
+            select(Integration).where(
+                Integration.tenant_id == tenant_id,
+                Integration.integration_type == "mcp",
+                Integration.is_active.is_(True),
+            )
+        )
+    ).all()
+    granted = [row for row in rows if str(agent_id) in row.config.get("agent_ids", [])]
+    private = [row for row in granted if private_mcp(row.config)]
+    if not private:
+        return {}
+    if len(granted) != 1:
+        raise IntegrationConfigError("Private agents must have exactly one MCP company connection")
+    connection = private[0]
+    cfg = load_integration_config(connection.config, connection.encrypted_config)
+    validate_mcp_config(cfg)
+    await validate_agent_grants(db, tenant_id, cfg)
+    if str(user_id) not in cfg.get("allowed_user_ids", []):
+        raise IntegrationConfigError("You are not approved for this private MCP connection")
+    return {"private_mcp": True, "private_mcp_integration_id": str(connection.id)}
 
 
 class _BoundedStream(httpx.AsyncByteStream):
@@ -376,6 +468,21 @@ async def authorized_runtime_config(db, tenant_id, agent_id, integration_id, *, 
         raise MCPError("MCP access unavailable")
     config = load_integration_config(integration.config, integration.encrypted_config)
     validate_mcp_config(config)
+    if private_mcp(config):
+        if call_id is None or not staff_browser(profile):
+            raise MCPError("Private MCP requires an authenticated staff browser call")
+        call, _ = await validate_staff_call(
+            db, tenant_id=tenant_id, agent_id=agent_id, call_id=call_id
+        )
+        if not (
+            (call.call_metadata or {}).get("private_mcp") is True
+            and call.call_metadata.get("private_mcp_integration_id") == str(integration_id)
+        ):
+            raise MCPError("Private company access was not reserved; start a new call")
+        if (call.call_metadata or {}).get("browser_user_id") not in config.get(
+            "allowed_user_ids", []
+        ):
+            raise MCPError("Private MCP user access unavailable")
     if str(agent_id) not in config.get("agent_ids", []):
         raise MCPError("MCP agent access revoked")
     await validate_agent_grants(db, tenant_id, config)

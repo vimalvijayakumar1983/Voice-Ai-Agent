@@ -538,6 +538,10 @@ def public_integration_config(
             "allowed_tools",
             "agent_ids",
             "public_data_approved",
+            "data_access_mode",
+            "private_data_approved",
+            "upstream_scope_approved",
+            "allowed_user_ids",
             "tools",
             "last_test",
         ):

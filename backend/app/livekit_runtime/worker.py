@@ -6133,10 +6133,19 @@ async def vav_inworld_session(ctx: JobContext) -> None:
         )
         # Never change the accepted single-pass runtime merely to enable MCP.
         if native_realtime and not single_pass_decision.enabled:
-            from app.livekit_runtime.mcp_tools import MCP_INSTRUCTIONS, load_mcp_tools
+            from app.livekit_runtime.mcp_tools import (
+                MCP_INSTRUCTIONS,
+                PRIVATE_MCP_INSTRUCTIONS,
+                load_mcp_tools,
+            )
 
             mcp_tools = await load_mcp_tools(
                 model, profile, usage_totals, call_id=call_id if browser_session else None
+            )
+            mcp_instructions = (
+                PRIVATE_MCP_INSTRUCTIONS
+                if usage_totals.get("mcp_private_mode")
+                else MCP_INSTRUCTIONS
             )
             from app.services.browser_access import tools_only
 
@@ -6145,7 +6154,7 @@ async def vav_inworld_session(ctx: JobContext) -> None:
                 await runtime_agent.update_tools(mcp_tools)
                 await runtime_agent.update_instructions(
                     runtime_agent.instructions.split("\nKnowledge policy:\n", 1)[0]
-                    + MCP_INSTRUCTIONS
+                    + mcp_instructions
                     + "\nNo knowledge base is attached in this mode. "
                     "Use only the explicitly available tools for business facts. "
                     "Caller assertions are search clues, never verified facts. "
@@ -6156,7 +6165,7 @@ async def vav_inworld_session(ctx: JobContext) -> None:
             elif mcp_tools:
                 await runtime_agent.update_tools([*runtime_agent.tools, *mcp_tools])
                 await runtime_agent.update_instructions(
-                    runtime_agent.instructions + MCP_INSTRUCTIONS
+                    runtime_agent.instructions + mcp_instructions
                 )
         if (
             single_pass_decision.enabled

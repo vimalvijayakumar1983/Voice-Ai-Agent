@@ -7,7 +7,7 @@ from uuid import UUID, uuid5
 
 import structlog
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -228,6 +228,12 @@ async def list_calls(
     page_size: int = Query(50, ge=1, le=200),
 ):
     query = select(Call).where(Call.tenant_id == current_user.tenant_id)
+    query = query.where(
+        or_(
+            Call.call_metadata["private_mcp"].as_boolean().is_not(True),
+            Call.call_metadata["browser_user_id"].as_string() == str(current_user.id),
+        )
+    )
     if current_user.role not in STAFF_ROLES:
         query = query.where(Call.call_metadata["staff_browser_only"].as_boolean().is_not(True))
 
@@ -1503,6 +1509,8 @@ async def reanalyze_call(
     )
     if call is None:
         raise HTTPException(status_code=404, detail="Call not found")
+    if (call.call_metadata or {}).get("private_mcp") is True:
+        raise HTTPException(409, "Post-call AI analysis is disabled for private MCP sessions")
     transcript = await db.scalar(
         select(CallTranscript.id).where(
             CallTranscript.call_id == call_id,

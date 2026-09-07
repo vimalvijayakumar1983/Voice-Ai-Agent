@@ -273,7 +273,50 @@ async def list_integrations(
     return [
         _integration_response(integration, _load_config_or_fail(integration))
         for integration in integrations
+        if current_user.role in {"owner", "admin"}
+        or integration.config.get("data_access_mode") != "private_staff"
     ]
+
+
+@router.get("/mcp/staff")
+async def mcp_staff_options(
+    current_user: CurrentUser = Depends(require_role("owner", "admin")),
+    db: AsyncSession = Depends(get_db),
+):
+    from app.models.user import User
+
+    users = (
+        await db.scalars(
+            select(User).where(
+                User.tenant_id == current_user.tenant_id,
+                User.is_active.is_(True),
+                User.role.in_(("owner", "admin")),
+            )
+        )
+    ).all()
+    return [{"id": str(user.id), "name": user.full_name, "email": user.email} for user in users]
+
+
+async def _audit_mcp_change(db, user, integration, config, action):
+    from app.services.audit import record_audit_event
+
+    await record_audit_event(
+        db,
+        tenant_id=user.tenant_id,
+        actor_user_id=user.id,
+        action=action,
+        resource_type="mcp_connection",
+        resource_id=str(integration.id),
+        details={
+            "data_access_mode": config.get("data_access_mode", "public"),
+            "agent_ids": config.get("agent_ids", []),
+            "allowed_user_ids": config.get("allowed_user_ids", []),
+            "allowed_tools": config.get("allowed_tools", []),
+            "private_data_approved": config.get("private_data_approved", False),
+            "upstream_scope_approved": config.get("upstream_scope_approved", False),
+            "is_active": integration.is_active,
+        },
+    )
 
 
 @router.get("/mcp/agents")
@@ -282,6 +325,7 @@ async def mcp_agent_options(
     db: AsyncSession = Depends(get_db),
 ):
     from app.models.agent import Agent, AgentRuntimeProfile
+    from app.services.browser_access import tools_only
     from app.services.mcp_connections import runtime_compatible
 
     rows = (
@@ -300,6 +344,14 @@ async def mcp_agent_options(
             "id": str(agent.id),
             "name": agent.name,
             "eligible": agent.is_active and runtime_compatible(profile),
+            "private_eligible": bool(
+                agent.is_active
+                and runtime_compatible(profile)
+                and tools_only(profile)
+                and not profile.enabled
+                and not profile.assigned_numbers
+                and (profile.runtime_config or {}).get("diagnostic_recording_mode", "off") == "off"
+            ),
             "reason": ""
             if agent.is_active and runtime_compatible(profile)
             else (
@@ -337,6 +389,8 @@ async def create_integration(
     _store_config_or_fail(integration, config)
     db.add(integration)
     await db.flush()
+    if integration_type == "mcp":
+        await _audit_mcp_change(db, current_user, integration, config, "mcp.created")
     return _integration_response(integration, config)
 
 
@@ -395,6 +449,8 @@ async def update_integration(
         _store_config_or_fail(integration, config)
 
     await db.flush()
+    if integration.integration_type == "mcp":
+        await _audit_mcp_change(db, current_user, integration, config, "mcp.policy_updated")
     return _integration_response(integration, config)
 
 
@@ -461,6 +517,7 @@ async def test_mcp_connection(
         raise HTTPException(status_code=409, detail="Connection changed while testing; retry")
     _store_config_or_fail(integration, config)
     await db.flush()
+    await _audit_mcp_change(db, current_user, integration, config, "mcp.discovered")
     return _integration_response(integration, config)
 
 
@@ -476,6 +533,8 @@ async def delete_integration(
     integration = result.scalar_one_or_none()
     if not integration:
         raise HTTPException(status_code=404, detail="Integration not found")
+    if integration.integration_type == "mcp":
+        await _audit_mcp_change(db, current_user, integration, {}, "mcp.deleted")
     await db.delete(integration)
 
 
