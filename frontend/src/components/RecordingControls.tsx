@@ -31,13 +31,13 @@ export default function RecordingControls({ callId, connected }: { callId: strin
   useEffect(() => () => { if (audioUrl) URL.revokeObjectURL(audioUrl); }, [audioUrl]);
 
   async function action(kind: 'start' | 'stop' | 'play') {
-    if (!config) return;
     setBusy(true); setError('');
     try {
       if (kind === 'play') {
         const blob = await api.getCallRecording(callId);
         setAudioUrl(URL.createObjectURL(blob));
       } else {
+        if (!config) throw new Error('Recording settings are unavailable. Refresh and try again.');
         const value = kind === 'start'
           ? await api.startRecording(callId, config.notice_version)
           : await api.stopRecording(callId);

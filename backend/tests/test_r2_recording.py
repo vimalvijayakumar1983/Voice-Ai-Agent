@@ -298,3 +298,36 @@ def test_retention_cannot_silently_disagree_with_consent_and_bucket_policy(monke
     assert Settings().recording_retention_days == 90
     with pytest.raises(ValidationError, match="recording_retention_days"):
         Settings(recording_retention_days=30)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lost_response", [False, True])
+async def test_start_response_cannot_overwrite_newer_webhook_state(
+    client, auth_headers, call, db, enabled, provider, lost_response
+):
+    async def complete_before_response(request):
+        await db.refresh(call)
+        call.call_metadata = {
+            **call.call_metadata,
+            "private_recording": {
+                **call.call_metadata["private_recording"],
+                "state": "ready",
+                "egress_id": "EG_test",
+                "stopped_by_user_at": "2026-09-07T12:00:00+00:00",
+            },
+        }
+        await db.commit()
+        if lost_response:
+            raise TimeoutError()
+        return info(call)
+
+    provider.egress.start_egress.side_effect = complete_before_response
+    result = await client.post(
+        f"/api/v1/call-recordings/{call.id}/start", json=consent(), headers=auth_headers
+    )
+    assert result.status_code == 200
+    assert result.json()["state"] == "ready"
+    await db.refresh(call)
+    assert (
+        call.call_metadata["private_recording"]["stopped_by_user_at"] == "2026-09-07T12:00:00+00:00"
+    )

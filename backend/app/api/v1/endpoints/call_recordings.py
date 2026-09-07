@@ -138,6 +138,13 @@ async def start_recording(
     except (Exception, asyncio.CancelledError) as error:
         # An interrupted response may be ambiguous. Never retry StartEgress.
         call = await owned_call(db, user, call_id, lock=True, caller_only=True)
+        current = recordings.recording_state(call.call_metadata)
+        if current.get("egress_id"):
+            # A signed webhook/reconciliation already confirmed this request.
+            # Never replace newer provider truth with a late HTTP failure.
+            if isinstance(error, asyncio.CancelledError):
+                raise
+            return response(current)
         save_state(call, {**state, "state": "unconfirmed" if attempted else "retryable"})
         await db.commit()
         if isinstance(error, asyncio.CancelledError):
@@ -154,7 +161,9 @@ async def start_recording(
     finally:
         await lk.aclose()
     call = await owned_call(db, user, call_id, lock=True, caller_only=True)
-    state = recordings.apply_provider_state({**state, "egress_id": info.egress_id}, info)
+    state = recordings.apply_provider_state(
+        {**recordings.recording_state(call.call_metadata), "egress_id": info.egress_id}, info
+    )
     save_state(call, state)
     await db.commit()
     return response(state)
