@@ -11,9 +11,10 @@ from uuid import uuid4
 import pytest
 from google.protobuf.json_format import MessageToJson
 from livekit import api
+from pydantic import ValidationError
 
 from app.api.v1.endpoints import call_recordings as endpoint
-from app.core.config import settings
+from app.core.config import Settings, settings
 from app.models.call import Call
 from app.services import r2_recording as r2
 from app.services.call_metadata import public_call_metadata
@@ -272,3 +273,26 @@ async def test_lost_start_response_recovered_by_exact_request(
     status = await client.get(url + "/status", headers=auth_headers)
     assert status.json()["available"] is True
     provider.egress.start_egress.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_preflight_failure_can_retry_without_duplicate_egress(
+    client, auth_headers, call, enabled, provider
+):
+    provider.room.list_participants.side_effect = TimeoutError()
+    url = f"/api/v1/call-recordings/{call.id}"
+    first = await client.post(url + "/start", json=consent(), headers=auth_headers)
+    assert first.status_code == 502
+    provider.egress.start_egress.assert_not_awaited()
+    status = await client.get(url + "/status", headers=auth_headers)
+    assert status.json()["state"] == "retryable"
+    provider.egress.list_egress.assert_not_awaited()
+    provider.room.list_participants.side_effect = None
+    second = await client.post(url + "/start", json=consent(), headers=auth_headers)
+    assert second.json()["state"] == "recording"
+    provider.egress.start_egress.assert_awaited_once()
+
+
+def test_retention_cannot_silently_disagree_with_consent_and_bucket_policy():
+    with pytest.raises(ValidationError, match="recording_retention_days"):
+        Settings(recording_retention_days=30)

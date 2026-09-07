@@ -50,7 +50,7 @@ export default function RecordingControls({ callId, connected }: { callId: strin
   if (!config?.enabled && status === 'off') return null;
   return <section aria-label="Private call recording" style={{ padding: 16, border: '1px solid #777', borderRadius: 8, marginTop: 12 }}>
     <strong>Private recording: {status}</strong>
-    {status === 'off' && connected && <>
+    {['off', 'retryable'].includes(status) && connected && <>
       <p>{config?.notice}</p>
       <label><input type="checkbox" checked={consent} onChange={e => setConsent(e.target.checked)} /> I am the caller and agree to this recording.</label>
       <button type="button" disabled={!consent || busy || !config?.enabled} onClick={() => void action('start')}>Start recording</button>

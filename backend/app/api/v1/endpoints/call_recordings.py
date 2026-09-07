@@ -93,7 +93,7 @@ async def start_recording(
         raise HTTPException(503, "Recording is not enabled")
     call = await owned_call(db, user, call_id, lock=True, caller_only=True)
     existing = recordings.recording_state(call.call_metadata)
-    if existing:
+    if existing and existing.get("state") != "retryable":
         return response(existing)  # Never create a duplicate or restart after stop.
     if call.status != "in_progress":
         raise HTTPException(409, "Connect to the browser call before recording")
@@ -122,23 +122,32 @@ async def start_recording(
     await db.commit()
     lk = client()
     info = None
+    attempted = False
     try:
         participants = await asyncio.wait_for(
             lk.room.list_participants(api.ListParticipantsRequest(room=room_name)), 10
         )
         if not any(p.identity == f"browser-{call_id}" for p in participants.participants):
             raise HTTPException(409, "Caller is no longer connected")
+        request = recordings.egress_request(user.tenant_id, call_id, room_name)
+        attempted = True
         info = await asyncio.wait_for(
-            lk.egress.start_egress(recordings.egress_request(user.tenant_id, call_id, room_name)),
+            lk.egress.start_egress(request),
             timeout=30,
         )
     except (Exception, asyncio.CancelledError) as error:
         # An interrupted response may be ambiguous. Never retry StartEgress.
         call = await owned_call(db, user, call_id, lock=True, caller_only=True)
-        save_state(call, {**state, "state": "unconfirmed"})
+        save_state(call, {**state, "state": "unconfirmed" if attempted else "retryable"})
         await db.commit()
         if isinstance(error, asyncio.CancelledError):
             raise
+        if not attempted:
+            if isinstance(error, HTTPException):
+                raise
+            raise HTTPException(
+                502, "Caller connection check failed. Please retry recording."
+            ) from None
         raise HTTPException(
             502, "Recording start was not confirmed. End the call to stop any capture."
         ) from None
@@ -201,7 +210,7 @@ async def status(
     call = await owned_call(db, user, call_id, lock=True)
     state = recordings.recording_state(call.call_metadata)
     egress_id = state.get("egress_id")
-    if state and state.get("state") not in {"ready", "failed", "expired"}:
+    if state and state.get("state") not in {"ready", "failed", "expired", "retryable"}:
         await db.rollback()
         lk = client()
         try:
