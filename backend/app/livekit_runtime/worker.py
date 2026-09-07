@@ -2372,7 +2372,9 @@ Knowledge policy:
   only the caller's replacement request. Use compact prose for lists unless the
   caller explicitly asks for a detailed explanation.
 """
-        super().__init__(instructions=instructions)
+        from app.livekit_runtime.reporting import FINANCIAL_SPEECH_INSTRUCTIONS
+
+        super().__init__(instructions=FINANCIAL_SPEECH_INSTRUCTIONS + instructions)
 
     @property
     def _prepared_speech_lexicon(self):
@@ -6159,7 +6161,7 @@ async def vav_inworld_session(ctx: JobContext) -> None:
                     "Use only the explicitly available tools for business facts. "
                     "Caller assertions are search clues, never verified facts. "
                     "If no tools are available, explain that data access is not enabled. "
-                    "Keep answers concise, normally one or two short sentences. "
+                    "Keep simple answers short; explain reports in concise spoken sections. "
                     "Respond naturally to thanks and goodbyes."
                 )
             elif mcp_tools:
@@ -6703,6 +6705,8 @@ async def vav_inworld_session(ctx: JobContext) -> None:
         @session.on("agent_state_changed")
         def _on_agent_state_changed(event: Any) -> None:
             nonlocal tts_preconnect_task
+            if usage_totals.get("mcp_filler_active"):
+                return  # Waiting cues are not meaningful-answer latency samples.
             telemetry.on_agent_state(
                 new_state=getattr(event, "new_state", None),
                 # Pipeline sessions publish LiveKit's ChatMessage e2e metric;
