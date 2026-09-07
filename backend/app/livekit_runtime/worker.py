@@ -1787,6 +1787,8 @@ class _LiveKitRuntimeTelemetry:
         self.last_user_speech_end_at = None
 
     def on_agent_state(self, *, new_state: object, capture_end_to_end: bool = True) -> None:
+        if self.runtime_metrics.get("mcp_filler_active"):
+            return  # Waiting cues must not finish a meaningful-answer latency trace.
         if new_state != "speaking":
             return
         now = time.monotonic()
@@ -2372,7 +2374,9 @@ Knowledge policy:
   only the caller's replacement request. Use compact prose for lists unless the
   caller explicitly asks for a detailed explanation.
 """
-        super().__init__(instructions=instructions)
+        from app.livekit_runtime.reporting import FINANCIAL_SPEECH_INSTRUCTIONS
+
+        super().__init__(instructions=FINANCIAL_SPEECH_INSTRUCTIONS + instructions)
 
     @property
     def _prepared_speech_lexicon(self):
@@ -6159,7 +6163,7 @@ async def vav_inworld_session(ctx: JobContext) -> None:
                     "Use only the explicitly available tools for business facts. "
                     "Caller assertions are search clues, never verified facts. "
                     "If no tools are available, explain that data access is not enabled. "
-                    "Keep answers concise, normally one or two short sentences. "
+                    "Keep simple answers short; explain reports in concise spoken sections. "
                     "Respond naturally to thanks and goodbyes."
                 )
             elif mcp_tools:

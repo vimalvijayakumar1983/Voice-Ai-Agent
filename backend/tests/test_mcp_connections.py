@@ -463,13 +463,24 @@ async def test_runtime_adapter_revocation_and_content_free_metrics(monkeypatch):
 
     monkeypatch.setattr(mcp_tools, "async_session_factory", fake_db)
     auth = AsyncMock(return_value=cfg)
-    call = AsyncMock(return_value={"data": "sensitive-result", "status": "ok"})
+    original = {
+        "data": "sensitive-result",
+        "status": "ok",
+        "amount": "4299154.12",
+        "currency": "AED",
+        "usd_unscaled": 450,
+        "zero": 0,
+        "missing": None,
+    }
+    call = AsyncMock(return_value=original)
     monkeypatch.setattr(mcp_tools, "authorized_runtime_config", auth)
     monkeypatch.setattr(mcp_tools, "call_read_tool", call)
     metrics = {}
     tool = mcp_tools._make_tool(uuid4(), uuid4(), uuid4(), "Test", descriptor, metrics)
     result = json.loads(await tool({}))
     assert result["untrusted_tool_data"]["status"] == "ok"
+    assert result["untrusted_tool_data"] == original
+    assert metrics["mcp_tool_calls"][0]["remote_duration_ms"] is not None
     assert "sensitive-result" not in json.dumps(metrics)
     assert auth.await_count == 2
     auth.side_effect = mcp.MCPError("revoked")
