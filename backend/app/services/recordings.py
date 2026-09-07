@@ -261,6 +261,10 @@ async def fetch_call_recording(
     transport: httpx.AsyncBaseTransport | None = None,
 ) -> RecordingAudio:
     """Retrieve one recording without exposing provider locators or secrets."""
+    if call.provider == "livekit_webrtc":
+        from app.services.r2_recording import fetch_audio
+
+        return await fetch_audio(call)
     if call.provider == "smallest":
         if not call.provider_call_sid:
             raise RecordingError("Recording is not available.", status_code=404)

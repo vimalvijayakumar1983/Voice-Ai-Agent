@@ -19,6 +19,7 @@ import {
   Volume2,
 } from 'lucide-react';
 import Layout from '@/components/Layout';
+import RecordingControls from '@/components/RecordingControls';
 import { agentTestReadinessMessage, isAgentCallReady } from '@/lib/agent-readiness.cjs';
 import { parseTestVariables, reduceTranscriptState, sessionErrorGuidance } from '@/lib/conversation-ui.cjs';
 import { api, RuntimeProfile, VoiceAgent } from '@/lib/api';
@@ -1235,6 +1236,9 @@ export default function Playground() {
               </>
             )}
           </div>
+          {browserTransport === 'livekit' && diagnostics.callId ? (
+            <RecordingControls key={diagnostics.callId} callId={diagnostics.callId} connected={active && state !== 'connecting'} />
+          ) : null}
         </section>
       </div>
     </Layout>

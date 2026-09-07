@@ -2,7 +2,14 @@ import re
 from datetime import datetime
 from uuid import UUID
 
-from pydantic import AliasChoices, BaseModel, Field, ValidationInfo, field_validator
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    Field,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
 from app.services.call_metadata import public_call_metadata
 from app.services.provider_variables import validate_provider_variables
@@ -36,6 +43,14 @@ class CallResponse(BaseModel):
 
     model_config = {"from_attributes": True}
 
+    @model_validator(mode="after")
+    def enforce_recording_expiry(self):
+        if self.provider == "livekit_webrtc":
+            self.recording_available = bool(
+                (self.call_metadata or {}).get("recording", {}).get("available")
+            )
+        return self
+
     @field_validator("call_metadata", mode="before")
     @classmethod
     def redact_private_metadata(cls, value):
@@ -53,6 +68,8 @@ class CallResponse(BaseModel):
             return bool(info.data.get("provider_call_sid"))
         if provider == "twilio":
             return bool(value)
+        if provider == "livekit_webrtc":
+            return value == "private-r2"
         return False
 
 
