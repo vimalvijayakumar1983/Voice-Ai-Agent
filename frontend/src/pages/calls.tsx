@@ -766,7 +766,7 @@ export default function Calls() {
                   <p className="detail-empty">No recording is currently reported for this conversation.</p>
                 )}
                 {selectedRuntime.recording_state === 'blocked' ? <p className={styles.recordingPolicy}>LiveKit capture was not started. A saved operator request is not consent; call-bound affirmative consent, Egress, encrypted regional storage, retention, deletion, and audited playback must all be operational first.</p> : null}
-                <p className={styles.recordingPolicy}>Legacy provider-hosted playback checks the latest explicit recording revocation. That legacy access rule never authorizes LiveKit capture, which remains default-off and fail-closed.</p>
+                <p className={styles.recordingPolicy}>{selectedCall.provider === 'livekit_webrtc' ? 'Browser recording requires explicit caller consent and Start recording in the Playground. Recordings are stored privately in Cloudflare R2 outside the UAE, with access expiring after 90 days. Calls made without recording cannot be recovered retroactively.' : 'Provider-hosted playback checks the latest explicit recording revocation. Phone recording requires a separate caller-consent flow.'}</p>
               </section>
 
               <section className="detail-section" aria-labelledby="call-summary-heading">

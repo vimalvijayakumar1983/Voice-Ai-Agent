@@ -453,6 +453,7 @@ def public_call_metadata(value: Any) -> dict[str, Any] | None:
         result.setdefault("runtime", {}).update(
             {
                 "recording_state": state,
+                "recording_requested_mode": "caller_consented",
                 "recording_enabled": state in {"preparing", "recording", "processing"},
                 "recording_consent_observed": True,
                 "recording_artifact_available": safe_recording["available"],
