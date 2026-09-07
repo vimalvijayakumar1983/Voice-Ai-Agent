@@ -775,9 +775,9 @@ export default function Calls() {
                   <h3 id="call-summary-heading">AI summary and outcome</h3>
                   {summary?.sentiment ? <span className="badge badge-info">{summary.sentiment}</span> : null}
                   {summary?.disposition_details?.needs_review ? <span className="badge badge-warning">Needs review</span> : null}
-                  <button type="button" className="btn btn-secondary btn-sm" disabled={analysisReprocessing || !transcript} onClick={() => void reanalyzeSelectedCall()}>
+                  {selectedCall.call_metadata?.private_mcp === true ? <span className="badge badge-info">Private session · AI summary disabled</span> : <button type="button" className="btn btn-secondary btn-sm" disabled={analysisReprocessing || !transcript} onClick={() => void reanalyzeSelectedCall()}>
                     <RefreshCw size={12} /> {analysisReprocessing ? 'Queuing…' : 'Re-analyze'}
-                  </button>
+                  </button>}
                 </div>
                 {analysisNotice ? <p className={styles.recordingNote} role="status">{analysisNotice}</p> : null}
                 {detailLoading ? (

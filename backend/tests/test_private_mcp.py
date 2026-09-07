@@ -95,6 +95,7 @@ async def setup_private(db, tenant, user):
         {"upstream_scope_approved": False},
         {"allowed_user_ids": ["invalid"]},
         {"data_access_mode": "anything"},
+        {"data_access_mode": []},
         {"private_data_approved": "true"},
     ],
 )
@@ -113,6 +114,22 @@ def test_mode_change_does_not_reinterpret_grants():
     updated = mcp.prepare_mcp_update(cfg, {"company_label": "Other company"})
     assert updated["last_test"]["status"] == "untested"
     assert updated["upstream_scope_approved"] is False
+
+
+def test_private_projection_reports_effective_summary_policy_without_actor_ids():
+    from app.services.call_metadata import public_call_metadata
+
+    value = public_call_metadata(
+        {
+            "agent_configuration": {"post_call_analysis_mode": "vav_ai"},
+            "private_mcp": True,
+            "browser_user_id": str(uuid4()),
+            "private_mcp_integration_id": str(uuid4()),
+        }
+    )
+    assert value["private_mcp"] is True
+    assert value["post_call_analysis_mode"] == "disabled"
+    assert "browser_user_id" not in value and "private_mcp_integration_id" not in value
 
 
 async def test_private_api_grants_and_audit(client, auth_headers, db, tenant, user, monkeypatch):

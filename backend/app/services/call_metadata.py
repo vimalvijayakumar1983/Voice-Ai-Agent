@@ -69,6 +69,9 @@ def public_call_metadata(value: Any) -> dict[str, Any] | None:
     analysis_mode = snapshot.get("post_call_analysis_mode")
     if analysis_mode in {"provider_first", "vav_ai", "disabled"}:
         result["post_call_analysis_mode"] = analysis_mode
+    if value.get("private_mcp") is True:
+        result["private_mcp"] = True
+        result["post_call_analysis_mode"] = "disabled"
     speech_provider = value.get("speech_provider")
     if speech_provider in {"smallest", "sarvam", "elevenlabs", "inworld"}:
         result["speech_provider"] = speech_provider

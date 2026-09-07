@@ -79,7 +79,7 @@ def validate_mcp_config(config: dict) -> None:
     label = config.get("company_label", "")
     if not isinstance(label, str) or not 1 <= len(label.strip()) <= 160:
         raise IntegrationConfigError("MCP company scope label is required (maximum 160 characters)")
-    if config.get("data_access_mode", "public") not in {"public", "private_staff"}:
+    if config.get("data_access_mode", "public") not in ("public", "private_staff"):
         raise IntegrationConfigError("Unsupported MCP data access mode")
     for key in ("allowed_tools", "agent_ids", "allowed_user_ids"):
         values = config.get(key, [])
