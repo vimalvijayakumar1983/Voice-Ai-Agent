@@ -25,9 +25,10 @@ def result(text=REPORT):
 
 
 class Handle:
-    def __init__(self, *, auto_finish=True, error=None):
+    def __init__(self, *, auto_finish=True, error=None, audio=None):
         self.interrupted = False
         self.error = error
+        self.audio = audio
         self.future = asyncio.get_running_loop().create_future()
         if auto_finish:
             self.future.set_result(None)
@@ -44,20 +45,71 @@ class Handle:
             self.future.set_result(None)
 
     def __await__(self):
-        return asyncio.shield(self.future).__await__()
+        async def wait():
+            if self.audio is not None:
+                try:
+                    async for _ in self.audio:
+                        pass
+                except Exception:
+                    # Real LiveKit say() may swallow the task error while its
+                    # public handle.exception() remains None.
+                    pass
+            await asyncio.shield(self.future)
+
+        return wait().__await__()
+
+
+class TTS:
+    capabilities = SimpleNamespace(streaming=True)
+
+    def __init__(self, *, frames=1, fail=False):
+        self.frames, self.fail = frames, fail
+        self.inputs = []
+
+    def stream(self, **options):
+        return self
+
+    def synthesize(self, text, **options):
+        self.inputs.append(text)
+        return self
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        pass
+
+    def push_text(self, text):
+        self.inputs.append(text)
+
+    def end_input(self):
+        pass
+
+    async def __aiter__(self):
+        for _ in range(self.frames):
+            yield SimpleNamespace(frame=object())
+        if self.fail:
+            raise RuntimeError("private provider failure")
 
 
 def context(*, auto_finish=True, error=None):
     spoken = []
 
     def say(text, **options):
-        handle = Handle(auto_finish=auto_finish, error=error if not spoken else None)
+        handle = Handle(
+            auto_finish=auto_finish, error=error if not spoken else None, audio=options.get("audio")
+        )
         spoken.append((text, options, handle))
         return handle
 
     return SimpleNamespace(
         speech_handle=SimpleNamespace(interrupted=False),
-        session=SimpleNamespace(tts=object(), say=say, spoken=spoken),
+        session=SimpleNamespace(
+            tts=TTS(),
+            say=say,
+            spoken=spoken,
+            conn_options=SimpleNamespace(tts_conn_options=object()),
+        ),
     )
 
 
@@ -95,7 +147,9 @@ async def test_exact_source_reaches_tts_without_model_continuation():
     with pytest.raises(llm.StopResponse) as stopped:
         await SourceDelivery(metrics, entries.append).deliver(ctx, result(), tool="sales")
     assert ctx.session.spoken[0][0] == REPORT
-    assert ctx.session.spoken[0][1] == {"allow_interruptions": True, "add_to_chat_ctx": False}
+    assert ctx.session.spoken[0][1]["allow_interruptions"] is True
+    assert ctx.session.spoken[0][1]["add_to_chat_ctx"] is False
+    assert ctx.session.tts.inputs == [REPORT]
     assert entries[0]["content"] == REPORT
     assert entries[0]["delivery_state"] == "finished"
     assert REPORT not in json.dumps(metrics)
@@ -145,6 +199,29 @@ async def test_interruption_during_authorization_prevents_stale_report():
         )
     assert not entries and not ctx.session.spoken
     assert metrics["mcp_source_delivery_state"] == "superseded"
+
+
+@pytest.mark.parametrize("frames,fail", [(0, True), (1, True), (0, False)])
+async def test_swallowed_tts_failure_or_empty_audio_is_not_finished(frames, fail):
+    ctx, metrics, entries = context(), {}, []
+    ctx.session.tts = TTS(frames=frames, fail=fail)
+    with pytest.raises(llm.StopResponse):
+        await SourceDelivery(metrics, entries.append).deliver(ctx, result(), tool="sales")
+    assert ctx.session.spoken[0][2].exception() is None
+    assert entries[0]["delivery_state"] == "failed"
+    assert metrics["mcp_source_delivery_state"] == "failed"
+    assert metrics.get("mcp_source_delivery_count", 0) == 0
+    assert len(ctx.session.spoken) == 2
+    assert "private provider failure" not in json.dumps(metrics)
+
+
+async def test_non_streaming_tts_preserves_literal_text():
+    ctx, entries = context(), []
+    ctx.session.tts.capabilities = SimpleNamespace(streaming=False)
+    with pytest.raises(llm.StopResponse):
+        await SourceDelivery({}, entries.append).deliver(ctx, result(), tool="sales")
+    assert entries[0]["delivery_state"] == "finished"
+    assert ctx.session.tts.inputs == [REPORT]
 
 
 async def test_late_report_is_not_spoken_after_interruption():

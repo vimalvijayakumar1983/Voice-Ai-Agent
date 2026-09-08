@@ -72,12 +72,21 @@ class SourceDelivery:
                 self.append_source(entry)
                 # Literal text -> configured external TTS. No LLM rewrite; don't
                 # feed the report back into its history for subsequent arithmetic.
-                handle = context.session.say(text, allow_interruptions=True, add_to_chat_ctx=False)
+                audio = _SourceAudio(context.session, text)
+                frames = audio.frames()
+                handle = context.session.say(
+                    text, audio=frames, allow_interruptions=True, add_to_chat_ctx=False
+                )
                 try:
                     await handle
                     failure = handle.exception()
                     if failure is not None:
                         raise failure
+                    # LiveKit 1.6 can log say() task failures without exposing
+                    # them on SpeechHandle.exception(). Observe our own stream
+                    # completion, not private SDK task internals.
+                    if not handle.interrupted and (not audio.completed or not audio.frame_count):
+                        raise RuntimeError("Source audio did not complete")
                 except asyncio.CancelledError:
                     entry["delivery_state"] = "interrupted"
                     raise
@@ -89,6 +98,7 @@ class SourceDelivery:
                 finally:
                     if not handle.done():
                         handle.interrupt()
+                    await frames.aclose()
                 self.metrics["mcp_source_delivery_state"] = entry["delivery_state"]
                 self.metrics["mcp_source_delivery_count"] = (
                     self.metrics.get("mcp_source_delivery_count", 0) + 1
@@ -110,3 +120,30 @@ class SourceDelivery:
             # Cancellation must still propagate so stale turns are not resurrected.
             if not asyncio.current_task().cancelling():
                 raise llm.StopResponse()
+
+
+class _SourceAudio:
+    """Track literal TTS generation through public SDK APIs, including silent failures."""
+
+    def __init__(self, session, text: str):
+        self.session = session
+        self.text = text
+        self.completed = False
+        self.frame_count = 0
+
+    async def frames(self):
+        engine = self.session.tts
+        options = self.session.conn_options.tts_conn_options
+        if engine.capabilities.streaming:
+            async with engine.stream(conn_options=options) as stream:
+                stream.push_text(self.text)
+                stream.end_input()
+                async for event in stream:
+                    self.frame_count += 1
+                    yield event.frame
+        else:
+            async with engine.synthesize(self.text, conn_options=options) as stream:
+                async for event in stream:
+                    self.frame_count += 1
+                    yield event.frame
+        self.completed = True
