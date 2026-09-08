@@ -25,6 +25,12 @@ CURRENCIES = {
     "SAR": "Saudi riyals",
     "INR": "Indian rupees",
 }
+SALES_GROUPS = {
+    "channel": "channels",
+    "salesman": "salespeople",
+    "category": "categories",
+    "month": "months",
+}
 SCALES = {
     "units": Decimal(1),
     "ones": Decimal(1),
@@ -110,6 +116,7 @@ class Brief:
     groups: tuple[str, ...] = ()
     period_name: str = ""
     currency: str = ""
+    group_noun: str = "channels"
 
 
 def compile_brief(source: str, *, question="", arguments=None, company="", scope="") -> Brief:
@@ -152,14 +159,12 @@ def compile_brief(source: str, *, question="", arguments=None, company="", scope
             )
             return Brief({"lead": text}, ["lead"], kind="invoice_due")
         rows = payload.get("rows")
-        if (
-            payload.get("group_by") != "channel"
-            or not isinstance(rows, list)
-            or not rows
-            or len(rows) > 200
-        ):
+        group = payload.get("group_by")
+        if group not in SALES_GROUPS or not isinstance(rows, list) or not rows or len(rows) > 500:
             return Brief({"lead": UNSUPPORTED}, ["lead"])
         start, end, period_name = period(payload, arguments)
+        if arguments.get("group_by", group) != group:
+            raise ValueError("Returned grouping differs from request")
         values = []
         for row in rows:
             if (
@@ -170,12 +175,13 @@ def compile_brief(source: str, *, question="", arguments=None, company="", scope
                 raise ValueError("Mixed currency or units")
             values.append((label(row["group_value"]), number(row["revenue_ex_vat"]) * scale))
         if len({name.casefold() for name, _ in values}) != len(values):
-            raise ValueError("Duplicate channel")
+            raise ValueError("Duplicate group")
         total = sum((value for _, value in values), Decimal(0))
         explicit = payload.get("total_revenue_ex_vat")
         if explicit is not None and number(explicit) * scale != total:
             raise ValueError("Total does not reconcile with rows")
-        qualifier = "Sales" if explicit is not None else "Sales across the returned channels"
+        noun = SALES_GROUPS[group]
+        qualifier = "Sales" if explicit is not None else f"Sales across the returned {noun}"
         if company:
             qualifier = f"For {label(company)}, {qualifier.lower()}"
         sentences = {
@@ -189,19 +195,25 @@ def compile_brief(source: str, *, question="", arguments=None, company="", scope
         if len(ranked) > 1 and all(value >= 0 for _, value in values) and total > 0:
             leaders = [f"{name} at {amount(value, exact=exact)}" for name, value in ranked[:3]]
             sentences["leaders"] = (
-                "The largest channel amounts were " + ", followed by ".join(leaders) + "."
+                f"The leading {noun} by revenue were " + ", followed by ".join(leaders) + "."
             )
         defaults = ["lead"] + (["leaders"] if "leaders" in sentences else [])
         followups = {
             "none": "",
-            "breakdown": "Would you like the channel breakdown?",
+            "breakdown": f"Would you like the breakdown by {noun}?",
             "compare": "Would you like me to retrieve the previous month's figures for comparison?",
         }
-        if re.search(r"\b(breakdown|each channel|all channels|channel.wise)\b", question, re.I):
+        if re.search(
+            r"\b(breakdown|each channel|all channels|channel.wise|"
+            r"salesperson.wise|salesman.wise)\b",
+            question,
+            re.I,
+        ):
             if len(values) <= 12:
+                heading = "salesperson" if group == "salesman" else group
                 sentences = {
                     "lead": sentences["lead"],
-                    "breakdown": "By channel: "
+                    "breakdown": f"By {heading}: "
                     + "; ".join(f"{name}, {amount(value, exact=exact)}" for name, value in values)
                     + ".",
                 }
@@ -223,7 +235,7 @@ def compile_brief(source: str, *, question="", arguments=None, company="", scope
         # Compare only same-company/scope/filter/basis reports with identical groups.
         filters = {k: v for k, v in arguments.items() if k not in {"start_date", "end_date"}}
         comparison_key = json.dumps(
-            [scope, company, currency, unit, basis, filters], sort_keys=True, default=str
+            [scope, company, currency, unit, basis, group, filters], sort_keys=True, default=str
         )
         return Brief(
             sentences,
@@ -231,7 +243,7 @@ def compile_brief(source: str, *, question="", arguments=None, company="", scope
             followups,
             "compare" if "compare" in followups else "none",
             required,
-            "channel_sales",
+            f"{group}_sales",
             comparison_key,
             start,
             end,
@@ -239,6 +251,7 @@ def compile_brief(source: str, *, question="", arguments=None, company="", scope
             tuple(sorted(name for name, _ in values)),
             period_name,
             currency,
+            noun,
         )
     except (ValueError, KeyError, TypeError, InvalidOperation, OverflowError):
         return Brief({"lead": INVALID}, ["lead"])
@@ -349,7 +362,7 @@ class ReportPresenter:
         brief = compile_brief(
             source, question=question, arguments=arguments, company=company, scope=scope
         )
-        if brief.kind == "channel_sales":
+        if brief.kind in {f"{group}_sales" for group in SALES_GROUPS}:
             if re.search(r"\b(compare|comparison|versus|vs|change|growth)\b", question, re.I):
                 previous = next(
                     (
@@ -370,12 +383,14 @@ class ReportPresenter:
                         )
                         direction = "up" if delta > 0 else "down" if delta < 0 else "unchanged"
                         brief.sentences["comparison"] = (
-                            f"Across the same returned channels, {new.period_name} is {direction} "
+                            f"Across the same returned {brief.group_noun}, "
+                            f"{new.period_name} is {direction} "
                             f"by {amount(abs(delta))} {CURRENCIES[brief.currency]}, "
                             f"or {percentage} percent, compared with {old.period_name}."
                             if delta
                             else (
-                                "The total across the same returned channels is unchanged "
+                                f"The total across the same returned {brief.group_noun} "
+                                "is unchanged "
                                 f"between {old.period_name} and {new.period_name}."
                             )
                         )

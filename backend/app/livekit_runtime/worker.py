@@ -6175,6 +6175,9 @@ async def vav_inworld_session(ctx: JobContext) -> None:
                 if usage_totals.get("mcp_private_mode")
                 else MCP_INSTRUCTIONS
             )
+            from app.livekit_runtime.mcp_request_context import report_date_instruction
+
+            mcp_instructions += report_date_instruction(getattr(model, "timezone", "UTC"))
             from app.services.browser_access import tools_only
 
             if tools_only(profile):

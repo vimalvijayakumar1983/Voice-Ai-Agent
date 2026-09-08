@@ -1,7 +1,9 @@
 """Approved public-data MCP tools for the native Inworld tool-loop lane only."""
 
+import asyncio
 import hashlib
 import json
+import re
 import time
 from contextlib import nullcontext
 from uuid import UUID, uuid4
@@ -12,6 +14,7 @@ from sqlalchemy import select
 from app.core.database import async_session_factory
 from app.livekit_runtime.lookup_filler import LookupFiller
 from app.livekit_runtime.mcp_delivery import SourceDelivery
+from app.livekit_runtime.mcp_request_context import failure_instruction, report_arguments
 from app.livekit_runtime.reporting import REPORT_ANALYSIS_INSTRUCTIONS
 from app.models.integration import Integration
 from app.services.mcp_connections import (
@@ -20,6 +23,7 @@ from app.services.mcp_connections import (
     call_read_tool,
     private_mcp,
     runtime_compatible,
+    safe_lookup_error,
 )
 
 MCP_INSTRUCTIONS = (
@@ -81,6 +85,7 @@ def _make_tool(
     filler=None,
     delivery=None,
     question_provider=None,
+    timezone="UTC",
 ):
     async def lookup(raw_arguments: dict, context: RunContext = None):
         question = question_provider() if question_provider is not None else ""
@@ -91,6 +96,10 @@ def _make_tool(
         status = "failed"
         remote_ms = None
         lookup_id = uuid4()
+        stage, error_code, attempts = "authorization", None, 0
+        request_arguments = report_arguments(
+            raw_arguments, question or "", descriptor["input_schema"], timezone=timezone
+        )
         try:
             # Fresh authorization on every execution: disabling/deleting a connection
             # or removing the grant prevents subsequent calls in an existing session.
@@ -134,9 +143,37 @@ def _make_tool(
             async with filler.pending(context) if filler is not None else nullcontext():
                 remote_started = time.monotonic()
                 try:
-                    result = await call_read_tool(config, approved, raw_arguments)
+                    for attempt in range(2):
+                        if context is not None and context.speech_handle.interrupted:
+                            status = "superseded"
+                            raise llm.StopResponse()
+                        if attempt:
+                            # A retry is a new execution; verify grants again.
+                            stage = "authorization"
+                            async with async_session_factory() as db:
+                                latest = await authorized_runtime_config(
+                                    db, tenant_id, agent_id, integration_id, call_id=call_id
+                                )
+                                if latest != config:
+                                    raise MCPError("MCP access changed", code="access_denied")
+                        if context is not None and context.speech_handle.interrupted:
+                            status = "superseded"
+                            raise llm.StopResponse()
+                        attempts += 1
+                        stage = "lookup"
+                        try:
+                            result = await call_read_tool(config, approved, request_arguments)
+                            break
+                        except MCPError as exc:
+                            idempotent = (approved.get("annotations") or {}).get(
+                                "idempotentHint"
+                            ) is True
+                            if attempt or not exc.retryable or not idempotent:
+                                raise
+                            await asyncio.sleep(0.15)
                 finally:
                     remote_ms = round((time.monotonic() - remote_started) * 1000)
+            stage = "authorization"
             async with async_session_factory() as db:
                 if staff_call_id is not None:
                     await validate_staff_call(
@@ -172,14 +209,17 @@ def _make_tool(
                     tool=descriptor["name"],
                     authorize=authorize_delivery,
                     question=question,
-                    arguments=raw_arguments,
+                    arguments=request_arguments,
                     company=company,
                     scope=str(integration_id),
                 )
             return json.dumps({"company": config["company_label"], "untrusted_tool_data": result})
         except llm.StopResponse:
             raise  # Direct source speech must never trigger a generative tool reply.
-        except Exception:
+        except Exception as exc:
+            failure = safe_lookup_error(exc, stage=stage)
+            error_code = "authorization_failed" if stage == "authorization" else failure.code
+            stage = failure.stage
             if access_mode == "private_staff":
                 try:
                     async with async_session_factory() as db:
@@ -197,10 +237,14 @@ def _make_tool(
             return json.dumps(
                 {
                     "status": "unavailable",
-                    "instruction": "Lookup failed or access was revoked. Do not invent a result.",
+                    "error_code": error_code,
+                    "instruction": failure_instruction(error_code),
                 }
             )
         finally:
+            metrics["mcp_last_error_code"] = error_code
+            metrics["mcp_last_failure_stage"] = stage if error_code else None
+            metrics["mcp_retry_count"] = metrics.get("mcp_retry_count", 0) + max(0, attempts - 1)
             traces = metrics.setdefault("mcp_tool_calls", [])
             if len(traces) < 50:
                 traces.append(
@@ -210,6 +254,16 @@ def _make_tool(
                         "status": status,
                         "duration_ms": round((time.monotonic() - started) * 1000),
                         "remote_duration_ms": remote_ms,
+                        "error_code": error_code,
+                        "failure_stage": stage if error_code else None,
+                        "attempts": attempts,
+                        "report_period": {
+                            key: value
+                            for key, value in request_arguments.items()
+                            if key in {"start_date", "end_date"}
+                            and isinstance(value, str)
+                            and re.fullmatch(r"\d{4}-\d{2}-\d{2}", value)
+                        },
                     }
                 )
 
@@ -314,6 +368,7 @@ async def load_mcp_tools(
                             filler=filler,
                             delivery=delivery,
                             question_provider=latest_question,
+                            timezone=getattr(model, "timezone", "UTC"),
                         )
                     )
     metrics["mcp_enabled_tool_count"] = len(tools)

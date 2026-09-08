@@ -128,6 +128,34 @@ async def test_unknown_schema_is_not_read_out():
     assert presentation["text"] == UNSUPPORTED
 
 
+@pytest.mark.parametrize(
+    "group,noun", [("salesman", "salespeople"), ("category", "categories"), ("month", "months")]
+)
+async def test_typed_large_sales_report_is_bounded_and_dimension_correct(group, noun):
+    rows = [{"group_value": f"Group {i}", "revenue_ex_vat": "450.25"} for i in range(500)]
+    raw = report(group_by=group, rows=rows)
+    assert len(raw) > 12000
+    rendered = await ReportPresenter({}).present(raw, arguments={"group_by": group})
+    assert rendered["kind"] == f"{group}_sales"
+    assert f"returned {noun}" in rendered["text"]
+    assert "225,125" in rendered["text"]
+    assert "revenue_ex_vat" not in rendered["text"]
+    assert len(rendered["text"].split()) < 150
+
+
+async def test_salesperson_breakdown_and_cross_dimension_comparison():
+    presenter = ReportPresenter({})
+    detailed = await presenter.present(
+        report(group_by="salesman"), question="Give me the breakdown"
+    )
+    assert "By salesperson:" in detailed["text"] and "By channel:" not in detailed["text"]
+    other = await presenter.present(
+        report(start_date="2099-07-01", end_date="2099-07-31"), question="Compare with August"
+    )
+    assert "comparison" not in other["sentence_ids"]
+    assert compile_brief(report(), arguments={"group_by": "salesman"}).sentences["lead"] == INVALID
+
+
 async def test_just_total_and_requested_breakdown_are_respected():
     short = await ReportPresenter({}).present(report(), question="Just the total please")
     assert "Shops" not in short["text"] and "Would you" not in short["text"]
