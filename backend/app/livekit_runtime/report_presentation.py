@@ -17,6 +17,12 @@ from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
 import httpx
 
+from app.livekit_runtime.mcp_request_context import (
+    completed_month_arguments,
+    forecast_requested,
+    local_today,
+)
+
 CURRENCIES = {
     "AED": "dirhams",
     "USD": "US dollars",
@@ -356,7 +362,16 @@ class ReportPresenter:
         self.previous: list[Brief] = []
 
     async def present(
-        self, source: str, *, question="", arguments=None, company="", scope=""
+        self,
+        source: str,
+        *,
+        question="",
+        arguments=None,
+        company="",
+        scope="",
+        forecast=None,
+        timezone="UTC",
+        now=None,
     ) -> dict:
         started = time.monotonic()
         brief = compile_brief(
@@ -401,6 +416,17 @@ class ReportPresenter:
                             "breakdown" if "breakdown" in brief.followups else "none"
                         )
             self.previous = (self.previous + [brief])[-4:]
+        if forecast_requested(question) and brief.total is not None:
+            apply_run_rate(
+                brief,
+                forecast,
+                question=question,
+                arguments=arguments or {},
+                company=company,
+                scope=scope,
+                timezone=timezone,
+                now=now,
+            )
         default = {
             "sentences": list(dict.fromkeys(brief.defaults + brief.required)),
             "follow_up": brief.default_followup,
@@ -459,6 +485,59 @@ class ReportPresenter:
             "sentence_ids": selected["sentences"] if state != "validation_fallback" else [],
             "fact_sentences": brief.sentences,
         }
+
+
+def apply_run_rate(brief, forecast, *, question, arguments, company, scope, timezone, now=None):
+    """Auditable calendar-day scenario, not an LLM-generated revenue prediction."""
+    today = local_today(timezone, now)
+    expected = completed_month_arguments(arguments, question, timezone=timezone, now=now)
+    baseline = None
+    if forecast and expected and forecast.get("arguments") == expected:
+        baseline = compile_brief(
+            forecast["source"], arguments=expected, company=company, scope=scope
+        )
+    valid = (
+        baseline is not None
+        and baseline.total is not None
+        and baseline.total >= 0
+        and baseline.kind == brief.kind
+        and baseline.comparison_key == brief.comparison_key
+        and baseline.groups == brief.groups
+        and baseline.start == brief.start
+        and brief.end == today
+        and baseline.end is not None
+        and (today - baseline.end).days == 1
+    )
+    # A changed ranking/limited result is not silently promoted into a company forecast.
+    if valid:
+        days = Decimal(baseline.end.day)
+        month_days = Decimal(calendar.monthrange(today.year, today.month)[1])
+        estimate = (baseline.total / days * month_days).quantize(
+            Decimal("0.01"), rounding=ROUND_HALF_UP
+        )
+        brief.sentences["estimate"] = (
+            f"For the same returned {brief.group_noun}, an indicative month-end run-rate is "
+            f"{amount(estimate)} {CURRENCIES[brief.currency]}. "
+            f"It uses reported sales through {baseline.end:%d %B}, "
+            f"across {int(days)} calendar days, "
+            "excluding today's partial day, and assumes the same daily pace continues. "
+            "This is an estimate, not booked revenue; "
+            "seasonality and future orders are not modelled."
+        )
+        brief.followups = {
+            "none": "",
+            "review": "As a next step, consider reviewing confirmed orders against this estimate.",
+        }
+    else:
+        brief.sentences["estimate"] = (
+            "I can report these actuals, but cannot yet calculate a reliable same-pace estimate: "
+            "a matching completed-day baseline is unavailable."
+        )
+        brief.followups = {"none": ""}
+    brief.defaults = ["lead", "estimate"]
+    brief.required = ["lead", "estimate"] + (["scope"] if "scope" in brief.sentences else [])
+    brief.sentences = {key: brief.sentences[key] for key in brief.required}
+    brief.default_followup = "none"
 
 
 def include_presentation_usage(snapshot: dict, metrics: dict) -> dict:

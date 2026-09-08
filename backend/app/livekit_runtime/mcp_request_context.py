@@ -7,26 +7,72 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from app.services.mcp_connections import calendar_date_fields
 
 
+def local_today(timezone="UTC", now=None):
+    try:
+        zone = ZoneInfo(timezone or "UTC")
+    except ZoneInfoNotFoundError:
+        zone = ZoneInfo("UTC")
+    return (now or datetime.now(UTC)).astimezone(zone).date()
+
+
+def forecast_requested(question):
+    if re.search(
+        r"\b(no|not|without|skip|avoid|don't)\s+(?:an?\s+|any\s+|the\s+)?"
+        r"(forecast|projection|estimate)\b",
+        question,
+        re.I,
+    ):
+        return False
+    return bool(
+        re.search(
+            r"\b(forecast|projected?|projection|expected turnover|"
+            r"expected sales|month.end estimate|run.rate)\b",
+            question,
+            re.I,
+        )
+    )
+
+
+def completed_month_arguments(arguments, question, *, timezone="UTC", now=None):
+    """Separate baseline: never treat today's partial sales as a complete day."""
+    today = local_today(timezone, now)
+    if (
+        not forecast_requested(question)
+        or today.day == 1
+        or arguments.get("start_date") != today.replace(day=1).isoformat()
+        or arguments.get("end_date") != today.isoformat()
+    ):
+        return None
+    return dict(arguments, end_date=(today - timedelta(days=1)).isoformat())
+
+
 def report_arguments(arguments, question, schema, *, timezone="UTC", now=None):
     """Resolve only an unambiguous previous calendar month; preserve all other filters."""
     result = dict(arguments)
     if calendar_date_fields(schema) != {"start_date", "end_date"}:
         return result
-    if not re.search(r"\b(last|previous) month\b", question, re.I):
+    current = bool(re.search(r"\b((this|current) month|month.to.date|mtd)\b", question, re.I))
+    previous = bool(re.search(r"\b(last|previous) month\b", question, re.I))
+    if not current and not previous:
         return result
     # Never collapse comparisons, explicit years/ranges or negated/corrected periods.
     if re.search(
-        r"\b(compare|comparison|versus|vs|not|except|before|after|since|until|to)\b|\d",
+        r"\b(compare|comparison|versus|vs|not|except|before|after|since|until)\b|\d",
         question,
         re.I,
     ):
         return result
-    try:
-        zone = ZoneInfo(timezone or "UTC")
-    except ZoneInfoNotFoundError:
-        zone = ZoneInfo("UTC")
-    observed = now or datetime.now(UTC)
-    previous_end = observed.astimezone(zone).date().replace(day=1) - timedelta(days=1)
+    if current and previous:
+        return result
+    range_question = re.sub(r"\bmonth.to.date\b", "MTD", question, flags=re.I)
+    if current and re.search(r"\b(to|next)\b", range_question, re.I):
+        return result
+    if previous and re.search(r"\bto\b", question, re.I):
+        return result
+    today = local_today(timezone, now)
+    if current:
+        return dict(result, start_date=today.replace(day=1).isoformat(), end_date=today.isoformat())
+    previous_end = today.replace(day=1) - timedelta(days=1)
     result.update(
         start_date=previous_end.replace(day=1).isoformat(), end_date=previous_end.isoformat()
     )
@@ -34,6 +80,7 @@ def report_arguments(arguments, question, schema, *, timezone="UTC", now=None):
 
 
 def report_date_instruction(timezone="UTC", *, now=None):
+    today = local_today(timezone, now)
     values = report_arguments(
         {},
         "last month",
@@ -48,6 +95,12 @@ def report_date_instruction(timezone="UTC", *, now=None):
     return (
         "\nFor report requests, 'last month' means the previous complete calendar month: "
         f"{values['start_date']} through {values['end_date']}. "
+        f"Current-month/month-to-date actuals mean {today.replace(day=1)} through {today}. "
+        "Always attempt the available authorised sales tool for current-month requests; "
+        "never infer data availability from a previously retrieved month. For a requested "
+        "month-end forecast or expected turnover, retrieve current-month sales. VAV can "
+        "calculate a labelled same-pace run-rate using a separate completed-day baseline; "
+        "do not refuse all estimates as predictions or invent a forecast yourself. "
         "Use these ISO dates without asking the caller to restate an unambiguous period. "
         "Keep company and filters unchanged unless the caller explicitly changes them. "
         "Follow the caller's latest correction. For an overall sales summary use the tool's "

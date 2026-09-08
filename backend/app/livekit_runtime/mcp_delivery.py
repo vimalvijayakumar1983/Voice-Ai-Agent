@@ -13,6 +13,7 @@ from datetime import UTC, datetime
 
 from livekit.agents import RunContext, llm
 
+from app.livekit_runtime.mcp_request_context import forecast_requested
 from app.livekit_runtime.report_presentation import ReportPresenter
 
 
@@ -50,6 +51,8 @@ class SourceDelivery:
         arguments: dict | None = None,
         company: str = "",
         scope: str = "",
+        forecast_loader=None,
+        timezone="UTC",
     ) -> None:
         """Stop automatic tool continuation even if source playback cannot start."""
         entry = None
@@ -78,8 +81,29 @@ class SourceDelivery:
                     "delivery_state": "preparing",
                 }
                 self.append_source(entry)
+                forecast = None
+                if forecast_loader is not None and forecast_requested(question):
+                    forecast = await forecast_loader()
+                    if forecast:
+                        baseline_text = source_text(forecast["result"])
+                        entry["forecast_source"] = {
+                            "content": baseline_text,
+                            "arguments": forecast["arguments"],
+                            "source_sha256": hashlib.sha256(baseline_text.encode()).hexdigest(),
+                        }
+                        forecast = {"source": baseline_text, "arguments": forecast["arguments"]}
+                if context.speech_handle.interrupted:
+                    entry["delivery_state"] = "superseded"
+                    self.metrics["mcp_source_delivery_state"] = "superseded"
+                    return
                 presentation = await self.presenter.present(
-                    text, question=question, arguments=arguments, company=company, scope=scope
+                    text,
+                    question=question,
+                    arguments=arguments,
+                    company=company,
+                    scope=scope,
+                    forecast=forecast,
+                    timezone=timezone,
                 )
                 # The model only selects server-validated sentences. Recheck
                 # permissions and interruption after the bounded presentation call.
