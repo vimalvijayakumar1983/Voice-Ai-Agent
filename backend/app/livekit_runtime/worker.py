@@ -1170,6 +1170,13 @@ def _reconcile_external_tts_usage(runtime_metrics: dict[str, Any]) -> None:
         expected.add("external_tts")
         if runtime_metrics.get("external_tts_characters") is not None:
             reported.add("external_tts")
+    presentation_requests = int(runtime_metrics.get("mcp_presentation_requests") or 0)
+    if presentation_requests:
+        expected.add("mcp_presentation")
+        if presentation_requests == runtime_metrics.get("mcp_presentation_usage_reported", 0):
+            reported.add("mcp_presentation")
+        else:
+            reported.discard("mcp_presentation")
     runtime_metrics["usage_components_expected"] = sorted(expected)
     runtime_metrics["usage_components_reported"] = sorted(reported)
     runtime_metrics["runtime_usage_components_complete"] = expected.issubset(reported)
@@ -6142,13 +6149,26 @@ async def vav_inworld_session(ctx: JobContext) -> None:
                 PRIVATE_MCP_INSTRUCTIONS,
                 load_mcp_tools,
             )
+            from app.livekit_runtime.report_presentation import (
+                InworldNarrativePlanner,
+                ReportPresenter,
+            )
 
+            report_presenter = ReportPresenter(
+                usage_totals,
+                InworldNarrativePlanner(
+                    api_key=api_keys.speech,
+                    model=profile.llm_model,
+                    base_url=settings.inworld_base_url,
+                ),
+            )
             mcp_tools = await load_mcp_tools(
                 model,
                 profile,
                 usage_totals,
                 call_id=call_id if browser_session else None,
                 source_turns=turns,
+                presenter=report_presenter,
             )
             mcp_instructions = (
                 PRIVATE_MCP_INSTRUCTIONS
@@ -6569,8 +6589,14 @@ async def vav_inworld_session(ctx: JobContext) -> None:
 
         @session.on("session_usage_updated")
         def _on_usage(event: Any) -> None:
+            from app.livekit_runtime.report_presentation import include_presentation_usage
+
             expected = ("llm",) if native_realtime else ("llm", "tts", "stt")
-            usage_totals.update(_usage_snapshot(event.usage, expected_components=expected))
+            usage_totals.update(
+                include_presentation_usage(
+                    _usage_snapshot(event.usage, expected_components=expected), usage_totals
+                )
+            )
             _reconcile_external_tts_usage(usage_totals)
 
         @session.on("metrics_collected")

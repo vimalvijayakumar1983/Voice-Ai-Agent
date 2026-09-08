@@ -280,7 +280,7 @@ async def test_two_reports_serialize_and_recheck_authorization():
     with pytest.raises(llm.StopResponse):
         await first
     await asyncio.sleep(0)
-    auth.assert_awaited_once()
+    assert auth.await_count == 2
     ctx.session.spoken[1][2].future.set_result(None)
     with pytest.raises(llm.StopResponse):
         await second
