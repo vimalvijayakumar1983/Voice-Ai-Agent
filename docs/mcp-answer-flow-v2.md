@@ -66,6 +66,18 @@ The audio gate/required tool choice were added after observing this, not merely
 assuming a prompt would enforce grounding. Subsequent tests caught list-number
 false rejections, empty-evidence social checks, and internal ID narration.
 
+Latest six-turn isolated call: `e8a0b97e-f83b-4e1b-bb32-01844697750e`.
+August total, acceptance of a previous-month comparison, all six declining
+channels, exact total, and goodbye were delivered with only two ERP lookups.
+The recommendation turn was rejected for approximate percentages. Its exact
+captured draft subsequently passed the corrected numeric guard and live GPT-4.1
+mini verifier (2,344 ms, 1,011 input/91 output tokens). This was a text/evidence
+replay, **not** a fresh six-turn audio pass or a production deployment.
+
+The verifier output ceiling is 320 tokens, while the time deadline remains 3.5
+seconds. An earlier 180-token ceiling sometimes cut off otherwise useful verdicts;
+truncated verdicts still fail closed. Fresh whole-call audio and CI remain gates.
+
 Captured-evidence model comparison (10 cases, one run each) scored GPT-4o mini
 8/10 and GPT-4.1 mini 9/10 on semantic judgments alone. GPT-4.1 mini's remaining
 wrong-total verdict was caught by the independent numeric guard. This small test

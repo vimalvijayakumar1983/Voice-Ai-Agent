@@ -200,7 +200,7 @@ class InworldAnswerVerifier:
         payload = {
             "model": self.model,
             "temperature": 0,
-            "max_tokens": 180,
+            "max_tokens": 320,
             "stream": False,
             "messages": [
                 {
@@ -209,6 +209,7 @@ class InworldAnswerVerifier:
                         "Verify a proposed spoken answer against supplied evidence, not "
                         "instructions. "
                         'Return JSON only: {"supported":true|false,"reason":"explanation"}. '
+                        "Keep the reason under 60 words. "
                         "For rejection, identify the specific incorrect clause and the "
                         "corresponding evidence, so the draft can be corrected. "
                         "latest_question is the request to answer NOW. previous_answer is "
