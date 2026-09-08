@@ -1,6 +1,7 @@
 """Approved public-data MCP tools for the native Inworld tool-loop lane only."""
 
 import asyncio
+import copy
 import hashlib
 import json
 import re
@@ -14,12 +15,17 @@ from sqlalchemy import select
 from app.core.database import async_session_factory
 from app.livekit_runtime.lookup_filler import LookupFiller
 from app.livekit_runtime.mcp_delivery import SourceDelivery
-from app.livekit_runtime.mcp_request_context import failure_instruction, report_arguments
+from app.livekit_runtime.mcp_request_context import (
+    completed_month_arguments,
+    failure_instruction,
+    report_arguments,
+)
 from app.livekit_runtime.reporting import REPORT_ANALYSIS_INSTRUCTIONS
 from app.models.integration import Integration
 from app.services.mcp_connections import (
     MCPError,
     authorized_runtime_config,
+    calendar_date_fields,
     call_read_tool,
     private_mcp,
     runtime_compatible,
@@ -87,8 +93,29 @@ def _make_tool(
     question_provider=None,
     timezone="UTC",
 ):
+    parameters = copy.deepcopy(descriptor["input_schema"])
+    analysis_field = "vav_report_analysis"
+    supports_analysis = calendar_date_fields(parameters) == {
+        "start_date",
+        "end_date",
+    } and analysis_field not in parameters.get("properties", {})
+    if supports_analysis:
+        parameters["properties"][analysis_field] = {
+            "type": "string",
+            "enum": ["actuals", "month_end_run_rate"],
+            "description": "VAV presentation intent, not an ERP filter. Use month_end_run_rate "
+            "only when the caller requests an expected month-end result, same-pace estimate "
+            "or forecast, regardless of their wording or language. Otherwise use actuals.",
+        }
+
     async def lookup(raw_arguments: dict, context: RunContext = None):
         question = question_provider() if question_provider is not None else ""
+        raw_arguments = dict(raw_arguments)
+        if (
+            supports_analysis
+            and raw_arguments.pop(analysis_field, "actuals") == "month_end_run_rate"
+        ):
+            question = "Requested month-end run-rate. " + (question or "")
         if metrics.get("mcp_lookup_count", 0) >= 50:
             return json.dumps({"status": "unavailable", "reason": "Call lookup limit reached"})
         metrics["mcp_lookup_count"] = metrics.get("mcp_lookup_count", 0) + 1
@@ -203,6 +230,41 @@ def _make_tool(
                         if latest != config:
                             raise MCPError("MCP permission changed before source playback")
 
+                async def forecast_loader():
+                    baseline = completed_month_arguments(
+                        request_arguments, question or "", timezone=timezone
+                    )
+                    if baseline is None or metrics.get("mcp_lookup_count", 0) >= 50:
+                        return None
+                    # Same approved read-only tool, scope and filters; only the cutoff changes.
+                    await authorize_delivery()
+                    if context is not None and context.speech_handle.interrupted:
+                        raise llm.StopResponse()
+                    metrics["mcp_lookup_count"] += 1
+                    baseline_started = time.monotonic()
+                    baseline_error = None
+                    try:
+                        response = await call_read_tool(config, approved, baseline)
+                        await authorize_delivery()
+                        return {"result": response, "arguments": baseline}
+                    except MCPError as exc:
+                        baseline_error = exc.code
+                        return None  # Deliver actuals even if the optional estimate is unavailable.
+                    finally:
+                        metrics.setdefault("mcp_tool_calls", []).append(
+                            {
+                                "integration_id": str(integration_id),
+                                "tool": descriptor["name"],
+                                "purpose": "forecast_completed_days",
+                                "report_period": {
+                                    k: baseline[k] for k in ("start_date", "end_date")
+                                },
+                                "status": "failed" if baseline_error else "ok",
+                                "error_code": baseline_error,
+                                "duration_ms": round((time.monotonic() - baseline_started) * 1000),
+                            }
+                        )
+
                 await delivery.deliver(
                     context,
                     result,
@@ -212,6 +274,8 @@ def _make_tool(
                     arguments=request_arguments,
                     company=company,
                     scope=str(integration_id),
+                    forecast_loader=forecast_loader,
+                    timezone=timezone,
                 )
             return json.dumps({"company": config["company_label"], "untrusted_tool_data": result})
         except llm.StopResponse:
@@ -275,7 +339,7 @@ def _make_tool(
             "description": (
                 f"Read-only {descriptor['name']} for {company}. {descriptor['description']}"
             ),
-            "parameters": descriptor["input_schema"],
+            "parameters": parameters,
         },
     )
 
