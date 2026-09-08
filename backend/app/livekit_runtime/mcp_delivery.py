@@ -34,11 +34,19 @@ def source_text(result: dict) -> str:
 
 
 class SourceDelivery:
-    def __init__(self, metrics: dict, append_source: Callable[[dict], None], *, presenter=None):
+    def __init__(
+        self,
+        metrics: dict,
+        append_source: Callable[[dict], None],
+        *,
+        presenter=None,
+        remember=False,
+    ):
         self.metrics = metrics
         self.append_source = append_source
         self._lock = asyncio.Lock()
         self.presenter = presenter or ReportPresenter(metrics)
+        self.remember = remember
 
     async def deliver(
         self,
@@ -128,7 +136,7 @@ class SourceDelivery:
                 audio = _SourceAudio(context.session, speech)
                 frames = audio.frames()
                 handle = context.session.say(
-                    speech, audio=frames, allow_interruptions=True, add_to_chat_ctx=False
+                    speech, audio=frames, allow_interruptions=True, add_to_chat_ctx=self.remember
                 )
                 try:
                     await handle

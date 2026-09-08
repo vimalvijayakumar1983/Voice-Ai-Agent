@@ -2037,6 +2037,12 @@ def _build_inworld_realtime_model(
         wire_telemetry=wire_telemetry,
         recognition_lexicon_count=len(recognition_terms),
         output_tts_model=_inworld_realtime_tts_model(profile),
+        **(
+            {"tool_choice": "required"}
+            if (getattr(profile, "runtime_config", None) or {}).get("mcp_answer_flow_v2") is True
+            and not single_pass
+            else {}
+        ),
     )
 
 
@@ -3898,6 +3904,14 @@ Knowledge policy:
 class VAVInworldRealtimeAgent(VAVInworldAgent):
     """Native agent for the grounded tool-loop and explicit single-pass policies."""
 
+    def realtime_audio_output_node(self, audio, model_settings):
+        metrics = getattr(self, "_mcp_checked_output_metrics", None)
+        if metrics is not None:
+            from app.livekit_runtime.mcp_answer_flow import gate_native_audio
+
+            return gate_native_audio(audio, metrics)
+        return super().realtime_audio_output_node(audio, model_settings)
+
     def __init__(
         self,
         *,
@@ -5493,7 +5507,11 @@ async def _finish_call(
                     tenant_id=call.tenant_id,
                     call_id=call.id,
                     turns=turns,
-                    full_text="\n".join(f"{turn['role']}: {turn['content']}" for turn in turns),
+                    full_text="\n".join(
+                        f"{turn['role']}: {turn['content']}"
+                        for turn in turns
+                        if turn.get("role") not in {"analysis", "analysis_candidate"}
+                    ),
                 )
             )
         outbox_ids = await persist_provider_callback_actions(
@@ -6050,6 +6068,14 @@ async def vav_inworld_session(ctx: JobContext) -> None:
             session = AgentSession(
                 llm=realtime_model,
                 tts=tts_engine,
+                # Two reports + arithmetic + checked answer can exceed the SDK's
+                # three-step default. Legacy agents keep their existing budget.
+                max_tool_steps=(
+                    8
+                    if runtime_config.get("mcp_answer_flow_v2") is True
+                    and not single_pass_decision.enabled
+                    else 3
+                ),
                 turn_handling=(
                     {"turn_detection": "realtime_llm"}
                     if provider_native_turns_qa
@@ -6162,6 +6188,27 @@ async def vav_inworld_session(ctx: JobContext) -> None:
                     base_url=settings.inworld_base_url,
                 ),
             )
+            from app.livekit_runtime.mcp_answer_flow import (
+                ANSWER_FLOW_INSTRUCTIONS,
+                InworldAnswerVerifier,
+            )
+            from app.livekit_runtime.mcp_answer_flow import (
+                enabled as answer_flow_enabled,
+            )
+
+            use_answer_flow = answer_flow_enabled(profile)
+            if use_answer_flow:
+                runtime_agent._mcp_checked_output_metrics = usage_totals
+            answer_verifier = (
+                InworldAnswerVerifier(
+                    api_key=api_keys.speech,
+                    model=profile.llm_model,
+                    base_url=settings.inworld_base_url,
+                    metrics=usage_totals,
+                )
+                if use_answer_flow
+                else None
+            )
             mcp_tools = await load_mcp_tools(
                 model,
                 profile,
@@ -6169,6 +6216,7 @@ async def vav_inworld_session(ctx: JobContext) -> None:
                 call_id=call_id if browser_session else None,
                 source_turns=turns,
                 presenter=report_presenter,
+                answer_verifier=answer_verifier,
             )
             mcp_instructions = (
                 PRIVATE_MCP_INSTRUCTIONS
@@ -6178,6 +6226,11 @@ async def vav_inworld_session(ctx: JobContext) -> None:
             from app.livekit_runtime.mcp_request_context import report_date_instruction
 
             mcp_instructions += report_date_instruction(getattr(model, "timezone", "UTC"))
+            if use_answer_flow:
+                from app.livekit_runtime.reporting import REPORT_ANALYSIS_INSTRUCTIONS
+
+                mcp_instructions = mcp_instructions.replace(REPORT_ANALYSIS_INSTRUCTIONS, "")
+                mcp_instructions += ANSWER_FLOW_INSTRUCTIONS
             from app.services.browser_access import tools_only
 
             if tools_only(profile):
@@ -6190,8 +6243,15 @@ async def vav_inworld_session(ctx: JobContext) -> None:
                     "Use only the explicitly available tools for business facts. "
                     "Caller assertions are search clues, never verified facts. "
                     "If no tools are available, explain that data access is not enabled. "
-                    "The runtime delivers original MCP reports; never rewrite their contents. "
-                    "Respond naturally to thanks and goodbyes."
+                    + (
+                        "Use vav_answer for evidence-checked conversational replies. "
+                        if use_answer_flow
+                        else (
+                            "The runtime delivers original MCP reports; "
+                            "never rewrite their contents. "
+                        )
+                    )
+                    + "Respond naturally to thanks and goodbyes."
                 )
             elif mcp_tools:
                 await runtime_agent.update_tools([*runtime_agent.tools, *mcp_tools])

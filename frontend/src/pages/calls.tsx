@@ -811,7 +811,7 @@ export default function Calls() {
                 ) : transcript ? (
                   transcript.turns.length ? (
                     <div className="call-transcript">
-                      {transcript.turns.map((turn, index) => {
+                      {transcript.turns.filter((turn) => !['analysis', 'analysis_candidate'].includes(valueFromRecord(turn, ['role']))).map((turn, index) => {
                         const speaker = valueFromRecord(turn, ['role', 'speaker', 'actor']) || `Turn ${index + 1}`;
                         const content = valueFromRecord(turn, ['text', 'content', 'transcript', 'message']) || 'No text captured.';
                         const language = transcriptLanguage(turn);
