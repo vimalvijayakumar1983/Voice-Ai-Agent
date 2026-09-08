@@ -716,6 +716,7 @@ async def test_native_browser_session_fails_before_reservation_when_tools_are_re
     )
     agent.supported_languages = ["en-GB", "ar-AE", "hi-IN"]
     agent.language_switching_enabled = True
+    agent.language_switching_mode = "automatic"
     profile.runtime_config = {
         "voice_runtime": "inworld_realtime",
         "stt_model": "auto",
