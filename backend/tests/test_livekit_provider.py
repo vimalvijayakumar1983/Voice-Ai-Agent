@@ -629,6 +629,7 @@ async def test_worker_preopen_failure_terminalizes_exact_outbound_call_once(
         voice_provider="inworld",
         voice_id="inworld:Ashley",
         language="en-GB",
+        supported_languages=["en-GB"],
     )
     db.add(agent)
     await db.flush()
@@ -741,6 +742,7 @@ async def test_duplicate_outbound_worker_never_fails_or_hangs_up_active_call(
         voice_provider="inworld",
         voice_id="inworld:Ashley",
         language="en-GB",
+        supported_languages=["en-GB"],
     )
     db.add(agent)
     await db.flush()
@@ -896,6 +898,7 @@ async def test_answered_inbound_dependency_failure_is_durable_and_pending_billin
         voice_provider="inworld",
         voice_id="inworld:Ashley",
         language="en-GB",
+        supported_languages=["en-GB"],
         max_call_duration_seconds=60,
     )
     db.add(agent)
@@ -1030,6 +1033,7 @@ async def test_answered_inbound_limit_rejection_terminalizes_and_hangs_up(
         voice_provider="inworld",
         voice_id="inworld:Ashley",
         language="en-GB",
+        supported_languages=["en-GB"],
         max_call_duration_seconds=60,
     )
     db.add(agent)
@@ -1149,6 +1153,7 @@ async def test_duplicate_inbound_job_cannot_fail_or_delete_legitimate_session(
         voice_provider="inworld",
         voice_id="inworld:Ashley",
         language="en-GB",
+        supported_languages=["en-GB"],
         max_call_duration_seconds=60,
     )
     db.add(agent)
@@ -1250,6 +1255,7 @@ async def test_inbound_knowledge_revocation_after_load_fails_exact_reservation(
         voice_provider="inworld",
         voice_id="inworld:Ashley",
         language="en-GB",
+        supported_languages=["en-GB"],
         max_call_duration_seconds=60,
     )
     knowledge = KnowledgeBase(
@@ -1445,6 +1451,7 @@ async def test_inbound_session_start_failure_after_greeting_provider_request_is_
         voice_provider="inworld",
         voice_id="inworld:Ashley",
         language="en-GB",
+        supported_languages=["en-GB"],
         max_call_duration_seconds=60,
     )
     db.add(agent)

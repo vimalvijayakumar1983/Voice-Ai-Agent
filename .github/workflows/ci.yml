@@ -33,7 +33,10 @@ jobs:
           POSTGRES_PASSWORD: voice_ai_ci
         ports:
           - 5432:5432
+        # Disposable CI data only: avoid hosted-runner disk sync bottlenecks.
+        # Keep real PostgreSQL and its transaction/constraint semantics unchanged.
         options: >-
+          --tmpfs /var/lib/postgresql/data:rw,size=2g
           --health-cmd "pg_isready -U voice_ai_ci -d voice_ai_ci"
           --health-interval 10s
           --health-timeout 5s
@@ -55,7 +58,14 @@ jobs:
       - run: alembic upgrade head
       - run: python -m ruff check app tests migrations
       - run: python -m ruff format --check app tests migrations
-      - run: python -m pytest -q
+      - run: python -m pytest -q --durations=25 --junitxml=test-results.xml
+      - name: Preserve backend test diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-test-results
+          path: backend/test-results.xml
+          if-no-files-found: warn
 
   frontend:
     runs-on: ubuntu-latest
