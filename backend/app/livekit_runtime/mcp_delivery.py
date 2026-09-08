@@ -92,6 +92,10 @@ class SourceDelivery:
                             "source_sha256": hashlib.sha256(baseline_text.encode()).hexdigest(),
                         }
                         forecast = {"source": baseline_text, "arguments": forecast["arguments"]}
+                if context.speech_handle.interrupted:
+                    entry["delivery_state"] = "superseded"
+                    self.metrics["mcp_source_delivery_state"] = "superseded"
+                    return
                 presentation = await self.presenter.present(
                     text,
                     question=question,

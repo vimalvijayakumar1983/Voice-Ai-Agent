@@ -247,6 +247,9 @@ def _make_tool(
                         response = await call_read_tool(config, approved, baseline)
                         await authorize_delivery()
                         return {"result": response, "arguments": baseline}
+                    except asyncio.CancelledError:
+                        baseline_error = "cancelled"
+                        raise
                     except MCPError as exc:
                         baseline_error = exc.code
                         return None  # Deliver actuals even if the optional estimate is unavailable.

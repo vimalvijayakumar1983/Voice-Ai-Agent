@@ -1,6 +1,7 @@
 import json
 from datetime import UTC, datetime
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
@@ -121,6 +122,31 @@ async def test_actuals_only_does_not_add_unsolicited_prediction():
         actual, question="Current month sales?", arguments=ARGS, forecast=baseline, now=NOW
     )
     assert "estimate" not in result["text"] and "run-rate" not in result["text"]
+
+
+async def test_interruption_during_baseline_skips_planning_and_speech():
+    from livekit.agents import llm
+
+    from app.livekit_runtime.mcp_delivery import SourceDelivery
+    from tests.test_mcp_delivery import context, result
+
+    ctx, entries, presenter = context(), [], SimpleNamespace(present=AsyncMock())
+    actual, baseline = sources()
+
+    async def load():
+        ctx.speech_handle.interrupted = True
+        return {"result": result(baseline["source"]), "arguments": baseline["arguments"]}
+
+    with pytest.raises(llm.StopResponse):
+        await SourceDelivery({}, entries.append, presenter=presenter).deliver(
+            ctx,
+            result(actual),
+            tool="sales",
+            question=QUESTION,
+            forecast_loader=load,
+        )
+    presenter.present.assert_not_called()
+    assert entries[0]["delivery_state"] == "superseded"
 
 
 @pytest.mark.parametrize("failure", [None, "network", "revoked", "interrupted"])
