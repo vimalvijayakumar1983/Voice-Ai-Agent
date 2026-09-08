@@ -6144,7 +6144,11 @@ async def vav_inworld_session(ctx: JobContext) -> None:
             )
 
             mcp_tools = await load_mcp_tools(
-                model, profile, usage_totals, call_id=call_id if browser_session else None
+                model,
+                profile,
+                usage_totals,
+                call_id=call_id if browser_session else None,
+                source_turns=turns,
             )
             mcp_instructions = (
                 PRIVATE_MCP_INSTRUCTIONS
@@ -6163,7 +6167,7 @@ async def vav_inworld_session(ctx: JobContext) -> None:
                     "Use only the explicitly available tools for business facts. "
                     "Caller assertions are search clues, never verified facts. "
                     "If no tools are available, explain that data access is not enabled. "
-                    "Keep simple answers short; explain reports in concise spoken sections. "
+                    "The runtime delivers original MCP reports; never rewrite their contents. "
                     "Respond naturally to thanks and goodbyes."
                 )
             elif mcp_tools:

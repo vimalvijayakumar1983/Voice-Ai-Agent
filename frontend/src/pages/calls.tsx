@@ -815,7 +815,8 @@ export default function Calls() {
                         const speaker = valueFromRecord(turn, ['role', 'speaker', 'actor']) || `Turn ${index + 1}`;
                         const content = valueFromRecord(turn, ['text', 'content', 'transcript', 'message']) || 'No text captured.';
                         const language = transcriptLanguage(turn);
-                        return <div className="call-transcript-turn" key={`${index}-${speaker}`} lang={language || undefined} dir="auto"><div className={styles.transcriptMeta}><strong>{speaker}</strong><span>{language ? languageName(language) : 'Language not reported'}</span></div><p>{content}</p></div>;
+                        const isSource = speaker === 'source';
+                        return <div className="call-transcript-turn" key={`${index}-${speaker}`} lang={language || undefined} dir="auto"><div className={styles.transcriptMeta}><strong>{isSource ? 'Original MCP response' : speaker}</strong><span>{isSource ? `Source text · ${valueFromRecord(turn, ['delivery_state']) || 'received'}` : language ? languageName(language) : 'Language not reported'}</span></div>{isSource ? <pre style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', font: 'inherit' }}>{content}</pre> : <p>{content}</p>}{isSource ? <small>Original returned content, not a verified ERP reconciliation. Playback may have been interrupted.</small> : null}</div>;
                       })}
                     </div>
                   ) : (

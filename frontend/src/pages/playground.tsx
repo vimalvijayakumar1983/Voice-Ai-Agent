@@ -1280,4 +1280,3 @@ function sessionDescription(
   if (state === 'connecting') return 'Preparing microphone, token, and secure connection';
   return 'Review the transcript and diagnostics before another test';
 }
-
