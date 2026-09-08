@@ -14,14 +14,16 @@ import json
 import re
 import time
 from contextlib import asynccontextmanager
-from datetime import timedelta
+from datetime import date, timedelta
 from urllib.parse import urlsplit
 from uuid import UUID
 
 import httpx
 from jsonschema import Draft202012Validator
+from jsonschema.exceptions import ValidationError
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
+from mcp.shared.exceptions import McpError as ProtocolError
 from sqlalchemy import select
 
 from app.models.agent import Agent, AgentRuntimeProfile
@@ -50,6 +52,9 @@ CLIENT_FIELDS = {
 TOOL_NAME = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 MAX_TOOLS = 100
 MAX_BYTES = 1_000_000
+MAX_RESULT_BYTES = (
+    200_000  # Includes text/structured copies; raw reports never enter voice context.
+)
 
 
 def private_mcp(config: dict) -> bool:
@@ -58,6 +63,67 @@ def private_mcp(config: dict) -> bool:
 
 class MCPError(ValueError):
     """Safe, content-free error; never expose the provider exception."""
+
+    def __init__(self, message, *, code="lookup_failed", stage="unknown", retryable=False):
+        super().__init__(message)
+        self.code, self.stage, self.retryable = code, stage, retryable
+
+
+def safe_lookup_error(error, *, stage="unknown") -> MCPError:
+    """Unwrap SDK task groups without releasing provider text, URLs or credentials."""
+    pending, seen, errors = [error], set(), []
+    while pending and len(seen) < 30:
+        item = pending.pop()
+        if id(item) in seen:
+            continue
+        seen.add(id(item))
+        errors.append(item)
+        pending.extend(getattr(item, "exceptions", ()))
+        if item.__cause__:
+            pending.append(item.__cause__)
+    for item in errors:
+        if isinstance(item, MCPError) and item.code != "lookup_failed":
+            return MCPError(
+                "MCP lookup unavailable",
+                code=item.code,
+                stage=stage if item.stage == "unknown" else item.stage,
+                retryable=item.retryable,
+            )
+    for item in errors:
+        if isinstance(item, ProtocolError):
+            code = {
+                -32602: "invalid_arguments",
+                -32601: "schema_changed",
+                -32603: "upstream_unavailable",
+            }.get(item.error.code, "tool_error")
+            return MCPError(
+                "MCP protocol request failed",
+                code=code,
+                stage=stage,
+                retryable=item.error.code == -32603,
+            )
+    if any(isinstance(item, (TimeoutError, httpx.TimeoutException)) for item in errors):
+        return MCPError("MCP lookup timed out", code="timeout", stage=stage, retryable=True)
+    if any(isinstance(item, httpx.TransportError) for item in errors):
+        return MCPError(
+            "MCP network request failed", code="network_error", stage=stage, retryable=True
+        )
+    if any(isinstance(item, ValidationError) for item in errors):
+        return MCPError("MCP arguments are invalid", code="invalid_arguments", stage=stage)
+    return MCPError("MCP lookup unavailable", stage=stage)
+
+
+def calendar_date_fields(schema):
+    """Apply calendar rules only when the remote tool declares that representation."""
+    return {
+        name
+        for name, prop in schema.get("properties", {}).items()
+        if name in {"start_date", "end_date"}
+        and isinstance(prop, dict)
+        and prop.get("type") == "string"
+        and (prop.get("format") == "date" or "YYYY-MM-DD" in str(prop.get("description", "")))
+        and prop.get("format") != "date-time"
+    }
 
 
 def validate_mcp_config(config: dict) -> None:
@@ -284,7 +350,20 @@ async def mcp_session(config: dict):
                     request.method in {"GET", "DELETE"} and response.status_code == 405
                 ):
                     await response.aclose()
-                    raise MCPError(f"MCP HTTP {response.status_code}")
+                    code = (
+                        "upstream_auth_failed"
+                        if response.status_code in {401, 403}
+                        else "rate_limited"
+                        if response.status_code == 429
+                        else "upstream_unavailable"
+                        if response.status_code >= 500
+                        else "upstream_request_rejected"
+                    )
+                    raise MCPError(
+                        "MCP HTTP request failed",
+                        code=code,
+                        retryable=response.status_code in {502, 503, 504},
+                    )
                 # Prevent compression bombs before JSON/SSE parsing.
                 if response.headers.get("content-encoding", "identity") != "identity":
                     await response.aclose()
@@ -409,36 +488,58 @@ async def discover_tools(config: dict) -> dict:
 
 async def call_read_tool(config: dict, tool: dict, arguments: dict) -> dict:
     started = time.monotonic()
+    stage = "arguments"
     try:
         if not isinstance(arguments, dict) or len(json.dumps(arguments)) > 8000:
             raise MCPError("MCP arguments exceed supported limits")
         if not tool["read_only"] or tool["name"] not in config.get("allowed_tools", []):
-            raise MCPError("MCP tool is not approved for read-only access")
+            raise MCPError("MCP tool is not approved for read-only access", code="access_denied")
         Draft202012Validator(tool["input_schema"]).validate(arguments)
+        # Date fields in discovered schemas often lack a JSON Schema format.
+        dates = {}
+        for key in calendar_date_fields(tool["input_schema"]):
+            if key in arguments:
+                value = arguments[key]
+                if not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+                    raise MCPError("Use ISO calendar dates", code="invalid_arguments")
+                try:
+                    dates[key] = date.fromisoformat(value)
+                except ValueError as exc:
+                    raise MCPError("Use valid calendar dates", code="invalid_arguments") from exc
+        if len(dates) == 2 and dates["start_date"] > dates["end_date"]:
+            raise MCPError("Invalid report period", code="invalid_arguments")
+        stage = "connect"
         async with mcp_session(config) as session:
+            stage = "catalog"
             current = {entry["name"]: entry for entry in await list_tools(session)}
             if current.get(tool["name"], {}).get("schema_hash") != tool["schema_hash"]:
-                raise MCPError("MCP tool changed. Rediscover and review permissions")
+                raise MCPError(
+                    "MCP tool changed. Rediscover and review permissions", code="schema_changed"
+                )
+            stage = "execute"
             result = await session.call_tool(tool["name"], arguments)
             if result.isError:
-                raise MCPError("MCP tool could not complete the request")
+                raise MCPError("MCP tool could not complete the request", code="tool_error")
+            stage = "result_validation"
             # No images, resource links, executable attachments, or automatic fetches.
             content = [item.text for item in result.content if item.type == "text"]
             data = {"text": content, "structured": result.structuredContent}
             encoded = json.dumps(data)
-            if len(encoded) > 12000:
-                raise MCPError("MCP result is too large; request a narrower result")
+            if len(encoded.encode("utf-8")) > MAX_RESULT_BYTES:
+                raise MCPError(
+                    "MCP result is too large; request a narrower result", code="result_too_large"
+                )
             if config.get("credential") and config["credential"] in encoded:
-                raise MCPError("MCP result contains a credential and cannot be returned")
+                raise MCPError(
+                    "MCP result contains a credential and cannot be returned", code="unsafe_result"
+                )
         return {
             "status": "ok",
             "data": data,
             "latency_ms": round((time.monotonic() - started) * 1000),
         }
     except Exception as exc:
-        raise MCPError(
-            "MCP lookup unavailable; do not invent an answer or claim an action"
-        ) from exc
+        raise safe_lookup_error(exc, stage=stage) from exc
 
 
 async def authorized_runtime_config(db, tenant_id, agent_id, integration_id, *, call_id=None):

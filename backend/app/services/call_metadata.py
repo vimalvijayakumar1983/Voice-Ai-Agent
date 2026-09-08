@@ -81,6 +81,8 @@ def public_call_metadata(value: Any) -> dict[str, Any] | None:
         string_fields = {
             "mcp_delivery_mode",
             "mcp_source_delivery_state",
+            "mcp_last_error_code",
+            "mcp_last_failure_stage",
             "mcp_presentation_state",
             "conversation_intent_version",
             "knowledge_interpretation_model",
@@ -127,6 +129,7 @@ def public_call_metadata(value: Any) -> dict[str, Any] | None:
         }
         numeric_fields = {
             "mcp_source_delivery_count",
+            "mcp_retry_count",
             "mcp_presentation_requests",
             "mcp_presentation_input_tokens",
             "mcp_presentation_output_tokens",
