@@ -1,6 +1,6 @@
-"""Deliver MCP source text without a generative report-rewriting pass.
+"""Preserve MCP sources and deliver separately validated spoken presentations.
 
-No arithmetic, rounding, language translation or entity replacement belongs here.
+Presentation calculations belong to the typed report compiler, never a freeform LLM.
 Only authorised results enter this boundary. Private source text is retained in the
 call transcript, not metrics, logs, the LLM tool output or the LLM chat history.
 """
@@ -12,6 +12,8 @@ from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 
 from livekit.agents import RunContext, llm
+
+from app.livekit_runtime.report_presentation import ReportPresenter
 
 
 def source_text(result: dict) -> str:
@@ -31,10 +33,11 @@ def source_text(result: dict) -> str:
 
 
 class SourceDelivery:
-    def __init__(self, metrics: dict, append_source: Callable[[dict], None]):
+    def __init__(self, metrics: dict, append_source: Callable[[dict], None], *, presenter=None):
         self.metrics = metrics
         self.append_source = append_source
         self._lock = asyncio.Lock()
+        self.presenter = presenter or ReportPresenter(metrics)
 
     async def deliver(
         self,
@@ -43,8 +46,13 @@ class SourceDelivery:
         *,
         tool: str,
         authorize: Callable[[], Awaitable[None]] | None = None,
+        question: str = "",
+        arguments: dict | None = None,
+        company: str = "",
+        scope: str = "",
     ) -> None:
         """Stop automatic tool continuation even if source playback cannot start."""
+        entry = None
         try:
             text = source_text(result)
             if context is None or context.session.tts is None:
@@ -67,15 +75,36 @@ class SourceDelivery:
                     "timestamp": datetime.now(UTC).isoformat(),
                     "source_tool": tool,
                     "source_sha256": hashlib.sha256(text.encode()).hexdigest(),
-                    "delivery_state": "scheduled",
+                    "delivery_state": "preparing",
                 }
                 self.append_source(entry)
-                # Literal text -> configured external TTS. No LLM rewrite; don't
-                # feed the report back into its history for subsequent arithmetic.
-                audio = _SourceAudio(context.session, text)
+                presentation = await self.presenter.present(
+                    text, question=question, arguments=arguments, company=company, scope=scope
+                )
+                # The model only selects server-validated sentences. Recheck
+                # permissions and interruption after the bounded presentation call.
+                if authorize is not None:
+                    await authorize()
+                if context.speech_handle.interrupted:
+                    entry["delivery_state"] = "superseded"
+                    self.metrics["mcp_source_delivery_state"] = "superseded"
+                    return
+                entry.update(
+                    {
+                        "presentation_text": presentation["text"],
+                        "presentation_version": presentation["version"],
+                        "presentation_kind": presentation["kind"],
+                        "presentation_state": presentation["state"],
+                        "presentation_sentence_ids": presentation["sentence_ids"],
+                        "presentation_fact_sentences": presentation["fact_sentences"],
+                        "delivery_state": "scheduled",
+                    }
+                )
+                speech = presentation["text"]
+                audio = _SourceAudio(context.session, speech)
                 frames = audio.frames()
                 handle = context.session.say(
-                    text, audio=frames, allow_interruptions=True, add_to_chat_ctx=False
+                    speech, audio=frames, allow_interruptions=True, add_to_chat_ctx=False
                 )
                 try:
                     await handle
@@ -98,16 +127,22 @@ class SourceDelivery:
                 finally:
                     if not handle.done():
                         handle.interrupt()
-                    await frames.aclose()
+                        # LiveKit owns and closes the iterator while interrupting.
+                    else:
+                        await frames.aclose()
                 self.metrics["mcp_source_delivery_state"] = entry["delivery_state"]
                 self.metrics["mcp_source_delivery_count"] = (
                     self.metrics.get("mcp_source_delivery_count", 0) + 1
                 )
         except asyncio.CancelledError:
+            if entry is not None:
+                entry["delivery_state"] = "interrupted"
             raise
         except Exception:
             # Source data must not escape through exception text or model fallback.
             self.metrics["mcp_source_delivery_state"] = "failed"
+            if entry is not None:
+                entry["delivery_state"] = "failed"
             if context is not None and context.session.tts is not None:
                 if not context.speech_handle.interrupted:
                     await context.session.say(

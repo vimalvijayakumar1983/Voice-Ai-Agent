@@ -204,7 +204,12 @@ def test_shared_policy_covers_exact_amounts_currency_units_and_analysis():
         "exact source values",
     ):
         assert rule in FINANCIAL_SPEECH_INSTRUCTIONS
-    for rule in ("recommendations", "Never invent", "directly", "permitted tool"):
+    for rule in (
+        "Recommendations",
+        "never guess a figure",
+        "validated presentation",
+        "permitted tool",
+    ):
         assert rule in PRIVATE_MCP_INSTRUCTIONS
 
 

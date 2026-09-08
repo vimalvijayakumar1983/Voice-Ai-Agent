@@ -80,8 +80,10 @@ def _make_tool(
     access_mode="public",
     filler=None,
     delivery=None,
+    question_provider=None,
 ):
     async def lookup(raw_arguments: dict, context: RunContext = None):
+        question = question_provider() if question_provider is not None else ""
         if metrics.get("mcp_lookup_count", 0) >= 50:
             return json.dumps({"status": "unavailable", "reason": "Call lookup limit reached"})
         metrics["mcp_lookup_count"] = metrics.get("mcp_lookup_count", 0) + 1
@@ -165,7 +167,14 @@ def _make_tool(
                             raise MCPError("MCP permission changed before source playback")
 
                 await delivery.deliver(
-                    context, result, tool=descriptor["name"], authorize=authorize_delivery
+                    context,
+                    result,
+                    tool=descriptor["name"],
+                    authorize=authorize_delivery,
+                    question=question,
+                    arguments=raw_arguments,
+                    company=company,
+                    scope=str(integration_id),
                 )
             return json.dumps({"company": config["company_label"], "untrusted_tool_data": result})
         except llm.StopResponse:
@@ -217,7 +226,9 @@ def _make_tool(
     )
 
 
-async def load_mcp_tools(model, profile, metrics, *, call_id=None, source_turns=None):
+async def load_mcp_tools(
+    model, profile, metrics, *, call_id=None, source_turns=None, presenter=None
+):
     from app.services.browser_access import staff_browser, validate_staff_call
 
     if not runtime_compatible(profile):
@@ -231,9 +242,22 @@ async def load_mcp_tools(model, profile, metrics, *, call_id=None, source_turns=
     )
     filler = LookupFiller(metrics, filler_language)
     delivery = SourceDelivery(
-        metrics, source_turns.append if source_turns is not None else lambda entry: None
+        metrics,
+        source_turns.append if source_turns is not None else lambda entry: None,
+        presenter=presenter,
     )
-    metrics["mcp_delivery_mode"] = "source_direct_v1"
+    metrics["mcp_delivery_mode"] = "professional_report_v1"
+
+    def latest_question():
+        return next(
+            (
+                str(turn.get("content", ""))
+                for turn in reversed(source_turns or [])
+                if turn.get("role") == "user"
+            ),
+            "",
+        )
+
     async with async_session_factory() as db:
         if staff_browser(profile):
             if call_id is None:
@@ -289,6 +313,7 @@ async def load_mcp_tools(model, profile, metrics, *, call_id=None, source_turns=
                             access_mode=config.get("data_access_mode", "public"),
                             filler=filler,
                             delivery=delivery,
+                            question_provider=latest_question,
                         )
                     )
     metrics["mcp_enabled_tool_count"] = len(tools)
