@@ -6,8 +6,9 @@ from collections.abc import AsyncGenerator
 
 import pytest
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import event
+from sqlalchemy import event, text
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.pool import NullPool, StaticPool
@@ -40,6 +41,10 @@ if TEST_DATABASE_URL.startswith("sqlite"):
         cursor.close()
 
 else:
+    # This fixture clears every mapped table. Refuse non-test database names.
+    test_database_name = make_url(TEST_DATABASE_URL).database or ""
+    if "test" not in test_database_name.lower() and not test_database_name.endswith("_ci"):
+        raise RuntimeError("PostgreSQL tests require an explicitly named test/_ci database")
     # pytest-asyncio creates isolated event loops for tests. asyncpg connections
     # are loop-bound, so a pooled connection from an earlier test cannot safely
     # be reused by a later loop. Real application engines remain pooled; only
@@ -55,8 +60,42 @@ def event_loop():
     loop.close()
 
 
+@pytest.fixture(scope="session")
+async def postgres_schema():
+    if TEST_DATABASE_URL.startswith("sqlite"):
+        yield
+        return
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    try:
+        yield
+    finally:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.drop_all)
+        await engine.dispose()
+
+
+async def clear_postgres_data():
+    # One transactional statement; includes every mapped table and resets sequences.
+    # Preserve migration state (alembic_version is not part of Base.metadata).
+    preparer = engine.dialect.identifier_preparer
+    tables = ", ".join(preparer.format_table(table) for table in Base.metadata.sorted_tables)
+    async with engine.begin() as conn:
+        await conn.execute(text("SET LOCAL lock_timeout = '10s'"))
+        await conn.execute(text(f"TRUNCATE TABLE {tables} RESTART IDENTITY CASCADE"))
+
+
 @pytest.fixture(autouse=True)
-async def setup_db():
+async def setup_db(postgres_schema):
+    if not TEST_DATABASE_URL.startswith("sqlite"):
+        # Clean before each test as well, so an interrupted prior run cannot leak data.
+        await clear_postgres_data()
+        try:
+            yield
+        finally:
+            await clear_postgres_data()
+        return
+    # Keep the existing in-memory SQLite path unchanged.
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     yield
