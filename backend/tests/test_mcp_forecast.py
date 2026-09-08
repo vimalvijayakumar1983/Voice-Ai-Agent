@@ -8,6 +8,7 @@ import pytest
 from app.livekit_runtime import mcp_tools
 from app.livekit_runtime.mcp_request_context import (
     completed_month_arguments,
+    forecast_requested,
     report_arguments,
     report_date_instruction,
 )
@@ -19,6 +20,19 @@ from tests.test_report_presentation import report
 NOW = datetime(2026, 9, 8, 9, tzinfo=UTC)
 QUESTION = "Current month sales and expected turnover by month end?"
 ARGS = {"start_date": "2026-09-01", "end_date": "2026-09-08", "group_by": "channel"}
+
+
+@pytest.mark.parametrize(
+    "question",
+    ["No forecast please", "Current month actuals without an estimate", "Don't forecast"],
+)
+def test_no_unsolicited_forecast(question):
+    assert not forecast_requested(question)
+
+
+def test_open_range_not_collapsed_to_mtd():
+    args = {"start_date": "2026-09-01", "end_date": "2026-10-31"}
+    assert report_arguments(args, "This month to next month", SCHEMA, now=NOW) == args
 
 
 @pytest.mark.parametrize(

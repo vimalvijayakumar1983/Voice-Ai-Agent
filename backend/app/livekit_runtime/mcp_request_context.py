@@ -16,6 +16,13 @@ def local_today(timezone="UTC", now=None):
 
 
 def forecast_requested(question):
+    if re.search(
+        r"\b(no|not|without|skip|avoid|don't)\s+(?:an?\s+|any\s+|the\s+)?"
+        r"(forecast|projection|estimate)\b",
+        question,
+        re.I,
+    ):
+        return False
     return bool(
         re.search(
             r"\b(forecast|projected?|projection|expected turnover|"
@@ -56,6 +63,9 @@ def report_arguments(arguments, question, schema, *, timezone="UTC", now=None):
     ):
         return result
     if current and previous:
+        return result
+    range_question = re.sub(r"\bmonth.to.date\b", "MTD", question, flags=re.I)
+    if current and re.search(r"\b(to|next)\b", range_question, re.I):
         return result
     if previous and re.search(r"\bto\b", question, re.I):
         return result
