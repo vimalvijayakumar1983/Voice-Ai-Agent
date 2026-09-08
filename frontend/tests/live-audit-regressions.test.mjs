@@ -122,7 +122,9 @@ test('diagnostic recording is opt-in, governed, and does not imply capture or pl
   assert.match(callsSource, /LiveKit recording state/);
   assert.match(callsSource, /LiveKit recording blocker/);
   assert.match(callsSource, /A saved operator request is not consent/);
-  assert.match(callsSource, /legacy access rule never authorizes LiveKit capture/);
+  assert.match(callsSource, /Browser recording requires explicit caller consent and Start recording/);
+  assert.match(callsSource, /access expiring after 90 days/);
+  assert.match(callsSource, /Phone recording requires a separate caller-consent flow/);
 });
 
 test('call diagnostics separate recognition, retrieval, grounding, and session latency', () => {

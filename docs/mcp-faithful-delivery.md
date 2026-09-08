@@ -42,6 +42,13 @@ duplicate text/structured output, no model continuation using the SDK output con
 cancellation, concurrent responses, missing TTS, and revoked authorisation. Fixtures
 are synthetic, and no production financial payload is sent to a provider by tests.
 
+The source delivery boundary also checks SpeechHandle.exception() before marking a
+report finished. Failed speech is labelled failed and does not increment the
+delivery count; a generic retry message is attempted without releasing provider
+error text. Interruption is rechecked after asynchronous authorisation so a stale
+report cannot start after the caller has moved to a new turn. Regression tests
+reproduce both failures and pass with these checks in place.
+
 Production canary: request a scoped report, compare source text against upstream,
 listen to exact figures, challenge/repeat without changing period, interrupt while
 reading, ask a different period, then finish with thanks/goodbye. Do not mark a call

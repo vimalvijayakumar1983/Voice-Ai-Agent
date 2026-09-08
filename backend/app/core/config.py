@@ -97,6 +97,16 @@ class Settings(BaseSettings):
     livekit_api_key: str = ""
     livekit_api_secret: str = ""
     livekit_agent_name: str = "vav-inworld"
+    # Recording credentials are server-only; never embed in browser room tokens.
+    recording_enabled: bool = False
+    recording_s3_access_key_id: str = Field(default="", repr=False)
+    recording_s3_secret_access_key: str = Field(default="", repr=False)
+    recording_s3_endpoint: str = ""
+    recording_s3_bucket: str = ""
+    recording_s3_region: str = "auto"
+    # This release has one policy, coupled to the approved R2 lifecycle and consent notice.
+    # Reject other values instead of silently promising a different retention period.
+    recording_retention_days: int = Field(default=90, ge=90, le=90)
     # Private HTTP origin of the always-on LiveKit Agents service. The API
     # probes both ``/`` and ``/worker`` before it permits activation.
     livekit_worker_health_url: str = ""

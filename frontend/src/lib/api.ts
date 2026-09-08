@@ -1914,6 +1914,24 @@ class ApiClient {
     return this.requestBlob(`/api/v1/calls/${callId}/recording`);
   }
 
+  async recordingConfiguration() {
+    return this.request<{ enabled: boolean; notice: string; notice_version: string }>('/api/v1/call-recordings/configuration');
+  }
+
+  async recordingStatus(callId: string) {
+    return this.request<{ state: string; available: boolean; expires_at?: string }>(`/api/v1/call-recordings/${callId}/status`);
+  }
+
+  async startRecording(callId: string, noticeVersion: string) {
+    return this.request<{ state: string; available: boolean }>(`/api/v1/call-recordings/${callId}/start`, {
+      method: 'POST', body: JSON.stringify({ consent: true, notice_version: noticeVersion }),
+    });
+  }
+
+  async stopRecording(callId: string) {
+    return this.request<{ state: string; available: boolean }>(`/api/v1/call-recordings/${callId}/stop`, { method: 'POST' });
+  }
+
   async getCallSummary(callId: string) {
     return this.request<CallSummary>(`/api/v1/calls/${callId}/summary`);
   }

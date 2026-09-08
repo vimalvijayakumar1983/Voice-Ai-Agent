@@ -57,6 +57,10 @@ class SourceDelivery:
                     return
                 if authorize is not None:
                     await authorize()  # Recheck after waiting behind another tool's speech.
+                # Permission checks yield; the caller may have moved to a new turn.
+                if context.speech_handle.interrupted:
+                    self.metrics["mcp_source_delivery_state"] = "superseded"
+                    return
                 entry = {
                     "role": "source",
                     "content": text,
@@ -71,10 +75,20 @@ class SourceDelivery:
                 handle = context.session.say(text, allow_interruptions=True, add_to_chat_ctx=False)
                 try:
                     await handle
+                    failure = handle.exception()
+                    if failure is not None:
+                        raise failure
+                except asyncio.CancelledError:
+                    entry["delivery_state"] = "interrupted"
+                    raise
+                except Exception:
+                    entry["delivery_state"] = "failed"
+                    raise
+                else:
+                    entry["delivery_state"] = "interrupted" if handle.interrupted else "finished"
                 finally:
                     if not handle.done():
                         handle.interrupt()
-                    entry["delivery_state"] = "interrupted" if handle.interrupted else "finished"
                 self.metrics["mcp_source_delivery_state"] = entry["delivery_state"]
                 self.metrics["mcp_source_delivery_count"] = (
                     self.metrics.get("mcp_source_delivery_count", 0) + 1

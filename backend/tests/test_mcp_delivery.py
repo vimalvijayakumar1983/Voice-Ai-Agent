@@ -25,14 +25,18 @@ def result(text=REPORT):
 
 
 class Handle:
-    def __init__(self, *, auto_finish=True):
+    def __init__(self, *, auto_finish=True, error=None):
         self.interrupted = False
+        self.error = error
         self.future = asyncio.get_running_loop().create_future()
         if auto_finish:
             self.future.set_result(None)
 
     def done(self):
         return self.future.done()
+
+    def exception(self):
+        return self.error
 
     def interrupt(self):
         self.interrupted = True
@@ -43,11 +47,11 @@ class Handle:
         return asyncio.shield(self.future).__await__()
 
 
-def context(*, auto_finish=True):
+def context(*, auto_finish=True, error=None):
     spoken = []
 
     def say(text, **options):
-        handle = Handle(auto_finish=auto_finish)
+        handle = Handle(auto_finish=auto_finish, error=error if not spoken else None)
         spoken.append((text, options, handle))
         return handle
 
@@ -111,6 +115,36 @@ async def test_unavailable_tts_does_not_fall_back_to_realtime_generation():
         await SourceDelivery(metrics, lambda _: None).deliver(ctx, result(), tool="sales")
     assert ctx.session.spoken == []
     assert metrics["mcp_source_delivery_state"] == "tts_unavailable"
+
+
+async def test_completed_handle_with_tts_error_is_failed_not_delivered():
+    ctx = context(error=RuntimeError("private provider details must not escape"))
+    metrics, entries = {}, []
+    with pytest.raises(llm.StopResponse):
+        await SourceDelivery(metrics, entries.append).deliver(ctx, result(), tool="sales")
+    assert entries[0]["delivery_state"] == "failed"
+    assert metrics["mcp_source_delivery_state"] == "failed"
+    assert metrics.get("mcp_source_delivery_count", 0) == 0
+    assert len(ctx.session.spoken) == 2
+    assert ctx.session.spoken[1][0] == (
+        "I couldn't deliver the original report. Please try the request again."
+    )
+    assert "private provider details" not in json.dumps(metrics)
+
+
+async def test_interruption_during_authorization_prevents_stale_report():
+    ctx, metrics, entries = context(), {}, []
+
+    async def authorize():
+        await asyncio.sleep(0)
+        ctx.speech_handle.interrupted = True
+
+    with pytest.raises(llm.StopResponse):
+        await SourceDelivery(metrics, entries.append).deliver(
+            ctx, result(), tool="sales", authorize=authorize
+        )
+    assert not entries and not ctx.session.spoken
+    assert metrics["mcp_source_delivery_state"] == "superseded"
 
 
 async def test_late_report_is_not_spoken_after_interruption():
