@@ -2,6 +2,15 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 
+test('derived comparisons and prepared answers are not labelled original MCP reports', () => {
+  const calls = readFileSync(new URL('../src/pages/calls.tsx', import.meta.url), 'utf8');
+  assert.match(calls, /sourceTool === 'vav_compare_reports'/);
+  assert.match(calls, /\['vav_answer', 'vav_answer_clarification'\]\.includes\(sourceTool\)/);
+  assert.match(calls, /Calculated from MCP evidence — not an original ERP report/);
+  assert.match(calls, /Prepared answer text — not an original MCP response/);
+  assert.match(calls, /<summary>\{sourceDescription\}<\/summary>/);
+});
+
 test('unspoken MCP analysis drafts are not rendered as conversation turns', () => {
   const calls = readFileSync(new URL('../src/pages/calls.tsx', import.meta.url), 'utf8');
   assert.match(calls, /turns\.filter\(\(turn\) => !\['analysis', 'analysis_candidate'\]/);

@@ -540,20 +540,20 @@ class MCPAnswerFlow:
                         "word_count": len(draft.split()),
                     }
                 )
-            if any(source_id in draft.lower() for source_id in self.records):
-                return packed(
-                    {
-                        "status": "rejected",
-                        "reason": "Remove internal evidence IDs from the spoken draft. "
-                        "Provide them only in the source_ids argument, never as spoken citations.",
-                    }
-                )
                 return packed(
                     {
                         "status": "rejected",
                         "reason": "Use 35–70 words answering only the active question; "
                         "hard limit 150 words and 1800 characters. Shorten and call vav_answer.",
                         "active_question": self.question_provider(),
+                    }
+                )
+            if any(source_id in draft.lower() for source_id in self.records):
+                return packed(
+                    {
+                        "status": "rejected",
+                        "reason": "Remove internal evidence IDs from the spoken draft. "
+                        "Provide them only in the source_ids argument, never as spoken citations.",
                     }
                 )
             if (

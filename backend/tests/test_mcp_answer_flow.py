@@ -165,6 +165,17 @@ async def test_internal_evidence_identifiers_are_not_spoken():
     verifier.assert_not_awaited()
 
 
+@pytest.mark.parametrize("draft", ["", "word " * 151, "a" * 1801])
+async def test_empty_or_oversized_drafts_rejected_before_verifier_and_speech(draft):
+    flow, _, entries, verifier = setup_flow()
+    ctx = context()
+    response = json.loads(await flow.answer(ctx, draft, []))
+    assert response["status"] == "rejected"
+    assert entries[-1]["validation"] == "rejected_length"
+    assert not ctx.session.spoken
+    verifier.assert_not_awaited()
+
+
 async def test_direct_native_audio_cannot_bypass_checked_delivery():
     async def audio():
         yield object()

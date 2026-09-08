@@ -90,3 +90,32 @@ current-month/forecast data and denied scope. Verify configured model cost and
 served code revision. Deploy default-off first; enable only a reviewed canary
 agent. Rollback is disabling the flag for new sessions, not removing safeguards
 from an already active private call.
+
+## Follow-up QA on September 8
+
+Isolated call `bf2625e9-7912-4c32-9700-b6acff40b1be` completed all six text-driven
+turns with audible checked delivery and no reported session errors. The same
+GPT-4.1 mini QA override was used; production configuration was not changed.
+The room was deleted at completion. The checks covered August sales, a contextual
+July comparison, all six declining channels, unknown causes versus suggestions,
+the exact August amount, and goodbye. No business lookup occurred for goodbye.
+
+This is **not a release pass**. August was fetched twice (three remote lookups
+instead of two). Answers were verbose and often narrated exact amounts rather
+than compact summaries. The comparison described Shops and Bulk Cement growth
+as approximately 10% each despite different exact percentages. A semantic pass
+does not establish numeric association or presentation quality. One valid
+'over 73%' draft was rejected by the conservative numeric gate and corrected to
+exact figures. These are explicit remaining evaluation cases, not hidden passes.
+
+Verifier duration was 1,130–1,915 ms per accepted answer; remote ERP lookups took
+2,904–6,757 ms. The QA script's whole-turn seconds include full speech playback
+and must not be reported as first-audio latency. No microphone ASR, pronunciation
+review or real caller interruption was exercised by this text-driven test.
+
+Review also fixed a draft-length branch that logged rejection without returning.
+New regression tests reject empty, over-150-word and over-1,800-character drafts
+before a paid verifier or speech. Call UI labels now distinguish original MCP
+reports, derived comparisons and prepared answers. After those fixes, 267 focused
+backend tests and 101 frontend tests passed locally. Full CI and production audio
+canary remain separate gates; the feature remains default-off.
