@@ -3980,7 +3980,21 @@ class VAVInworldRealtimeAgent(VAVInworldAgent):
         """Return concise, approved evidence for a complete caller query."""
 
         semantic_variant = " ".join(semantic_query.split()).strip()
-        query_variants = (semantic_variant,) if semantic_variant else ()
+        # The model's tool query is an interpretation, not a replacement for
+        # what the caller actually asked. Keep the latest caller wording as an
+        # independent retrieval lane (e.g. 'dental doctor' versus 'dentist').
+        # Only the current user turn is eligible; never resurrect an earlier
+        # question after a stop/hold or other conversation-control turn.
+        caller_query = None
+        for message in reversed(self.chat_ctx.messages()):
+            if message.role == "user":
+                text = message.text_content or ""
+                if not (_is_courtesy_utterance(text) or _is_silent_stop_utterance(text)):
+                    caller_query = _knowledge_query(self.chat_ctx, message)
+                break
+        query_variants = tuple(
+            dict.fromkeys(value for value in (caller_query, semantic_variant) if value)
+        )
         if self._provider_native_turns_qa and self._company_scope:
             # Share authorised company/reference resolution, not turn control.
             # Direct retrieval otherwise keeps the default company when the
