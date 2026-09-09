@@ -419,6 +419,7 @@ async def load_mcp_tools(
             latest_question,
             current_turn,
             answer_verifier,
+            conversation_provider=lambda: source_turns,
         )
         metrics["mcp_delivery_mode"] = "mcp_answer_v2"
 

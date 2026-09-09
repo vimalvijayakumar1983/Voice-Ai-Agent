@@ -110,19 +110,19 @@ async def test_call_regression_accept_comparison_then_ask_decliners_not_leaders(
             followup, "Gypsum declined by 600 dirhams; Shops grew by 200 dirhams.", [comparison_id]
         )
     assert len([e for e in entries if e.get("source_tool") == "sales_summary"]) == 2
-    assert verifier.await_args.args[1] == {"latest_question": "Which channels underperformed?"}
+    request = verifier.await_args.args[1]
+    assert request["latest_question"] == "Which channels underperformed?"
+    assert request["previous_answer"].startswith("August sales declined")
     assert flow.last_answer.startswith("Gypsum declined")
 
 
-@pytest.mark.parametrize("fault", ["scope", "currency", "groups", "basis", "filters", "reversed"])
+@pytest.mark.parametrize("fault", ["scope", "currency", "basis", "filters", "reversed"])
 async def test_comparisons_fail_closed_on_incomparable_evidence(fault):
     flow, _, _, _ = setup_flow()
     old = await collect(flow, monthly(7, "100", "200"))
     source = json.loads(monthly(8, "90", "250"))
     if fault == "currency":
         source["currency"] = "USD"
-    if fault == "groups":
-        source["rows"][1]["group_value"] = "Export"
     if fault == "basis":
         source["basis"] = "Different exclusions"
     new = await collect(flow, json.dumps(source), scope="other" if fault == "scope" else "trading")
@@ -348,7 +348,9 @@ async def test_verifier_is_bounded_uses_configured_model_and_accounts_usage(effo
                 "choices": [
                     {
                         "finish_reason": "stop",
-                        "message": {"content": '{"supported":true,"reason":"supported"}'},
+                        "message": {
+                            "content": '{"reason":"supported","violations":[],"supported":true}'
+                        },
                     }
                 ],
                 "usage": {"prompt_tokens": 100, "completion_tokens": 12},
@@ -367,3 +369,171 @@ async def test_verifier_is_bounded_uses_configured_model_and_accounts_usage(effo
     assert await verifier("Approved info", "What info?", [{"source_text": "Approved info"}]) is True
     assert metrics["mcp_presentation_input_tokens"] == 100
     assert metrics["mcp_presentation_output_tokens"] == 12
+
+
+async def test_different_salespeople_can_be_compared_without_inventing_zero_rows():
+    flow, _, _, _ = setup_flow()
+    old = await collect(
+        flow,
+        report(
+            start_date="2099-07-01",
+            end_date="2099-07-31",
+            group_by="salesman",
+            rows=[
+                {"group_value": "Returning", "revenue_ex_vat": "8000"},
+                {"group_value": "July only", "revenue_ex_vat": "4000"},
+            ],
+        ),
+    )
+    new = await collect(
+        flow,
+        report(
+            group_by="salesman",
+            rows=[
+                {"group_value": "Returning", "revenue_ex_vat": "6000"},
+                {"group_value": "New person", "revenue_ex_vat": "1000"},
+                {"group_value": "Another new person", "revenue_ex_vat": "500"},
+            ],
+        ),
+    )
+    evidence = json.loads(await flow.compare(old, new))["evidence"]
+    assert evidence["group_coverage"] == "matched_only"
+    assert evidence["groups_by_change_ascending"] == [
+        {
+            "group": "Returning",
+            "earlier": "8000",
+            "later": "6000",
+            "delta": "-2000",
+            "percent_change": "-25.00",
+        }
+    ]
+    assert len(evidence["unmatched_groups"]) == 3
+    assert all(row["delta"] is None for row in evidence["unmatched_groups"])
+    assert all(row["percent_change"] is None for row in evidence["unmatched_groups"])
+    assert evidence["total"]["delta"] == "-4500"
+    assert "not proof" in evidence["total_basis"]
+
+
+@pytest.mark.parametrize("before", ["0", "-100"])
+async def test_nonpositive_baseline_does_not_invent_percentage(before):
+    flow, _, _, _ = setup_flow()
+    old = await collect(flow, monthly(7, before, "100"))
+    new = await collect(flow, monthly(8, "200", "100"))
+    evidence = json.loads(await flow.compare(old, new))["evidence"]
+    row = next(r for r in evidence["groups_by_change_ascending"] if r["group"] == "Shops")
+    assert row["percent_change"] is None
+
+
+async def test_verifier_receives_clarification_history_not_unspoken_candidates():
+    from app.livekit_runtime.mcp_answer_flow import conversation_context
+
+    flow, turns, entries, verify = setup_flow()
+    dialogue = [
+        {"role": "user", "content": "Compare August with the previous month."},
+        {"role": "user", "content": "Means in July."},
+        {"role": "source", "content": "private source should not leak as dialogue"},
+        {"role": "analysis_candidate", "content": "Wrong rejected statement"},
+    ]
+    flow.conversation_provider = lambda: dialogue
+    turns.append("Means in July.")
+    old = await collect(flow, monthly(7, "800", "300"))
+    new = await collect(flow, monthly(8, "600", "300"))
+    compared = json.loads(await flow.compare(old, new))["source_id"]
+    with pytest.raises(llm.StopResponse):
+        await flow.answer(context(), "August declined by 200 dirhams versus July.", [compared])
+    request = verify.await_args.args[1]
+    assert request["latest_question"] == "Means in July."
+    assert request["conversation_history"] == dialogue[:2]
+    assert conversation_context(dialogue) == dialogue[:2]
+    assert entries[-3]["request_context"] == request
+
+
+async def test_final_spoken_summary_is_formatted_before_verification_source_stays_exact():
+    flow, _, entries, verify = setup_flow()
+    source_id = await collect(flow, monthly(8, "8236000", "426000"))
+    original = json.dumps(flow.records[source_id].packet)
+    ctx = context()
+    with pytest.raises(llm.StopResponse):
+        await flow.answer(ctx, "Shops were AED 8,236,000 and Gypsum AED 426,000.", [source_id])
+    expected = "Shops were 8.24 million dirhams and Gypsum 426 thousand dirhams."
+    assert ctx.session.spoken[0][0] == expected
+    assert verify.await_args.args[0] == expected
+    assert flow.last_answer == expected
+    assert json.dumps(flow.records[source_id].packet) == original
+    candidate = next(e for e in entries if e["role"] == "analysis_candidate")
+    assert candidate["content"] != candidate["spoken_text"]
+    assert len(candidate["financial_speech_bindings"]) == 2
+
+
+async def test_expired_and_mismatched_reports_return_distinct_safe_repair_codes():
+    flow, _, entries, _ = setup_flow()
+    old = await collect(flow, monthly(7, "100", "200"))
+    new = await collect(flow, monthly(8, "90", "210"))
+    tool = flow.tools()[0]
+    reversed_error = json.loads(await tool(new, old))
+    assert reversed_error["code"] == "incompatible_reports"
+    flow.records[old].expires = 0
+    expired = json.loads(await tool(old, new))
+    assert expired["code"] == "evidence_expired" and "fresh" in expired["reason"]
+    missing = json.loads(await tool("missing", new))
+    assert missing["code"] == "evidence_missing"
+    assert entries[-1]["event"] == "mcp_answer_error"
+
+
+def test_context_is_bounded_and_only_actual_dialogue_is_used():
+    from app.livekit_runtime.mcp_answer_flow import conversation_context
+
+    history = conversation_context([{"role": "user", "content": "a" * 2000} for _ in range(100)])
+    assert len(history) <= 12
+    assert sum(len(t["content"]) for t in history) <= 6000
+
+
+@pytest.mark.parametrize(
+    "verdict,expected",
+    [
+        ({"reason": "Wrong entity", "violations": ["Wrong entity"], "supported": True}, False),
+        ({"reason": "Wrong entity", "violations": ["Wrong entity"], "supported": False}, False),
+        ({"reason": "OK", "supported": True}, False),
+        ({"reason": "OK", "violations": [], "supported": "true"}, False),
+        ({"reason": "OK", "violations": [], "supported": True}, True),
+    ],
+)
+async def test_verifier_rejects_inconsistent_or_incomplete_verdict(verdict, expected):
+    def respond(request):
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {"content": json.dumps(verdict)},
+                    }
+                ]
+            },
+        )
+
+    verifier = InworldAnswerVerifier(
+        api_key="test",
+        model="openai/gpt-5.6-luna",
+        base_url="https://example.test",
+        metrics={},
+        transport=httpx.MockTransport(respond),
+        reasoning_effort="none",
+    )
+    assert await verifier("Test", {}, []) is expected
+
+
+def test_numeric_check_understands_explicit_units_on_generic_money_reports():
+    packets = [
+        {
+            "source_text": json.dumps(
+                {
+                    "currency": "USD",
+                    "unit": "thousands",
+                    "purchase_amount": "426",
+                }
+            )
+        }
+    ]
+    assert numbers_supported("USD 426000", packets, "Purchases?")
+    assert not numbers_supported("USD 426000000", packets, "Purchases?")
