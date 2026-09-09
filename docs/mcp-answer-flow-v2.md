@@ -154,3 +154,33 @@ frames prove delivery, not good pronunciation. Human speech input, pronunciation
 interruption, denied access, current-month and forecast scenarios remain untested
 in this run. The runtime and verifier focused suites passed locally (151 tests).
 CI, controlled browser-call listening and production promotion are separate gates.
+
+## Luna without reasoning comparison on September 9
+
+Isolated call `afc7720b-2a3e-4dad-8f5c-d3e5baca6bcf` repeated the same six questions
+with `openai/gpt-5.6-luna` and explicit `none` in both the native loop and verifier.
+Voice, tools, instructions, answer checks and production settings were unchanged.
+Inworld's live model catalogue listed Luna with function calling and EFFORT_NONE.
+The call completed with six delivered answers, two ERP lookups, no session errors
+and room cleanup. Independent Decimal sums of captured ERP rows match both monthly
+totals. Channel amounts and final recommendations remain grounded in the comparison.
+
+There were two semantic-check rejections and eight verifier requests, versus no
+rejections and six requests for Sol. One rejected 'partly offset' despite this
+being a supported arithmetic description of the channel changes. The other
+rejected ranking Gypsum and Export as the largest declines without naming the
+metric, although they are the top two absolute declines in the captured data.
+The regenerated answers succeeded; do not count unnecessary retries as successful
+error detection. This exposes verifier consistency, not ERP availability, as an
+evaluation concern. Recommendations did not perform further investigative reads.
+
+Text-request-to-first-detected-audio measurements were 4,831 / 3,817 / 5,324 /
+11,969 / 3,703 / 3,521 ms in question order. On the directly comparable exact-total
+and goodbye prompts, Sol measured 4,779 / 4,113 ms; its recommendations prompt
+measured 8,847 ms versus Luna's 11,969 ms. These are single runs with different
+generated answers, not an A/B latency distribution. Any-audio can include filler;
+initial-turn timing includes startup. Neither end-of-speech latency nor audible
+pronunciation quality was measured. Luna is compatible and worth further testing,
+but this mixed result does not justify production promotion or a speed guarantee.
+No application code change was needed beyond the previously committed explicit
+reasoning support. The QA harness now retains per-turn observations in QA metadata.
