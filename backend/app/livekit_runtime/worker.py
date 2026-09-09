@@ -3979,6 +3979,16 @@ class VAVInworldRealtimeAgent(VAVInworldAgent):
     ) -> str:
         """Return concise, approved evidence for a complete caller query."""
 
+        if self._provider_native_turns_qa and self._company_scope:
+            # Share authorised company/reference resolution, not turn control.
+            # Direct retrieval otherwise keeps the default company when the
+            # native model asks for another company in the same approved KB.
+            if self._telemetry is not None:
+                metrics = self._telemetry.runtime_metrics
+                metrics["native_qa_tool_requests"] = (
+                    int(metrics.get("native_qa_tool_requests", 0)) + 1
+                )
+            return await self.retrieve_single_pass_evidence(query)
         semantic_variant = " ".join(semantic_query.split()).strip()
         # The model's tool query is an interpretation, not a replacement for
         # what the caller actually asked. Keep the latest caller wording as an
@@ -3995,16 +4005,6 @@ class VAVInworldRealtimeAgent(VAVInworldAgent):
         query_variants = tuple(
             dict.fromkeys(value for value in (caller_query, semantic_variant) if value)
         )
-        if self._provider_native_turns_qa and self._company_scope:
-            # Share authorised company/reference resolution, not turn control.
-            # Direct retrieval otherwise keeps the default company when the
-            # native model asks for another company in the same approved KB.
-            if self._telemetry is not None:
-                metrics = self._telemetry.runtime_metrics
-                metrics["native_qa_tool_requests"] = (
-                    int(metrics.get("native_qa_tool_requests", 0)) + 1
-                )
-            return await self.retrieve_single_pass_evidence(query)
         return await self._retrieve_approved_knowledge(
             query=query,
             query_variants=query_variants,
