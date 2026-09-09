@@ -65,3 +65,27 @@ Production readiness requires CI and deployed revision verification, not just te
 - Candidate live calls are separate from normal deployed-worker verification. A first
   candidate call exposed the broader-tool selection failure above; do not count a
   completed call or finished audio as proof that its requested reports succeeded.
+
+## Production smoke regression and corrective patch
+
+The normal deployed-worker test of PR #36 answered the five financial turns, but
+the final closing reached an answer-check failure. The structured `runtime_event`
+then broke `_finish_call` because the plain-text transcript builder indexed its
+missing `content`. Deployment was rolled back to the previous revision. The QA
+call was explicitly marked failed with an audit record; lost worker-memory traces
+were not reconstructed or presented as original evidence.
+
+- Every answer-check error now has safe textual content and an exception type.
+- Plain transcript construction ignores structured runtime events and malformed
+  content while retaining them in the original turns for diagnostics. Analysis
+  candidates remain excluded from spoken/disposition text.
+- Strict, unambiguous English goodbye utterances use one fixed server-authored
+  non-factual closing. This does not approve arbitrary model text or bypass factual
+  validation. Mixed requests and other languages retain normal processing.
+- Unknown missing-period sales must not be asserted as either zero or nonzero.
+- Corrective tests: 107 focused tests passed; actual Luna historical-evidence
+  verification passed 7/7 cases, including rejection of the observed nonzero claim.
+
+The next deployed-worker test must verify terminal call status AND saved transcript,
+not just completed audio. Production rollback does not mean the corrective patch
+has already been deployed.

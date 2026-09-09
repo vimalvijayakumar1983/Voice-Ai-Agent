@@ -5460,6 +5460,17 @@ async def _abort_outbound_preopen_despite_cancellation(
             continue
 
 
+def _transcript_full_text(turns):
+    """Structured diagnostics stay in turns, not spoken transcript/disposition text."""
+    return "\n".join(
+        f"{turn.get('role', 'unknown')}: {turn['content']}"
+        for turn in turns
+        if isinstance(turn, dict)
+        and turn.get("role") not in {"analysis", "analysis_candidate", "runtime_event"}
+        and isinstance(turn.get("content"), str)
+    )
+
+
 async def _finish_call(
     call_id: UUID,
     turns: list[dict[str, str]],
@@ -5510,11 +5521,7 @@ async def _finish_call(
                     tenant_id=call.tenant_id,
                     call_id=call.id,
                     turns=turns,
-                    full_text="\n".join(
-                        f"{turn['role']}: {turn['content']}"
-                        for turn in turns
-                        if turn.get("role") not in {"analysis", "analysis_candidate"}
-                    ),
+                    full_text=_transcript_full_text(turns),
                 )
             )
         outbox_ids = await persist_provider_callback_actions(
