@@ -390,6 +390,7 @@ export default function KnowledgeStudio() {
         description: String(form.get('description') || ''),
         scope_type: String(form.get('scope_type') || 'workspace') as KnowledgeScope,
         scope_label: String(form.get('scope_label') || ''),
+        owner_company: String(form.get('owner_company') || '').trim() || null,
         languages: String(form.get('languages') || 'en').split(',').map((item) => item.trim()).filter(Boolean),
         tags: String(form.get('tags') || '').split(',').map((item) => item.trim()).filter(Boolean),
       });
@@ -418,6 +419,7 @@ export default function KnowledgeStudio() {
         description: String(form.get('description') || ''),
         scope_type: String(form.get('scope_type') || 'workspace') as KnowledgeScope,
         scope_label: String(form.get('scope_label') || ''),
+        owner_company: String(form.get('owner_company') || '').trim() || null,
         languages: String(form.get('languages') || 'en').split(',').map((item) => item.trim()).filter(Boolean),
         tags: String(form.get('tags') || '').split(',').map((item) => item.trim()).filter(Boolean),
       });
@@ -720,11 +722,11 @@ export default function KnowledgeStudio() {
                   {canEditKnowledge && <button type="button" className="btn btn-secondary btn-sm" disabled={working !== null} onClick={() => { setShowCreate(false); setShowAIWizard(false); setGeneratedDraft(null); setShowEdit(true); if (router.query.create === 'ai') void router.replace('/knowledge', undefined, { shallow: true }); }}><Pencil size={12} /> Edit details</button>}
                   {canGovernKnowledge && <button type="button" className="btn btn-ghost btn-sm" disabled={working !== null} onClick={deleteSelected} aria-label={`Delete ${selected.name}`}><Trash2 size={13} /> Delete</button>}
                 </div>
-                <div className={styles.progressRail} aria-label={`${selected.indexed_source_count} of ${selected.source_count} documents ready for agents`}>
+                <div className={styles.progressRail} aria-label={`${selected.indexed_source_count} of ${selected.source_count} documents with extracted text`}>
                   <div style={{ width: `${selected.source_count ? Math.round(selected.indexed_source_count / selected.source_count * 100) : 0}%` }} />
                 </div>
                 <div className={styles.heroMeta}>
-                  <span><strong>{selected.indexed_source_count}/{selected.source_count}</strong> ready for agents</span>
+                  <span><strong>{selected.indexed_source_count}/{selected.source_count}</strong> extracted</span>
                   <span><strong>{selected.languages.join(', ').toUpperCase()}</strong> languages</span>
                   <span><strong>{selected.agent_bindings.length}</strong> bound agents</span>
                   <span><strong>{selected.last_synced_at ? formatDate(selected.last_synced_at) : 'Never'}</strong> provider check</span>
@@ -784,7 +786,7 @@ export default function KnowledgeStudio() {
                         Live release {selected.serving_revision.revision_id.slice(0, 12)} · {selected.serving_revision.source_count} sources · {selected.serving_revision.chunk_count} retrieval chunks · published {new Date(selected.serving_revision.published_at).toLocaleString()}. Calls remain pinned to this immutable release until the draft passes approval.
                       </p>
                     )}
-                    <p>{selected.sync_status === 'ready' ? 'Every source has VAV-searchable content. An owner or admin may change approval.' : 'Make every source VAV-searchable before approval becomes available.'}</p>
+                    <p>{selected.sync_status === 'ready' ? 'Every source has extracted text. Publication also checks known extraction failures and representative retrieval for a declared company.' : 'Make every source VAV-searchable before approval becomes available.'}</p>
                     {selected.speech_lexicon ? (
                       <p role="status">
                         Voice recognition artifact {selected.speech_lexicon.artifact_id.slice(0, 12)} · {selected.speech_lexicon.entry_count} complete terms · {typeof selected.speech_lexicon.coverage.tier_one_coverage_pct === 'number' ? `${selected.speech_lexicon.coverage.tier_one_coverage_pct.toFixed(1)}% critical-name coverage` : 'critical-name coverage unavailable'}. It is pinned to this approved source revision.
@@ -857,6 +859,7 @@ function KnowledgeFormPanel({ mode, knowledge, draft, busy, onSubmit, onCancel }
       <div className="form-group"><label htmlFor="kb-description">Purpose</label><textarea id="kb-description" name="description" maxLength={1000} defaultValue={knowledge?.description || generated?.description || ''} placeholder="Approved product descriptions, delivery policies, returns and customer FAQs." /></div>
       <div className="form-grid">
         <div className="form-group"><label htmlFor="kb-scope-label">Scope name</label><input id="kb-scope-label" name="scope_label" maxLength={255} defaultValue={knowledge?.scope_label || generated?.scope_label || ''} placeholder="E-commerce division" /></div>
+        <div className="form-group"><label htmlFor="kb-owner">Company this knowledge belongs to</label><input id="kb-owner" name="owner_company" maxLength={160} defaultValue={knowledge?.owner_company || ''} placeholder="Exact company name configured on the agent" /><small>For a single-company knowledge base, all approved sources belong to this company, including doctors and departments. Leave blank for mixed-company knowledge; those facts need individual attribution. Changing this requires publication.</small></div>
         <div className="form-group"><label htmlFor="kb-languages">Languages <span>Comma separated</span></label><input id="kb-languages" name="languages" defaultValue={knowledge?.languages.join(', ') || generated?.languages.join(', ') || 'en'} placeholder="en, ar, hi, ml" /></div>
       </div>
       <div className="form-group"><label htmlFor="kb-tags">Tags <span>Comma separated</span></label><input id="kb-tags" name="tags" defaultValue={knowledge?.tags.join(', ') || generated?.tags.join(', ') || ''} placeholder="products, delivery, returns" /></div>
@@ -965,13 +968,13 @@ function SourceReview({ source }: { source: KnowledgeSource }) {
 }
 
 function SourcesSection({ sources, canRepair, canRemove, busy, onRepair, onCompile, onRemove }: { sources: KnowledgeSource[]; canRepair: boolean; canRemove: boolean; busy: boolean; onRepair: (source: KnowledgeSource) => void; onCompile: (source: KnowledgeSource) => void; onRemove: (source: KnowledgeSource) => void }) {
-  const readyCount = sources.filter((source) => source.retrieval_ready && source.status === 'indexed' && (source.company_fact_count ?? 0) > 0).length;
-  return <section className={styles.section} aria-labelledby="sources-heading"><div className={styles.sectionHeading}><div><span className={styles.sectionIcon}><Layers3 size={15} /></span><div><h3 id="sources-heading">Source inventory</h3><p>Text extraction and company attribution are checked separately. Scoped agents need approved facts for their configured company.</p></div></div><span className="badge badge-neutral">{sources.length} documents · {readyCount} with company facts</span></div>{sources.length === 0 ? <div className={styles.sourceEmpty}><FileText size={20} /><div><strong>No sources yet</strong><p>Add curated web pages, searchable text, or an approved PDF to begin.</p></div></div> : <div className={styles.sourceList}>{sources.map((source) => {
+  const readyCount = sources.filter((source) => source.quality_status === 'sample_checks_passed').length;
+  return <section className={styles.section} aria-labelledby="sources-heading"><div className={styles.sectionHeading}><div><span className={styles.sectionIcon}><Layers3 size={15} /></span><div><h3 id="sources-heading">Source inventory</h3><p>Extraction is not answer readiness. Each document shows extraction issues and whether representative company-scoped retrieval checks passed.</p></div></div><span className="badge badge-neutral">{sources.length} documents · {readyCount} passed sample checks</span></div>{sources.length === 0 ? <div className={styles.sourceEmpty}><FileText size={20} /><div><strong>No sources yet</strong><p>Add curated web pages, searchable text, or an approved PDF to begin.</p></div></div> : <div className={styles.sourceList}>{sources.map((source) => {
     const method = typeof source.source_metadata?.extraction_method === 'string' ? source.source_metadata.extraction_method : null;
     const compiler = sourceCompiler(source);
     const compilation = sourceUploadCompilation(source);
     const compilationActive = compilation?.status === 'queued' || compilation?.status === 'processing';
-    const isReady = source.retrieval_ready && source.status === 'indexed' && (source.company_fact_count ?? 0) > 0;
+    const isReady = source.quality_status === 'sample_checks_passed';
     const recovery = sourceRecovery(source);
     const isWebsite = source.source_type === 'url' || source.source_type === 'website' || source.source_type === 'sitemap';
     // Ready web pages may still need a deliberate refresh when their website
@@ -984,11 +987,10 @@ function SourcesSection({ sources, canRepair, canRemove, busy, onRepair, onCompi
       : !source.retrieval_ready
         ? isWebsite ? 'VAV could not read this page yet. Use Repair page to recover it automatically.' : 'VAV cannot use this document yet. Re-upload it to run extraction and OCR repair.'
         : null;
-    const detail = [recoveryDetail, !compilationActive && source.retrieval_ready && !(source.company_fact_count ?? 0)
-      ? 'Text is readable, but no company-attributed facts are compiled. This source is unavailable to company-scoped agents. Refresh it with AI-verified extraction, then review and approve the compiled knowledge.' : null].filter(Boolean).join(' ');
+    const detail = [recoveryDetail, ...(source.quality_issues || ['Retrieval has not been tested. Extracted text alone does not prove answer readiness.'])].filter(Boolean).join(' ');
     const recoveryActive = recovery?.status === 'queued' || recovery?.status === 'processing';
     const refreshLabel = isReady ? 'Refresh page' : 'Repair page';
-return <article className={styles.sourceRow} key={source.id}><span className={styles.sourceTypeIcon}>{source.source_type === 'file' ? <FileText size={16} /> : source.source_type === 'text' ? <Layers3 size={16} /> : <Globe2 size={16} />}</span><div className={styles.sourceIdentity}><strong>{source.name}</strong><span>{source.location || (source.size_bytes ? formatBytes(source.size_bytes) : source.source_type)} · {source.retrieval_ready ? `${source.extracted_character_count.toLocaleString()} searchable characters${method ? ` · ${method === 'native' ? 'text extracted' : method === 'static_html' ? 'HTML extracted' : method === 'javascript_render' ? 'JavaScript rendered' : method}` : ''}${compiler ? ` · ${compilerLabel(compiler)}` : ''}` : 'no voice-searchable text'}</span>{compiler?.warning && <p>{compiler.warning}</p>}{detail && <p className={recoveryActive || compilationActive ? styles.recoveryProgress : undefined}>{detail}</p>}{source.error_message && source.error_message !== detail && <p>{source.error_message}</p>}<SourceReview key={`${source.id}:${source.updated_at}`} source={source} /></div><span className={`badge ${isReady ? 'badge-success' : sourceBadge(source.status)}`}>{compilationActive ? (compilation?.status === 'queued' ? 'Queued' : 'Processing AI') : isReady ? 'Company facts available' : recoveryActive ? recoveryStageLabel(recovery.stage) : source.retrieval_ready && source.status === 'indexed' ? 'Text searchable' : source.status.replace('_', ' ')}</span><time>{formatDate(source.last_synced_at || source.updated_at)}</time><span className={styles.sourceActions}>{canRepair && repairable && <button type="button" className="btn btn-secondary btn-sm" disabled={busy || recoveryActive} onClick={() => onRepair(source)} aria-label={`${refreshLabel} ${source.name} and re-index its searchable content`} title="Download, render, extract, index and verify the latest page content"><RefreshCw size={12} className={recoveryActive ? 'spin' : undefined} /> {refreshLabel}</button>}{canRepair && !isWebsite && (source.retrieval_ready || Boolean(compilation)) && <button type="button" className="btn btn-secondary btn-sm" disabled={busy || compilationActive} onClick={() => onCompile(source)} aria-label={`Structure ${source.name} with AI`} title="Compile the original into source-checked VAV facts; review before approval">{compilationActive ? 'Processing…' : busy ? 'Working…' : compilation?.status === 'failed' ? 'Retry processing' : 'Structure with AI'}</button>}{canRemove && <button type="button" className="icon-button" disabled={busy} onClick={() => onRemove(source)} aria-label={`Stage removal of ${source.name}`} title="Stage removal for the next approved VAV release"><Trash2 size={14} /></button>}</span></article>;
+return <article className={styles.sourceRow} key={source.id}><span className={styles.sourceTypeIcon}>{source.source_type === 'file' ? <FileText size={16} /> : source.source_type === 'text' ? <Layers3 size={16} /> : <Globe2 size={16} />}</span><div className={styles.sourceIdentity}><strong>{source.name}</strong><span>{source.location || (source.size_bytes ? formatBytes(source.size_bytes) : source.source_type)} · {source.retrieval_ready ? `${source.extracted_character_count.toLocaleString()} extracted characters${method ? ` · ${method === 'native' ? 'text extracted' : method === 'static_html' ? 'HTML extracted' : method === 'javascript_render' ? 'JavaScript rendered' : method}` : ''}${compiler ? ` · ${compilerLabel(compiler)}` : ''}` : 'no voice-searchable text'}</span>{compiler?.warning && <p>{compiler.warning}</p>}{detail && <p className={recoveryActive || compilationActive ? styles.recoveryProgress : undefined}>{detail}</p>}{source.error_message && source.error_message !== detail && <p>{source.error_message}</p>}<SourceReview key={`${source.id}:${source.updated_at}`} source={source} /></div><span className={`badge ${isReady ? 'badge-success' : source.quality_status === 'needs_repair' ? 'badge-danger' : 'badge-neutral'}`}>{compilationActive ? (compilation?.status === 'queued' ? 'Queued' : 'Processing AI') : isReady ? 'Sample checks passed' : recoveryActive ? recoveryStageLabel(recovery.stage) : source.quality_status === 'needs_repair' ? 'Needs repair' : source.retrieval_ready ? 'Extracted · not verified' : source.status.replace('_', ' ')}</span><time>{formatDate(source.last_synced_at || source.updated_at)}</time><span className={styles.sourceActions}>{canRepair && repairable && <button type="button" className="btn btn-secondary btn-sm" disabled={busy || recoveryActive} onClick={() => onRepair(source)} aria-label={`${refreshLabel} ${source.name} and re-index its searchable content`} title="Download, render, extract, index and verify the latest page content"><RefreshCw size={12} className={recoveryActive ? 'spin' : undefined} /> {refreshLabel}</button>}{canRepair && !isWebsite && (source.retrieval_ready || Boolean(compilation)) && <button type="button" className="btn btn-secondary btn-sm" disabled={busy || compilationActive} onClick={() => onCompile(source)} aria-label={`Structure ${source.name} with AI`} title="Compile the original into source-checked VAV facts; review before approval">{compilationActive ? 'Processing…' : busy ? 'Working…' : compilation?.status === 'failed' ? 'Retry processing' : 'Structure with AI'}</button>}{canRemove && <button type="button" className="icon-button" disabled={busy} onClick={() => onRemove(source)} aria-label={`Stage removal of ${source.name}`} title="Stage removal for the next approved VAV release"><Trash2 size={14} /></button>}</span></article>;
   })}</div>}</section>;
 }
 
@@ -1003,13 +1005,12 @@ function AgentBinding({ selected, agents, busy, canManage, onBind, onUnbind }: {
 }
 
 function StatusBadge({ status }: { status: KnowledgeBase['sync_status'] }) {
-  const labels: Record<KnowledgeBase['sync_status'], string> = { local_only: 'Local draft', provisioning: 'Connecting', processing: 'Processing', ready: 'Ready', error: 'Needs attention' };
-  return <span className={`badge ${status === 'ready' ? 'badge-success' : status === 'error' ? 'badge-danger' : status === 'processing' || status === 'provisioning' ? 'badge-warning' : 'badge-neutral'}`}>{labels[status]}</span>;
+  const labels: Record<KnowledgeBase['sync_status'], string> = { local_only: 'Local draft', provisioning: 'Connecting', processing: 'Processing', ready: 'Text extracted', error: 'Needs attention' };
+  return <span className={`badge ${status === 'error' ? 'badge-danger' : status === 'processing' || status === 'provisioning' ? 'badge-warning' : 'badge-neutral'}`}>{labels[status]}</span>;
 }
 
 function StatusDot({ status }: { status: KnowledgeBase['sync_status'] }) { return <span className={`${styles.statusDot} ${styles[`status_${status}`]}`} title={status.replace('_', ' ')} />; }
 function scopeLabel(kb: KnowledgeBase) { return kb.scope_label || scopeOptions.find((scope) => scope.value === kb.scope_type)?.label || kb.scope_type; }
-function sourceBadge(status: KnowledgeSource['status']) { if (status === 'indexed') return 'badge-success'; if (status === 'failed') return 'badge-danger'; if (status === 'processing' || status === 'pending') return 'badge-warning'; return 'badge-neutral'; }
 type SourceRecovery = { status?: string; stage?: string; message?: string };
 function sourceUploadCompilation(source: KnowledgeSource): SourceRecovery | null { const value = source.source_metadata?.upload_compile; return value && typeof value === 'object' ? value as SourceRecovery : null; }
 type SourceCompiler = { effective_mode?: string; model?: string; input_tokens?: number; output_tokens?: number; estimated_cost_usd?: number; estimated_cost_aed?: number; reused?: boolean; warning?: string | null };

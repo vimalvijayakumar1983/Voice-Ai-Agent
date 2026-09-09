@@ -308,6 +308,8 @@ export interface KnowledgeSource {
   source_metadata: Record<string, unknown> | null;
   retrieval_ready: boolean;
   company_fact_count?: number;
+  quality_status?: string;
+  quality_issues?: string[];
   extracted_character_count: number;
   last_synced_at: string | null;
   created_at: string;
@@ -396,6 +398,7 @@ export interface KnowledgeBase {
   approval_status: 'draft' | 'approved';
   scope_type: KnowledgeScope;
   scope_label: string | null;
+  owner_company?: string | null;
   languages: string[];
   tags: string[];
   source_count: number;
@@ -1721,6 +1724,7 @@ class ApiClient {
     description?: string;
     scope_type?: KnowledgeScope;
     scope_label?: string;
+    owner_company?: string | null;
     languages?: string[];
     tags?: string[];
   }) {
@@ -1735,7 +1739,7 @@ class ApiClient {
   }
 
   async updateKnowledgeBase(id: string, data: Partial<Pick<KnowledgeBase,
-    'name' | 'description' | 'scope_type' | 'scope_label' | 'languages' | 'tags'>>) {
+    'name' | 'description' | 'scope_type' | 'scope_label' | 'owner_company' | 'languages' | 'tags'>>) {
     return this.request<KnowledgeBase>(`/api/v1/knowledge/${id}`, {
       method: 'PATCH',
       body: JSON.stringify(data),

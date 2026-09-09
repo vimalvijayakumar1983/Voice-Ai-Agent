@@ -345,11 +345,24 @@ def _token_forms(base_tokens: list[str]) -> set[str]:
     for token in base_tokens:
         tokens.add(token)
         tokens.add(_singular(token))
+        if token == "dr":
+            tokens.add("doctor")
     return tokens
 
 
 def _query_tokens(value: str) -> set[str]:
-    return {_singular(token) for token in _base_tokens(value)} - _QUERY_STOP_WORDS
+    # Request framing is not an evidence constraint. Keep names, numbers,
+    # negation, dates and specialties untouched (no fuzzy content substitution).
+    value = re.sub(r"\b(?:the )?names? of\b", " ", value, flags=re.I)
+    value = re.sub(r"\b(?:i am|i'm|we are|we're)?\s*looking for\b", " ", value, flags=re.I)
+    tokens = {_singular(token) for token in _base_tokens(value)} - _QUERY_STOP_WORDS
+    if tokens & {"doctor", "department", "specialty"} and not re.search(
+        r"\b(?:today|tomorrow|now|currently|appointment|slot|schedule|\d+)\b", value, re.I
+    ):
+        # A general directory question asks which entries are listed, not
+        # whether the word 'available' occurs next to every clinician's name.
+        tokens.discard("available")
+    return tokens
 
 
 def _is_phone_query(value: str, query_tokens: set[str]) -> bool:
@@ -942,11 +955,23 @@ def _source_retrieval_documents(
     content: object,
     structured_content: object,
     company_subject: str | None = None,
+    owner_company: str | None = None,
 ) -> list[tuple[str, str]]:
     """Keep verified facts fast without hiding facts an AI extractor omitted."""
 
-    structured = _structured_retrieval_content(structured_content, company_subject=company_subject)
-    if company_subject is not None:
+    from app.services.conversation_scope import company_key
+
+    owned = bool(
+        owner_company
+        and company_subject
+        and company_key(owner_company) == company_key(company_subject)
+    )
+    if owner_company and company_subject and not owned:
+        return []
+    structured = _structured_retrieval_content(
+        structured_content, company_subject=None if owned else company_subject
+    )
+    if company_subject is not None and not owned:
         # A mention in a footer/title is not ownership. Unattributed raw prose
         # must not reintroduce a subsidiary's facts through a fallback lane.
         return [(name, structured)] if structured else []
@@ -2107,6 +2132,7 @@ async def _retrieve_serving_revision_context(
         ]
 
     documents: list[tuple[str, str]] = []
+    owner_company = (revision.manifest or {}).get("owner_company")
     for row in source_rows:
         documents.extend(
             _source_retrieval_documents(
@@ -2114,13 +2140,24 @@ async def _retrieve_serving_revision_context(
                 content=row.content,
                 structured_content=row.structured_content,
                 company_subject=company_subject,
+                owner_company=owner_company,
             )
         )
     if revision.knowledge_content and company_subject is None:
         documents.append((revision.knowledge_name, revision.knowledge_content))
+    rank_variants = query_plan.variants
+    if owner_company and company_subject:
+        from app.services.conversation_scope import company_key
+
+        if company_key(owner_company) == company_key(company_subject):
+            # Ownership has already been enforced. Do not require a doctor's
+            # name (fact subject) to contain the company name as well.
+            rank_variants = tuple(
+                re.sub(re.escape(company_subject), " ", v, flags=re.I) for v in rank_variants
+            )
     matches = await asyncio.to_thread(
         _rank_contextual_knowledge,
-        query_plan.variants,
+        rank_variants,
         documents,
         limit,
     )

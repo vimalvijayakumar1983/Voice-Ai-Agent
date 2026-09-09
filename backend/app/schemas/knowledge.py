@@ -30,8 +30,14 @@ class KnowledgeBaseCreate(BaseModel):
     description: Annotated[str, Field(max_length=1000)] = ""
     scope_type: KnowledgeScope = "workspace"
     scope_label: Annotated[str | None, Field(max_length=255)] = None
+    owner_company: Annotated[str | None, Field(min_length=1, max_length=160)] = None
     languages: list[str] = Field(default_factory=lambda: ["en"], max_length=20)
     tags: list[str] = Field(default_factory=list, max_length=20)
+
+    @field_validator("owner_company", mode="before")
+    @classmethod
+    def clean_owner(cls, value):
+        return value.strip() or None if isinstance(value, str) else value
 
     @field_validator("name", "description")
     @classmethod
@@ -111,8 +117,14 @@ class KnowledgeBaseUpdate(BaseModel):
     description: Annotated[str | None, Field(max_length=1000)] = None
     scope_type: KnowledgeScope | None = None
     scope_label: Annotated[str | None, Field(max_length=255)] = None
+    owner_company: Annotated[str | None, Field(min_length=1, max_length=160)] = None
     languages: list[str] | None = Field(default=None, max_length=20)
     tags: list[str] | None = Field(default=None, max_length=20)
+
+    @field_validator("owner_company", mode="before")
+    @classmethod
+    def clean_owner(cls, value):
+        return value.strip() or None if isinstance(value, str) else value
 
     @field_validator("name", "description")
     @classmethod
@@ -134,6 +146,8 @@ class KnowledgeSourceResponse(BaseModel):
     source_metadata: dict | None
     retrieval_ready: bool = False
     company_fact_count: int = 0
+    quality_status: str = "not_tested"
+    quality_issues: list[str] = Field(default_factory=list)
     extracted_character_count: int = 0
     last_synced_at: datetime | None
     created_at: datetime
@@ -230,6 +244,7 @@ class KnowledgeBaseResponse(BaseModel):
     approval_status: Literal["draft", "approved"]
     scope_type: KnowledgeScope
     scope_label: str | None
+    owner_company: str | None = None
     languages: list[str]
     tags: list[str]
     source_count: int
