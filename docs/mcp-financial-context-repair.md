@@ -12,6 +12,9 @@ tenant grants or public-access settings change. Luna remains the configured mode
   in the inspected call, with 66 names common to both periods).
 - Generic error replies incorrectly invited the caller to narrow clear questions.
 - A live verifier returned a true boolean despite a rejection in its explanation.
+- A candidate call selected a broader financial tool for a grouping already supported
+  by the successful sales report tool, then stopped after that tool failed. Tool
+  selection now prioritizes the narrow matching schema and one authorized alternative.
 
 ## Contracts
 
@@ -51,3 +54,14 @@ Regression prompts: total -> previous month -> clarification -> salesperson
 declines -> summarize -> exact amount -> goodbye. Include changed group membership,
 missing/zero/negative baselines, other currencies, explicit units and revoked access.
 Production readiness requires CI and deployed revision verification, not just tests.
+
+## Validation before deployment
+
+- Full local backend suite: 1,914 passed, 33 skipped (9 September 2026).
+- Focused financial formatting and answer-flow suite: 68 passed.
+- Historical-call evidence with actual Luna verification: 6/6 cases passed, including
+  rejecting a deliberately incorrect Shops/total association. Salesperson comparison
+  retained 66 matched and 11 unmatched names rather than inventing missing values.
+- Candidate live calls are separate from normal deployed-worker verification. A first
+  candidate call exposed the broader-tool selection failure above; do not count a
+  completed call or finished audio as proof that its requested reports succeeded.
