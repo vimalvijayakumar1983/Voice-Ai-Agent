@@ -61,6 +61,7 @@ _QUERY_STOP_WORDS = {
     "and",
     "anyway",
     "are",
+    "at",
     "be",
     "been",
     "being",
@@ -355,7 +356,17 @@ def _query_tokens(value: str) -> set[str]:
     # negation, dates and specialties untouched (no fuzzy content substitution).
     value = re.sub(r"\b(?:the )?names? of\b", " ", value, flags=re.I)
     value = re.sub(r"\b(?:i am|i'm|we are|we're)?\s*looking for\b", " ", value, flags=re.I)
-    tokens = {_singular(token) for token in _base_tokens(value)} - _QUERY_STOP_WORDS
+    tokens = {
+        _singular(token) for token in _base_tokens(value) if token not in _QUERY_STOP_WORDS
+    } - _QUERY_STOP_WORDS
+    if _is_service_capability_query(value):
+        # These verbs express a request for a service, not an additional fact.
+        # Preserve the service, price, negation, date and other constraints.
+        tokens.difference_update({"offer", "provide", "specialise", "specialize"})
+    if re.search(r"\b(?:is|are)\b.+\bavailable\b", value, re.I) and not re.search(
+        r"\b(?:today|tomorrow|now|currently|appointment|slot|schedule|\d+)\b", value, re.I
+    ):
+        tokens.discard("available")
     if tokens & {"doctor", "department", "specialty"} and not re.search(
         r"\b(?:today|tomorrow|now|currently|appointment|slot|schedule|\d+)\b", value, re.I
     ):
@@ -811,6 +822,14 @@ def _is_group_overview_source(source: str) -> bool:
 def _requested_subject_tokens(query: str) -> set[str]:
     """Return an explicit organization/person named in the caller's question."""
 
+    # Sentence-initial auxiliaries are capitalized too: 'Does Royal Medical
+    # Center ...' names Royal Medical Center, not 'Does Royal Medical Center'.
+    query = re.sub(
+        r"^\s*(?:(?:what|which|who|does|do|did|can|could|is|are|was|were|has|have|will|would)\s+)+",
+        "",
+        query,
+        flags=re.I,
+    )
     candidates = [match.group(0) for match in _ENTITY_SEQUENCE.finditer(query)]
     if candidates:
         return set(_base_tokens(max(candidates, key=lambda item: len(_base_tokens(item)))))
