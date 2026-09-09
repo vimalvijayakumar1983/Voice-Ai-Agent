@@ -2037,6 +2037,9 @@ def _build_inworld_realtime_model(
         wire_telemetry=wire_telemetry,
         recognition_lexicon_count=len(recognition_terms),
         output_tts_model=_inworld_realtime_tts_model(profile),
+        llm_reasoning_effort=(getattr(profile, "runtime_config", None) or {}).get(
+            "llm_reasoning_effort"
+        ),
         **(
             {"tool_choice": "required"}
             if (getattr(profile, "runtime_config", None) or {}).get("mcp_answer_flow_v2") is True
@@ -6205,6 +6208,7 @@ async def vav_inworld_session(ctx: JobContext) -> None:
                     model=profile.llm_model,
                     base_url=settings.inworld_base_url,
                     metrics=usage_totals,
+                    reasoning_effort=runtime_config.get("llm_reasoning_effort"),
                 )
                 if use_answer_flow
                 else None

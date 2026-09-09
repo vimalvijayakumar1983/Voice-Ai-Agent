@@ -332,10 +332,15 @@ async def test_private_flag_uses_actual_tool_authorization_without_legacy_speech
     assert rejected["status"] == "unavailable" and not ctx.session.spoken
 
 
-async def test_verifier_is_bounded_uses_configured_model_and_accounts_usage():
+@pytest.mark.parametrize("effort", [None, "none"])
+async def test_verifier_is_bounded_uses_configured_model_and_accounts_usage(effort):
     def respond(request):
         body = json.loads(request.content)
         assert body["model"] == "openai/gpt-4o-mini"
+        if effort is None:
+            assert "reasoning_effort" not in body
+        else:
+            assert body["reasoning_effort"] == "none"
         assert "wrong" in body["messages"][0]["content"]
         return httpx.Response(
             200,
@@ -357,6 +362,7 @@ async def test_verifier_is_bounded_uses_configured_model_and_accounts_usage():
         base_url="https://example.test",
         metrics=metrics,
         transport=httpx.MockTransport(respond),
+        reasoning_effort=effort,
     )
     assert await verifier("Approved info", "What info?", [{"source_text": "Approved info"}]) is True
     assert metrics["mcp_presentation_input_tokens"] == 100

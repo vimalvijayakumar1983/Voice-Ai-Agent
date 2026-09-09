@@ -191,9 +191,12 @@ class InworldAnswerVerifier:
     Arithmetic comes from server evidence, and a failed/unavailable verifier denies speech.
     """
 
-    def __init__(self, *, api_key, model, base_url, metrics, transport=None):
+    def __init__(self, *, api_key, model, base_url, metrics, transport=None, reasoning_effort=None):
+        if reasoning_effort not in (None, "none"):
+            raise ValueError("Checked MCP reasoning supports only explicit 'none' or omission")
         self.api_key, self.model, self.base_url = api_key, model, base_url
         self.metrics, self.transport = metrics, transport
+        self.reasoning_effort = reasoning_effort
         self.last_reason = None
 
     async def __call__(self, draft, question, evidence):
@@ -248,6 +251,8 @@ class InworldAnswerVerifier:
                 },
             ],
         }
+        if self.reasoning_effort is not None:
+            payload["reasoning_effort"] = self.reasoning_effort
         if not evidence:
             payload["messages"][0]["content"] = (
                 "Check a conversational reply, NOT a factual report. "

@@ -2889,6 +2889,52 @@ async def test_native_inworld_realtime_model_uses_one_grounded_speech_session(mo
     await canary_session.aclose()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("effort", [None, "none"])
+async def test_inworld_reasoning_none_is_explicit_and_other_agents_keep_defaults(
+    monkeypatch, effort
+):
+    async def no_network_main(_session):
+        return None
+
+    monkeypatch.setattr(
+        inworld_realtime_adapter.InworldRealtimeSession, "_main_task", no_network_main
+    )
+    model = SimpleNamespace(
+        name="Trading QA",
+        voice_id="inworld:Anjali",
+        language="en",
+        supported_languages=["en"],
+        speech_rate=1.0,
+    )
+    profile = SimpleNamespace(
+        stt_language="en",
+        llm_model="openai/gpt-5.6-sol",
+        runtime_config={"voice_runtime": "inworld_realtime", "llm_reasoning_effort": effort},
+    )
+    telemetry = {}
+    realtime = _build_inworld_realtime_model(
+        model=model,
+        profile=profile,
+        api_key="test",
+        wire_telemetry=telemetry,
+    )
+    session = realtime.session()
+    try:
+        payload = session._create_session_update_event()["session"]
+        assert payload["model"] == "openai/gpt-5.6-sol"
+        if effort is None:
+            assert "text_generation_config" not in payload
+            assert telemetry["llm_reasoning_effort_serialized"] is None
+        else:
+            assert payload["text_generation_config"] == {
+                "reasoning": {"effort": "NONE", "exclude": True}
+            }
+            assert telemetry["llm_reasoning_effort_serialized"] == "NONE"
+    finally:
+        await session.aclose()
+
+
 def test_inworld_stt_serialization_diagnostics_reset_atomically_for_every_update():
     private_prompt = "Private company names and caller vocabulary"
     wire_telemetry = {

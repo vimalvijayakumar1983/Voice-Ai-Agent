@@ -119,3 +119,38 @@ before a paid verifier or speech. Call UI labels now distinguish original MCP
 reports, derived comparisons and prepared answers. After those fixes, 267 focused
 backend tests and 101 frontend tests passed locally. Full CI and production audio
 canary remain separate gates; the feature remains default-off.
+
+## Sol without reasoning QA on September 9
+
+At the user's request, isolated call `629fbaec-0870-42a7-b8a3-32545666e6b9`
+used `openai/gpt-5.6-sol` for the native tool loop and answer verifier with explicit
+`none` reasoning. Production settings were not changed. The native session sends
+`text_generation_config.reasoning = {"effort": "NONE", "exclude": true}`;
+the Inworld chat-compatible verifier sends `reasoning_effort: "none"`.
+Omitting this per-agent runtime setting preserves existing provider defaults.
+Only explicit `none` is currently supported by this adapter. A separate synthetic
+native probe observed the provider echo `NONE` and emit a function call, resolving
+the tool-compatibility error seen with Sol/high. Serialization telemetry alone
+does not prove a provider honoured a setting.
+
+All six text-driven turns produced checked answers and completed audio delivery,
+with no reported session errors or rejected drafts. The captured sources support
+the reported total, month comparison and all six declining channels. The answer
+distinguished unverified causes from suggested investigations, preserved the exact
+total on request and responded to goodbye. Only two remote ERP reads occurred;
+the follow-up questions reused call-local evidence. The QA room was deleted.
+
+This is not a latency or presentation release pass. Remote reads took 2,425 and
+3,182 ms; observed verifier durations ranged from 1,518 to 2,495 ms. First detected
+audio was 11,179 ms on the initial text request including session startup; captured
+later requests included 5,074, 8,847, 4,779 and 4,113 ms. These measure text submission
+to any received non-silent audio, potentially a filler, NOT caller end-of-speech
+to the first meaningful answer. No comparable previous-run first-audio benchmark
+exists. Do not claim a latency improvement from this run.
+
+Answers still narrate long exact figures even in summaries, and the recommendations
+turn suggests investigation without performing a deeper causal drill-down. Audio
+frames prove delivery, not good pronunciation. Human speech input, pronunciation,
+interruption, denied access, current-month and forecast scenarios remain untested
+in this run. The runtime and verifier focused suites passed locally (151 tests).
+CI, controlled browser-call listening and production promotion are separate gates.

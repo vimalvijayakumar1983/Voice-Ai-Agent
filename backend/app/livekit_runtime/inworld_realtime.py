@@ -76,6 +76,12 @@ class InworldRealtimeSession(openai.realtime.RealtimeSession):
         payload.setdefault("session", {}).setdefault("audio", {}).setdefault("output", {})[
             "model"
         ] = self._realtime_model.output_tts_model
+        effort = self._realtime_model.llm_reasoning_effort
+        if effort is not None:
+            payload["session"].setdefault("text_generation_config", {})["reasoning"] = {
+                "effort": effort.upper(),
+                "exclude": True,
+            }
         self._record_wire_telemetry(payload)
         return payload
 
@@ -103,6 +109,8 @@ class InworldRealtimeSession(openai.realtime.RealtimeSession):
             }
         )
         session = payload.get("session")
+        generation = session.get("text_generation_config", {}) if isinstance(session, dict) else {}
+        telemetry["llm_reasoning_effort_serialized"] = generation.get("reasoning", {}).get("effort")
         audio = session.get("audio") if isinstance(session, dict) else None
         input_audio = audio.get("input") if isinstance(audio, dict) else None
         output_audio = audio.get("output") if isinstance(audio, dict) else None
@@ -142,13 +150,19 @@ class InworldRealtimeModel(openai.realtime.RealtimeModel):
         wire_telemetry: dict[str, Any] | None = None,
         recognition_lexicon_count: int = 0,
         output_tts_model: str = INWORLD_TTS_MODEL,
+        llm_reasoning_effort: str | None = None,
         **kwargs,
     ):
+        # Only the explicitly tested no-reasoning setting is exposed here.
+        # Inworld currently rejects Sol function tools with high reasoning.
+        if llm_reasoning_effort not in (None, "none"):
+            raise ValueError("Inworld voice reasoning supports only explicit 'none' or omission")
         super().__init__(**kwargs)
         self._provider_label = "Inworld Realtime API"
         self._wire_telemetry = wire_telemetry
         self._recognition_lexicon_count = max(0, int(recognition_lexicon_count))
         self.output_tts_model = output_tts_model
+        self.llm_reasoning_effort = llm_reasoning_effort
 
     @property
     def provider(self) -> str:
