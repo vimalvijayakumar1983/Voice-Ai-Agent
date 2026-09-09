@@ -75,6 +75,39 @@ def test_no_medical_topic_is_invented_by_request_normalization():
     assert not rank_knowledge("What is the dental doctor's consultation fee?", docs)
 
 
+@pytest.mark.parametrize(
+    "company,service",
+    [("Royal Medical Center", "dermatology"), ("Future Supply Company", "delivery")],
+)
+def test_service_question_framing_preserves_topic_and_constraints(company, service):
+    facts = {
+        "facts": [
+            {
+                "subject": company,
+                "predicate": "service offering",
+                "value": service,
+                "evidence": f"{company} offers {service}.",
+            }
+        ]
+    }
+    docs = _source_retrieval_documents(
+        name="Business services", content=f"{company} offers {service}.", structured_content=facts
+    )
+    for query in [
+        f"Does {company} offer {service}?",
+        f"Does {company} provide {service}?",
+        f"Is {service} available at {company}?",
+    ]:
+        assert rank_knowledge(query, docs), query
+    for query in [
+        f"Does {company} offer cancer treatment?",
+        f"Does {company} offer free {service}?",
+        f"Is {service} available tomorrow at 10?",
+        f"What is the {service} fee at {company}?",
+    ]:
+        assert not rank_knowledge(query, docs), query
+
+
 def test_departments_and_doctor_directory_are_retrievable_without_live_slot_claims():
     doctors = [("Our team", "Dr Asha Rao — Dental doctor. Dr Sam Ali — ENT specialist.")]
     assert rank_knowledge("Which doctors are available?", doctors)
@@ -142,6 +175,116 @@ async def test_long_empty_directory_shell_automatically_renders(monkeypatch):
     monkeypatch.setattr(recovery, "render_html", still_empty)
     with pytest.raises(recovery.WebsiteRecoveryError, match="directory entries"):
         await recovery.recover_page("https://clinic.example/doctors")
+
+
+@pytest.mark.asyncio
+async def test_owned_publication_checks_natural_service_questions(db, tenant):
+    company = "Example Medical Center"
+    phrases = [
+        f"Does {company} offer dermatology?",
+        f"Is dermatology available at {company}?",
+        f"What dermatology services does {company} offer?",
+    ]
+    kb = KnowledgeBase(
+        tenant_id=tenant.id,
+        name=company + " One Day Surgery",
+        owner_company=company + " One Day Surgery",
+        sync_status="ready",
+        approval_status="draft",
+        source_count=1,
+        indexed_source_count=1,
+    )
+    source = KnowledgeSource(
+        tenant_id=tenant.id,
+        source_type="text",
+        name="Our clinicians",
+        status="indexed",
+        content=f"{company} offers dermatology.",
+        structured_content={
+            "facts": [
+                {
+                    "subject": company,
+                    "predicate": "service offering",
+                    "value": "dermatology",
+                    "evidence": f"{company} offers dermatology.",
+                    "search_phrases": phrases,
+                }
+            ]
+        },
+    )
+    kb.sources.append(source)
+    db.add(kb)
+    await db.flush()
+    lexicon = await publish_speech_lexicon(
+        db, tenant_id=tenant.id, knowledge_base=kb, allow_draft_for_approval=True
+    )
+    await publish_serving_revision(
+        db,
+        tenant_id=tenant.id,
+        knowledge_base=kb,
+        speech_lexicon=lexicon,
+        allow_draft_for_approval=True,
+    )
+    assert kb.readiness_report[str(source.id)]["checks_count"] == 3
+    assert kb.readiness_report[str(source.id)]["status"] == "passed"
+
+
+@pytest.mark.asyncio
+async def test_owned_person_retrieval_accepts_unambiguous_company_name_prefix(db, tenant):
+    company = "Example Medical Center One Day Surgery"
+    kb = KnowledgeBase(
+        tenant_id=tenant.id,
+        name=company,
+        owner_company=company,
+        sync_status="ready",
+        approval_status="draft",
+        source_count=1,
+        indexed_source_count=1,
+    )
+    kb.sources.append(
+        KnowledgeSource(
+            tenant_id=tenant.id,
+            source_type="text",
+            name="Dental Doctor",
+            status="indexed",
+            content="Dr Kevin is the dental doctor",
+            structured_content=structured(),
+        )
+    )
+    db.add(kb)
+    await db.flush()
+    lexicon = await publish_speech_lexicon(
+        db, tenant_id=tenant.id, knowledge_base=kb, allow_draft_for_approval=True
+    )
+    revision = await publish_serving_revision(
+        db,
+        tenant_id=tenant.id,
+        knowledge_base=kb,
+        speech_lexicon=lexicon,
+        allow_draft_for_approval=True,
+    )
+    for scope in (None, company):
+        for subject in (company, "Example Medical Center"):
+            result = await retrieve_knowledge_context(
+                db,
+                tenant_id=tenant.id,
+                agent_id=uuid4(),
+                knowledge_base_id=kb.id,
+                serving_revision_id=revision.id,
+                company_subject=scope,
+                query=f"Who is the dental doctor at {subject}?",
+            )
+            assert result and "Dr Kevin" in result
+        result = await retrieve_knowledge_context(
+            db,
+            tenant_id=tenant.id,
+            agent_id=uuid4(),
+            knowledge_base_id=kb.id,
+            serving_revision_id=revision.id,
+            company_subject=scope,
+            query="Who is the dental doctor at Different Medical Center?",
+        )
+        assert not result
 
 
 @pytest.mark.asyncio
