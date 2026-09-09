@@ -1359,6 +1359,8 @@ async def live_runtime_readiness(
                 # Preserve the deployed control probe byte-for-byte while making
                 # the canary prove the distinct manual, tool-free response path.
                 probe_options["single_pass"] = True
+            if runtime_config.get("llm_reasoning_effort") is not None:
+                probe_options["reasoning_effort"] = runtime_config["llm_reasoning_effort"]
             await inworld.realtime_readiness_probe(
                 **probe_options,
             )
@@ -1571,6 +1573,12 @@ async def update_runtime_profile(
     runtime_config = profile.runtime_config if isinstance(profile.runtime_config, dict) else {}
     if "staff_browser_only" in data.model_fields_set:
         runtime_config = {**runtime_config, "staff_browser_only": data.staff_browser_only}
+    # Keep the tested Luna route non-reasoning rather than inheriting a provider default.
+    runtime_config = {**runtime_config}
+    if data.llm_model == "openai/gpt-5.6-luna":
+        runtime_config["llm_reasoning_effort"] = "none"
+    else:
+        runtime_config.pop("llm_reasoning_effort", None)
     if "knowledge_source_mode" in data.model_fields_set:
         runtime_config = {**runtime_config, "knowledge_source_mode": data.knowledge_source_mode}
     if "voice_runtime" in data.model_fields_set:

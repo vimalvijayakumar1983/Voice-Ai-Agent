@@ -393,6 +393,7 @@ class InworldClient:
         stt_language: str | None,
         output_tts_model: str = INWORLD_TTS_MODEL,
         single_pass: bool = False,
+        reasoning_effort: str | None = None,
     ) -> None:
         """Prove the exact native response path selected by the runtime policy.
 
@@ -407,6 +408,8 @@ class InworldClient:
                 "Inworld is not configured. Add an API key in Settings.", status_code=503
             )
         selected_model = _probe_value(model_id, "Realtime model")
+        if reasoning_effort not in (None, "none"):
+            raise InworldError("Unsupported native reasoning setting.", status_code=422)
         selected_voice = _probe_value(voice_id, "voice ID")
         selected_stt = _probe_value(stt_model_id, "Realtime transcription model")
         selected_tts = _probe_value(output_tts_model, "Realtime speech model")
@@ -465,6 +468,10 @@ class InworldClient:
                 },
             },
         }
+        if reasoning_effort is not None:
+            update["session"]["text_generation_config"] = {
+                "reasoning": {"effort": "NONE", "exclude": True}
+            }
         try:
             async with aiohttp.ClientSession() as session:
                 websocket = await asyncio.wait_for(
@@ -494,6 +501,16 @@ class InworldClient:
                             "Inworld Realtime readiness probe did not accept the selected route."
                         )
                     effective = configured.get("session")
+                    if reasoning_effort is not None and (
+                        not isinstance(effective, dict)
+                        or effective.get("text_generation_config", {})
+                        .get("reasoning", {})
+                        .get("effort")
+                        != "NONE"
+                    ):
+                        raise InworldError(
+                            "Inworld did not acknowledge reasoning disabled.", status_code=422
+                        )
                     effective_audio = (
                         effective.get("audio") if isinstance(effective, dict) else None
                     )

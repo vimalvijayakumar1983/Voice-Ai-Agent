@@ -280,6 +280,7 @@ export default function RuntimeControlPanel({ agent, profile, onClose, onChange 
           }}>
             {inworldRuntime && form.voice_runtime === 'inworld_realtime' ? <>
               <optgroup label="Inside the native Inworld Realtime session">
+                <option value="inworld:openai/gpt-5.6-luna">Inworld Router → GPT-5.6 Luna · reasoning off</option>
                 <option value="inworld:openai/gpt-4o-mini">Inworld Router → GPT-4o mini</option>
                 <option value="inworld:openai/gpt-4o">Inworld Router → GPT-4o</option>
               </optgroup>

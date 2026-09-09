@@ -1169,6 +1169,7 @@ async def _verify_native_browser_capability(
     stt_model_id: str,
     stt_language: str | None,
     single_pass: bool = False,
+    reasoning_effort: str | None = None,
 ) -> None:
     try:
         probe_options: dict[str, Any] = {
@@ -1179,6 +1180,8 @@ async def _verify_native_browser_capability(
         }
         if single_pass:
             probe_options["single_pass"] = True
+        if reasoning_effort is not None:
+            probe_options["reasoning_effort"] = reasoning_effort
         await inworld.realtime_readiness_probe(**probe_options)
     except InworldError as exc:
         raise HTTPException(
@@ -3841,6 +3844,11 @@ async def create_livekit_browser_session(
             stt_model_id=native_route[2],
             stt_language=native_route[3],
             single_pass=native_single_pass,
+            **(
+                {"reasoning_effort": runtime_config["llm_reasoning_effort"]}
+                if runtime_config.get("llm_reasoning_effort") is not None
+                else {}
+            ),
         )
     try:
         await LiveKitSIPProvider(

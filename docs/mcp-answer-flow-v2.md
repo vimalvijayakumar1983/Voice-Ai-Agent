@@ -220,3 +220,19 @@ the results do not isolate each role. GPT-4o mini's faster exact-total turn does
 not outweigh the observed answer completeness and verifier failures for promoting
 it to the private ERP workflow. Sol was the most consistent of these three runs;
 presentation, human audio testing and broader regression gates remain outstanding.
+
+## Requested release target
+
+The user selected GPT-5.6 Luna (replacing the briefly requested Sol promotion).
+The release adds Luna to the native tool-loop model picker and save contract,
+persists explicit no-reasoning on save, and removes that setting when returning to
+legacy models. Readiness and browser preflight use the same reasoning value and
+require the provider to acknowledge NONE. Pipeline and experimental single-pass
+Luna routes are not enabled by this change. Existing model defaults are unchanged.
+
+The exact Luna/Anjali/AssemblyAI en-GB native readiness probe passed against Inworld.
+Local verification: 173 focused backend tests, 101 frontend tests, frontend lint
+and production build passed. Full CI, deployment, Trading-only flag/model update
+and verification through the deployed worker remain release steps, not implied
+by this document. Preserve the previous Trading settings for rollback; do not
+change other agents, private access, read-only MCP grants or recording policy.
