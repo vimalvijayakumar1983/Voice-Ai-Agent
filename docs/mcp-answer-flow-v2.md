@@ -184,3 +184,39 @@ pronunciation quality was measured. Luna is compatible and worth further testing
 but this mixed result does not justify production promotion or a speed guarantee.
 No application code change was needed beyond the previously committed explicit
 reasoning support. The QA harness now retains per-turn observations in QA metadata.
+
+## GPT-4o mini comparison on September 9
+
+The user's 'gpt mini 4' request was interpreted explicitly as GPT-4o mini. Isolated
+call `4d39e1ac-a05d-49ce-9066-588039973d75` used `openai/gpt-4o-mini` for both the
+native answer loop and semantic verifier, omitting reasoning parameters. The same
+six prompts, voice, tools, checks and bounds were retained. Production was unchanged;
+the QA room was deleted and no session errors were reported.
+
+Five turns delivered checked answers; recommendations instead delivered the bounded
+failure clarification. The channel-list answer omitted FEPY despite evidence of its
+decline, and the checker accepted the incomplete list. Other spoken totals, channel
+amounts and percentages matched the captured comparison. The first total answer
+became a long full-channel readout after the verifier unnecessarily rejected a
+correct shorter summary. Both recommendation drafts were rejected with inconsistent
+reasons, including treating an explicit lack of causal evidence as contradicting
+the evidence's own lack of causal explanation. Eight verifier requests produced
+three rejected drafts. This is not five fully correct answers out of six: one of
+the accepted answers was incomplete.
+
+There were four remote ERP reads: August, September-to-date, August again, and July.
+Sol and Luna needed only August and July. GPT-4o mini repeated the August fetch
+while the earlier evidence was still within the 180-second TTL. Remote lookup
+times varied from 1,360 to 7,140 ms, so total timing differences cannot all be
+attributed to model choice. First detected audio measured 16,401 / 4,439 / 4,649 /
+9,871 / 3,154 / 5,283 ms. The 9,871 ms turn delivered a failure clarification, not
+recommendations, and must not be presented as a faster successful recommendation.
+Exact-total and goodbye comparisons were respectively Sol 4,779 / 4,113 ms,
+Luna 3,703 / 3,521 ms, and GPT-4o mini 3,154 / 5,283 ms.
+
+These are one text-driven run per model with any-audio timing, not a statistical
+voice-latency benchmark. Both generation and verification models changed together;
+the results do not isolate each role. GPT-4o mini's faster exact-total turn does
+not outweigh the observed answer completeness and verifier failures for promoting
+it to the private ERP workflow. Sol was the most consistent of these three runs;
+presentation, human audio testing and broader regression gates remain outstanding.
