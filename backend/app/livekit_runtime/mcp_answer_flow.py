@@ -290,7 +290,8 @@ class InworldAnswerVerifier:
                         "channel increased. Do not reject for omitted optional highlights unless "
                         "the draft explicitly claims an exhaustive list. For differing "
                         "group membership, allow supported matched-group changes with the "
-                        "coverage limitation; missing rows are not zero. Returned-group totals "
+                        "coverage limitation. Missing-period values are UNKNOWN: reject claims "
+                        "that they equal zero OR that they are nonzero. Returned-group totals "
                         "must not be claimed to prove full company coverage. "
                         "Recommendations may be explicitly labelled "
                         "possibilities/suggestions, never "
@@ -394,6 +395,28 @@ class CheckedPresenter:
         }
 
 
+def social_closing(question):
+    """Only unambiguous English closings get a fixed, non-factual server reply.
+
+    Mixed requests, other languages and arbitrary generated text still require the
+    normal answer path. This never certifies model-authored content as evidence.
+    """
+    normalized = re.sub(r"[^\w\s]", " ", str(question).lower())
+    normalized = " ".join(normalized.split())
+    if normalized in {
+        "goodbye",
+        "good bye",
+        "bye",
+        "thank you goodbye",
+        "thanks goodbye",
+        "thank you good bye",
+        "thanks bye",
+        "thank you bye",
+    }:
+        return "Thank you. Goodbye."
+    return None
+
+
 class MCPAnswerFlow:
     def __init__(
         self,
@@ -432,6 +455,8 @@ class MCPAnswerFlow:
                 "role": "runtime_event",
                 "event": "mcp_answer_error",
                 "code": code,
+                "content": f"MCP answer check failed: {code}",
+                "error_type": type(exc).__name__,
                 "timestamp": datetime.now(UTC).isoformat(),
                 "turn": self.turn(),
             }
@@ -627,7 +652,8 @@ class MCPAnswerFlow:
             "group_coverage": "matched_only" if a.keys() != b.keys() else "same_returned_groups",
             "coverage_note": (
                 "Per-group changes/rankings cover only groups present in both reports. "
-                "Other groups have an unknown missing-period amount, not zero."
+                "Other groups have unknown missing-period amounts. Do not assert that "
+                "those amounts equal zero or that they are nonzero."
                 if a.keys() != b.keys()
                 else "Changes cover the groups returned in both reports."
             ),
@@ -654,6 +680,9 @@ class MCPAnswerFlow:
 
     async def answer(self, context, draft, source_ids):
         turn = self.turn()
+        closing = social_closing(self.question_provider())
+        if closing is not None:
+            draft, source_ids = closing, []
         draft = spoken_draft(draft)
         async with self.lock:
             if turn in self.answered_turns:
@@ -759,13 +788,17 @@ class MCPAnswerFlow:
                 candidate["spoken_text"] = draft
                 candidate["financial_speech_bindings"] = bindings
                 candidate["request_context"] = request
-                supported = await asyncio.wait_for(
-                    self.verifier(
-                        draft,
-                        request,
-                        packets,
-                    ),
-                    timeout=3.5,
+                supported = (
+                    True
+                    if closing is not None
+                    else await asyncio.wait_for(
+                        self.verifier(
+                            draft,
+                            request,
+                            packets,
+                        ),
+                        timeout=3.5,
+                    )
                 )
                 await authorize()
                 if supported is not True:
@@ -793,14 +826,17 @@ class MCPAnswerFlow:
                         }
                     )
                 self.answered_turns.add(turn)
-                candidate["validation"] = "semantic_verifier_passed"
+                validation = (
+                    "fixed_social_closing" if closing is not None else "semantic_verifier_passed"
+                )
+                candidate["validation"] = validation
                 self.append_source(
                     {
                         "role": "analysis",
                         "timestamp": datetime.now(UTC).isoformat(),
                         "source_ids": source_ids,
                         "content": draft,
-                        "validation": "semantic_verifier_passed",
+                        "validation": validation,
                     }
                 )
                 try:

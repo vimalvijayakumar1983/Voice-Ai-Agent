@@ -188,10 +188,10 @@ async def test_direct_native_audio_cannot_bypass_checked_delivery():
 
 async def test_social_reply_uses_checked_path_without_fetching_private_reports():
     flow, turns, _, verify = setup_flow()
-    turns.append("Thank you, goodbye")
+    turns.append("Thank you")
     ctx = context()
     with pytest.raises(llm.StopResponse):
-        await flow.answer(ctx, "You're welcome. Goodbye!", [])
+        await flow.answer(ctx, "You're welcome.", [])
     assert len(ctx.session.spoken) == 1 and not flow.records
     assert verify.await_args.args[2] == []
 
