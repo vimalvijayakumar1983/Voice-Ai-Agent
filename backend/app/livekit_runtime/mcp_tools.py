@@ -92,6 +92,7 @@ def _make_tool(
     delivery=None,
     question_provider=None,
     timezone="UTC",
+    answer_flow=None,
 ):
     parameters = copy.deepcopy(descriptor["input_schema"])
     analysis_field = "vav_report_analysis"
@@ -128,6 +129,7 @@ def _make_tool(
             raw_arguments, question or "", descriptor["input_schema"], timezone=timezone
         )
         try:
+            answer_turn = answer_flow.begin_lookup() if answer_flow is not None else None
             # Fresh authorization on every execution: disabling/deleting a connection
             # or removing the grant prevents subsequent calls in an existing session.
             async with async_session_factory() as db:
@@ -268,6 +270,20 @@ def _make_tool(
                             }
                         )
 
+                if answer_flow is not None:
+                    return await answer_flow.collect(
+                        result,
+                        tool=descriptor["name"],
+                        arguments=request_arguments,
+                        company=company,
+                        scope=str(integration_id),
+                        authorize=authorize_delivery,
+                        turn=answer_turn,
+                        context=context,
+                        forecast_loader=forecast_loader,
+                        question=question,
+                        timezone=timezone,
+                    )
                 await delivery.deliver(
                     context,
                     result,
@@ -348,7 +364,14 @@ def _make_tool(
 
 
 async def load_mcp_tools(
-    model, profile, metrics, *, call_id=None, source_turns=None, presenter=None
+    model,
+    profile,
+    metrics,
+    *,
+    call_id=None,
+    source_turns=None,
+    presenter=None,
+    answer_verifier=None,
 ):
     from app.services.browser_access import staff_browser, validate_staff_call
 
@@ -378,6 +401,26 @@ async def load_mcp_tools(
             ),
             "",
         )
+
+    from app.livekit_runtime.mcp_answer_flow import MCPAnswerFlow, enabled
+
+    answer_flow = None
+    if enabled(profile):
+        if answer_verifier is None or source_turns is None:
+            metrics["mcp_setup_unavailable"] = True
+            return []
+
+        def current_turn():
+            return sum(1 for turn in source_turns or [] if turn.get("role") == "user")
+
+        answer_flow = MCPAnswerFlow(
+            metrics,
+            source_turns.append if source_turns is not None else lambda entry: None,
+            latest_question,
+            current_turn,
+            answer_verifier,
+        )
+        metrics["mcp_delivery_mode"] = "mcp_answer_v2"
 
     async with async_session_factory() as db:
         if staff_browser(profile):
@@ -436,7 +479,10 @@ async def load_mcp_tools(
                             delivery=delivery,
                             question_provider=latest_question,
                             timezone=getattr(model, "timezone", "UTC"),
+                            answer_flow=answer_flow,
                         )
                     )
+    if answer_flow is not None and tools:
+        tools.extend(answer_flow.tools())
     metrics["mcp_enabled_tool_count"] = len(tools)
     return tools

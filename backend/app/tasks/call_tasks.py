@@ -759,7 +759,9 @@ async def _process_completed_call_async(
                     f"{str(turn.get('role') or 'unknown').title()}: "
                     f"{str(turn.get('content') or '').strip()}"
                     for turn in transcript.turns
-                    if isinstance(turn, dict) and str(turn.get("content") or "").strip()
+                    if isinstance(turn, dict)
+                    and turn.get("role") not in {"analysis", "analysis_candidate"}
+                    and str(turn.get("content") or "").strip()
                 )
             has_substantive_caller_input = _has_substantive_caller_input(transcript.turns)
             summary_result = await db.execute(

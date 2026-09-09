@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 PRODUCTION_LLM_MODELS = {
     "openai": ("gpt-4o-mini", "gpt-4o"),
-    "inworld": ("auto", "openai/gpt-4o-mini", "openai/gpt-4o"),
+    "inworld": ("auto", "openai/gpt-4o-mini", "openai/gpt-4o", "openai/gpt-5.6-luna"),
 }
 
 InworldSTTModel = Literal[
@@ -88,6 +88,10 @@ class RuntimeProfileUpdate(BaseModel):
             provider_name = "OpenAI" if self.llm_provider == "openai" else "Inworld"
             raise ValueError(f"{provider_name} LLM routes support only: {choices}")
         self.llm_model = model
+        if model == "openai/gpt-5.6-luna" and (
+            self.voice_runtime != "inworld_realtime" or self.knowledge_turn_mode != "tool_loop"
+        ):
+            raise ValueError("Luna currently requires Native Inworld Realtime tool-loop mode")
         if self.voice_runtime == "inworld_realtime" and self.llm_provider != "inworld":
             raise ValueError(
                 "Native Inworld Realtime requires the Inworld LLM route; the selected "
