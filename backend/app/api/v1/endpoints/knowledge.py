@@ -237,12 +237,37 @@ def _provider_error(exc: SmallestAIError) -> HTTPException:
     return HTTPException(status_code=exc.status_code, detail=str(exc))
 
 
-def _source_response(source: KnowledgeSource) -> KnowledgeSourceResponse:
+def _source_response(
+    source: KnowledgeSource, *, published_revision_id=None, owner_company=None, check=None
+) -> KnowledgeSourceResponse:
+    from app.services.knowledge_quality import (
+        QUALITY_CHECK_VERSION,
+        source_fingerprint,
+        source_quality,
+    )
+
+    quality_status, quality_issues = source_quality(source)
+    check = check or {}
+    if (
+        quality_status not in {"needs_repair", "processing"}
+        and check.get("revision_id") == str(published_revision_id)
+        and check.get("owner_company") == owner_company
+        and check.get("source_fingerprint") == source_fingerprint(source)
+        and check.get("status") == "passed"
+        and check.get("checker_version") == QUALITY_CHECK_VERSION
+    ):
+        quality_status = "sample_checks_passed"
+        quality_issues = [
+            f"{check.get('checks_count', 0)} representative retrieval checks passed against "
+            "the published company-scoped revision. This does not prove complete coverage."
+        ]
     content = source.content if isinstance(source.content, str) else ""
     extracted = source.raw_content if isinstance(source.raw_content, str) else content
     response = KnowledgeSourceResponse.model_validate(source)
     return response.model_copy(
         update={
+            "quality_status": quality_status,
+            "quality_issues": quality_issues,
             "retrieval_ready": bool(content.strip()),
             "extracted_character_count": len(extracted.strip()),
             "company_fact_count": sum(
@@ -318,6 +343,7 @@ def _knowledge_response(kb: KnowledgeBase) -> KnowledgeBaseResponse:
         approval_status=kb.approval_status,
         scope_type=kb.scope_type,
         scope_label=kb.scope_label,
+        owner_company=kb.owner_company,
         languages=kb.languages or ["en"],
         tags=kb.tags or [],
         source_count=kb.source_count,
@@ -327,7 +353,15 @@ def _knowledge_response(kb: KnowledgeBase) -> KnowledgeBaseResponse:
         speech_lexicon=speech_lexicon,
         serving_revision=serving_revision,
         has_pending_changes=kb.approval_status == "draft" and serving_revision is not None,
-        sources=[_source_response(source) for source in kb.sources],
+        sources=[
+            _source_response(
+                source,
+                published_revision_id=kb.serving_revision_id,
+                owner_company=kb.owner_company,
+                check=(kb.readiness_report or {}).get(str(source.id)),
+            )
+            for source in kb.sources
+        ],
         agent_bindings=bindings,
         crawls=[KnowledgeCrawlResponse.model_validate(crawl) for crawl in kb.crawls],
         created_at=kb.created_at,
@@ -990,6 +1024,7 @@ async def create_knowledge_base(
         provider="smallest",
         scope_type=data.scope_type,
         scope_label=data.scope_label,
+        owner_company=data.owner_company,
         languages=data.languages,
         tags=data.tags,
         sources=[],
@@ -1176,6 +1211,7 @@ async def update_knowledge_base(
         "description",
         "scope_type",
         "scope_label",
+        "owner_company",
         "languages",
         "tags",
     }

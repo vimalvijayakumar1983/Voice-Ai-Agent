@@ -317,11 +317,16 @@ def build_serving_revision(
     if speech_lexicon.knowledge_base_id != knowledge_base.id:
         raise KnowledgeServingError("Speech lexicon does not belong to this knowledge base")
     current_sources = tuple(knowledge_base.sources)
+    from app.services.knowledge_quality import source_quality
+
     for source in current_sources:
         if source.status not in _ELIGIBLE_SOURCE_STATUSES or not has_searchable_content(source):
             raise KnowledgeServingError(
                 f"Source '{source.name}' must be searchable before publication"
             )
+        quality_status, issues = source_quality(source)
+        if quality_status == "needs_repair":
+            raise KnowledgeServingError(f"Source '{source.name}': {issues[0]}")
     # IDs alone are insufficient: a KB can retain an older valid artifact
     # while its draft sources have changed. Rebuild the deterministic manifest
     # and require an exact match before pairing speech hints with new content.
@@ -432,6 +437,10 @@ def build_serving_revision(
         },
         "sources": source_manifest,
     }
+    # Retain ownership in the hashed immutable release, never read the mutable
+    # KB declaration while a call is in progress. Old releases remain valid.
+    if knowledge_base.owner_company:
+        manifest["owner_company"] = knowledge_base.owner_company.strip()
     content_sha256 = _sha256(
         {
             "compiler_version": SERVING_COMPILER_VERSION,
@@ -764,6 +773,50 @@ async def publish_serving_revision(
         ]
         db.add(revision)
         await db.flush()
+    if knowledge_base.owner_company:
+        # Real PostgreSQL candidate selection + the production ranker, not a
+        # synthetic 'text exists' predicate. Run before switching the live pin.
+        from app.services.knowledge_quality import (
+            MAX_PUBLICATION_PROBES,
+            QUALITY_CHECK_VERSION,
+            retrieval_probes,
+            source_fingerprint,
+        )
+        from app.services.knowledge_retrieval import retrieve_knowledge_context
+
+        readiness_report = {}
+        remaining_probes = MAX_PUBLICATION_PROBES
+        for source in knowledge_base.sources:
+            probes = retrieval_probes(source)[:remaining_probes]
+            remaining_probes -= len(probes)
+            for query, subject, value in probes:
+                context = await retrieve_knowledge_context(
+                    db,
+                    tenant_id=tenant_id,
+                    agent_id=uuid.UUID(int=0),
+                    query=query,
+                    knowledge_base_id=knowledge_base.id,
+                    serving_revision_id=revision.id,
+                    company_subject=knowledge_base.owner_company,
+                )
+                normalized = " ".join((context or "").casefold().split())
+                if any(
+                    " ".join(term.casefold().split()) not in normalized for term in (subject, value)
+                ):
+                    raise KnowledgeServingError(
+                        f"Retrieval check failed for '{source.name}': {query}. "
+                        "The previous published release has not been replaced."
+                    )
+            readiness_report[str(source.id)] = {
+                "checker_version": QUALITY_CHECK_VERSION,
+                "status": "passed" if probes else "not_tested",
+                "coverage": "representative_samples_only",
+                "checks_count": len(probes),
+                "source_fingerprint": source_fingerprint(source),
+                "revision_id": str(revision.id),
+                "owner_company": knowledge_base.owner_company,
+            }
+        knowledge_base.readiness_report = readiness_report
     knowledge_base.serving_revision_id = revision.id
     knowledge_base.speech_lexicon_artifact_id = speech_lexicon.id
     return revision

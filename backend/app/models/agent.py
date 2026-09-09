@@ -149,6 +149,9 @@ class KnowledgeBase(TenantScopedModel):
     approval_status: Mapped[str] = mapped_column(String(30), default="draft")
     scope_type: Mapped[str] = mapped_column(String(30), default="workspace")
     scope_label: Mapped[str | None] = mapped_column(String(255))
+    # Explicit administrator declaration, distinct from each fact's subject.
+    owner_company: Mapped[str | None] = mapped_column(String(160))
+    readiness_report: Mapped[dict | None] = mapped_column(JSONB)
     languages: Mapped[list[str]] = mapped_column(JSONB, default=lambda: ["en"])
     tags: Mapped[list[str]] = mapped_column(JSONB, default=list)
     source_count: Mapped[int] = mapped_column(Integer, default=0)
