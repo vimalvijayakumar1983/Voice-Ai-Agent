@@ -109,6 +109,42 @@ def test_empty_doctor_directory_is_not_usable_but_short_plain_text_is():
 
 
 @pytest.mark.asyncio
+async def test_long_empty_directory_shell_automatically_renders(monkeypatch):
+    from app.services import website_recovery as recovery
+
+    shell = (
+        "<title>Our doctors</title><main><p>"
+        + ("Find trusted medical professionals for quality healthcare and consultations. " * 30)
+        + "</p></main>"
+    )
+    calls = []
+
+    async def download(url):
+        return url, shell, len(shell)
+
+    async def render(url):
+        calls.append(url)
+        html = (
+            "<title>Our doctors</title><main><p>Dr Asha Rao is our dental doctor. "
+            + ("She provides dental consultations at the clinic. " * 5)
+            + "</p></main>"
+        )
+        return html, len(html)
+
+    monkeypatch.setattr(recovery, "download_html", download)
+    monkeypatch.setattr(recovery, "render_html", render)
+    result = await recovery.recover_page("https://clinic.example/doctors")
+    assert calls and result.method == "javascript_render" and "Dr Asha Rao" in result.text
+
+    async def still_empty(url):
+        return shell, len(shell)
+
+    monkeypatch.setattr(recovery, "render_html", still_empty)
+    with pytest.raises(recovery.WebsiteRecoveryError, match="directory entries"):
+        await recovery.recover_page("https://clinic.example/doctors")
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "company,person,role",
     [

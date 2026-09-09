@@ -777,6 +777,7 @@ async def publish_serving_revision(
         # Real PostgreSQL candidate selection + the production ranker, not a
         # synthetic 'text exists' predicate. Run before switching the live pin.
         from app.services.knowledge_quality import (
+            MAX_PUBLICATION_PROBES,
             QUALITY_CHECK_VERSION,
             retrieval_probes,
             source_fingerprint,
@@ -784,8 +785,10 @@ async def publish_serving_revision(
         from app.services.knowledge_retrieval import retrieve_knowledge_context
 
         readiness_report = {}
+        remaining_probes = MAX_PUBLICATION_PROBES
         for source in knowledge_base.sources:
-            probes = retrieval_probes(source)
+            probes = retrieval_probes(source)[:remaining_probes]
+            remaining_probes -= len(probes)
             for query, subject, value in probes:
                 context = await retrieve_knowledge_context(
                     db,
@@ -807,6 +810,7 @@ async def publish_serving_revision(
             readiness_report[str(source.id)] = {
                 "checker_version": QUALITY_CHECK_VERSION,
                 "status": "passed" if probes else "not_tested",
+                "coverage": "representative_samples_only",
                 "checks_count": len(probes),
                 "source_fingerprint": source_fingerprint(source),
                 "revision_id": str(revision.id),

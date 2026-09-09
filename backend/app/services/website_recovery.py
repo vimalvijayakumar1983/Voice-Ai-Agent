@@ -359,6 +359,16 @@ def extract_readable_text(document: str, *, url: str) -> tuple[str, str]:
         seen.add(key)
         cleaned.append(normalized)
     text = "\n\n".join(cleaned)[:MAX_EXTRACTED_CHARS]
+    from app.services.knowledge_quality import missing_doctor_directory
+
+    if missing_doctor_directory(title, url, text):
+        # Trigger the existing automatic browser-rendering recovery even when
+        # an empty directory shell contains many SEO/navigation characters.
+        # If rendering also fails this source stays failed, never 'indexed'.
+        raise WebsiteRecoveryError(
+            "Doctor directory entries were not extracted; only page text was found.",
+            code="no_readable_text",
+        )
     if len(text) < MIN_USEFUL_CHARS:
         raise WebsiteRecoveryError(
             "The downloaded page contained too little readable text.",

@@ -23,9 +23,13 @@ treated as a required content term, unlike “Who is the dental doctor?”.
   from live appointment availability.
 - Flag empty extraction and doctor pages without named entries. Keep short
   plain-text facts valid. These heuristics are not a proof of completeness.
+- An empty doctor listing automatically enters the existing JavaScript-render
+  recovery, even when its navigation/SEO text exceeds the old length threshold.
+  If rendering still lacks entries it is a visible failed source, not indexed.
 - Before publishing owned KBs, run up to three representative fact questions
   per source through production retrieval against the candidate immutable
   release. A failure prevents the pointer switch. The transaction rolls back.
+  A publication samples at most 24 queries; unsampled sources remain unverified.
 - Reports are stamped with source fingerprint, release, company and checker
   version. A changed source/owner cannot reuse a green report.
 - UI distinguishes “Needs repair”, “Extracted · not verified” and “Sample checks

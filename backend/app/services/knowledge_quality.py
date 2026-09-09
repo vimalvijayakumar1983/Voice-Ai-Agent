@@ -10,6 +10,15 @@ import re
 from urllib.parse import urlsplit
 
 QUALITY_CHECK_VERSION = "knowledge-readiness-1"
+MAX_PUBLICATION_PROBES = 24
+
+
+def missing_doctor_directory(title: str, url: str, text: str) -> bool:
+    path = urlsplit(url).path.casefold().rstrip("/")
+    directory = path.endswith(("/doctors", "/our-doctors", "/doctors-directory")) or bool(
+        re.search(r"\b(?:our doctors|best doctors|doctors directory)\b", title, re.I)
+    )
+    return directory and not re.search(r"\b(?:Dr\.?|Doctor)\s+[A-Z][\w'-]+", text)
 
 
 def source_fingerprint(source) -> str:
@@ -43,20 +52,19 @@ def source_quality(source) -> tuple[str, list[str]]:
         return "processing", ["Source extraction or compilation is still running."]
     if source.status == "failed":
         return "needs_repair", [source.error_message or "Source processing failed."]
-    title = str(source.name or "").lower()
-    path = urlsplit(str(source.location or "")).path.lower().rstrip("/")
-    directory = source.source_type in {"website", "url", "sitemap"} and bool(
-        re.search(r"\bdoctors?\b", title) or path.endswith("/doctors")
-    )
+    missing_directory = source.source_type in {
+        "website",
+        "url",
+        "sitemap",
+    } and missing_doctor_directory(str(source.name or ""), str(source.location or ""), content)
     # A doctor listing page without even one named clinician is demonstrably
     # incomplete. Navigation words such as 'Doctors' do not satisfy this check.
-    named_doctor = re.search(r"\b(?:Dr\.?|Doctor)\s+[A-Z][\w'-]+", content)
     facts = (source.structured_content or {}).get("facts") or []
     person_entity = any(
         isinstance(e, dict) and e.get("entity_type") == "person" and e.get("evidence")
         for e in (source.structured_content or {}).get("entities", [])
     )
-    if directory and not named_doctor and not person_entity:
+    if missing_directory and not person_entity:
         return "needs_repair", [
             "This looks like a doctor directory, but no named doctor entries were extracted. "
             "Headings and navigation are not a usable directory."
