@@ -2165,15 +2165,35 @@ async def _retrieve_serving_revision_context(
     if revision.knowledge_content and company_subject is None:
         documents.append((revision.knowledge_name, revision.knowledge_content))
     rank_variants = query_plan.variants
-    if owner_company and company_subject:
+    if owner_company:
         from app.services.conversation_scope import company_key
 
-        if company_key(owner_company) == company_key(company_subject):
+        if company_subject is None or company_key(owner_company) == company_key(company_subject):
             # Ownership has already been enforced. Do not require a doctor's
             # name (fact subject) to contain the company name as well.
-            rank_variants = tuple(
-                re.sub(re.escape(company_subject), " ", v, flags=re.I) for v in rank_variants
-            )
+            owner_words = _base_tokens(owner_company)
+            normalized_variants = []
+            for variant in rank_variants:
+                # Remove the complete owner first: entity extraction bounds
+                # long names, so stripping its prefix first can leave a suffix
+                # (for example 'Day Surgery') as an unrelated fact constraint.
+                without_owner = re.sub(re.escape(owner_company), " ", variant, flags=re.I)
+                if without_owner != variant:
+                    normalized_variants.append(without_owner)
+                    continue
+                named_subject = _requested_subject_tokens(variant)
+                for width in range(len(owner_words), 2, -1):
+                    prefix = owner_words[:width]
+                    if named_subject == set(prefix):
+                        variant = re.sub(
+                            r"\b" + r"\W+".join(map(re.escape, prefix)) + r"\b",
+                            " ",
+                            variant,
+                            flags=re.I,
+                        )
+                        break
+                normalized_variants.append(variant)
+            rank_variants = tuple(normalized_variants)
     matches = await asyncio.to_thread(
         _rank_contextual_knowledge,
         rank_variants,

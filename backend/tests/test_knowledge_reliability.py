@@ -230,6 +230,64 @@ async def test_owned_publication_checks_natural_service_questions(db, tenant):
 
 
 @pytest.mark.asyncio
+async def test_owned_person_retrieval_accepts_unambiguous_company_name_prefix(db, tenant):
+    company = "Example Medical Center One Day Surgery"
+    kb = KnowledgeBase(
+        tenant_id=tenant.id,
+        name=company,
+        owner_company=company,
+        sync_status="ready",
+        approval_status="draft",
+        source_count=1,
+        indexed_source_count=1,
+    )
+    kb.sources.append(
+        KnowledgeSource(
+            tenant_id=tenant.id,
+            source_type="text",
+            name="Dental Doctor",
+            status="indexed",
+            content="Dr Kevin is the dental doctor",
+            structured_content=structured(),
+        )
+    )
+    db.add(kb)
+    await db.flush()
+    lexicon = await publish_speech_lexicon(
+        db, tenant_id=tenant.id, knowledge_base=kb, allow_draft_for_approval=True
+    )
+    revision = await publish_serving_revision(
+        db,
+        tenant_id=tenant.id,
+        knowledge_base=kb,
+        speech_lexicon=lexicon,
+        allow_draft_for_approval=True,
+    )
+    for scope in (None, company):
+        for subject in (company, "Example Medical Center"):
+            result = await retrieve_knowledge_context(
+                db,
+                tenant_id=tenant.id,
+                agent_id=uuid4(),
+                knowledge_base_id=kb.id,
+                serving_revision_id=revision.id,
+                company_subject=scope,
+                query=f"Who is the dental doctor at {subject}?",
+            )
+            assert result and "Dr Kevin" in result
+        result = await retrieve_knowledge_context(
+            db,
+            tenant_id=tenant.id,
+            agent_id=uuid4(),
+            knowledge_base_id=kb.id,
+            serving_revision_id=revision.id,
+            company_subject=scope,
+            query="Who is the dental doctor at Different Medical Center?",
+        )
+        assert not result
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "company,person,role",
     [
