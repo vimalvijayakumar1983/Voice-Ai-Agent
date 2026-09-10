@@ -129,11 +129,19 @@ def make_record(
 
 
 def dedupe_records(records: Iterable[KnowledgeRecord]) -> list[KnowledgeRecord]:
-    """Drop whole records repeated verbatim; never drop a label shared by records."""
+    """Drop whole records repeated verbatim within the same heading context.
+
+    The same row under two different headings (opening hours for Branch A and
+    for Branch B) means two different things, so both occurrences are kept; a
+    label shared by records is never dropped either.
+    """
     unique: list[KnowledgeRecord] = []
-    seen: set[str] = set()
+    seen: set[tuple[tuple[str, ...], str]] = set()
     for record in records:
-        key = record.text.casefold()
+        key = (
+            tuple(part.casefold() for part in record.heading_path),
+            record.text.casefold(),
+        )
         if key in seen:
             continue
         seen.add(key)
@@ -262,15 +270,20 @@ def coverage_report(
     facts_rejected = int(validation.get("facts_rejected", 0) or 0)
 
     record_like = [record for record in records if record.kind in RECORD_LIKE_KINDS]
-    evidence_blob = " ".join(
-        grounding_normalized(
+    # One bundle per fact: a record counts as captured only when a single fact
+    # carries all of its fields together. Matching fragments across unrelated
+    # facts would let an omitted row pass because its name appears in one fact
+    # and its price in another.
+    fact_bundles = [
+        " "
+        + grounding_normalized(
             " ".join(
                 str(fact.get(key) or "") for key in ("subject", "predicate", "value", "evidence")
             )
         )
+        + " "
         for fact in facts
-    )
-    evidence_blob = f" {evidence_blob} "
+    ]
     subject_blob = " ".join(
         grounding_normalized(str(item.get("subject") or item.get("name") or ""))
         for item in (*facts, *entities)
@@ -282,8 +295,10 @@ def coverage_report(
     entities_found: list[str] = []
     entities_with_facts = 0
     for record in record_like:
-        fragments = record.fragments or (record.text,)
-        if all(f" {grounding_normalized(fragment)} " in evidence_blob for fragment in fragments):
+        fragments = [
+            f" {grounding_normalized(fragment)} " for fragment in record.fragments or (record.text,)
+        ]
+        if any(all(fragment in bundle for fragment in fragments) for bundle in fact_bundles):
             covered += 1
         else:
             uncovered.append(record.text[:200])
