@@ -217,6 +217,7 @@ _PAGINATED_DIRECTORY_HTML = """
   <label>Gender</label><select><option>Any</option></select>
   <button type="submit">Search</button>
 </form>
+<div class="filters"><label>Gender</label><select><option>Any</option></select></div>
 <p>Our doctors provide family medicine, paediatrics and dental care across Abu Dhabi
 with same-day appointments and insurance support for every patient.</p>
 <div class="card"><h3>Dr Randa Ahmed</h3><p>General Practitioner</p>
@@ -237,7 +238,10 @@ def test_filter_controls_and_pagination_widgets_are_not_records():
     texts = [record.text for record in records]
     assert "Dr Randa Ahmed | General Practitioner | 22+ Years Experience" in texts
     assert "Dr Dalia Wahba | Anesthesiologist | 23+ Years Experience" in texts
-    assert not any("All Specialties" in text or text in {"Any", "Next", "Search"} for text in texts)
+    assert not any(
+        "All Specialties" in text or text in {"Any", "Next", "Search", "Gender", "Specialty"}
+        for text in texts
+    )
     assert not any(text.startswith("1 | 2") for text in texts)
 
 

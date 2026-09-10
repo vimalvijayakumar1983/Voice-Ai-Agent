@@ -561,6 +561,9 @@ def extract_page_records(
             # Filter bars, search boxes and pagination widgets are controls,
             # not knowledge: "Specialty: All Specialties" is never a fact.
             "form",
+            "fieldset",
+            "legend",
+            "label",
             "select",
             "option",
             "input",
@@ -662,6 +665,18 @@ def should_render_javascript(document: str, text: str) -> bool:
 
 async def render_html(url: str) -> tuple[str, int]:
     """Render a same-origin JavaScript page in the bundled Chromium fallback."""
+    _final_url, document, downloaded_bytes = await render_page(url)
+    return document, downloaded_bytes
+
+
+async def render_page(url: str) -> tuple[str, str, int]:
+    """Render a JavaScript page and return the browser's final URL with the document.
+
+    The final URL matters for paginated listings: a relative "next" link on a
+    page that redirected (``/doctors?page=2`` to ``/en/doctors?page=2``) must
+    resolve against where the browser ended up, as ``download_html`` already
+    reports for static pages.
+    """
     hostname, address = await _resolve_public_destination(url)
     try:
         from playwright.async_api import TimeoutError as PlaywrightTimeoutError
@@ -789,7 +804,7 @@ async def render_html(url: str) -> tuple[str, int]:
                     "The rendered page is larger than the 5 MB recovery limit.",
                     code="page_too_large",
                 )
-            return document, len(document.encode("utf-8"))
+            return final._replace(fragment="").geturl(), document, len(document.encode("utf-8"))
     except WebsiteRecoveryError:
         raise
     except Exception as exc:

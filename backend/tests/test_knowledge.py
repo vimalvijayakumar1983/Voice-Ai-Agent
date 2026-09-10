@@ -2040,3 +2040,37 @@ async def test_paginated_directory_pages_are_merged_into_one_source(monkeypatch)
     assert failure.value.code == "pagination_incomplete"
     assert failure.value.retryable is True
     assert "page=3" in str(failure.value)
+
+    # A JavaScript-rendered listing paginates through the renderer, not the
+    # static downloader.
+    rendered: list[str] = []
+    # Page 2 redirects into a localised path whose "Next" link is relative, so
+    # page 3 must resolve against the browser's final URL, not the requested one.
+    localised = {
+        "https://clinic.example/doctors?page=2": (
+            "https://clinic.example/en/doctors?page=2",
+            listing(2, ["Dr Three"], next_page=3).replace(
+                'href="/doctors?page=3"', 'href="?page=3"'
+            ),
+        ),
+        "https://clinic.example/en/doctors?page=3": (
+            "https://clinic.example/en/doctors?page=3",
+            listing(3, ["Dr Four"], next_page=None),
+        ),
+    }
+
+    async def render(url):
+        rendered.append(url)
+        final_url, document = localised[url]
+        return final_url, document, len(document)
+
+    monkeypatch.setattr(knowledge_tasks, "render_page", render)
+    merged_rendered, rendered_records = await knowledge_tasks._follow_pagination(
+        first, pages[first_url], records, signatures, fetch=knowledge_tasks._fetch_rendered
+    )
+    assert rendered == [
+        "https://clinic.example/doctors?page=2",
+        "https://clinic.example/en/doctors?page=3",
+    ]
+    assert merged_rendered.pages == 3
+    assert "Dr Four | General Practitioner" in merged_rendered.text

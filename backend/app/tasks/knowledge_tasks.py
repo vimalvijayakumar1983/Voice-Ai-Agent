@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
@@ -52,7 +52,7 @@ from app.services.website_recovery import (
     extract_page_records,
     find_next_page_url,
     recovery_metadata,
-    render_html,
+    render_page,
     should_render_javascript,
 )
 from app.tasks.async_runner import run_async as _run_async
@@ -989,11 +989,18 @@ async def _commit_repair_success(
     return committed
 
 
+async def _fetch_rendered(url: str) -> tuple[str, str, int]:
+    """Fetch a listing page through the renderer, reporting the browser's final URL."""
+    return await render_page(url)
+
+
 async def _follow_pagination(
     page: RecoveredPage,
     document: str,
     records: list[KnowledgeRecord],
     card_signatures: set[tuple[str, tuple[str, ...]]] | None = None,
+    *,
+    fetch: Callable[[str], Awaitable[tuple[str, str, int]]] | None = None,
 ) -> tuple[RecoveredPage, list[KnowledgeRecord]]:
     """Merge the records of a paginated listing's later pages into one source.
 
@@ -1020,7 +1027,7 @@ async def _follow_pagination(
             break
         seen.add(next_url)
         try:
-            fetched_url, next_document, next_bytes = await download_html(next_url)
+            fetched_url, next_document, next_bytes = await (fetch or download_html)(next_url)
         except WebsiteRecoveryError as exc:
             raise WebsiteRecoveryError(
                 f"Page {pages + 1} of this listing ({next_url}) could not be downloaded, so "
@@ -1112,19 +1119,30 @@ async def _repair(
                 repair_run_id=repair_run_id,
             ):
                 return
+            rendered_signatures: set[tuple[str, tuple[str, ...]]] = set()
             try:
-                rendered_html, rendered_bytes = await render_html(final_url)
-                title, records = extract_page_records(rendered_html, url=final_url)
-                text = render_records(records)
+                rendered_url, rendered_html, rendered_bytes = await render_page(final_url)
+                title, rendered_records = extract_page_records(
+                    rendered_html, url=rendered_url, card_signatures=rendered_signatures
+                )
+            except WebsiteRecoveryError:
+                # Only the initial render may fall back to the usable static
+                # page. A failure while paginating below is not swallowed:
+                # that would index exactly the truncated listing that
+                # _follow_pagination exists to reject.
+                page = static_page
+            else:
+                records = rendered_records
                 page = RecoveredPage(
-                    final_url,
+                    rendered_url,
                     title,
-                    text,
+                    render_records(records),
                     "javascript_render",
                     rendered_bytes,
                 )
-            except WebsiteRecoveryError:
-                page = static_page
+                page, records = await _follow_pagination(
+                    page, rendered_html, records, rendered_signatures, fetch=_fetch_rendered
+                )
         else:
             page = static_page
     except WebsiteRecoveryError as exc:
@@ -1139,10 +1157,16 @@ async def _repair(
             repair_run_id=repair_run_id,
         ):
             return
-        rendered_html, rendered_bytes = await render_html(final_url)
-        title, records = extract_page_records(rendered_html, url=final_url)
+        rendered_url, rendered_html, rendered_bytes = await render_page(final_url)
+        rendered_signatures = set()
+        title, records = extract_page_records(
+            rendered_html, url=rendered_url, card_signatures=rendered_signatures
+        )
         text = render_records(records)
-        page = RecoveredPage(final_url, title, text, "javascript_render", rendered_bytes)
+        page = RecoveredPage(rendered_url, title, text, "javascript_render", rendered_bytes)
+        page, records = await _follow_pagination(
+            page, rendered_html, records, rendered_signatures, fetch=_fetch_rendered
+        )
     if not await _set_stage(
         tenant_id,
         kb_id,
@@ -1191,6 +1215,12 @@ async def _repair(
             text=page.text,
             requested_mode=requested_mode,
             api_key=openai_api_key or None,
+            # A homepage or a merged multi-page directory can exceed the
+            # request-time budget; the worker is not on the HTTP deadline and
+            # its run is fenced by the stale-repair sweeper, so use the same
+            # longer budget as background text and PDF compilation.
+            timeout_seconds=120.0,
+            max_retries=1,
         )
     content_sha256 = hashlib.sha256(compiled.content.encode("utf-8")).hexdigest()
     if not await _set_stage(

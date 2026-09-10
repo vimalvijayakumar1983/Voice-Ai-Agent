@@ -502,3 +502,13 @@ async def test_ai_verified_mode_requires_an_openai_key():
             text="Approved directory content long enough to process.",
             requested_mode="ai_verified",
         )
+
+
+def test_failed_automatic_compilation_names_the_reason():
+    from app.services.knowledge_compiler import _failure_reason
+
+    class RateLimitedError(Exception):
+        status_code = 429
+
+    assert _failure_reason(RateLimitedError("too many requests")) == "RateLimitedError 429"
+    assert _failure_reason(TimeoutError()) == "TimeoutError"

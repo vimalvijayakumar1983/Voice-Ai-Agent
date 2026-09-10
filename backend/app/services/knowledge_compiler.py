@@ -642,6 +642,18 @@ async def _compile_complete_source(**kwargs) -> tuple[dict, int, int]:
     return structured, sum(item[1] for item in results), sum(item[2] for item in results)
 
 
+def _failure_reason(exc: BaseException) -> str:
+    """A short, safe reason for a failed compilation: the error class and any HTTP status.
+
+    Provider response bodies, credentials and page text never reach the UI; the
+    class name and status code are enough to tell a rate limit from a timeout
+    or a malformed model reply.
+    """
+    status = getattr(exc, "status_code", None)
+    name = type(exc).__name__
+    return f"{name} {status}" if status else name
+
+
 async def compile_source_knowledge(
     *,
     title: str,
@@ -708,7 +720,10 @@ async def compile_source_knowledge(
                     raise KnowledgeCompilerError(
                         "OpenAI could not compile this page. Retry it or use Automatic mode."
                     ) from exc
-                warning = "AI compilation failed; VAV retained deterministic searchable content."
+                warning = (
+                    f"AI compilation failed ({_failure_reason(exc)}); VAV retained "
+                    "deterministic searchable content."
+                )
 
     input_rate, output_rate = _MODEL_PRICES_PER_MILLION.get(model or "", (0.0, 0.0))
     estimated_cost = (input_tokens * input_rate + output_tokens * output_rate) / 1_000_000
