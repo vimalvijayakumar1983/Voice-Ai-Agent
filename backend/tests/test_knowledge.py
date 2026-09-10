@@ -14,6 +14,8 @@ from app.models.agent import (
     KnowledgeSource,
 )
 from app.services import website_crawler
+from app.services.knowledge_compiler import COMPILER_VERSION, CompiledKnowledge, _build_document
+from app.services.knowledge_records import make_record
 from app.services.knowledge_retrieval import retrieve_knowledge_context
 from app.services.knowledge_sources import (
     consolidate_duplicate_url_sources,
@@ -22,15 +24,63 @@ from app.services.knowledge_sources import (
 from app.services.pdf_ingestion import PreparedPdf
 
 
-def _prepared_pdf(text: str) -> PreparedPdf:
+def _prepared_pdf(text: str, records=()) -> PreparedPdf:
     return PreparedPdf(
-        provider_content=b"%PDF-1.4\nsearchable",
+        searchable_content=b"%PDF-1.4\nsearchable",
         extracted_text=text,
         extraction_method="native",
         page_count=1,
         sha256="f" * 64,
         ocr_page_count=0,
+        records=tuple(records),
     )
+
+
+def _queued_compiles(monkeypatch) -> list[tuple[list[str], str]]:
+    from app.tasks import knowledge_tasks
+
+    queued: list[tuple[list[str], str]] = []
+    monkeypatch.setattr(
+        knowledge_tasks.compile_knowledge_source,
+        "apply_async",
+        lambda *, args, queue: queued.append((args, queue)),
+    )
+    return queued
+
+
+def _fake_compilation(monkeypatch, facts: list[dict], *, db=None) -> None:
+    """Make the worker compile with a fixed verified result instead of OpenAI."""
+    from app.tasks import knowledge_tasks
+
+    async def compile_knowledge(*, title, url, text, requested_mode, api_key=None, **_kwargs):
+        structured = {
+            "schema_version": COMPILER_VERSION,
+            "page_type": "directory",
+            "entities": [],
+            "facts": facts,
+            "deterministic_contacts": {"phones": [], "emails": []},
+            "source": {"title": title, "url": url},
+            "validation": {"facts_accepted": len(facts), "facts_rejected": 0},
+            "compiler": {
+                "version": COMPILER_VERSION,
+                "requested_mode": requested_mode,
+                "effective_mode": "ai_verified",
+                "model": "fake-model",
+            },
+        }
+        return CompiledKnowledge(
+            content=_build_document(title=title, url=url, text=text, structured=structured),
+            structured=structured,
+            effective_mode="ai_verified",
+            model="fake-model",
+            input_tokens=10,
+            output_tokens=5,
+            estimated_cost_usd=0.0001,
+        )
+
+    monkeypatch.setattr(knowledge_tasks, "compile_knowledge", compile_knowledge)
+    if db is not None:
+        monkeypatch.setattr(knowledge_tasks, "async_session_factory", lambda: db)
 
 
 @pytest.mark.parametrize("provider", ["sarvam", "elevenlabs", "inworld"])
@@ -52,7 +102,7 @@ def test_source_changes_are_live_for_every_bound_vav_agent(provider):
 
 
 @pytest.mark.asyncio
-async def test_pdf_upload_is_indexed_locally_and_replaces_the_same_filename(
+async def test_pdf_upload_extracts_records_then_compiles_and_measures_coverage(
     client,
     auth_headers,
     tenant,
@@ -60,14 +110,17 @@ async def test_pdf_upload_is_indexed_locally_and_replaces_the_same_filename(
     monkeypatch,
 ):
     from app.api.v1.endpoints import knowledge as knowledge_endpoint
+    from app.tasks import knowledge_tasks
 
+    row = make_record("table_row", ["Service: Consultation", "Price: AED 150"], page=1)
     monkeypatch.setattr(
         knowledge_endpoint,
         "prepare_pdf",
         lambda *_args, **_kwargs: _prepared_pdf(
-            "Botox treatment knowledge for reliable customer support."
+            "Fee schedule\n\nService: Consultation | Price: AED 150", records=[row]
         ),
     )
+    queued = _queued_compiles(monkeypatch)
     agent = Agent(
         tenant_id=tenant.id,
         name="Inworld concierge",
@@ -97,24 +150,49 @@ async def test_pdf_upload_is_indexed_locally_and_replaces_the_same_filename(
     response = await client.post(
         f"/api/v1/knowledge/{knowledge.id}/sources/pdf",
         headers=auth_headers,
-        files={"media": ("botox.pdf", b"%PDF-1.4\nknowledge", "application/pdf")},
+        files={"media": ("fees.pdf", b"%PDF-1.4\nknowledge", "application/pdf")},
     )
 
     assert response.status_code == 200
     body = response.json()
     assert body["provider"] == "vav"
-    assert body["sync_status"] == "ready"
+    assert body["sync_status"] == "processing"
     assert body["approval_status"] == "draft"
     first_source = body["sources"][0]
-    assert first_source["status"] == "indexed"
-    assert first_source["retrieval_ready"] is True
-    assert first_source["source_metadata"]["retrieval_content_source"] == "vav_pdf_ingestion"
+    assert first_source["status"] == "processing"
+    assert first_source["source_metadata"]["record_count"] == 1
+    assert queued == [([str(tenant.id), str(knowledge.id), first_source["id"]], "knowledge")]
+
+    _fake_compilation(
+        monkeypatch,
+        [
+            {
+                "subject": "Consultation",
+                "predicate": "price",
+                "value": "AED 150",
+                "evidence": "Service: Consultation | Price: AED 150",
+                "search_phrases": ["consultation fee"],
+            }
+        ],
+        db=db,
+    )
+    await knowledge_tasks._compile_source(tenant.id, knowledge.id, UUID(first_source["id"]))
+    db.expire_all()
+
+    refreshed = await client.get(f"/api/v1/knowledge/{knowledge.id}", headers=auth_headers)
+    body = refreshed.json()
+    assert body["sync_status"] == "ready"
+    source = body["sources"][0]
+    assert source["status"] == "indexed"
+    assert source["retrieval_ready"] is True
+    assert source["source_metadata"]["coverage"]["status"] == "complete"
+    assert source["source_metadata"]["coverage"]["records_covered"] == 1
     assert body["agent_bindings"][0]["sync_status"] == "synced"
 
     replacement = await client.post(
         f"/api/v1/knowledge/{knowledge.id}/sources/pdf",
         headers=auth_headers,
-        files={"media": ("botox.pdf", b"%PDF-1.4\nreplacement", "application/pdf")},
+        files={"media": ("fees.pdf", b"%PDF-1.4\nreplacement", "application/pdf")},
     )
 
     assert replacement.status_code == 200
@@ -668,6 +746,7 @@ async def test_pasted_text_can_be_approved_bound_and_retrieved_by_inworld(
     auth_headers,
     tenant,
     db,
+    monkeypatch,
 ):
     agent = Agent(
         tenant_id=tenant.id,
@@ -686,6 +765,7 @@ async def test_pasted_text_can_be_approved_bound_and_retrieved_by_inworld(
     db.add_all([agent, knowledge])
     await db.commit()
 
+    queued = _queued_compiles(monkeypatch)
     added = await client.post(
         f"/api/v1/knowledge/{knowledge.id}/sources/text",
         headers=auth_headers,
@@ -695,9 +775,35 @@ async def test_pasted_text_can_be_approved_bound_and_retrieved_by_inworld(
         },
     )
     assert added.status_code == 200
-    assert added.json()["sync_status"] == "ready"
-    assert added.json()["sources"][0]["status"] == "indexed"
-    assert added.json()["sources"][0]["retrieval_ready"] is True
+    assert added.json()["sync_status"] == "processing"
+    source_id = added.json()["sources"][0]["id"]
+    assert added.json()["sources"][0]["status"] == "processing"
+    assert queued == [([str(tenant.id), str(knowledge.id), source_id], "knowledge")]
+
+    _fake_compilation(
+        monkeypatch,
+        [
+            {
+                "subject": "PRP consultations",
+                "predicate": "availability",
+                "value": "available after a doctor completes an assessment",
+                "evidence": (
+                    "PRP consultations are available after a doctor completes an assessment."
+                ),
+                "search_phrases": ["are PRP consultations available"],
+            }
+        ],
+        db=db,
+    )
+    from app.tasks import knowledge_tasks
+
+    await knowledge_tasks._compile_source(tenant.id, knowledge.id, UUID(source_id))
+    db.expire_all()
+    ready = await client.get(f"/api/v1/knowledge/{knowledge.id}", headers=auth_headers)
+    assert ready.json()["sync_status"] == "ready"
+    assert ready.json()["sources"][0]["status"] == "indexed"
+    assert ready.json()["sources"][0]["retrieval_ready"] is True
+    assert ready.json()["sources"][0]["source_metadata"]["coverage"]["status"] == "complete"
 
     approved = await client.post(
         f"/api/v1/knowledge/{knowledge.id}/approval",
@@ -837,7 +943,9 @@ async def test_adding_content_revokes_existing_knowledge_approval(
     auth_headers,
     tenant,
     db,
+    monkeypatch,
 ):
+    _queued_compiles(monkeypatch)
     knowledge = KnowledgeBase(
         tenant_id=tenant.id,
         name="Approved clinic knowledge",
@@ -861,3 +969,205 @@ async def test_adding_content_revokes_existing_knowledge_approval(
     assert response.status_code == 200
     assert response.json()["approval_status"] == "draft"
     assert response.json()["published_at"] is None
+
+
+def _indexed_source(tenant, *, name: str, coverage: dict | None, **extra) -> KnowledgeSource:
+    metadata = {"coverage": coverage} if coverage is not None else {}
+    return KnowledgeSource(
+        tenant_id=tenant.id,
+        source_type="text",
+        name=name,
+        content=f"{name} approved content.",
+        status="indexed",
+        source_metadata=metadata,
+        **extra,
+    )
+
+
+@pytest.mark.asyncio
+async def test_approval_requires_measured_coverage_and_acknowledges_partial_gaps(
+    client,
+    auth_headers,
+    tenant,
+    db,
+):
+    knowledge = KnowledgeBase(
+        tenant_id=tenant.id,
+        name="Coverage-gated knowledge",
+        sync_status="ready",
+        approval_status="draft",
+    )
+    unmeasured = _indexed_source(tenant, name="Legacy page", coverage=None)
+    knowledge.sources.append(unmeasured)
+    knowledge.source_count = 1
+    knowledge.indexed_source_count = 1
+    db.add(knowledge)
+    await db.commit()
+
+    blocked = await client.post(
+        f"/api/v1/knowledge/{knowledge.id}/approval",
+        headers=auth_headers,
+        json={"approved": True},
+    )
+    assert blocked.status_code == 409
+    assert "Re-index" in blocked.json()["detail"]
+    assert "Legacy page" in blocked.json()["detail"]
+
+    unmeasured.source_metadata = {
+        "coverage": {
+            "status": "partial",
+            "record_total": 4,
+            "records_covered": 3,
+            "uncovered": ["Dr Dalia Hassan | General Practitioner | 23+ Years Experience"],
+            "uncovered_total": 1,
+        }
+    }
+    await db.commit()
+
+    partial = await client.post(
+        f"/api/v1/knowledge/{knowledge.id}/approval",
+        headers=auth_headers,
+        json={"approved": True},
+    )
+    assert partial.status_code == 409
+    assert "accept_partial_coverage" in partial.json()["detail"]
+
+    acknowledged = await client.post(
+        f"/api/v1/knowledge/{knowledge.id}/approval",
+        headers=auth_headers,
+        json={"approved": True, "accept_partial_coverage": True},
+    )
+    assert acknowledged.status_code == 200
+    assert acknowledged.json()["approval_status"] == "approved"
+
+    unmeasured.source_metadata = {"coverage": {"status": "complete", "record_total": 4}}
+    knowledge.approval_status = "draft"
+    await db.commit()
+    complete = await client.post(
+        f"/api/v1/knowledge/{knowledge.id}/approval",
+        headers=auth_headers,
+        json={"approved": True},
+    )
+    assert complete.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_reindex_requeues_every_source_type_with_the_current_pipeline(
+    client,
+    auth_headers,
+    tenant,
+    db,
+    monkeypatch,
+):
+    from app.api.v1.endpoints import knowledge as knowledge_endpoint
+    from app.tasks import knowledge_tasks
+
+    queued_compiles = _queued_compiles(monkeypatch)
+    queued_repairs: list[tuple[list[str], str]] = []
+    monkeypatch.setattr(
+        knowledge_tasks.repair_website_source,
+        "apply_async",
+        lambda *, args, queue: queued_repairs.append((args, queue)),
+    )
+    monkeypatch.setattr(
+        knowledge_endpoint,
+        "prepare_pdf",
+        lambda *_args, **_kwargs: _prepared_pdf(
+            "Service: Consultation | Price: AED 150",
+            records=[make_record("table_row", ["Service: Consultation", "Price: AED 150"])],
+        ),
+    )
+    knowledge = KnowledgeBase(
+        tenant_id=tenant.id,
+        name="Legacy knowledge",
+        sync_status="ready",
+        approval_status="approved",
+        published_at=datetime.now(UTC),
+    )
+    pdf = KnowledgeSource(
+        tenant_id=tenant.id,
+        source_type="file",
+        name="fees.pdf",
+        content="Consultation AED 150",
+        file_content=b"%PDF-1.4\nlegacy",
+        status="indexed",
+    )
+    text = KnowledgeSource(
+        tenant_id=tenant.id,
+        source_type="text",
+        name="FAQ",
+        content="Opening hours: 9 AM to 9 PM daily",
+        status="indexed",
+    )
+    page = KnowledgeSource(
+        tenant_id=tenant.id,
+        source_type="website",
+        name="Doctors",
+        location="https://clinic.example/doctors",
+        content="Dr Randa Ahmed General Practitioner",
+        raw_content="Dr Randa Ahmed General Practitioner",
+        content_sha256="a" * 64,
+        status="indexed",
+    )
+    knowledge.sources.extend([pdf, text, page])
+    knowledge.source_count = 3
+    knowledge.indexed_source_count = 3
+    db.add(knowledge)
+    await db.commit()
+
+    response = await client.post(
+        f"/api/v1/knowledge/{knowledge.id}/reindex",
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["approval_status"] == "draft"
+    assert body["sync_status"] == "processing"
+    by_name = {source["name"]: source for source in body["sources"]}
+    assert by_name["fees.pdf"]["status"] == "processing"
+    assert by_name["fees.pdf"]["source_metadata"]["record_count"] == 1
+    assert by_name["FAQ"]["status"] == "processing"
+    assert by_name["FAQ"]["source_metadata"]["record_count"] == 1
+    assert by_name["Doctors"]["status"] == "processing"
+    assert by_name["Doctors"]["source_metadata"]["force_recompile"] is True
+    assert by_name["Doctors"]["source_metadata"]["recovery"]["stage"] == "queued"
+    assert sorted(args[2] for args, _queue in queued_compiles) == sorted(
+        [by_name["fees.pdf"]["id"], by_name["FAQ"]["id"]]
+    )
+    assert queued_repairs == [
+        ([str(tenant.id), str(knowledge.id), by_name["Doctors"]["id"]], "knowledge")
+    ]
+    stored_text = await db.get(KnowledgeSource, UUID(by_name["FAQ"]["id"]))
+    await db.refresh(stored_text)
+    assert stored_text.structured_content["records"][0]["kind"] == "field"
+
+
+@pytest.mark.asyncio
+async def test_compile_without_ai_marks_coverage_not_compiled(tenant, db, monkeypatch):
+    from app.tasks import knowledge_tasks
+
+    monkeypatch.setattr(knowledge_tasks, "async_session_factory", lambda: db)
+    monkeypatch.setattr(knowledge_tasks.settings, "openai_api_key", "")
+    knowledge = KnowledgeBase(tenant_id=tenant.id, name="Keyless workspace")
+    source = KnowledgeSource(
+        tenant_id=tenant.id,
+        source_type="text",
+        name="FAQ",
+        raw_content="Opening hours: 9 AM to 9 PM daily. Walk-in visits are welcome.",
+        content="Opening hours: 9 AM to 9 PM daily. Walk-in visits are welcome.",
+        status="processing",
+        source_metadata={"processing_mode": "automatic"},
+    )
+    knowledge.sources.append(source)
+    db.add(knowledge)
+    await db.commit()
+
+    await knowledge_tasks._compile_source(tenant.id, knowledge.id, source.id)
+    db.expire_all()
+    refreshed = await db.get(KnowledgeSource, source.id)
+
+    assert refreshed.status == "indexed"
+    assert refreshed.source_metadata["coverage"]["status"] == "not_compiled"
+    assert refreshed.source_metadata["compiler"]["warning"]
+    assert "Opening hours" in refreshed.content

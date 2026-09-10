@@ -144,9 +144,10 @@ Note: the pipeline runtime retrieves once in the turn hook and the native realti
 - PDF: table rows via the table finder; reading order preserved; page and heading path retained.
 - Text: paragraphs and list items as records.
 - Compiler runs for all types with the platform key. Coverage report stored per source and shown in the UI. Incomplete sources cannot be approved.
-- Migration: re-extract PDFs from stored bytes; queue recrawl for websites.
+- Re-index action: re-extract PDFs from stored bytes, re-split text, and recompile website pages with the current pipeline. Existing knowledge bases must be re-indexed once; approval is blocked until they are.
+- Approval gate: a source whose AI compilation did not run blocks approval; partial coverage requires an explicit acknowledgement that is audit-logged.
 
-Acceptance: the four-doctor directory fixture yields four records each with name, specialty and experience; a fixture PDF price table yields one record per row; coverage report shows 100% for both.
+Acceptance: the four-doctor directory fixture yields four records each with name, specialty and experience; a fixture PDF price table yields one record per row; coverage report shows complete for both. Delivered in commit sequence on the same branch as PR 1.
 
 ### PR 3. pgvector hybrid retrieval
 

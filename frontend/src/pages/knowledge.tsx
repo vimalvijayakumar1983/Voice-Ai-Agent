@@ -37,6 +37,7 @@ import {
   KnowledgeProcessingMode,
   KnowledgeScope,
   KnowledgeSource,
+  KnowledgeSourceCoverage,
   VoiceAgent,
 } from '@/lib/api';
 import styles from '@/styles/Knowledge.module.css';
@@ -151,6 +152,48 @@ export default function KnowledgeStudio() {
     } finally {
       setWorking(null);
     }
+  };
+
+  const approveSelected = async () => {
+    if (!selected) return;
+    const approving = selected.approval_status !== 'approved';
+    const successText = approving ? 'Knowledge approved for agent binding.' : 'Approval removed; bound agents require review.';
+    setWorking('approve');
+    setNotice(null);
+    try {
+      let updated: KnowledgeBase;
+      try {
+        updated = await api.approveKnowledgeBase(selected.id, approving);
+      } catch (error) {
+        const message = errorMessage(error, 'The knowledge operation failed.');
+        if (!approving || !message.includes('accept_partial_coverage')) throw error;
+        const acknowledged = window.confirm(
+          `${message.split(' Review the uncovered records')[0]}\n\nApprove anyway? Callers will not be able to get answers for the uncovered records until they are fixed.`,
+        );
+        if (!acknowledged) {
+          setNotice({ type: 'info', text: 'Approval cancelled. Review the uncovered records in each source, then approve again.' });
+          return;
+        }
+        updated = await api.approveKnowledgeBase(selected.id, true, true);
+      }
+      replaceKnowledgeBase(updated);
+      setNotice({ type: 'success', text: successText });
+    } catch (error) {
+      setNotice({ type: 'error', text: errorMessage(error, 'The knowledge operation failed.') });
+    } finally {
+      setWorking(null);
+    }
+  };
+
+  const reindexSelected = async () => {
+    if (!selected || !window.confirm(
+      `Re-index every source in ${selected.name}? VAV will re-extract, recompile and re-measure each source. Approval is withdrawn until the sources are ready again.`,
+    )) return;
+    await runAction(
+      'reindex',
+      () => api.reindexKnowledgeBase(selected.id),
+      'Re-indexing queued. Sources become ready again as compilation completes.',
+    );
   };
 
   const clearCreatePanels = () => {
@@ -417,6 +460,9 @@ export default function KnowledgeStudio() {
           <button type="button" className="btn btn-secondary" disabled={!selected || working !== null || !canEditKnowledge} onClick={() => selected && runAction('refresh', () => api.refreshKnowledgeBase(selected.id), 'Sources were recounted and duplicate pages merged.')}>
             <RefreshCw size={14} className={working === 'refresh' ? 'spin' : undefined} /> Refresh status
           </button>
+          {canEditKnowledge && <button type="button" className="btn btn-secondary" disabled={!selected || working !== null || !selected.sources.length} onClick={reindexSelected} title="Re-extract, recompile and re-measure coverage for every source">
+            <RefreshCw size={14} className={working === 'reindex' ? 'spin' : undefined} /> Re-index all sources
+          </button>}
           {canEditKnowledge && <button type="button" className="btn btn-secondary" disabled={working !== null} onClick={aiWizardVisible ? clearCreatePanels : openAIWizard}>
             {aiWizardVisible ? <X size={14} /> : <Sparkles size={14} />}{aiWizardVisible ? 'Close AI wizard' : 'Create with AI'}
           </button>}
@@ -568,8 +614,8 @@ export default function KnowledgeStudio() {
                   <div className={styles.approvalCard}>
                     <span className={styles.miniLabel}>Release gate</span>
                     <strong>{selected.approval_status === 'approved' ? 'Approved for agent use' : 'Draft—not available to agents'}</strong>
-                    <p>{selected.sync_status === 'ready' ? 'Every source has VAV-searchable content. An owner or admin may change approval.' : 'Make every source VAV-searchable before approval becomes available.'}</p>
-                    {canGovernKnowledge && <button type="button" className={`btn ${selected.approval_status === 'approved' ? 'btn-secondary' : 'btn-primary'} btn-sm`} disabled={working !== null || (selected.approval_status !== 'approved' && selected.sync_status !== 'ready')} onClick={() => runAction('approve', () => api.approveKnowledgeBase(selected.id, selected.approval_status !== 'approved'), selected.approval_status === 'approved' ? 'Approval removed; bound agents require review.' : 'Knowledge approved for agent binding.')}>
+                    <p>{selected.sync_status === 'ready' ? (coverageSummary(selected) || 'Every source has VAV-searchable content. An owner or admin may change approval.') : 'Make every source VAV-searchable before approval becomes available.'}</p>
+                    {canGovernKnowledge && <button type="button" className={`btn ${selected.approval_status === 'approved' ? 'btn-secondary' : 'btn-primary'} btn-sm`} disabled={working !== null || (selected.approval_status !== 'approved' && selected.sync_status !== 'ready')} onClick={() => approveSelected()}>
                       {selected.approval_status === 'approved' ? <X size={12} /> : <Check size={12} />}{selected.approval_status === 'approved' ? 'Return to draft' : 'Approve knowledge'}
                     </button>}
                   </div>
@@ -680,6 +726,7 @@ function SourcesSection({ sources, canRepair, canRemove, busy, onRepair, onRemov
   return <section className={styles.section} aria-labelledby="sources-heading"><div className={styles.sectionHeading}><div><span className={styles.sectionIcon}><Layers3 size={15} /></span><div><h3 id="sources-heading">Source inventory</h3><p>One canonical row per document. “Ready for agents” always requires searchable VAV text.</p></div></div><span className="badge badge-neutral">{sources.length} documents · {readyCount} ready</span></div>{sources.length === 0 ? <div className={styles.sourceEmpty}><FileText size={20} /><div><strong>No sources yet</strong><p>Add curated web pages, searchable text, or an approved PDF to begin.</p></div></div> : <div className={styles.sourceList}>{sources.map((source) => {
     const method = typeof source.source_metadata?.extraction_method === 'string' ? source.source_metadata.extraction_method : null;
     const compiler = sourceCompiler(source);
+    const coverage = sourceCoverage(source);
     const isReady = source.retrieval_ready && source.status === 'indexed';
     const recovery = sourceRecovery(source);
     const isWebsite = source.source_type === 'url' || source.source_type === 'website' || source.source_type === 'sitemap';
@@ -695,7 +742,7 @@ function SourcesSection({ sources, canRepair, canRemove, busy, onRepair, onRemov
         : null;
     const recoveryActive = recovery?.status === 'queued' || recovery?.status === 'processing';
     const refreshLabel = isReady ? 'Refresh page' : 'Repair page';
-    return <article className={styles.sourceRow} key={source.id}><span className={styles.sourceTypeIcon}>{source.source_type === 'file' ? <FileText size={16} /> : source.source_type === 'text' ? <Layers3 size={16} /> : <Globe2 size={16} />}</span><div className={styles.sourceIdentity}><strong>{source.name}</strong><span>{source.location || (source.size_bytes ? formatBytes(source.size_bytes) : source.source_type)} · {source.retrieval_ready ? `${source.extracted_character_count.toLocaleString()} searchable characters${method ? ` · ${method === 'native' ? 'text extracted' : method === 'static_html' ? 'HTML extracted' : method === 'javascript_render' ? 'JavaScript rendered' : method}` : ''}${compiler ? ` · ${compilerLabel(compiler)}` : ''}` : 'no voice-searchable text'}</span>{compiler?.warning && <p>{compiler.warning}</p>}{detail && <p className={recoveryActive ? styles.recoveryProgress : undefined}>{detail}</p>}{source.error_message && source.error_message !== detail && <p>{source.error_message}</p>}</div><span className={`badge ${isReady ? 'badge-success' : sourceBadge(source.status)}`}>{isReady ? 'Ready for agents' : recoveryActive ? recoveryStageLabel(recovery.stage) : source.status.replace('_', ' ')}</span><time>{formatDate(source.last_synced_at || source.updated_at)}</time><span className={styles.sourceActions}>{canRepair && repairable && <button type="button" className="btn btn-secondary btn-sm" disabled={busy || recoveryActive} onClick={() => onRepair(source)} aria-label={`${refreshLabel} ${source.name} and re-index its searchable content`} title="Download, render, extract, index and verify the latest page content"><RefreshCw size={12} className={recoveryActive ? 'spin' : undefined} /> {refreshLabel}</button>}{canRemove && <button type="button" className="icon-button" disabled={busy} onClick={() => onRemove(source)} aria-label={`Remove ${source.name} from VAV knowledge`} title="Remove from VAV knowledge"><Trash2 size={14} /></button>}</span></article>;
+    return <article className={styles.sourceRow} key={source.id}><span className={styles.sourceTypeIcon}>{source.source_type === 'file' ? <FileText size={16} /> : source.source_type === 'text' ? <Layers3 size={16} /> : <Globe2 size={16} />}</span><div className={styles.sourceIdentity}><strong>{source.name}</strong><span>{source.location || (source.size_bytes ? formatBytes(source.size_bytes) : source.source_type)} · {source.retrieval_ready ? `${source.extracted_character_count.toLocaleString()} searchable characters${method ? ` · ${method === 'native' ? 'text extracted' : method === 'static_html' ? 'HTML extracted' : method === 'javascript_render' ? 'JavaScript rendered' : method}` : ''}${compiler ? ` · ${compilerLabel(compiler)}` : ''}` : 'no voice-searchable text'}</span>{compiler?.warning && <p>{compiler.warning}</p>}{coverage && <p className={coverage.status === 'partial' || coverage.status === 'not_compiled' ? styles.coverageWarning : undefined}>{coverageLabel(coverage)}</p>}{detail && <p className={recoveryActive ? styles.recoveryProgress : undefined}>{detail}</p>}{source.error_message && source.error_message !== detail && <p>{source.error_message}</p>}</div><span className={`badge ${isReady ? 'badge-success' : sourceBadge(source.status)}`}>{isReady ? 'Ready for agents' : recoveryActive ? recoveryStageLabel(recovery.stage) : source.status.replace('_', ' ')}</span><time>{formatDate(source.last_synced_at || source.updated_at)}</time><span className={styles.sourceActions}>{canRepair && repairable && <button type="button" className="btn btn-secondary btn-sm" disabled={busy || recoveryActive} onClick={() => onRepair(source)} aria-label={`${refreshLabel} ${source.name} and re-index its searchable content`} title="Download, render, extract, index and verify the latest page content"><RefreshCw size={12} className={recoveryActive ? 'spin' : undefined} /> {refreshLabel}</button>}{canRemove && <button type="button" className="icon-button" disabled={busy} onClick={() => onRemove(source)} aria-label={`Remove ${source.name} from VAV knowledge`} title="Remove from VAV knowledge"><Trash2 size={14} /></button>}</span></article>;
   })}</div>}</section>;
 }
 
@@ -716,6 +763,23 @@ function scopeLabel(kb: KnowledgeBase) { return kb.scope_label || scopeOptions.f
 function sourceBadge(status: KnowledgeSource['status']) { if (status === 'indexed') return 'badge-success'; if (status === 'failed') return 'badge-danger'; if (status === 'processing' || status === 'pending') return 'badge-warning'; return 'badge-neutral'; }
 type SourceRecovery = { status?: string; stage?: string; message?: string };
 type SourceCompiler = { effective_mode?: string; model?: string; input_tokens?: number; output_tokens?: number; estimated_cost_usd?: number; estimated_cost_aed?: number; reused?: boolean; warning?: string | null };
+function sourceCoverage(source: KnowledgeSource): KnowledgeSourceCoverage | null { const value = source.source_metadata?.coverage; return value && typeof value === 'object' ? value as KnowledgeSourceCoverage : null; }
+function coverageLabel(coverage: KnowledgeSourceCoverage) {
+  if (coverage.status === 'skipped') return 'Coverage not measured: fast (deterministic) extraction was requested.';
+  if (coverage.status === 'not_compiled') return 'Not compiled: AI verification did not run. Re-index with an OpenAI key configured.';
+  const base = `${coverage.records_covered} of ${coverage.record_total} records captured as verified facts · ${coverage.facts_accepted} facts`;
+  if (coverage.status === 'complete') return `Coverage complete · ${base}`;
+  const examples = coverage.uncovered.slice(0, 3).join(' ; ');
+  return `Partial coverage · ${base}. Not captured: ${examples}${coverage.uncovered_total > 3 ? ` (+${coverage.uncovered_total - 3} more)` : ''}`;
+}
+function coverageSummary(kb: KnowledgeBase) {
+  const coverages = kb.sources.map(sourceCoverage);
+  const missing = coverages.filter((value) => !value || value.status === 'not_compiled').length;
+  const partial = coverages.filter((value) => value?.status === 'partial').length;
+  if (missing) return `${missing} source${missing === 1 ? '' : 's'} must be re-indexed to measure coverage before approval.`;
+  if (partial) return `${partial} source${partial === 1 ? ' has' : 's have'} partial coverage. Approval will ask you to acknowledge the uncovered records.`;
+  return 'Every source is compiled with complete coverage. An owner or admin may change approval.';
+}
 function sourceRecovery(source: KnowledgeSource): SourceRecovery | null { const value = source.source_metadata?.recovery; return value && typeof value === 'object' ? value as SourceRecovery : null; }
 function sourceCompiler(source: KnowledgeSource): SourceCompiler | null { const value = source.source_metadata?.compiler; return value && typeof value === 'object' ? value as SourceCompiler : null; }
 function compilerLabel(value: SourceCompiler) { if (value.reused) return 'unchanged · previous compilation reused'; if (value.effective_mode !== 'ai_verified') return 'deterministic knowledge'; const tokens = Number(value.input_tokens || 0) + Number(value.output_tokens || 0); const usd = Number(value.estimated_cost_usd || 0); const aed = Number(value.estimated_cost_aed || usd * 3.6725); return `AI-verified${value.model ? ` by ${value.model}` : ''} · ${tokens.toLocaleString()} tokens · $${usd.toFixed(4)} / AED ${aed.toFixed(4)}`; }

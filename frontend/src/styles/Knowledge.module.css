@@ -313,3 +313,4 @@
 @media (prefers-reduced-motion: reduce) {
   .progressRail > div { transition: none; }
 }
+.sourceIdentity .coverageWarning { color: var(--warning, #b45309); }

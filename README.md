@@ -249,7 +249,10 @@ content-addressed artifacts avoid uploading unchanged pages again. PDF uploads
 are validated and capped at 8 MiB. A knowledge base cannot be approved until
 every source is retrieval-ready. Ingestion and retrieval are local to VAV: no
 external knowledge provider is provisioned, and bound agents read the approved
-sources directly on every turn.
+sources directly on every turn. Every source type is extracted as records
+(directory cards, table rows, list entries, fields, paragraphs), compiled into
+verified facts, and measured for coverage; the report is stored on each source
+and shown in Knowledge Studio.
 
 | Action | Endpoint | Guardrail |
 | --- | --- | --- |
@@ -258,9 +261,11 @@ sources directly on every turn.
 | Repair failed crawl | `POST /api/v1/knowledge/{id}/crawls/{crawl_id}/retry` | Requeues discovery or only failed page ledgers |
 | Discover sitemap | `POST /api/v1/knowledge/{id}/sitemap/discover` | Public HTTPS sitemap only; selection required before indexing |
 | Index selected pages | `POST /api/v1/knowledge/{id}/sources/urls` | Public HTTPS URLs, de-duplicated, maximum 100 per request; each page is downloaded, compiled and indexed by VAV |
-| Upload PDF | `POST /api/v1/knowledge/{id}/sources/pdf` | PDF signature/type check; maximum 8 MiB |
+| Upload PDF | `POST /api/v1/knowledge/{id}/sources/pdf` | PDF signature/type check; maximum 8 MiB; tables extracted as rows, then compiled |
+| Add text | `POST /api/v1/knowledge/{id}/sources/text` | Split into records, then compiled and measured |
+| Re-index all sources | `POST /api/v1/knowledge/{id}/reindex` | Re-extracts, recompiles and re-measures coverage for every source |
 | Refresh | `POST /api/v1/knowledge/{id}/refresh` | Recounts sources and merges canonical URL duplicates locally |
-| Approve knowledge | `POST /api/v1/knowledge/{id}/approval` | Owner/admin; every source must have VAV-searchable text |
+| Approve knowledge | `POST /api/v1/knowledge/{id}/approval` | Owner/admin; every source compiled and measured; partial coverage needs explicit acknowledgement |
 | Bind to agent | `POST /api/v1/knowledge/{id}/bindings` | Owner/admin; VAV-native agents only; one knowledge base per agent |
 
 ## Verification

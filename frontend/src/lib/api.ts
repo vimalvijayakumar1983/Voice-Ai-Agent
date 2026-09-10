@@ -279,6 +279,18 @@ export type KnowledgeScope = 'workspace' | 'group' | 'division' | 'branch' | 'de
 export type KnowledgeSyncStatus = 'local_only' | 'processing' | 'ready' | 'error';
 export type KnowledgeProcessingMode = 'automatic' | 'fast' | 'ai_verified';
 
+export interface KnowledgeSourceCoverage {
+  status: 'complete' | 'partial' | 'not_compiled' | 'skipped';
+  record_total: number;
+  records_covered: number;
+  uncovered: string[];
+  uncovered_total: number;
+  entities_found: number;
+  entities_with_facts: number;
+  facts_accepted: number;
+  facts_rejected: number;
+}
+
 export interface KnowledgeSource {
   id: string;
   knowledge_base_id: string;
@@ -1760,11 +1772,15 @@ class ApiClient {
     return this.request<KnowledgeBase>(`/api/v1/knowledge/${id}/refresh`, { method: 'POST' });
   }
 
-  async approveKnowledgeBase(id: string, approved: boolean) {
+  async approveKnowledgeBase(id: string, approved: boolean, acceptPartialCoverage = false) {
     return this.request<KnowledgeBase>(`/api/v1/knowledge/${id}/approval`, {
       method: 'POST',
-      body: JSON.stringify({ approved }),
+      body: JSON.stringify({ approved, accept_partial_coverage: acceptPartialCoverage }),
     });
+  }
+
+  async reindexKnowledgeBase(id: string) {
+    return this.request<KnowledgeBase>(`/api/v1/knowledge/${id}/reindex`, { method: 'POST' });
   }
 
   async bindKnowledgeAgent(id: string, agentId: string) {

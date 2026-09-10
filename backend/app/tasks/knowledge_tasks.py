@@ -24,7 +24,15 @@ from app.services.knowledge_compiler import (
     COMPILER_VERSION,
     CompiledKnowledge,
     KnowledgeCompilerError,
-    compile_website_knowledge,
+    compile_knowledge,
+)
+from app.services.knowledge_records import (
+    KnowledgeRecord,
+    coverage_report,
+    records_from_payload,
+    records_from_text,
+    records_to_payload,
+    render_records,
 )
 from app.services.knowledge_sources import (
     canonical_source_url,
@@ -39,7 +47,7 @@ from app.services.website_recovery import (
     RecoveredPage,
     WebsiteRecoveryError,
     download_html,
-    extract_readable_text,
+    extract_page_records,
     recovery_metadata,
     render_html,
     should_render_javascript,
@@ -479,6 +487,132 @@ async def _mark_crawl_failed(crawl_id: UUID, message: str) -> None:
         await session.close()
 
 
+async def _openai_api_key(session, tenant_id: UUID) -> str:
+    """Resolve the compilation key: tenant override first, then the platform key."""
+    try:
+        openai_config = await load_provider_config(session, tenant_id, "openai")
+    except ProviderCredentialError:
+        openai_config = None
+    return str((openai_config or {}).get("api_key") or settings.openai_api_key).strip()
+
+
+def _store_compiled(
+    source: KnowledgeSource,
+    *,
+    compiled: CompiledKnowledge,
+    records: list[KnowledgeRecord],
+    requested_mode: str,
+    reused: bool,
+) -> dict:
+    """Persist compiled knowledge, records and the coverage report on one source."""
+    structured = dict(compiled.structured or {})
+    structured["records"] = records_to_payload(records)
+    coverage = coverage_report(
+        records,
+        structured,
+        requested_mode=requested_mode,
+        effective_mode=compiled.effective_mode,
+    )
+    now = datetime.now(UTC)
+    source.content = compiled.content
+    source.structured_content = structured
+    source.compiled_at = source.compiled_at if reused and source.compiled_at else now
+    source.last_synced_at = now
+    metadata = dict(source.source_metadata or {})
+    metadata.pop("force_recompile", None)
+    metadata["coverage"] = coverage
+    metadata["record_count"] = len(records)
+    metadata["compiler"] = {**(structured.get("compiler") or {}), "reused": reused}
+    source.source_metadata = metadata
+    return coverage
+
+
+async def _compile_source(tenant_id: UUID, kb_id: UUID, source_id: UUID) -> None:
+    """Compile a PDF or pasted-text source that VAV already extracted."""
+    session, knowledge_base, source = await _context(tenant_id, kb_id, source_id)
+    try:
+        metadata = dict(source.source_metadata or {})
+        requested_mode = str(metadata.get("processing_mode") or "automatic")
+        if requested_mode not in {"automatic", "fast", "ai_verified"}:
+            requested_mode = "automatic"
+        text = str(source.raw_content or source.content or "")
+        records = records_from_payload((source.structured_content or {}).get("records"))
+        if not records:
+            records = records_from_text(text)
+            text = render_records(records) or text
+            source.raw_content = text
+        source_kind = "pdf" if source.source_type == "file" else "text"
+        api_key = await _openai_api_key(session, tenant_id)
+    finally:
+        await session.close()
+    if not text.strip():
+        raise KnowledgeCompilerError("The source has no extracted text to compile.")
+
+    compiled = await compile_knowledge(
+        title=source.name,
+        url=source.location or source.name,
+        text=text,
+        requested_mode=requested_mode,  # type: ignore[arg-type]
+        api_key=api_key or None,
+        source_kind=source_kind,
+    )
+
+    session, knowledge_base, source = await _context(tenant_id, kb_id, source_id)
+    try:
+        coverage = _store_compiled(
+            source,
+            compiled=compiled,
+            records=records,
+            requested_mode=requested_mode,
+            reused=False,
+        )
+        source.status = "indexed"
+        source.error_message = None
+        knowledge_base.last_synced_at = datetime.now(UTC)
+        _recount(knowledge_base)
+        mark_knowledge_bindings_live(knowledge_base)
+        await record_audit_event(
+            session,
+            tenant_id=tenant_id,
+            actor_user_id=None,
+            action="knowledge_source.compiled",
+            resource_type="knowledge_source",
+            resource_id=str(source.id),
+            details={
+                "source_type": source.source_type,
+                "processing_mode": requested_mode,
+                "compiler_mode": compiled.effective_mode,
+                "compiler_model": compiled.model,
+                "compiler_input_tokens": compiled.input_tokens,
+                "compiler_output_tokens": compiled.output_tokens,
+                "compiler_estimated_cost_usd": round(compiled.estimated_cost_usd, 8),
+                "coverage_status": coverage["status"],
+                "records_covered": coverage["records_covered"],
+                "record_total": coverage["record_total"],
+            },
+        )
+        await session.commit()
+    finally:
+        await session.close()
+
+
+async def _mark_compile_failed(
+    tenant_id: UUID, kb_id: UUID, source_id: UUID, *, message: str
+) -> None:
+    try:
+        session, knowledge_base, source = await _context(tenant_id, kb_id, source_id)
+    except WebsiteRecoveryError:
+        return
+    try:
+        source.status = "failed"
+        source.error_message = message[:1000]
+        source.last_synced_at = datetime.now(UTC)
+        _recount(knowledge_base)
+        await session.commit()
+    finally:
+        await session.close()
+
+
 async def _repair(tenant_id: UUID, kb_id: UUID, source_id: UUID) -> None:
     await _set_stage(
         tenant_id,
@@ -497,18 +631,16 @@ async def _repair(tenant_id: UUID, kb_id: UUID, source_id: UUID) -> None:
     existing_compiled_content = source.content
     existing_structured_content = source.structured_content
     staged_refresh = bool(source_metadata.get("staged_refresh"))
-    try:
-        openai_config = await load_provider_config(session, tenant_id, "openai")
-    except ProviderCredentialError:
-        openai_config = None
-    openai_api_key = str((openai_config or {}).get("api_key") or settings.openai_api_key).strip()
+    force_recompile = bool(source_metadata.get("force_recompile"))
+    openai_api_key = await _openai_api_key(session, tenant_id)
     await session.close()
     if not location:
         raise WebsiteRecoveryError("The source has no website URL.", code="invalid_source")
 
     final_url, static_html, downloaded_bytes = await download_html(location)
     try:
-        title, text = extract_readable_text(static_html, url=final_url)
+        title, records = extract_page_records(static_html, url=final_url)
+        text = render_records(records)
         static_page = RecoveredPage(final_url, title, text, "static_html", downloaded_bytes)
         if should_render_javascript(static_html, text):
             await _set_stage(
@@ -520,7 +652,8 @@ async def _repair(tenant_id: UUID, kb_id: UUID, source_id: UUID) -> None:
             )
             try:
                 rendered_html, rendered_bytes = await render_html(final_url)
-                title, text = extract_readable_text(rendered_html, url=final_url)
+                title, records = extract_page_records(rendered_html, url=final_url)
+                text = render_records(records)
                 page = RecoveredPage(
                     final_url,
                     title,
@@ -543,7 +676,8 @@ async def _repair(tenant_id: UUID, kb_id: UUID, source_id: UUID) -> None:
             "The raw page had no usable text. VAV is rendering its JavaScript content.",
         )
         rendered_html, rendered_bytes = await render_html(final_url)
-        title, text = extract_readable_text(rendered_html, url=final_url)
+        title, records = extract_page_records(rendered_html, url=final_url)
+        text = render_records(records)
         page = RecoveredPage(final_url, title, text, "javascript_render", rendered_bytes)
     await _set_stage(
         tenant_id,
@@ -570,7 +704,8 @@ async def _repair(tenant_id: UUID, kb_id: UUID, source_id: UUID) -> None:
             await session.close()
         staged_refresh = False
     reused_compilation = bool(
-        existing_content_sha256 == raw_content_sha256
+        not force_recompile
+        and existing_content_sha256 == raw_content_sha256
         and existing_compiled_content
         and existing_structured_content
         and (existing_structured_content.get("compiler") or {}).get("version") == COMPILER_VERSION
@@ -598,12 +733,13 @@ async def _repair(tenant_id: UUID, kb_id: UUID, source_id: UUID) -> None:
             "compiling",
             "Structuring extracted knowledge and verifying every AI fact against its source.",
         )
-        compiled = await compile_website_knowledge(
+        compiled = await compile_knowledge(
             title=page.title,
             url=page.url,
             text=page.text,
             requested_mode=requested_mode,
             api_key=openai_api_key or None,
+            source_kind="website",
         )
     await _set_stage(
         tenant_id,
@@ -618,14 +754,19 @@ async def _repair(tenant_id: UUID, kb_id: UUID, source_id: UUID) -> None:
         source.name = page.title[:255]
         source.location = page.url
         source.raw_content = page.text
-        source.content = compiled.content
-        source.structured_content = compiled.structured
         source.content_sha256 = raw_content_sha256
         source.mime_type = "text/html"
         source.size_bytes = page.downloaded_bytes
         source.status = "indexed"
         source.provider_item_id = None
         source.error_message = None
+        coverage = _store_compiled(
+            source,
+            compiled=compiled,
+            records=records,
+            requested_mode=requested_mode,
+            reused=reused_compilation,
+        )
         metadata = dict(source.source_metadata or {})
         metadata.pop("staged_refresh", None)
         metadata.pop("provider_artifact_name", None)
@@ -634,23 +775,21 @@ async def _repair(tenant_id: UUID, kb_id: UUID, source_id: UUID) -> None:
                 "extraction_method": page.method,
                 "content_sha256": content_sha256,
                 "retrieval_content_source": "vav_website_recovery",
-                "compiler": {
-                    **(compiled.structured.get("compiler") or {}),
-                    "reused": reused_compilation,
-                },
             }
         )
         source.source_metadata = recovery_metadata(
             metadata,
             stage="verified",
             status="completed",
-            message="Readable text was extracted, compiled and indexed for agent retrieval.",
+            message=(
+                "Readable text was extracted, compiled and indexed for agent retrieval."
+                if coverage["status"] in {"complete", "skipped"}
+                else "Indexed, but some records were not captured as facts; review coverage."
+            ),
             method=page.method,
             extracted_characters=len(page.text),
         )
         now = datetime.now(UTC)
-        source.compiled_at = source.compiled_at if reused_compilation else now
-        source.last_synced_at = now
         knowledge_base.last_synced_at = now
 
         await consolidate_duplicate_url_sources(
@@ -677,6 +816,9 @@ async def _repair(tenant_id: UUID, kb_id: UUID, source_id: UUID) -> None:
                 "compiler_output_tokens": compiled.output_tokens,
                 "compiler_estimated_cost_usd": round(compiled.estimated_cost_usd, 8),
                 "compilation_reused": reused_compilation,
+                "coverage_status": coverage["status"],
+                "records_covered": coverage["records_covered"],
+                "record_total": coverage["record_total"],
             },
         )
         await session.commit()
@@ -835,5 +977,39 @@ def repair_website_source(self, tenant_id: str, knowledge_base_id: str, source_i
                 source_uuid,
                 message="VAV could not complete website recovery. Retry the page.",
                 code="unexpected_failure",
+            )
+        )
+
+
+@celery_app.task(
+    name="app.tasks.knowledge_tasks.compile_knowledge_source",
+    bind=True,
+    max_retries=2,
+)
+def compile_knowledge_source(self, tenant_id: str, knowledge_base_id: str, source_id: str):
+    tenant_uuid = UUID(tenant_id)
+    knowledge_uuid = UUID(knowledge_base_id)
+    source_uuid = UUID(source_id)
+    try:
+        _run_async(_compile_source(tenant_uuid, knowledge_uuid, source_uuid))
+    except KnowledgeCompilerError as exc:
+        _run_async(_mark_compile_failed(tenant_uuid, knowledge_uuid, source_uuid, message=str(exc)))
+    except WebsiteRecoveryError:
+        # The source or knowledge base was deleted while queued.
+        return
+    except Exception:
+        logger.exception(
+            "knowledge_source_compile_unexpected_failure",
+            knowledge_base_id=knowledge_base_id,
+            source_id=source_id,
+        )
+        if self.request.retries < self.max_retries:
+            raise self.retry(countdown=5 * (self.request.retries + 1))
+        _run_async(
+            _mark_compile_failed(
+                tenant_uuid,
+                knowledge_uuid,
+                source_uuid,
+                message="VAV could not compile this source. Re-index it to retry.",
             )
         )

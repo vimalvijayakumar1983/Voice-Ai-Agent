@@ -43,6 +43,12 @@ from app.services.knowledge_ai_wizard import (
     KnowledgeAIWizardError,
     generate_knowledge_ai_draft,
 )
+from app.services.knowledge_records import (
+    coverage_blocks_approval,
+    records_from_text,
+    records_to_payload,
+    render_records,
+)
 from app.services.knowledge_sources import (
     KNOWLEDGE_PROVIDER,
     VAV_NATIVE_KNOWLEDGE_PROVIDERS,
@@ -185,6 +191,46 @@ def _retrieval_signature(kb: KnowledgeBase) -> tuple[tuple[str, str, str, str], 
             for source in kb.sources
         )
     )
+
+
+def _queue_compilation(tenant_id: UUID, kb_id: UUID, source_ids: list[UUID]) -> list[UUID]:
+    """Queue local compilation for sources; return the IDs that could not be queued."""
+    from app.tasks.knowledge_tasks import compile_knowledge_source
+
+    failed: list[UUID] = []
+    for source_id in source_ids:
+        try:
+            compile_knowledge_source.apply_async(
+                args=[str(tenant_id), str(kb_id), str(source_id)],
+                queue="knowledge",
+            )
+        except Exception:
+            failed.append(source_id)
+    return failed
+
+
+def _mark_unqueued_sources_failed(kb: KnowledgeBase, source_ids: list[UUID]) -> None:
+    for source in kb.sources:
+        if source.id in source_ids:
+            source.status = "failed"
+            source.error_message = (
+                "The knowledge worker is temporarily unavailable. Re-index this source."
+            )
+    _recount(kb)
+
+
+def _coverage_blockers(kb: KnowledgeBase) -> tuple[list[str], list[str]]:
+    """Return (sources blocked outright, sources with partial coverage)."""
+    blocked: list[str] = []
+    partial: list[str] = []
+    for source in kb.sources:
+        coverage = (source.source_metadata or {}).get("coverage")
+        reason = coverage_blocks_approval(coverage)
+        if reason is not None:
+            blocked.append(f"{source.name}: {reason}")
+        elif isinstance(coverage, dict) and coverage.get("status") == "partial":
+            partial.append(source.name)
+    return blocked, partial
 
 
 @router.get("", response_model=list[KnowledgeBaseResponse])
@@ -593,19 +639,25 @@ async def add_text_source(
 ):
     kb = await _get_knowledge_base(db, current_user.tenant_id, kb_id)
     approval_invalidated = invalidate_knowledge_approval(kb)
-    kb.sources.append(
-        KnowledgeSource(
-            tenant_id=current_user.tenant_id,
-            source_type="text",
-            name=data.name,
-            content=data.content,
-            size_bytes=len(data.content.encode()),
-            status="indexed",
-            source_metadata={"retrieval_content_source": "vav_text"},
-        )
+    records = records_from_text(data.content)
+    rendered = render_records(records) or data.content
+    source = KnowledgeSource(
+        tenant_id=current_user.tenant_id,
+        source_type="text",
+        name=data.name,
+        raw_content=rendered,
+        content=rendered,
+        structured_content={"records": records_to_payload(records)},
+        size_bytes=len(data.content.encode()),
+        status="processing",
+        source_metadata={
+            "retrieval_content_source": "vav_text",
+            "processing_mode": "automatic",
+            "record_count": len(records),
+        },
     )
+    kb.sources.append(source)
     _recount(kb)
-    mark_knowledge_bindings_live(kb)
     await db.flush()
     await record_audit_event(
         db,
@@ -617,9 +669,17 @@ async def add_text_source(
         details={
             "name": data.name,
             "bytes": len(data.content.encode()),
+            "records": len(records),
             "approval_invalidated": approval_invalidated,
         },
     )
+    # The worker must never race the request transaction that records the source.
+    await db.commit()
+    unqueued = _queue_compilation(current_user.tenant_id, kb.id, [source.id])
+    kb = await _get_knowledge_base(db, current_user.tenant_id, kb.id)
+    if unqueued:
+        _mark_unqueued_sources_failed(kb, unqueued)
+        await db.commit()
     return _knowledge_response(kb)
 
 
@@ -757,23 +817,25 @@ async def upload_pdf_source(
     source.name = filename
     source.content = prepared.extracted_text
     source.raw_content = prepared.extracted_text
+    source.structured_content = {"records": records_to_payload(list(prepared.records))}
     source.file_content = content
     source.mime_type = "application/pdf"
     source.size_bytes = len(content)
-    source.status = "indexed"
+    source.status = "processing"
     source.provider_item_id = None
     source.error_message = None
     source.source_metadata = {
         "retrieval_content_source": "vav_pdf_ingestion",
+        "processing_mode": "automatic",
         "extraction_method": prepared.extraction_method,
         "page_count": prepared.page_count,
         "ocr_page_count": prepared.ocr_page_count,
+        "record_count": len(prepared.records),
         "sha256": prepared.sha256,
     }
     source.last_synced_at = now
     _recount(kb)
     kb.last_synced_at = now
-    mark_knowledge_bindings_live(kb)
     await db.flush()
     await record_audit_event(
         db,
@@ -788,12 +850,19 @@ async def upload_pdf_source(
             "name": filename,
             "bytes": len(content),
             "characters": len(prepared.extracted_text),
+            "records": len(prepared.records),
             "extraction_method": prepared.extraction_method,
             "ocr_pages": prepared.ocr_page_count,
             "replaced_existing": bool(existing_source),
             "approval_invalidated": approval_invalidated,
         },
     )
+    await db.commit()
+    unqueued = _queue_compilation(current_user.tenant_id, kb.id, [source.id])
+    kb = await _get_knowledge_base(db, current_user.tenant_id, kb.id)
+    if unqueued:
+        _mark_unqueued_sources_failed(kb, unqueued)
+        await db.commit()
     return _knowledge_response(kb)
 
 
@@ -864,6 +933,126 @@ async def refresh_knowledge_base(
     return _knowledge_response(kb)
 
 
+@router.post(
+    "/{kb_id}/reindex",
+    response_model=KnowledgeBaseResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def reindex_knowledge_base(
+    kb_id: UUID,
+    current_user: CurrentUser = Depends(require_role("owner", "admin", "member")),
+    db: AsyncSession = Depends(get_db),
+):
+    """Re-extract, recompile and re-measure every source with the current pipeline."""
+    kb = await _get_knowledge_base(db, current_user.tenant_id, kb_id)
+    if not kb.sources:
+        raise HTTPException(status_code=409, detail="This knowledge base has no sources")
+    approval_invalidated = invalidate_knowledge_approval(kb)
+    compile_ids: list[UUID] = []
+    repair_ids: list[UUID] = []
+    for source in kb.sources:
+        metadata = dict(source.source_metadata or {})
+        metadata.pop("coverage", None)
+        metadata.setdefault("processing_mode", "automatic")
+        if source.source_type == "file":
+            if not source.file_content:
+                source.status = "failed"
+                source.error_message = "The original PDF is not stored. Upload it again."
+                source.source_metadata = metadata
+                continue
+            try:
+                prepared: PreparedPdf = await asyncio.to_thread(
+                    prepare_pdf,
+                    bytes(source.file_content),
+                    languages=kb.languages,
+                )
+            except PdfIngestionError as exc:
+                source.status = "failed"
+                source.error_message = str(exc)
+                source.source_metadata = metadata
+                continue
+            source.raw_content = prepared.extracted_text
+            source.content = prepared.extracted_text
+            source.structured_content = {"records": records_to_payload(list(prepared.records))}
+            metadata.update(
+                {
+                    "extraction_method": prepared.extraction_method,
+                    "page_count": prepared.page_count,
+                    "ocr_page_count": prepared.ocr_page_count,
+                    "record_count": len(prepared.records),
+                    "sha256": prepared.sha256,
+                }
+            )
+            source.status = "processing"
+            source.error_message = None
+            source.source_metadata = metadata
+            compile_ids.append(source.id)
+        elif source.source_type == "text":
+            text = str(source.raw_content or source.content or "")
+            records = records_from_text(text)
+            rendered = render_records(records) or text
+            source.raw_content = rendered
+            source.content = rendered
+            source.structured_content = {"records": records_to_payload(records)}
+            metadata["record_count"] = len(records)
+            source.status = "processing"
+            source.error_message = None
+            source.source_metadata = metadata
+            compile_ids.append(source.id)
+        elif source.location:
+            metadata["force_recompile"] = True
+            metadata["recovery_attempts"] = int(metadata.get("recovery_attempts") or 0) + 1
+            source.status = "processing"
+            source.error_message = None
+            source.source_metadata = recovery_metadata(
+                metadata,
+                stage="queued",
+                status="queued",
+                message="Queued for re-extraction and recompilation with the current pipeline.",
+            )
+            repair_ids.append(source.id)
+    _recount(kb)
+    kb.sync_error = None
+    await record_audit_event(
+        db,
+        tenant_id=current_user.tenant_id,
+        actor_user_id=current_user.id,
+        action="knowledge_base.reindex_queued",
+        resource_type="knowledge_base",
+        resource_id=str(kb.id),
+        details={
+            "compile_sources": len(compile_ids),
+            "repair_sources": len(repair_ids),
+            "approval_invalidated": approval_invalidated,
+        },
+    )
+    await db.commit()
+
+    from app.tasks.knowledge_tasks import _mark_failed
+    from app.tasks.knowledge_tasks import repair_website_source as repair_task
+
+    unqueued = _queue_compilation(current_user.tenant_id, kb.id, compile_ids)
+    for source_id in repair_ids:
+        try:
+            repair_task.apply_async(
+                args=[str(current_user.tenant_id), str(kb.id), str(source_id)],
+                queue="knowledge",
+            )
+        except Exception:
+            await _mark_failed(
+                current_user.tenant_id,
+                kb.id,
+                source_id,
+                message="The page-extraction worker is temporarily unavailable. Retry this page.",
+                code="worker_unavailable",
+            )
+    kb = await _get_knowledge_base(db, current_user.tenant_id, kb.id)
+    if unqueued:
+        _mark_unqueued_sources_failed(kb, unqueued)
+        await db.commit()
+    return _knowledge_response(kb)
+
+
 @router.post("/{kb_id}/approval", response_model=KnowledgeBaseResponse)
 async def set_knowledge_approval(
     kb_id: UUID,
@@ -873,11 +1062,32 @@ async def set_knowledge_approval(
 ):
     kb = await _get_knowledge_base(db, current_user.tenant_id, kb_id)
     _recount(kb)
-    if data.approved and (kb.sync_status != "ready" or not kb.indexed_source_count):
-        raise HTTPException(
-            status_code=409,
-            detail="Make every source VAV-searchable before approving this knowledge base",
-        )
+    partial_sources: list[str] = []
+    if data.approved:
+        if kb.sync_status != "ready" or not kb.indexed_source_count:
+            raise HTTPException(
+                status_code=409,
+                detail="Make every source VAV-searchable before approving this knowledge base",
+            )
+        blocked, partial_sources = _coverage_blockers(kb)
+        if blocked:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Re-index these sources so VAV can compile and measure them before "
+                    "approval: " + "; ".join(blocked[:5])
+                ),
+            )
+        if partial_sources and not data.accept_partial_coverage:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Partial coverage: some records in "
+                    + ", ".join(partial_sources[:5])
+                    + " were not captured as verified facts. Review the uncovered records, "
+                    "or approve with accept_partial_coverage to acknowledge the gap."
+                ),
+            )
     kb.approval_status = "approved" if data.approved else "draft"
     kb.published_at = datetime.now(UTC) if data.approved else None
     await record_audit_event(
@@ -887,7 +1097,11 @@ async def set_knowledge_approval(
         action="knowledge_base.approval_changed",
         resource_type="knowledge_base",
         resource_id=str(kb.id),
-        details={"approved": data.approved},
+        details={
+            "approved": data.approved,
+            "accepted_partial_coverage": bool(data.approved and partial_sources),
+            "partial_coverage_sources": partial_sources[:20],
+        },
     )
     return _knowledge_response(kb)
 
