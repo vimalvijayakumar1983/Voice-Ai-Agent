@@ -52,7 +52,7 @@ from app.services.website_recovery import (
     extract_page_records,
     find_next_page_url,
     recovery_metadata,
-    render_html,
+    render_page,
     should_render_javascript,
 )
 from app.tasks.async_runner import run_async as _run_async
@@ -990,8 +990,8 @@ async def _commit_repair_success(
 
 
 async def _fetch_rendered(url: str) -> tuple[str, str, int]:
-    document, downloaded_bytes = await render_html(url)
-    return url, document, downloaded_bytes
+    """Fetch a listing page through the renderer, reporting the browser's final URL."""
+    return await render_page(url)
 
 
 async def _follow_pagination(
@@ -1119,25 +1119,30 @@ async def _repair(
                 repair_run_id=repair_run_id,
             ):
                 return
+            rendered_signatures: set[tuple[str, tuple[str, ...]]] = set()
             try:
-                rendered_html, rendered_bytes = await render_html(final_url)
-                rendered_signatures: set[tuple[str, tuple[str, ...]]] = set()
-                title, records = extract_page_records(
-                    rendered_html, url=final_url, card_signatures=rendered_signatures
+                rendered_url, rendered_html, rendered_bytes = await render_page(final_url)
+                title, rendered_records = extract_page_records(
+                    rendered_html, url=rendered_url, card_signatures=rendered_signatures
                 )
-                text = render_records(records)
+            except WebsiteRecoveryError:
+                # Only the initial render may fall back to the usable static
+                # page. A failure while paginating below is not swallowed:
+                # that would index exactly the truncated listing that
+                # _follow_pagination exists to reject.
+                page = static_page
+            else:
+                records = rendered_records
                 page = RecoveredPage(
-                    final_url,
+                    rendered_url,
                     title,
-                    text,
+                    render_records(records),
                     "javascript_render",
                     rendered_bytes,
                 )
                 page, records = await _follow_pagination(
                     page, rendered_html, records, rendered_signatures, fetch=_fetch_rendered
                 )
-            except WebsiteRecoveryError:
-                page = static_page
         else:
             page = static_page
     except WebsiteRecoveryError as exc:
@@ -1152,13 +1157,13 @@ async def _repair(
             repair_run_id=repair_run_id,
         ):
             return
-        rendered_html, rendered_bytes = await render_html(final_url)
+        rendered_url, rendered_html, rendered_bytes = await render_page(final_url)
         rendered_signatures = set()
         title, records = extract_page_records(
-            rendered_html, url=final_url, card_signatures=rendered_signatures
+            rendered_html, url=rendered_url, card_signatures=rendered_signatures
         )
         text = render_records(records)
-        page = RecoveredPage(final_url, title, text, "javascript_render", rendered_bytes)
+        page = RecoveredPage(rendered_url, title, text, "javascript_render", rendered_bytes)
         page, records = await _follow_pagination(
             page, rendered_html, records, rendered_signatures, fetch=_fetch_rendered
         )
