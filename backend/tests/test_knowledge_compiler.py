@@ -616,3 +616,26 @@ async def test_cut_off_model_reply_is_reported_not_parsed():
     from app.services.knowledge_compiler import _failure_reason
 
     assert _failure_reason(failure.value).startswith("KnowledgeCompilerError: AI reply was cut off")
+
+
+def test_segments_after_the_first_open_with_the_active_heading_context():
+    from app.services.knowledge_compiler import _record_segments
+
+    doctors = [f"Dr Number{index} | General Practitioner" for index in range(1, 7)]
+    nurses = [f"Nurse Number{index} | Paediatrics" for index in range(1, 7)]
+    text = "\n\n".join(["Royal Medical Center", "Our Doctors", *doctors, "Our Nurses", *nurses])
+
+    segments = _record_segments(text, limit=170)
+
+    assert len(segments) >= 3
+    assert segments[0].startswith("Royal Medical Center\n\nOur Doctors")
+    for segment in segments[1:]:
+        assert segment.startswith("Royal Medical Center\n\n")
+    doctor_segments = [segment for segment in segments if "Dr Number" in segment]
+    nurse_segments = [segment for segment in segments if "Nurse Number" in segment]
+    assert all("Our Doctors" in segment for segment in doctor_segments)
+    assert all("Our Nurses" in segment for segment in nurse_segments[1:] or nurse_segments)
+    # Every record appears exactly once across the segments.
+    joined = "\n\n".join(segments)
+    for record in doctors + nurses:
+        assert joined.count(record) == 1

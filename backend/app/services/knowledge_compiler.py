@@ -609,24 +609,55 @@ _MAX_COMPLETION_TOKENS = 16_000
 _SEGMENT_CONCURRENCY = 5
 
 
+_HEADING_MAX_CHARS = 90
+
+
+def _looks_like_heading(block: str) -> bool:
+    """A short single-line block without record separators or sentence punctuation."""
+    line = block.strip()
+    return (
+        0 < len(line) <= _HEADING_MAX_CHARS
+        and "\n" not in line
+        and " | " not in line
+        and not line.endswith((".", "!", "?", ":", ";"))
+    )
+
+
 def _record_segments(text: str, *, limit: int | None = None) -> list[str]:
     """Split rendered records (blank-line separated) into segments under ``limit``.
 
     Records are never cut in half; a single record longer than the limit is
-    sliced with a small overlap so nothing is dropped.
+    sliced with a small overlap so nothing is dropped. Every segment after the
+    first opens with the heading context in force at that point (the page's
+    opening heading and the most recent section heading), so a record such as
+    "Dr Name | Cardiology" still sits under the organisation and section that
+    give it an explicit subject when the compiler validates its evidence.
     """
     limit = _SEGMENT_CHARS if limit is None else limit
     if len(text) <= limit:
         return [text]
     blocks = [block for block in re.split(r"\n\s*\n", text) if block.strip()]
+    opening = blocks[0].strip() if blocks and _looks_like_heading(blocks[0]) else ""
+    section = ""
     segments: list[str] = []
     current: list[str] = []
     size = 0
+
+    def context() -> list[str]:
+        return [part for part in dict.fromkeys((opening, section)) if part]
+
+    def open_segment() -> None:
+        nonlocal current, size
+        current = context()
+        size = sum(len(part) + 2 for part in current)
+
+    def close_segment() -> None:
+        if any(part not in context() for part in current):
+            segments.append("\n\n".join(current))
+
     for block in blocks:
         if len(block) > limit:
-            if current:
-                segments.append("\n\n".join(current))
-                current, size = [], 0
+            close_segment()
             start = 0
             while start < len(block):
                 end = min(start + limit, len(block))
@@ -634,14 +665,17 @@ def _record_segments(text: str, *, limit: int | None = None) -> list[str]:
                 if end == len(block):
                     break
                 start = max(end - 200, start + 1)
+            open_segment()
             continue
         if current and size + len(block) + 2 > limit:
-            segments.append("\n\n".join(current))
-            current, size = [], 0
-        current.append(block)
-        size += len(block) + 2
-    if current:
-        segments.append("\n\n".join(current))
+            close_segment()
+            open_segment()
+        if block.strip() not in current:
+            current.append(block)
+            size += len(block) + 2
+        if _looks_like_heading(block) and block.strip() != opening:
+            section = block.strip()
+    close_segment()
     return segments or [text]
 
 

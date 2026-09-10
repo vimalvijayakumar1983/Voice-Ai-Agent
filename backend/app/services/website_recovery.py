@@ -684,6 +684,64 @@ async def render_page(url: str) -> tuple[str, str, int]:
 _NEXT_CONTROL_PATTERN = re.compile(r"^\s*(next|next page|next\s*[»›]|[»›→])\s*$", re.IGNORECASE)
 
 
+_LISTING_FINGERPRINT_JS = """() => {
+  const body = document.body;
+  if (!body) return "";
+  const html = body.innerHTML;
+  const text = body.innerText || "";
+  return `${location.href}|${html.length}|${text.length}|`
+    + html.slice(0, 2000) + "|" + html.slice(-2000);
+}"""
+_LISTING_CHANGE_TIMEOUT_MS = 15_000
+_LISTING_SETTLE_POLL_MS = 500
+_LISTING_SETTLE_MAX_MS = 6_000
+
+
+async def _listing_fingerprint(page) -> str:
+    return str(await page.evaluate(_LISTING_FINGERPRINT_JS))
+
+
+async def _wait_for_listing_change(page, before: str) -> bool:
+    """Wait until the listing's DOM differs from ``before`` and then stops changing.
+
+    A client-side Next button fetches the next page without navigating, so the
+    document's load state is already idle and says nothing about the cards.
+    The renderer therefore waits for the body to change, then for it to hold
+    still across consecutive polls, so a loading shell is never captured as a
+    page. Returns False when nothing changed within the timeout.
+    """
+    from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+
+    try:
+        await page.wait_for_function(
+            "(before) => { const body = document.body; if (!body) return false;"
+            " const html = body.innerHTML; const text = body.innerText || '';"
+            " const now = `${location.href}|${html.length}|${text.length}|`"
+            " + html.slice(0, 2000) + '|' + html.slice(-2000); return now !== before; }",
+            arg=before,
+            timeout=_LISTING_CHANGE_TIMEOUT_MS,
+        )
+    except PlaywrightTimeoutError:
+        return False
+    except Exception:
+        # A Next link that navigates destroys the execution context mid-wait;
+        # the navigation itself is the change.
+        with suppress(Exception):
+            await page.wait_for_load_state("domcontentloaded", timeout=20_000)
+    with suppress(PlaywrightTimeoutError):
+        await page.wait_for_load_state("networkidle", timeout=5_000)
+    previous = await _listing_fingerprint(page)
+    waited = 0
+    while waited < _LISTING_SETTLE_MAX_MS:
+        await page.wait_for_timeout(_LISTING_SETTLE_POLL_MS)
+        waited += _LISTING_SETTLE_POLL_MS
+        current = await _listing_fingerprint(page)
+        if current == previous:
+            break
+        previous = current
+    return True
+
+
 async def _next_listing_control(page):
     """The visible, enabled "Next" link or button of a listing, if it has one."""
     for role in ("link", "button"):
@@ -845,31 +903,38 @@ async def render_listing(
                 (final._replace(fragment="").geturl(), document, len(document.encode("utf-8")))
             ]
             while len(documents) < max_pages:
-                control = await _next_listing_control(page)
-                if control is None:
-                    break
+                page_number = len(documents) + 1
                 try:
+                    control = await _next_listing_control(page)
+                    if control is None:
+                        break
+                    before = await _listing_fingerprint(page)
                     await control.click(timeout=5_000)
-                    with suppress(PlaywrightTimeoutError):
-                        await page.wait_for_load_state("networkidle", timeout=5_000)
-                    await page.wait_for_timeout(750)
-                except PlaywrightTimeoutError as exc:
+                    changed = await _wait_for_listing_change(page, before)
+                    if not changed:
+                        break  # The control did nothing: the listing has no further page.
+                    current = urlsplit(page.url)
+                    if current.scheme != "https" or current.hostname != hostname:
+                        raise WebsiteRecoveryError(
+                            "The listing's Next control left its approved website host.",
+                            code="pagination_incomplete",
+                        )
+                    next_document = await page.content()
+                except WebsiteRecoveryError:
+                    raise
+                except Exception as exc:
+                    # Once a Next control was found, every failure while advancing
+                    # or capturing (a detached element, a destroyed context, a
+                    # timeout) means the listing is incomplete, never "rendered".
                     raise WebsiteRecoveryError(
-                        f"Page {len(documents) + 1} of this listing did not load after "
+                        f"Page {page_number} of this listing could not be captured after "
                         "its Next control was activated, so the listing would be incomplete.",
                         code="pagination_incomplete",
                         retryable=True,
                     ) from exc
-                current = urlsplit(page.url)
-                if current.scheme != "https" or current.hostname != hostname:
-                    raise WebsiteRecoveryError(
-                        "The listing's Next control left its approved website host.",
-                        code="pagination_incomplete",
-                    )
-                next_document = await page.content()
                 if len(next_document.encode("utf-8")) > MAX_WEBSITE_BYTES:
                     raise WebsiteRecoveryError(
-                        f"Page {len(documents) + 1} of this listing is larger than the 5 MB "
+                        f"Page {page_number} of this listing is larger than the 5 MB "
                         "recovery limit.",
                         code="pagination_incomplete",
                     )
