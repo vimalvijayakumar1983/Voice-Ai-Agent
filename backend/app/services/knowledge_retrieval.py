@@ -142,6 +142,64 @@ _QUERY_STOP_WORDS = {
     "its",
     "she",
     "share",
+    # Question shapes and short function words. A caller asking "how many"
+    # or "which doctor does" must not be required to find those words in the
+    # evidence: they describe the question, not the fact.
+    "all",
+    "am",
+    "any",
+    "anyone",
+    "anything",
+    "as",
+    "ask",
+    "asking",
+    "at",
+    "but",
+    "by",
+    "each",
+    "either",
+    "every",
+    "find",
+    "found",
+    "get",
+    "got",
+    "here",
+    "if",
+    "im",
+    "in",
+    "into",
+    "let",
+    "lets",
+    "look",
+    "looking",
+    "many",
+    "much",
+    "need",
+    "needs",
+    "no",
+    "not",
+    "on",
+    "or",
+    "really",
+    "say",
+    "said",
+    "see",
+    "should",
+    "some",
+    "someone",
+    "still",
+    "sure",
+    "than",
+    "too",
+    "up",
+    "very",
+    "whether",
+    "whom",
+    "whose",
+    "why",
+    "will",
+    "with",
+    "without",
 }
 _SOURCE_NOISE_TOKENS = {
     "base",
@@ -867,6 +925,29 @@ def _structured_subject_tokens(chunk: str) -> set[str]:
     return set(_base_tokens(match.group(1))) if match else set()
 
 
+_SUBJECT_LINE = re.compile(r"^SUBJECT:\s*(.+?)\s*$", re.MULTILINE)
+
+
+def _known_subject_filter(query: str, documents: list[tuple[str, str]]) -> set[str]:
+    """Return the caller's named subject only when a compiled record carries it.
+
+    Speech recognition capitalises specialties, services and product names
+    exactly like proper nouns. ``Family Medicine doctor`` must therefore not be
+    treated as a request for an entity called "Family Medicine": doing so
+    discarded every record whose SUBJECT line was a doctor's name. Only a
+    subject that actually exists in the compiled knowledge can narrow results.
+    """
+
+    requested = _requested_subject_tokens(query)
+    if not requested:
+        return set()
+    for _source, content in documents:
+        for match in _SUBJECT_LINE.finditer(content):
+            if requested <= set(_base_tokens(match.group(1))):
+                return requested
+    return set()
+
+
 def _intent_content(value: str, *, phone_query: bool) -> str:
     """Prefer compiler-verified subject/fact bundles over ambiguous raw prose.
 
@@ -1071,7 +1152,7 @@ def rank_knowledge(
     broad_query = _is_broad_query(query, query_tokens)
     service_capability_query = _is_service_capability_query(query)
     directory_query = bool(query_tokens & _DIRECTORY_QUERY_TOKENS)
-    requested_subject_tokens = _requested_subject_tokens(query)
+    requested_subject_tokens = _known_subject_filter(query, documents)
     matches: list[KnowledgeMatch] = []
     for source, content in documents:
         if service_capability_query and (

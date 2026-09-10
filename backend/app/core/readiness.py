@@ -13,7 +13,7 @@ logger = structlog.get_logger()
 # bridge while feature writes are frozen. It is never a post-feature rollback
 # image: once serving-revision pointers are written, rollback must use the
 # pointer-aware release described in the runbook.
-EXPECTED_DATABASE_REVISIONS = frozenset({"20260909_025"})
+EXPECTED_DATABASE_REVISIONS = frozenset({"20260910_026"})
 READINESS_TIMEOUT_SECONDS = 3.0
 
 

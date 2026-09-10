@@ -330,6 +330,8 @@ class AgentKnowledgeBindRequest(BaseModel):
 
 class KnowledgeApprovalRequest(BaseModel):
     approved: bool
+    # Explicit acknowledgement that some records were not captured as facts.
+    accept_partial_coverage: bool = False
 
 
 class KnowledgeReleaseReactivationRequest(BaseModel):

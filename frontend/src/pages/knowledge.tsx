@@ -796,7 +796,7 @@ export default function KnowledgeStudio() {
                     ) : (
                       <p>The versioned voice-recognition artifact is compiled automatically when this exact source revision is approved.</p>
                     )}
-                    {canGovernKnowledge && selected.approval_status !== 'approved' && <button type="button" className="btn btn-primary btn-sm" disabled={working !== null || selected.sync_status !== 'ready'} onClick={() => runAction('approve', () => api.approveKnowledgeBase(selected.id, true), 'Knowledge approved for agent binding.')}>
+                    {canGovernKnowledge && selected.approval_status !== 'approved' && <button type="button" className="btn btn-primary btn-sm" disabled={working !== null || selected.sync_status !== 'ready'} onClick={() => runAction('approve', () => approveWithCoverageAcknowledgement(selected.id), 'Knowledge approved for agent binding.')}>
                       <Check size={12} /> Approve knowledge
                     </button>}
                     {canGovernKnowledge && selected.serving_revision && <button type="button" className="btn btn-danger btn-sm" disabled={working !== null} onClick={() => runAction('revoke-live', () => api.approveKnowledgeBase(selected.id, false), 'Live release revoked. New calls cannot use this knowledge; calls already in progress keep their immutable release.')}>
@@ -1022,4 +1022,19 @@ function recoveryStageLabel(stage?: string) { const labels: Record<string, strin
 function crawlStatusLabel(status: KnowledgeCrawl['status']) { const labels: Record<KnowledgeCrawl['status'], string> = { queued: 'Queued', discovering: 'Discovering', indexing: 'Indexing', retrying: 'Repairing', completed: 'Complete', completed_with_errors: 'Needs repair', failed: 'Discovery failed', cancelled: 'Cancelled' }; return labels[status]; }
 function formatBytes(bytes: number) { return bytes < 1024 * 1024 ? `${Math.ceil(bytes / 1024)} KB` : `${(bytes / 1024 / 1024).toFixed(1)} MB`; }
 function formatDate(value: string) { return new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value)); }
+async function approveWithCoverageAcknowledgement(knowledgeBaseId: string) {
+  try {
+    return await api.approveKnowledgeBase(knowledgeBaseId, true);
+  } catch (error) {
+    const message = errorMessage(error, '');
+    if (!message.includes('accept_partial_coverage')) throw error;
+    const summary = message.split(' Review the uncovered records')[0];
+    const acknowledged = window.confirm(
+      `${summary}\n\nApprove anyway? Callers will not get answers for the uncovered records until the source is fixed and recompiled.`,
+    );
+    if (!acknowledged) throw new Error('Approval cancelled. Review the uncovered records shown on each source, then approve again.');
+    return api.approveKnowledgeBase(knowledgeBaseId, true, true);
+  }
+}
+
 function errorMessage(error: unknown, fallback: string) { return error instanceof Error ? error.message : fallback; }

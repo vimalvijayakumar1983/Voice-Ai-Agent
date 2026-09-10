@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
@@ -30,6 +31,12 @@ from app.services.knowledge_compiler import (
     KnowledgeCompilerError,
     compile_website_knowledge,
 )
+from app.services.knowledge_records import (
+    KnowledgeRecord,
+    coverage_report,
+    records_to_payload,
+    render_records,
+)
 from app.services.knowledge_sources import (
     VAV_NATIVE_KNOWLEDGE_PROVIDERS,
     canonical_source_url,
@@ -50,7 +57,7 @@ from app.services.website_recovery import (
     RecoveredPage,
     WebsiteRecoveryError,
     download_html,
-    extract_readable_text,
+    extract_page_records,
     recovery_metadata,
     render_html,
     searchable_pdf,
@@ -83,6 +90,9 @@ def _compiled_serving_signature(*, content: str | None, structured: dict | None)
     # Validation counts describe the compiler run, not knowledge served to an
     # agent. The source-grounded facts/entities they summarize remain included.
     source.pop("validation", None)
+    # Extraction records feed the coverage report; the compiled facts they were
+    # measured against are what agents receive, so records do not participate.
+    source.pop("records", None)
     compiler = compiler if isinstance(compiler, dict) else {}
     payload = {
         "schema": "vav.compiled-serving-signature.v1",
@@ -1672,6 +1682,7 @@ async def _commit_repair_success(
     artifact_name: str,
     requested_mode: str,
     reused_compilation: bool,
+    records: Sequence[KnowledgeRecord] = (),
     provider_cleanup_ids: tuple[str, ...] = (),
     provider_upload_reservation_id: UUID | None = None,
 ) -> bool:
@@ -1738,9 +1749,16 @@ async def _commit_repair_success(
             content=source.content,
             structured=source.structured_content,
         )
+        compiled_structured = {**compiled.structured, "records": records_to_payload(records)}
+        coverage = coverage_report(
+            records,
+            compiled.structured,
+            requested_mode=requested_mode,
+            effective_mode=compiled.effective_mode,
+        )
         next_serving_signature = _compiled_serving_signature(
             content=compiled.content,
-            structured=compiled.structured,
+            structured=compiled_structured,
         )
         staged_refresh = bool(metadata.get("staged_refresh"))
         serving_content_changed = previous_serving_signature != next_serving_signature
@@ -1754,7 +1772,7 @@ async def _commit_repair_success(
         source.location = page.url
         source.raw_content = page.text
         source.content = compiled.content
-        source.structured_content = compiled.structured
+        source.structured_content = compiled_structured
         source.content_sha256 = raw_content_sha256
         source.mime_type = "text/html"
         source.size_bytes = page.downloaded_bytes
@@ -1797,6 +1815,8 @@ async def _commit_repair_success(
                     **(compiled.structured.get("compiler") or {}),
                     "reused": reused_compilation,
                 },
+                "coverage": coverage,
+                "record_count": len(records),
             }
         )
         source.source_metadata = recovery_metadata(
@@ -1912,7 +1932,8 @@ async def _repair(
 
     final_url, static_html, downloaded_bytes = await download_html(location)
     try:
-        title, text = extract_readable_text(static_html, url=final_url)
+        title, records = extract_page_records(static_html, url=final_url)
+        text = render_records(records)
         static_page = RecoveredPage(final_url, title, text, "static_html", downloaded_bytes)
         if should_render_javascript(static_html, text):
             if not await _set_stage(
@@ -1926,7 +1947,8 @@ async def _repair(
                 return
             try:
                 rendered_html, rendered_bytes = await render_html(final_url)
-                title, text = extract_readable_text(rendered_html, url=final_url)
+                title, records = extract_page_records(rendered_html, url=final_url)
+                text = render_records(records)
                 page = RecoveredPage(
                     final_url,
                     title,
@@ -1951,7 +1973,8 @@ async def _repair(
         ):
             return
         rendered_html, rendered_bytes = await render_html(final_url)
-        title, text = extract_readable_text(rendered_html, url=final_url)
+        title, records = extract_page_records(rendered_html, url=final_url)
+        text = render_records(records)
         page = RecoveredPage(final_url, title, text, "javascript_render", rendered_bytes)
     if not await _set_stage(
         tenant_id,
@@ -2157,6 +2180,7 @@ async def _repair(
         artifact_name=artifact_name,
         requested_mode=requested_mode,
         reused_compilation=reused_compilation,
+        records=records,
         provider_cleanup_ids=provider_cleanup_ids,
         provider_upload_reservation_id=provider_upload_reservation_id,
     )

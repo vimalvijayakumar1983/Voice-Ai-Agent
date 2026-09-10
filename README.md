@@ -263,9 +263,9 @@ approved crawl completes.
 | Repair failed crawl | `POST /api/v1/knowledge/{id}/crawls/{crawl_id}/retry` | Requeues discovery or only failed page ledgers |
 | Discover sitemap | `POST /api/v1/knowledge/{id}/sitemap/discover` | Public HTTPS sitemap only; selection required before indexing |
 | Index selected pages | `POST /api/v1/knowledge/{id}/sources/urls` | Public HTTPS URLs, de-duplicated, maximum 100 per request |
-| Upload PDF | `POST /api/v1/knowledge/{id}/sources/pdf` | PDF signature/type check; maximum 8 MiB |
+| Upload PDF | `POST /api/v1/knowledge/{id}/sources/pdf` | PDF signature/type check; maximum 8 MiB; tables extracted as rows and measured for coverage |
 | Refresh processing | `POST /api/v1/knowledge/{id}/refresh` | Provider status remains authoritative |
-| Approve knowledge | `POST /api/v1/knowledge/{id}/approval` | Owner/admin; all provider sources must be indexed |
+| Approve knowledge | `POST /api/v1/knowledge/{id}/approval` | Owner/admin; all sources indexed; a source whose AI compilation did not run blocks approval; partial coverage needs `accept_partial_coverage` |
 | Bind to agent | `POST /api/v1/knowledge/{id}/bindings` | Owner/admin; one knowledge base per Smallest agent |
 
 ## Verification

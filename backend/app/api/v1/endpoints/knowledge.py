@@ -62,6 +62,12 @@ from app.services.knowledge_compiler import (
     KnowledgeCompilerError,
     compile_source_knowledge,
 )
+from app.services.knowledge_records import (
+    coverage_blocks_approval,
+    coverage_report,
+    records_from_text,
+    records_to_payload,
+)
 from app.services.knowledge_serving import (
     KnowledgeServingError,
     publish_serving_revision,
@@ -152,17 +158,33 @@ async def _compile_uploaded_content(
 
 
 def _apply_uploaded_compilation(
-    source: KnowledgeSource, *, raw_text: str, compiled: CompiledKnowledge
+    source: KnowledgeSource,
+    *,
+    raw_text: str,
+    compiled: CompiledKnowledge,
+    records=None,
 ) -> None:
+    # Records are the unit of coverage: what the source presented together
+    # (a card, a table row, a field) must have been captured as verified facts.
+    records = list(records) if records else records_from_text(raw_text)
+    compiler = compiled.structured.get("compiler") or {}
+    coverage = coverage_report(
+        records,
+        compiled.structured,
+        requested_mode=str(compiler.get("requested_mode") or "automatic"),
+        effective_mode=str(compiled.effective_mode or compiler.get("effective_mode") or "fast"),
+    )
     source.raw_content = raw_text
     source.content = compiled.content
-    source.structured_content = compiled.structured
+    source.structured_content = {**compiled.structured, "records": records_to_payload(records)}
     source.content_sha256 = hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
     source.compiled_at = datetime.now(UTC)
     source.source_metadata = {
         **(source.source_metadata or {}),
-        "compiler": compiled.structured.get("compiler") or {},
-        "processing_mode": (compiled.structured.get("compiler") or {}).get("requested_mode"),
+        "compiler": compiler,
+        "processing_mode": compiler.get("requested_mode"),
+        "coverage": coverage,
+        "record_count": len(records),
     }
     if source.source_metadata.get("upload_compile"):
         previous_job = source.source_metadata["upload_compile"]
@@ -631,6 +653,20 @@ async def _ensure_remote(
     # scrape/upload failure cannot leave an orphaned provider knowledge base.
     await db.commit()
     return remote_id
+
+
+def _coverage_blockers(kb: KnowledgeBase) -> tuple[list[str], list[str]]:
+    """Return (sources blocked outright, sources with partial coverage)."""
+    blocked: list[str] = []
+    partial: list[str] = []
+    for source in kb.sources:
+        coverage = (source.source_metadata or {}).get("coverage")
+        reason = coverage_blocks_approval(coverage)
+        if reason is not None:
+            blocked.append(f"{source.name}: {reason}")
+        elif isinstance(coverage, dict) and coverage.get("status") == "partial":
+            partial.append(source.name)
+    return blocked, partial
 
 
 def _recount(kb: KnowledgeBase) -> None:
@@ -2097,7 +2133,12 @@ async def upload_pdf_source(
         if stale_provider_ids:
             source_metadata["provider_cleanup_pending_ids"] = sorted(stale_provider_ids)
         source.source_metadata = source_metadata
-        _apply_uploaded_compilation(source, raw_text=prepared.extracted_text, compiled=compiled)
+        _apply_uploaded_compilation(
+            source,
+            raw_text=prepared.extracted_text,
+            compiled=compiled,
+            records=prepared.records,
+        )
         source.last_synced_at = datetime.now(UTC)
         await db.flush()
 
@@ -2396,6 +2437,27 @@ async def set_knowledge_approval(
             status_code=409,
             detail="Make every source VAV-searchable before approving this knowledge base",
         )
+    partial_sources: list[str] = []
+    if data.approved:
+        blocked, partial_sources = _coverage_blockers(kb)
+        if blocked:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Recompile these sources so VAV can verify and measure them before "
+                    "approval: " + "; ".join(blocked[:5])
+                ),
+            )
+        if partial_sources and not data.accept_partial_coverage:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Partial coverage: some records in "
+                    + ", ".join(partial_sources[:5])
+                    + " were not captured as verified facts. Review the uncovered records, "
+                    "or approve with accept_partial_coverage to acknowledge the gap."
+                ),
+            )
     speech_lexicon = None
     serving_revision = None
     if data.approved:
@@ -2444,6 +2506,8 @@ async def set_knowledge_approval(
         resource_id=str(kb.id),
         details={
             "approved": data.approved,
+            "accepted_partial_coverage": bool(data.approved and partial_sources),
+            "partial_coverage_sources": partial_sources[:20],
             "speech_lexicon_artifact_id": str(speech_lexicon.id) if speech_lexicon else None,
             "serving_revision_id": str(serving_revision.id) if serving_revision else None,
             "serving_revocation_generation": kb.serving_revocation_generation,

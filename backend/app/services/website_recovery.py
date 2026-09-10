@@ -8,6 +8,8 @@ import io
 import ipaddress
 import json
 import socket
+from collections import Counter
+from collections.abc import Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -16,9 +18,16 @@ from urllib.parse import urljoin, urlsplit
 import httpcore
 import httpx
 import pymupdf
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 
 from app.services.integration_security import IntegrationConfigError, validate_public_https_url
+from app.services.knowledge_records import (
+    RECORD_SEPARATOR,
+    KnowledgeRecord,
+    dedupe_records,
+    make_record,
+    render_records,
+)
 
 MAX_WEBSITE_BYTES = 5 * 1024 * 1024
 MAX_BROWSER_API_BYTES = 2 * 1024 * 1024
@@ -299,8 +308,156 @@ def _json_strings(value: object) -> list[str]:
     return []
 
 
-def extract_readable_text(document: str, *, url: str) -> tuple[str, str]:
-    """Extract de-duplicated human-readable content from static or rendered HTML."""
+_HEADING_TAGS = {"h1": 1, "h2": 2, "h3": 3, "h4": 4}
+_SKIP_TAGS = frozenset({"script", "style", "noscript", "svg", "canvas", "template", "button"})
+_CARD_MAX_CHARS = 600
+_CARD_MAX_FRAGMENTS = 14
+
+
+def _element_signature(element: Tag) -> tuple[str, tuple[str, ...]]:
+    classes = element.get("class") or []
+    if isinstance(classes, str):
+        classes = classes.split()
+    return element.name or "", tuple(sorted(str(value) for value in classes))
+
+
+def _fragments(element: Tag) -> list[str]:
+    return [" ".join(value.split()) for value in element.stripped_strings if value.strip()]
+
+
+def _looks_like_card(element: Tag, fragments: list[str]) -> bool:
+    if element.name in {"table", "thead", "tbody", "ul", "ol", "dl", "tr", "dt", "dd"}:
+        return False
+    if len(fragments) < 2 or len(fragments) > _CARD_MAX_FRAGMENTS:
+        return False
+    return sum(len(fragment) for fragment in fragments) <= _CARD_MAX_CHARS
+
+
+def _table_records(
+    table: Tag, *, heading_path: Sequence[str], records: list[KnowledgeRecord]
+) -> None:
+    header: list[str] = []
+    rows = table.find_all("tr")
+    for row in rows:
+        cells = [cell for cell in row.find_all(["th", "td"], recursive=False)]
+        if not cells:
+            cells = row.find_all(["th", "td"])
+        values = [" ".join(cell.get_text(" ", strip=True).split()) for cell in cells]
+        if not any(values):
+            continue
+        if not header and all(cell.name == "th" for cell in cells):
+            header = values
+            record = make_record(
+                "heading", [RECORD_SEPARATOR.join(values)], heading_path=heading_path
+            )
+            if record:
+                records.append(record)
+            continue
+        if header and len(header) == len(values):
+            values = [
+                f"{name}: {value}" if name and value and not value.startswith(f"{name}:") else value
+                for name, value in zip(header, values, strict=True)
+            ]
+        record = make_record("table_row", values, heading_path=heading_path)
+        if record:
+            records.append(record)
+
+
+def _walk_records(
+    element: Tag,
+    *,
+    heading_path: list[str],
+    records: list[KnowledgeRecord],
+) -> None:
+    children = [child for child in element.children if isinstance(child, Tag)]
+    signatures = Counter(_element_signature(child) for child in children)
+    for child in children:
+        name = child.name or ""
+        if name in _SKIP_TAGS:
+            continue
+        if name in _HEADING_TAGS:
+            text = " ".join(child.get_text(" ", strip=True).split())
+            if text:
+                level = _HEADING_TAGS[name]
+                del heading_path[max(level - 1, 0) :]
+                record = make_record("heading", [text], heading_path=heading_path)
+                heading_path.append(text)
+                if record:
+                    records.append(record)
+            continue
+        if name == "table":
+            _table_records(child, heading_path=heading_path, records=records)
+            continue
+        if name == "dl":
+            terms = child.find_all(["dt", "dd"])
+            current_term = ""
+            for item in terms:
+                text = " ".join(item.get_text(" ", strip=True).split())
+                if item.name == "dt":
+                    current_term = text
+                    continue
+                record = make_record(
+                    "field",
+                    [f"{current_term}: {text}" if current_term else text],
+                    heading_path=heading_path,
+                )
+                if record:
+                    records.append(record)
+            continue
+        fragments = _fragments(child)
+        if not fragments:
+            continue
+        repeated = signatures[_element_signature(child)] >= 2
+        if name == "tr":
+            record = make_record("table_row", fragments, heading_path=heading_path)
+            if record:
+                records.append(record)
+            continue
+        if name == "li":
+            if child.find(["ul", "ol"]) is not None and len(fragments) > _CARD_MAX_FRAGMENTS:
+                _walk_records(child, heading_path=heading_path, records=records)
+                continue
+            record = make_record(
+                "card" if len(fragments) > 1 else "list_item",
+                fragments,
+                heading_path=heading_path,
+            )
+            if record:
+                records.append(record)
+            continue
+        if name in {"p", "blockquote", "pre", "figcaption"}:
+            record = make_record("paragraph", [" ".join(fragments)], heading_path=heading_path)
+            if record:
+                records.append(record)
+            continue
+        if repeated and _looks_like_card(child, fragments):
+            # Sibling components with the same tag and classes are one repeated
+            # layout: a doctor card, a price tile, a service block. Keep each
+            # one whole so a label shared by several cards is never removed.
+            record = make_record("card", fragments, heading_path=heading_path)
+            if record:
+                records.append(record)
+            continue
+        if child.find(list(_CONTENT_TAGS) + ["table", "dl", "div", "section", "article"]) is None:
+            record = make_record(
+                "card" if len(fragments) > 1 else "paragraph",
+                fragments,
+                heading_path=heading_path,
+            )
+            if record:
+                records.append(record)
+            continue
+        _walk_records(child, heading_path=heading_path, records=records)
+
+
+def extract_page_records(document: str, *, url: str) -> tuple[str, list[KnowledgeRecord]]:
+    """Extract structured records from static or rendered HTML.
+
+    Repeated sibling components become one record each with their fragments
+    kept together; tables become rows; headings carry context. Only whole
+    records repeated verbatim are removed, never a label that several records
+    legitimately share.
+    """
     soup = BeautifulSoup(document, "html.parser")
     title = " ".join((soup.title.get_text(" ", strip=True) if soup.title else "").split())
     description_tag = soup.find("meta", attrs={"name": "description"})
@@ -339,29 +496,45 @@ def extract_readable_text(document: str, *, url: str) -> tuple[str, str]:
         root = semantic_root if semantic_size >= body_size * 0.6 else body_root
     else:
         root = body_root
-    lines = [title, description]
-    lines.extend(element.get_text(" ", strip=True) for element in root.find_all(_CONTENT_TAGS))
-    lines.extend(structured)
-    if sum(len(value) for value in lines) < STATIC_RENDER_THRESHOLD:
+
+    records: list[KnowledgeRecord] = []
+    if title:
+        records.append(KnowledgeRecord(kind="heading", text=title))
+    if description:
+        record = make_record("paragraph", [description])
+        if record:
+            records.append(record)
+    if isinstance(root, Tag):
+        _walk_records(root, heading_path=[], records=records)
+    for value in structured:
+        record = make_record("field", [value])
+        if record:
+            records.append(record)
+    if sum(len(record.text) for record in records) < STATIC_RENDER_THRESHOLD and isinstance(
+        root, Tag
+    ):
         # Modern sites often use generic component divs instead of semantic
-        # paragraphs. Preserve their visible fragments without duplicating a
-        # well-structured page's complete body.
-        lines.extend(root.stripped_strings)
-    cleaned: list[str] = []
-    seen: set[str] = set()
-    for value in lines:
-        normalized = " ".join(value.split()).strip()
-        if len(normalized) < 2:
-            continue
-        key = normalized.casefold()
-        if key in seen:
-            continue
-        seen.add(key)
-        cleaned.append(normalized)
-    text = "\n\n".join(cleaned)[:MAX_EXTRACTED_CHARS]
+        # paragraphs. Preserve visible fragments that no record already holds
+        # without duplicating a well-structured page's complete body.
+        captured = {record.text.casefold() for record in records}
+        captured.update(fragment.casefold() for record in records for fragment in record.fragments)
+        for value in root.stripped_strings:
+            record = make_record("paragraph", [value])
+            if record and record.text.casefold() not in captured:
+                captured.add(record.text.casefold())
+                records.append(record)
+    records = dedupe_records(records)
+    total = 0
+    bounded: list[KnowledgeRecord] = []
+    for record in records:
+        total += len(record.text) + 2
+        if total > MAX_EXTRACTED_CHARS:
+            break
+        bounded.append(record)
+    rendered = render_records(bounded)
     from app.services.knowledge_quality import missing_doctor_directory
 
-    if missing_doctor_directory(title, url, text):
+    if missing_doctor_directory(title, url, rendered):
         # Trigger the existing automatic browser-rendering recovery even when
         # an empty directory shell contains many SEO/navigation characters.
         # If rendering also fails this source stays failed, never 'indexed'.
@@ -369,12 +542,18 @@ def extract_readable_text(document: str, *, url: str) -> tuple[str, str]:
             "Doctor directory entries were not extracted; only page text was found.",
             code="no_readable_text",
         )
-    if len(text) < MIN_USEFUL_CHARS:
+    if len(rendered) < MIN_USEFUL_CHARS:
         raise WebsiteRecoveryError(
             "The downloaded page contained too little readable text.",
             code="no_readable_text",
         )
-    return title or url, text
+    return title or url, bounded
+
+
+def extract_readable_text(document: str, *, url: str) -> tuple[str, str]:
+    """Extract human-readable content as record-per-paragraph text."""
+    title, records = extract_page_records(document, url=url)
+    return title, render_records(records)
 
 
 def should_render_javascript(document: str, text: str) -> bool:
