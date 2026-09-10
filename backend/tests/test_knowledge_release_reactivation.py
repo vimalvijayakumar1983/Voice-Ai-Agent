@@ -7,8 +7,6 @@ import pytest
 from sqlalchemy import select
 
 from app.models.agent import (
-    Agent,
-    AgentKnowledgeBinding,
     KnowledgeBase,
     KnowledgeServingRevisionSource,
     KnowledgeSource,
@@ -210,7 +208,7 @@ async def test_release_reactivation_rejects_unknown_target_and_requires_reason_a
 
 
 @pytest.mark.asyncio
-async def test_release_reactivation_rejects_corruption_and_provider_native_bindings(
+async def test_release_reactivation_rejects_corrupted_release_sources(
     client,
     auth_headers,
     db,
@@ -236,37 +234,3 @@ async def test_release_reactivation_rejects_corruption_and_provider_native_bindi
     )
     assert corrupted.status_code == 409
     assert "integrity validation" in corrupted.json()["detail"]
-
-    # Restore the immutable fixture so the provider-bound failure proves the
-    # provider guard rather than merely encountering the integrity guard first.
-    first_source.content = "Example Medical Centre telephone is +971 2 111 1111."
-    agent = Agent(
-        tenant_id=tenant.id,
-        name="Provider-native receptionist",
-        system_prompt="Use the provider-native collection.",
-        voice_provider="smallest",
-    )
-    db.add(agent)
-    await db.flush()
-    db.add(
-        AgentKnowledgeBinding(
-            tenant_id=tenant.id,
-            agent_id=agent.id,
-            knowledge_base_id=knowledge.id,
-            provider="smallest",
-        )
-    )
-    await db.commit()
-
-    provider_bound = await client.post(
-        f"/api/v1/knowledge/{knowledge.id}/releases/{first.id}/activate",
-        headers=auth_headers,
-        json={
-            "expected_current_revision_id": str(second.id),
-            "reason": "This needs a separate provider rollback.",
-        },
-    )
-    assert provider_bound.status_code == 409
-    assert "provider-native Smallest.ai collection" in provider_bound.json()["detail"]
-    await db.refresh(knowledge)
-    assert knowledge.serving_revision_id == second.id

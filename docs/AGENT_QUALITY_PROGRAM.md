@@ -158,12 +158,15 @@ failed on the 10 September call retrieve the stored fact; existing tests pass.
 
 ### PR 1b. Local-only knowledge ingestion
 
-Removes the Smallest.ai provider from PDF upload, crawl repair, delete and
-refresh, the provider cleanup outbox for knowledge artifacts, and the
-provider-dependent binding rules. Legacy bindings to Smallest.ai agents are
-rejected or migrated explicitly, never marked live. Built against the new base
-because the provider paths on `main` grew a durable cleanup outbox after the
-original analysis.
+Status: implemented (stacked on PR 1).
+
+Removes the Smallest.ai provider from PDF upload, URL registration, sitemap
+discovery, crawl repair, delete and refresh; the knowledge-base provisioning
+endpoint; the provider cleanup sweeper for knowledge artifacts; and the
+provider-dependent binding rules. Binding a knowledge base to an agent that does
+not use VAV retrieval is refused, and an existing binding to such an agent is
+never reported as synced. Migration 027 relabels every knowledge base as served
+by `vav` and clears remote identifiers.
 
 Acceptance: PDF upload and page repair succeed with no provider key; binding a
 knowledge base to an agent that does not use VAV retrieval is refused.

@@ -81,10 +81,6 @@ celery_app.conf.update(
             "task": "app.tasks.campaign_tasks.sweep_provider_callback_outbox",
             "schedule": 60.0,
         },
-        "sweep-provider-cleanup-outbox": {
-            "task": "app.tasks.knowledge_tasks.sweep_provider_cleanup_outbox",
-            "schedule": 60.0,
-        },
         "sweep-stale-knowledge-repairs": {
             "task": "app.tasks.knowledge_tasks.sweep_stale_knowledge_repairs",
             "schedule": 300.0,

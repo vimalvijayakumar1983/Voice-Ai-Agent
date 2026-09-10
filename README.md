@@ -264,9 +264,9 @@ approved crawl completes.
 | Discover sitemap | `POST /api/v1/knowledge/{id}/sitemap/discover` | Public HTTPS sitemap only; selection required before indexing |
 | Index selected pages | `POST /api/v1/knowledge/{id}/sources/urls` | Public HTTPS URLs, de-duplicated, maximum 100 per request |
 | Upload PDF | `POST /api/v1/knowledge/{id}/sources/pdf` | PDF signature/type check; maximum 8 MiB; tables extracted as rows and measured for coverage |
-| Refresh processing | `POST /api/v1/knowledge/{id}/refresh` | Provider status remains authoritative |
+| Refresh processing | `POST /api/v1/knowledge/{id}/refresh` | Recounts sources and merges canonical URL duplicates locally |
 | Approve knowledge | `POST /api/v1/knowledge/{id}/approval` | Owner/admin; all sources indexed; a source whose AI compilation did not run blocks approval; partial coverage needs `accept_partial_coverage` |
-| Bind to agent | `POST /api/v1/knowledge/{id}/bindings` | Owner/admin; one knowledge base per Smallest agent |
+| Bind to agent | `POST /api/v1/knowledge/{id}/bindings` | Owner/admin; VAV-native agents only (Inworld, Sarvam, ElevenLabs); one knowledge base per agent |
 
 ## Verification
 

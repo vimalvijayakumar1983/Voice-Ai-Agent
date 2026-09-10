@@ -190,8 +190,6 @@ async def create_kb(db, tenant):
     kb = KnowledgeBase(
         tenant_id=tenant.id,
         name="Unified test",
-        provider="smallest",
-        provider_knowledge_base_id="remote-test",
         sync_status="ready",
     )
     db.add(kb)
@@ -237,20 +235,6 @@ async def test_text_uses_grounding_compiler_and_preserves_original(
 async def test_pdf_uses_same_facts_and_keeps_binary_original(
     client, auth_headers, tenant, db, fake_ai, monkeypatch
 ):
-    items = []
-
-    class Provider:
-        async def list_knowledge_items(self, _):
-            return list(items)
-
-        async def upload_knowledge_pdf(self, **kwargs):
-            assert kwargs["content"] == b"%PDF-searchable"
-            items.append(
-                {"_id": "pdf-1", "fileName": kwargs["file_name"], "processingStatus": "processing"}
-            )
-            return {"data": {"_id": "pdf-1"}}
-
-    monkeypatch.setattr(endpoint, "get_smallest_client", Provider)
     monkeypatch.setattr(
         endpoint,
         "prepare_pdf",
@@ -278,7 +262,8 @@ async def test_pdf_uses_same_facts_and_keeps_binary_original(
     assert source.structured_content["facts"] == [FACT]
     assert source.source_metadata["ocr_page_count"] == 1
     assert source.source_metadata["compiler"]["requested_mode"] == "ai_verified"
-    assert source.status == "processing"  # local compilation != remote indexing
+    assert source.status == "indexed"  # local compilation is the whole pipeline
+    assert source.provider_item_id is None
     assert len(fake_ai.requests) == 1
 
 
@@ -521,7 +506,7 @@ async def test_recompile_cannot_overwrite_concurrent_source_edit(
 
 
 @pytest.mark.asyncio
-async def test_pdf_compiler_failure_precedes_remote_upload(
+async def test_pdf_compiler_failure_leaves_no_source_behind(
     client, auth_headers, tenant, db, monkeypatch
 ):
     kb = await create_kb(db, tenant)
@@ -541,11 +526,7 @@ async def test_pdf_compiler_failure_precedes_remote_upload(
     async def fail(**kwargs):
         raise compiler.KnowledgeCompilerError("Compilation failed; original draft unchanged.")
 
-    def unexpected_provider():
-        raise AssertionError("No remote upload is permitted after compilation failure")
-
     monkeypatch.setattr(endpoint, "compile_source_knowledge", fail)
-    monkeypatch.setattr(endpoint, "get_smallest_client", unexpected_provider)
     response = await client.post(
         f"/api/v1/knowledge/{kb.id}/sources/pdf",
         headers=auth_headers,
@@ -917,21 +898,3 @@ async def test_fast_retry_recovers_failed_background_source(
     assert result["sync_status"] == "ready"
     assert result["sources"][0]["status"] == "indexed"
     assert result["sources"][0]["error_message"] is None
-
-
-def test_later_pdf_compilation_snapshots_current_provider_status():
-    source = KnowledgeSource(
-        source_type="file",
-        status="indexed",
-        source_metadata={
-            "upload_compile": {"status": "completed", "provider_status": "processing"},
-        },
-    )
-    jobs.queue_source(source, actor_id=uuid4(), mode="ai_verified")
-    assert jobs.job_for(source)["provider_status"] == "indexed"
-    failed_job = jobs.job_for(source)
-    failed_job["status"] = "failed"
-    jobs.set_job(source, failed_job)
-    source.status = "failed"
-    jobs.queue_source(source, actor_id=uuid4(), mode="ai_verified")
-    assert jobs.job_for(source)["provider_status"] == "indexed"

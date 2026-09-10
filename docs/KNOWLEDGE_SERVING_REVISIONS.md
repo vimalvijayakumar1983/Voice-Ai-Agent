@@ -53,9 +53,8 @@ currently sees and a mandatory reason. Under the knowledge-base row lock, VAV:
 
 The mutable working copy returns to draft review. Calls already in progress
 keep their original revision pin, while new calls receive the reactivated
-release. This action controls VAV-native retrieval only; it intentionally
-rejects a knowledge base bound to a provider-native Smallest.ai agent because
-that remote collection needs its own verified rollback mechanism.
+release. Knowledge is served only by VAV's local index, so reactivation is the
+complete rollback: no external provider copy exists to roll back separately.
 
 ## Per-call pinning contract
 

@@ -14,7 +14,6 @@ from app.core.database import async_session_factory
 from app.models.agent import KnowledgeSource
 from app.models.user import User
 from app.services.knowledge_compiler import compile_source_knowledge
-from app.services.knowledge_sources import VAV_NATIVE_KNOWLEDGE_PROVIDERS
 from app.services.provider_credentials import ProviderCredentialError, load_provider_config
 from app.tasks.async_runner import run_async
 from app.tasks.worker import celery_app
@@ -32,7 +31,6 @@ def set_job(source, job):
 
 
 def queue_source(source, *, actor_id, mode):
-    previous = job_for(source)
     set_job(
         source,
         {
@@ -41,9 +39,6 @@ def queue_source(source, *, actor_id, mode):
             "mode": mode,
             "actor_id": str(actor_id),
             "queued_at": datetime.now(UTC).isoformat(),
-            "provider_status": previous.get("provider_status", source.status)
-            if previous.get("status") == "failed"
-            else source.status,
             "message": "Original saved. Waiting for background AI processing.",
         },
     )
@@ -52,16 +47,11 @@ def queue_source(source, *, actor_id, mode):
 
 
 async def _authorized(db, kb, job):
-    from app.api.v1.endpoints.knowledge import _ensure_bound_agents_accept_knowledge_change
-
     actor = await db.get(User, UUID(job["actor_id"]))
     if not actor or actor.tenant_id != kb.tenant_id or not actor.is_active:
         raise ValueError("Source editor no longer has access.")
     if actor.role not in {"owner", "admin", "member"}:
         raise ValueError("Source editor no longer has edit permission.")
-    _ensure_bound_agents_accept_knowledge_change(kb)
-    if any(b.agent.voice_provider not in VAV_NATIVE_KNOWLEDGE_PROVIDERS for b in kb.agent_bindings):
-        raise ValueError("Review agent bindings before compiling this source.")
 
 
 async def _load(db, tenant_id, kb_id, source_id):
@@ -80,7 +70,7 @@ async def _load(db, tenant_id, kb_id, source_id):
 async def _finish(tenant_id, kb_id, source_id, run_id, compiled=None, error=None):
     from app.api.v1.endpoints.knowledge import (
         _apply_uploaded_compilation,
-        _invalidate_bound_agent_deployments,
+        _mark_native_bindings_live,
         _recount,
     )
     from app.services.audit import record_audit_event
@@ -107,13 +97,13 @@ async def _finish(tenant_id, kb_id, source_id, run_id, compiled=None, error=None
             job.update(status="failed", message=source.error_message)
         else:
             _apply_uploaded_compilation(source, raw_text=source.raw_content, compiled=compiled)
-            source.status = "indexed" if source.source_type == "text" else job["provider_status"]
+            source.status = "indexed"
             source.error_message = None
             job.update(
                 status="completed", message="Processing complete. Review facts before approval."
             )
             invalidate_knowledge_approval(kb)
-            _invalidate_bound_agent_deployments(kb)
+            _mark_native_bindings_live(kb)
         job["finished_at"] = datetime.now(UTC).isoformat()
         set_job(source, job)
         _recount(kb)

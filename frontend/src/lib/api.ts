@@ -291,7 +291,7 @@ export interface AgentProviderCatalog {
 }
 
 export type KnowledgeScope = 'workspace' | 'group' | 'division' | 'branch' | 'department';
-export type KnowledgeSyncStatus = 'local_only' | 'provisioning' | 'processing' | 'ready' | 'error';
+export type KnowledgeSyncStatus = 'local_only' | 'processing' | 'ready' | 'error';
 export type KnowledgeProcessingMode = 'automatic' | 'fast' | 'ai_verified';
 
 export interface KnowledgeSource {
@@ -392,7 +392,6 @@ export interface KnowledgeBase {
   name: string;
   description: string | null;
   provider: string;
-  provider_knowledge_base_id: string | null;
   sync_status: KnowledgeSyncStatus;
   sync_error: string | null;
   approval_status: 'draft' | 'approved';
@@ -1744,10 +1743,6 @@ class ApiClient {
       method: 'PATCH',
       body: JSON.stringify(data),
     });
-  }
-
-  async provisionKnowledgeBase(id: string) {
-    return this.request<KnowledgeBase>(`/api/v1/knowledge/${id}/provision`, { method: 'POST' });
   }
 
   async discoverKnowledgeSitemap(id: string, sitemapUrl: string) {
