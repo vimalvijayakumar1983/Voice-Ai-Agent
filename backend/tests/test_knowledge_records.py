@@ -1,5 +1,6 @@
 from app.services.knowledge_records import (
     coverage_blocks_approval,
+    coverage_issue,
     coverage_report,
     make_record,
     records_from_text,
@@ -161,3 +162,77 @@ Opening hours: 9 AM to 5 PM
         ((), "Branch B"),
         (("Branch B",), "Opening hours: 9 AM to 5 PM"),
     ]
+
+
+def test_prose_only_sources_are_reported_as_unstructured_not_complete():
+    records = [
+        make_record("heading", ["About us"]),
+        make_record("paragraph", ["Royal Medical Center has served Abu Dhabi since 2005."]),
+    ]
+    structured = {
+        "facts": [
+            {
+                "subject": "Royal Medical Center",
+                "predicate": "serving since",
+                "value": "2005",
+                "evidence": "Royal Medical Center has served Abu Dhabi since 2005.",
+            }
+        ],
+        "entities": [],
+        "validation": {"facts_accepted": 1},
+    }
+
+    report = coverage_report(
+        records, structured, requested_mode="automatic", effective_mode="ai_verified"
+    )
+
+    assert report["status"] == "unstructured"
+    assert report["record_total"] == 0
+    assert coverage_blocks_approval(report) is None
+    assert "completeness is not verified" in coverage_issue(report)
+
+
+def test_a_fact_captures_a_record_when_it_carries_its_identifying_words():
+    records = [
+        make_record("list_item", ["Physiotherapy Department"]),
+        make_record("list_item", ["Laser Department"]),
+        make_record("list_item", ["Pediatric Dentistry Department"]),
+    ]
+    structured = {
+        "facts": [
+            {
+                "subject": "Royal Medical Center",
+                "predicate": "departments",
+                "value": "Physiotherapy, Laser",
+                "evidence": "Departments: Physiotherapy, Laser",
+            },
+            {
+                "subject": "Royal Medical Center",
+                "predicate": "department",
+                "value": "Dentistry",
+                "evidence": "Dentistry Department",
+            },
+        ],
+        "entities": [],
+        "validation": {"facts_accepted": 2},
+    }
+
+    report = coverage_report(
+        records, structured, requested_mode="automatic", effective_mode="ai_verified"
+    )
+
+    assert report["records_covered"] == 2
+    assert report["uncovered"] == ["Pediatric Dentistry Department"]
+
+
+def test_every_uncovered_record_is_kept_for_review():
+    records = [make_record("list_item", [f"Department {index}"]) for index in range(40)]
+    structured = {"facts": [], "entities": [], "validation": {"facts_accepted": 0}}
+
+    report = coverage_report(
+        records, structured, requested_mode="automatic", effective_mode="ai_verified"
+    )
+
+    assert report["uncovered_total"] == 40
+    assert len(report["uncovered"]) == 40
+    assert "(+37 more)" in coverage_issue(report)

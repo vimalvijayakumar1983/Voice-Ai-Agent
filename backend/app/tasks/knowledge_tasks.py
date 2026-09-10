@@ -31,6 +31,7 @@ from app.services.knowledge_compiler import (
 from app.services.knowledge_records import (
     KnowledgeRecord,
     coverage_report,
+    dedupe_records,
     records_to_payload,
     render_records,
 )
@@ -44,10 +45,12 @@ from app.services.knowledge_sources import (
 from app.services.provider_credentials import ProviderCredentialError, load_provider_config
 from app.services.website_crawler import discover_website
 from app.services.website_recovery import (
+    MAX_PAGINATED_PAGES,
     RecoveredPage,
     WebsiteRecoveryError,
     download_html,
     extract_page_records,
+    find_next_page_url,
     recovery_metadata,
     render_html,
     should_render_javascript,
@@ -905,6 +908,10 @@ async def _commit_repair_success(
         source.provider_item_id = None
         source.error_message = None
         metadata.pop("staged_refresh", None)
+        metadata.pop("force_recompile", None)
+        metadata.pop("pages_followed", None)
+        if getattr(page, "pages", 1) > 1:
+            metadata["pages_followed"] = int(page.pages)
         metadata.pop("provider_artifact_name", None)
         metadata.pop("provider_cleanup_pending_ids", None)
         metadata.update(
@@ -982,6 +989,67 @@ async def _commit_repair_success(
     return committed
 
 
+async def _follow_pagination(
+    page: RecoveredPage,
+    document: str,
+    records: list[KnowledgeRecord],
+    card_signatures: set[tuple[str, tuple[str, ...]]] | None = None,
+) -> tuple[RecoveredPage, list[KnowledgeRecord]]:
+    """Merge the records of a paginated listing's later pages into one source.
+
+    A directory that shows twelve doctors and a "Next" link is one source to
+    the caller, so its later pages are downloaded through the same safe path
+    and their records appended.  The walk is bounded and stops at the first
+    page that repeats or leaves the site.  A page that advertises a next page
+    which cannot be downloaded fails the whole source: a silently truncated
+    listing would otherwise be measured and reported as complete.
+
+    Returns the merged page and the merged records, which are the records the
+    coverage report must be measured against.
+    """
+    seen = {page.url}
+    card_signatures = set() if card_signatures is None else card_signatures
+    merged = list(records)
+    current_document = document
+    current_url = page.url
+    pages = 1
+    total_bytes = page.downloaded_bytes
+    while pages < MAX_PAGINATED_PAGES:
+        next_url = find_next_page_url(current_document, url=current_url)
+        if not next_url or next_url in seen:
+            break
+        seen.add(next_url)
+        try:
+            fetched_url, next_document, next_bytes = await download_html(next_url)
+        except WebsiteRecoveryError as exc:
+            raise WebsiteRecoveryError(
+                f"Page {pages + 1} of this listing ({next_url}) could not be downloaded, so "
+                f"the listing would be incomplete: {exc}",
+                code="pagination_incomplete",
+                retryable=exc.retryable,
+            ) from exc
+        if fetched_url in seen and fetched_url != next_url:
+            break
+        seen.add(fetched_url)
+        _title, next_records = extract_page_records(
+            next_document, url=fetched_url, card_signatures=card_signatures
+        )
+        # Repeated headings collapse in dedupe_records; cards and rows are new.
+        merged.extend(next_records)
+        pages += 1
+        total_bytes += next_bytes
+        current_document, current_url = next_document, fetched_url
+    if pages == 1:
+        return page, records
+    merged = dedupe_records(merged)
+    return (
+        RecoveredPage(
+            page.url, page.title, render_records(merged), page.method, total_bytes, pages=pages
+        ),
+        merged,
+    )
+
+
 async def _repair(
     tenant_id: UUID,
     kb_id: UUID,
@@ -1010,6 +1078,9 @@ async def _repair(
     existing_content_sha256 = source.content_sha256
     existing_compiled_content = source.content
     existing_structured_content = source.structured_content
+    # A knowledge-base re-index asks for a fresh compilation even when the page
+    # text and compiler version are unchanged.
+    force_recompile = bool(source_metadata.get("force_recompile"))
     try:
         openai_config = await load_provider_config(session, tenant_id, "openai")
     except ProviderCredentialError:
@@ -1021,9 +1092,16 @@ async def _repair(
 
     final_url, static_html, downloaded_bytes = await download_html(location)
     try:
-        title, records = extract_page_records(static_html, url=final_url)
+        card_signatures: set[tuple[str, tuple[str, ...]]] = set()
+        title, records = extract_page_records(
+            static_html, url=final_url, card_signatures=card_signatures
+        )
         text = render_records(records)
         static_page = RecoveredPage(final_url, title, text, "static_html", downloaded_bytes)
+        if not should_render_javascript(static_html, text):
+            static_page, records = await _follow_pagination(
+                static_page, static_html, records, card_signatures
+            )
         if should_render_javascript(static_html, text):
             if not await _set_stage(
                 tenant_id,
@@ -1076,7 +1154,8 @@ async def _repair(
         return
     raw_content_sha256 = hashlib.sha256(page.text.encode("utf-8")).hexdigest()
     reused_compilation = bool(
-        existing_content_sha256 == raw_content_sha256
+        not force_recompile
+        and existing_content_sha256 == raw_content_sha256
         and existing_compiled_content
         and existing_structured_content
         and (existing_structured_content.get("compiler") or {}).get("version") == COMPILER_VERSION

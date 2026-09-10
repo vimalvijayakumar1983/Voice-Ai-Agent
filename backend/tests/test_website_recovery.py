@@ -9,6 +9,7 @@ from app.services.website_recovery import (
     download_html,
     extract_page_records,
     extract_readable_text,
+    find_next_page_url,
     recover_page,
     recovery_metadata,
     searchable_pdf,
@@ -204,3 +205,53 @@ def test_readable_text_renders_one_record_per_paragraph():
     paragraphs = text.split("\n\n")
     assert "Dr Dalia Hassan | General Practitioner | 23+ Years Experience" in paragraphs
     assert paragraphs.count("General Practitioner") == 0
+
+
+_PAGINATED_DIRECTORY_HTML = """
+<html><head><title>Our Doctors - Royal Medical</title>
+<link rel="next" href="/doctors?page=2"></head><body>
+<main>
+<form class="filters" role="search">
+  <label>Specialty</label>
+  <select><option>All Specialties</option><option>Cardiology</option></select>
+  <label>Gender</label><select><option>Any</option></select>
+  <button type="submit">Search</button>
+</form>
+<p>Our doctors provide family medicine, paediatrics and dental care across Abu Dhabi
+with same-day appointments and insurance support for every patient.</p>
+<div class="card"><h3>Dr Randa Ahmed</h3><p>General Practitioner</p>
+<p>22+ Years Experience</p></div>
+<div class="card"><h3>Dr Dalia Wahba</h3><p>Anesthesiologist</p>
+<p>23+ Years Experience</p></div>
+<div class="pagination"><a href="/doctors?page=1">1</a><a href="/doctors?page=2">2</a>
+<a href="/doctors?page=2">Next</a></div>
+</main></body></html>
+"""
+
+
+def test_filter_controls_and_pagination_widgets_are_not_records():
+    _title, records = extract_page_records(
+        _PAGINATED_DIRECTORY_HTML, url="https://royalmedical.ae/doctors"
+    )
+
+    texts = [record.text for record in records]
+    assert "Dr Randa Ahmed | General Practitioner | 22+ Years Experience" in texts
+    assert "Dr Dalia Wahba | Anesthesiologist | 23+ Years Experience" in texts
+    assert not any("All Specialties" in text or text in {"Any", "Next", "Search"} for text in texts)
+    assert not any(text.startswith("1 | 2") for text in texts)
+
+
+def test_find_next_page_url_prefers_rel_next_and_stays_on_site():
+    assert (
+        find_next_page_url(_PAGINATED_DIRECTORY_HTML, url="https://royalmedical.ae/doctors")
+        == "https://royalmedical.ae/doctors?page=2"
+    )
+    by_text = '<a href="/doctors?page=3">Next</a>'
+    assert (
+        find_next_page_url(by_text, url="https://royalmedical.ae/doctors?page=2")
+        == "https://royalmedical.ae/doctors?page=3"
+    )
+    assert find_next_page_url(by_text, url="https://royalmedical.ae/doctors?page=3") is None
+    off_site = '<a rel="next" href="https://other.example/doctors?page=2">Next</a>'
+    assert find_next_page_url(off_site, url="https://royalmedical.ae/doctors") is None
+    assert find_next_page_url("<p>No links</p>", url="https://royalmedical.ae/doctors") is None

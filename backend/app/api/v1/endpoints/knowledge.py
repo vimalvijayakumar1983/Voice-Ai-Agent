@@ -74,6 +74,7 @@ from app.services.knowledge_serving import (
 from app.services.knowledge_sources import (
     KNOWLEDGE_PROVIDER,
     VAV_NATIVE_KNOWLEDGE_PROVIDERS,
+    WEBSITE_SOURCE_TYPES,
     canonical_source_url,
     consolidate_duplicate_url_sources,
     has_searchable_content,
@@ -92,6 +93,7 @@ router = APIRouter(prefix="/knowledge", tags=["Knowledge Studio"])
 logger = structlog.get_logger()
 MAX_KNOWLEDGE_PDF_BYTES = 8 * 1024 * 1024
 MAX_SITEMAP_URLS = 500
+MAX_REINDEX_SOURCES = 250
 
 
 async def _compile_uploaded_content(
@@ -400,17 +402,37 @@ async def _get_knowledge_base(
 
 
 def _coverage_blockers(kb: KnowledgeBase) -> tuple[list[str], list[str]]:
-    """Return (sources blocked outright, sources with partial coverage)."""
+    """Return (sources blocked outright, sources with partial coverage).
+
+    Before a knowledge base has been re-indexed, a source compiled by an older
+    pipeline carries no coverage report and is tolerated so existing workspaces
+    keep working.  Once the operator has re-indexed, every source has been
+    through a path that measures coverage, so a missing report blocks approval.
+    """
     blocked: list[str] = []
     partial: list[str] = []
     for source in kb.sources:
         coverage = (source.source_metadata or {}).get("coverage")
         reason = coverage_blocks_approval(coverage)
+        if reason is None and coverage is None and kb.reindex_requested_at is not None:
+            reason = "coverage was never measured; re-index this knowledge base"
         if reason is not None:
             blocked.append(f"{source.name}: {reason}")
         elif isinstance(coverage, dict) and coverage.get("status") == "partial":
             partial.append(source.name)
     return blocked, partial
+
+
+def _source_work_in_progress(source: KnowledgeSource) -> bool:
+    metadata = source.source_metadata if isinstance(source.source_metadata, dict) else {}
+    recovery = metadata.get("recovery") if isinstance(metadata.get("recovery"), dict) else {}
+    compilation = (
+        metadata.get("upload_compile") if isinstance(metadata.get("upload_compile"), dict) else {}
+    )
+    return recovery.get("status") in {"queued", "processing"} or compilation.get("status") in {
+        "queued",
+        "processing",
+    }
 
 
 def _recount(kb: KnowledgeBase) -> None:
@@ -1501,6 +1523,170 @@ async def refresh_knowledge_base(
         },
     )
     return _knowledge_response(kb)
+
+
+@router.post(
+    "/{kb_id}/reindex",
+    response_model=KnowledgeBaseResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def reindex_knowledge_base(
+    kb_id: UUID,
+    request: Request,
+    current_user: CurrentUser = Depends(require_role("owner", "admin", "member")),
+    db: AsyncSession = Depends(get_db),
+):
+    """Re-extract, recompile and re-measure every source with the current pipeline.
+
+    Website pages are downloaded and compiled again through the fenced repair
+    worker (staged while a live release exists, so callers keep the approved
+    text).  PDFs are re-read from the stored file and pasted text is re-split,
+    both through the background compile outbox.  The approved release stays
+    live until the operator approves the re-indexed draft.
+    """
+    kb = await _get_knowledge_base(db, current_user.tenant_id, kb_id)
+    if not kb.sources:
+        raise HTTPException(status_code=409, detail="This knowledge base has no sources")
+    if any(_source_work_in_progress(source) for source in kb.sources):
+        raise HTTPException(
+            status_code=409,
+            detail="Sources are still being processed. Wait for them to finish, then re-index.",
+        )
+    if len(kb.sources) > MAX_REINDEX_SOURCES:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"This knowledge base has {len(kb.sources)} sources; a re-index handles at most "
+                f"{MAX_REINDEX_SOURCES}. Split it into smaller knowledge bases first."
+            ),
+        )
+    # One re-index fans out into a paid compilation per source, so it is
+    # bounded separately from the per-request compile budget: a tenant may start
+    # two re-indexes per ten minutes, each of at most MAX_REINDEX_SOURCES jobs.
+    await enforce_rate_limit(
+        request,
+        scope="knowledge-base-reindex",
+        limit=2,
+        window_seconds=600,
+        subject=str(current_user.tenant_id),
+        bind_to_client=False,
+        limit_detail="Too many re-index requests. Please retry in ten minutes.",
+        unavailable_detail="Knowledge compilation is temporarily unavailable. Retry shortly.",
+    )
+    from app.tasks.knowledge_compile_tasks import job_for, queue_source, set_job
+    from app.tasks.knowledge_tasks import _queue_repair_metadata
+
+    now = datetime.now(UTC)
+    repair_jobs: dict[UUID, str] = {}
+    compile_jobs: dict[UUID, str] = {}
+    unusable: list[str] = []
+    draft_changed = False
+    for source in list(kb.sources):
+        metadata = dict(source.source_metadata or {})
+        mode = str(metadata.get("processing_mode") or "automatic")
+        if mode not in {"automatic", "ai_verified"}:
+            mode = "automatic"
+        if source.source_type in WEBSITE_SOURCE_TYPES and source.location:
+            metadata["processing_mode"] = mode
+            metadata["force_recompile"] = True
+            staged_refresh = bool(
+                kb.approval_status == "approved"
+                and source.status == "indexed"
+                and has_searchable_content(source)
+                and source.content_sha256
+            )
+            queued_metadata, repair_run_id, _ = _queue_repair_metadata(
+                metadata,
+                staged_refresh=staged_refresh,
+                message="Queued for re-extraction and recompilation with the current pipeline.",
+            )
+            if not staged_refresh:
+                source.status = "processing"
+                draft_changed = True
+            source.error_message = None
+            source.source_metadata = queued_metadata
+            repair_jobs[source.id] = repair_run_id
+        elif source.source_type == "file":
+            if not source.file_content:
+                source.status = "failed"
+                source.error_message = "The original PDF is not stored. Upload it again."
+                unusable.append(source.name)
+                continue
+            # The worker re-reads the file; keep the previous text as the fallback.
+            source.raw_content = source.raw_content or source.content
+            queue_source(source, actor_id=current_user.id, mode=mode)
+            job = job_for(source)
+            job["enqueued_at"] = now.isoformat()
+            set_job(source, job)
+            compile_jobs[source.id] = job["run_id"]
+            draft_changed = True
+        elif source.source_type == "text":
+            raw_text = source.raw_content or (
+                source.content if not source.structured_content else None
+            )
+            if not raw_text or not raw_text.strip():
+                source.status = "failed"
+                source.error_message = "No original text is stored for this source. Add it again."
+                unusable.append(source.name)
+                continue
+            source.raw_content = raw_text
+            queue_source(source, actor_id=current_user.id, mode=mode)
+            job = job_for(source)
+            job["enqueued_at"] = now.isoformat()
+            set_job(source, job)
+            compile_jobs[source.id] = job["run_id"]
+            draft_changed = True
+    approval_invalidated = invalidate_knowledge_approval(kb) if draft_changed else False
+    kb.reindex_requested_at = now
+    kb.sync_error = None
+    _recount(kb)
+    await record_audit_event(
+        db,
+        tenant_id=current_user.tenant_id,
+        actor_user_id=current_user.id,
+        action="knowledge_base.reindex_queued",
+        resource_type="knowledge_base",
+        resource_id=str(kb.id),
+        details={
+            "repair_sources": len(repair_jobs),
+            "compile_sources": len(compile_jobs),
+            "unusable_sources": unusable,
+            "approval_invalidated": approval_invalidated,
+        },
+    )
+    # Workers must never race the request transaction that records the jobs.
+    await db.commit()
+
+    from app.tasks.knowledge_compile_tasks import compile_upload
+    from app.tasks.knowledge_tasks import _mark_failed
+    from app.tasks.knowledge_tasks import repair_website_source as repair_task
+
+    for source_id, repair_run_id in repair_jobs.items():
+        try:
+            repair_task.apply_async(
+                args=[str(current_user.tenant_id), str(kb.id), str(source_id), repair_run_id],
+                queue="knowledge",
+            )
+        except Exception:
+            await _mark_failed(
+                current_user.tenant_id,
+                kb.id,
+                source_id,
+                message="The page-extraction worker is temporarily unavailable. Retry this page.",
+                code="worker_unavailable",
+                repair_run_id=repair_run_id,
+            )
+    for source_id, run_id in compile_jobs.items():
+        try:
+            # The source row is the durable outbox; a failed enqueue is retried by beat.
+            compile_upload.apply_async(
+                args=[str(current_user.tenant_id), str(kb.id), str(source_id), run_id],
+                retry=False,
+            )
+        except Exception:
+            logger.warning("knowledge_reindex_enqueue_deferred", source_id=str(source_id))
+    refreshed = await _get_knowledge_base(db, current_user.tenant_id, kb.id, for_update=False)
+    return _knowledge_response(refreshed)
 
 
 @router.post("/{kb_id}/approval", response_model=KnowledgeBaseResponse)

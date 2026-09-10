@@ -158,6 +158,11 @@ class KnowledgeBase(TenantScopedModel):
     indexed_source_count: Mapped[int] = mapped_column(Integer, default=0)
     last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Set when an operator re-indexes every source with the current pipeline.
+    # From then on a source without a coverage report blocks approval: every
+    # source has been through a path that measures coverage, so a missing
+    # report is an error rather than a legacy artefact.
+    reindex_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     # Points at one immutable, source-revision-stamped speech lexicon.  New
     # source revisions create a new artifact and approval atomically swaps this
     # pointer; historical artifacts are retained for audit and call replay.

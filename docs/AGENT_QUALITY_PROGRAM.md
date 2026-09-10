@@ -173,10 +173,36 @@ knowledge base to an agent that does not use VAV retrieval is refused.
 
 ### PR 2. Re-index and completeness for existing knowledge bases
 
-- Knowledge-base level re-index: re-extract PDFs from stored bytes, re-split
-  text, recompile web pages with the current pipeline.
-- Coverage becomes required for approval once every source in a knowledge base
-  has been recompiled at least once.
+Status: implemented.
+
+- Knowledge-base level re-index (`POST /knowledge/{id}/reindex`, "Re-index all
+  sources" in Knowledge Studio): PDFs are re-read from the stored file by the
+  background compile worker, pasted text is re-split into records, and website
+  pages go through the fenced repair worker with `force_recompile` so an
+  unchanged page is still recompiled. Website pages of an approved knowledge
+  base are staged, so callers keep the approved text until re-approval.
+- Coverage becomes required for approval once a knowledge base has been
+  re-indexed (`reindex_requested_at`): from then on a source without a coverage
+  report blocks approval instead of being flagged as unmeasured.
+
+Completeness fixes from the Royal Medical verification on 10 September:
+
+- Filter bars, search boxes, pagination widgets and other form controls are
+  removed before records are extracted, so "Specialty: All Specialties" or
+  "Next" never counts as a missing record.
+- A paginated listing (a `rel="next"` link or a "Next" anchor on the same
+  host) is followed for up to 12 pages and merged into one source; a card
+  layout learned on the first page is still recognised when it appears alone
+  on the last page. The number of pages is stored as `pages_followed`.
+- A source with no cards, rows, lists or fields is reported as `unstructured`
+  ("prose only") rather than "complete: 0 of 0 records".
+- Every uncovered record is stored (up to 300) and Knowledge Studio lists all
+  of them under "Not captured", instead of three examples.
+- A record counts as captured when one fact carries every identifying word of
+  each of its fields, ignoring generic nouns such as "department"; words from
+  different facts are still never combined.
+- The recovery banner reports the source's coverage instead of claiming the
+  text was verified.
 
 Acceptance: an existing knowledge base re-indexes end to end and shows complete
 coverage on the Royal Medical doctor directory.

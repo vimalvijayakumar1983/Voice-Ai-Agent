@@ -1830,6 +1830,10 @@ class ApiClient {
     return this.request<KnowledgeBase>(`/api/v1/knowledge/${id}/refresh`, { method: 'POST' });
   }
 
+  async reindexKnowledgeBase(id: string) {
+    return this.request<KnowledgeBase>(`/api/v1/knowledge/${id}/reindex`, { method: 'POST' });
+  }
+
   async approveKnowledgeBase(id: string, approved: boolean, acceptPartialCoverage = false) {
     return this.request<KnowledgeBase>(`/api/v1/knowledge/${id}/approval`, {
       method: 'POST',
