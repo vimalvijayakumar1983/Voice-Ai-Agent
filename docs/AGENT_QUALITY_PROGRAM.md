@@ -203,6 +203,13 @@ Completeness fixes from the Royal Medical verification on 10 September:
   different facts are still never combined.
 - The recovery banner reports the source's coverage instead of claiming the
   text was verified.
+- Pages are compiled in record-aligned segments of 12,000 characters so each
+  strict-JSON reply stays inside the model's output budget; a cut-off reply is
+  reported as such instead of surfacing as an invalid document. This was the
+  cause of the homepage and doctors "AI compilation failed" results.
+- A JavaScript-rendered listing whose "Next" is a button (no link to follow)
+  is paginated by the renderer clicking the control and capturing each state,
+  up to 12 pages; a click that fails or leaves the site fails the source.
 
 Acceptance: an existing knowledge base re-indexes end to end and shows complete
 coverage on the Royal Medical doctor directory.

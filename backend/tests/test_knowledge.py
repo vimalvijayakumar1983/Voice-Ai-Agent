@@ -2074,3 +2074,47 @@ async def test_paginated_directory_pages_are_merged_into_one_source(monkeypatch)
     ]
     assert merged_rendered.pages == 3
     assert "Dr Four | General Practitioner" in merged_rendered.text
+
+
+@pytest.mark.asyncio
+async def test_rendered_listing_pages_behind_a_next_button_become_one_source(monkeypatch):
+    from app.tasks import knowledge_tasks
+
+    intro = (
+        "<p>Our doctors provide family medicine, paediatrics and dental care across Abu Dhabi "
+        "with same-day appointments and insurance support for every patient.</p>"
+    )
+
+    def state(names: list[str]) -> str:
+        cards = "".join(
+            f'<div class="card"><h3>{name}</h3><p>General Practitioner</p></div>' for name in names
+        )
+        return (
+            "<html><head><title>Our Doctors</title></head><body><main><h1>Our Doctors</h1>"
+            f"{intro}{cards}<button>Next</button></main></body></html>"
+        )
+
+    async def render_listing(url, *, max_pages=12):
+        assert url == "https://clinic.example/doctors"
+        return [
+            ("https://clinic.example/doctors", state(["Dr One", "Dr Two"]), 900),
+            ("https://clinic.example/doctors", state(["Dr Three"]), 800),
+            ("https://clinic.example/doctors", state(["Dr Four"]), 800),
+        ]
+
+    monkeypatch.setattr(knowledge_tasks, "render_listing", render_listing)
+
+    page, records = await knowledge_tasks._render_listing_records(
+        "https://clinic.example/doctors", set()
+    )
+
+    assert page.method == "javascript_render"
+    assert page.pages == 3
+    assert page.downloaded_bytes == 2500
+    assert [record.text for record in records if record.kind == "card"] == [
+        "Dr One | General Practitioner",
+        "Dr Two | General Practitioner",
+        "Dr Three | General Practitioner",
+        "Dr Four | General Practitioner",
+    ]
+    assert page.text.count("Our Doctors") == 1

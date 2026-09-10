@@ -516,7 +516,7 @@ assert that extraction or the source list is exhaustive; VAV tracks coverage.
                 {"role": "system", "content": prompt},
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
             ],
-            max_completion_tokens=8_000,
+            max_completion_tokens=_MAX_COMPLETION_TOKENS,
             response_format={
                 "type": "json_schema",
                 "json_schema": {
@@ -526,7 +526,15 @@ assert that extraction or the source list is exhaustive; VAV tracks coverage.
                 },
             },
         )
-        result = _PageKnowledge.model_validate_json(response.choices[0].message.content or "{}")
+        choice = response.choices[0]
+        if getattr(choice, "finish_reason", None) == "length":
+            raise KnowledgeCompilerError(
+                "AI reply was cut off before the structured document was complete; "
+                "the segment carries too many records for one pass."
+            )
+        result = _PageKnowledge.model_validate_json(choice.message.content or "{}")
+    except KnowledgeCompilerError:
+        raise
     except (IndexError, TypeError, ValueError, json.JSONDecodeError, ValidationError) as exc:
         raise KnowledgeCompilerError(
             "AI returned an invalid structured knowledge document."
@@ -593,24 +601,97 @@ assert that extraction or the source list is exhaustive; VAV tracks coverage.
     return structured, input_tokens, output_tokens
 
 
-async def _compile_complete_source(**kwargs) -> tuple[dict, int, int]:
-    """Visit all extracted text, including long PDFs, without truncating the tail.
+# One strict-JSON reply must stay well inside the model's output budget. With a
+# fact per record field plus search phrases, roughly 40 facts already cost
+# 7,000 tokens, so a page is compiled in record-aligned segments of this size.
+_SEGMENT_CHARS = 12_000
+_MAX_COMPLETION_TOKENS = 16_000
+_SEGMENT_CONCURRENCY = 5
 
-    Bounded overlapping segments preserve nearby headings. Every returned fact
+
+_HEADING_MAX_CHARS = 90
+
+
+def _looks_like_heading(block: str) -> bool:
+    """A short single-line block without record separators or sentence punctuation."""
+    line = block.strip()
+    return (
+        0 < len(line) <= _HEADING_MAX_CHARS
+        and "\n" not in line
+        and " | " not in line
+        and not line.endswith((".", "!", "?", ":", ";"))
+    )
+
+
+def _record_segments(text: str, *, limit: int | None = None) -> list[str]:
+    """Split rendered records (blank-line separated) into segments under ``limit``.
+
+    Records are never cut in half; a single record longer than the limit is
+    sliced with a small overlap so nothing is dropped. Every segment after the
+    first opens with the heading context in force at that point (the page's
+    opening heading and the most recent section heading), so a record such as
+    "Dr Name | Cardiology" still sits under the organisation and section that
+    give it an explicit subject when the compiler validates its evidence.
+    """
+    limit = _SEGMENT_CHARS if limit is None else limit
+    if len(text) <= limit:
+        return [text]
+    blocks = [block for block in re.split(r"\n\s*\n", text) if block.strip()]
+    opening = blocks[0].strip() if blocks and _looks_like_heading(blocks[0]) else ""
+    section = ""
+    segments: list[str] = []
+    current: list[str] = []
+    size = 0
+
+    def context() -> list[str]:
+        return [part for part in dict.fromkeys((opening, section)) if part]
+
+    def open_segment() -> None:
+        nonlocal current, size
+        current = context()
+        size = sum(len(part) + 2 for part in current)
+
+    def close_segment() -> None:
+        if any(part not in context() for part in current):
+            segments.append("\n\n".join(current))
+
+    for block in blocks:
+        if len(block) > limit:
+            close_segment()
+            start = 0
+            while start < len(block):
+                end = min(start + limit, len(block))
+                segments.append(block[start:end])
+                if end == len(block):
+                    break
+                start = max(end - 200, start + 1)
+            open_segment()
+            continue
+        if current and size + len(block) + 2 > limit:
+            close_segment()
+            open_segment()
+        if block.strip() not in current:
+            current.append(block)
+            size += len(block) + 2
+        if _looks_like_heading(block) and block.strip() != opening:
+            section = block.strip()
+    close_segment()
+    return segments or [text]
+
+
+async def _compile_complete_source(**kwargs) -> tuple[dict, int, int]:
+    """Visit all extracted text without truncating the tail or the model's reply.
+
+    Record-aligned segments keep every reply inside the output budget, so a
+    homepage with eighty records or a merged multi-page directory compiles
+    instead of failing validation on a cut-off document. Every returned fact
     is still checked against its own segment, never a different document.
     """
     text = kwargs["text"]
-    if len(text) <= 120_000:
+    segments = _record_segments(text)
+    if len(segments) == 1:
         return await _compile_ai(**kwargs)
-    segments = []
-    start = 0
-    while start < len(text):
-        end = min(start + 110_000, len(text))
-        segments.append(text[start:end])
-        if end == len(text):
-            break
-        start = end - 1_500
-    semaphore = asyncio.Semaphore(3)
+    semaphore = asyncio.Semaphore(_SEGMENT_CONCURRENCY)
 
     async def compile_segment(segment: str):
         async with semaphore:
@@ -630,8 +711,11 @@ async def _compile_complete_source(**kwargs) -> tuple[dict, int, int]:
         structured[key] = merged
     structured["validation"] = {
         key: sum(result.get("validation", {}).get(key, 0) for result, _, _ in results)
-        for key in ("entities_rejected", "facts_rejected")
+        for key in ("entities_rejected", "facts_rejected", "facts_projected")
     }
+    structured["validation"]["entities_accepted"] = len(structured["entities"])
+    structured["validation"]["facts_accepted"] = len(structured["facts"])
+    structured["validation"]["all_evidence_source_grounded"] = True
     structured["exact_fact_coverage"] = {
         "complete": False,
         "absence_authoritative": False,
@@ -651,6 +735,8 @@ def _failure_reason(exc: BaseException) -> str:
     """
     status = getattr(exc, "status_code", None)
     name = type(exc).__name__
+    if isinstance(exc, KnowledgeCompilerError):
+        return f"{name}: {exc}"
     return f"{name} {status}" if status else name
 
 

@@ -52,6 +52,7 @@ from app.services.website_recovery import (
     extract_page_records,
     find_next_page_url,
     recovery_metadata,
+    render_listing,
     render_page,
     should_render_javascript,
 )
@@ -994,6 +995,40 @@ async def _fetch_rendered(url: str) -> tuple[str, str, int]:
     return await render_page(url)
 
 
+async def _render_listing_records(
+    url: str, card_signatures: set[tuple[str, tuple[str, ...]]]
+) -> tuple[RecoveredPage, list[KnowledgeRecord]]:
+    """Render a page and every listing page behind its Next control as one source."""
+    documents = await render_listing(url)
+    first_url, first_document, total_bytes = documents[0]
+    title, records = extract_page_records(
+        first_document, url=first_url, card_signatures=card_signatures
+    )
+    merged = list(records)
+    for page_url, document, downloaded_bytes in documents[1:]:
+        total_bytes += downloaded_bytes
+        try:
+            _title, more = extract_page_records(
+                document, url=page_url, card_signatures=card_signatures
+            )
+        except WebsiteRecoveryError as exc:
+            if exc.code == "no_readable_text":
+                continue  # An empty trailing page ends the listing; nothing was lost.
+            raise
+        merged.extend(more)
+    if len(documents) > 1:
+        merged = dedupe_records(merged)
+    page = RecoveredPage(
+        first_url,
+        title,
+        render_records(merged),
+        "javascript_render",
+        total_bytes,
+        pages=len(documents),
+    )
+    return page, merged
+
+
 async def _follow_pagination(
     page: RecoveredPage,
     document: str,
@@ -1121,28 +1156,15 @@ async def _repair(
                 return
             rendered_signatures: set[tuple[str, tuple[str, ...]]] = set()
             try:
-                rendered_url, rendered_html, rendered_bytes = await render_page(final_url)
-                title, rendered_records = extract_page_records(
-                    rendered_html, url=rendered_url, card_signatures=rendered_signatures
-                )
-            except WebsiteRecoveryError:
-                # Only the initial render may fall back to the usable static
-                # page. A failure while paginating below is not swallowed:
-                # that would index exactly the truncated listing that
-                # _follow_pagination exists to reject.
+                page, records = await _render_listing_records(final_url, rendered_signatures)
+            except WebsiteRecoveryError as exc:
+                # Only a failed initial render may fall back to the usable
+                # static page. A failure while paginating is not swallowed:
+                # that would index exactly the truncated listing the renderer
+                # refuses to report as whole.
+                if exc.code == "pagination_incomplete":
+                    raise
                 page = static_page
-            else:
-                records = rendered_records
-                page = RecoveredPage(
-                    rendered_url,
-                    title,
-                    render_records(records),
-                    "javascript_render",
-                    rendered_bytes,
-                )
-                page, records = await _follow_pagination(
-                    page, rendered_html, records, rendered_signatures, fetch=_fetch_rendered
-                )
         else:
             page = static_page
     except WebsiteRecoveryError as exc:
@@ -1157,16 +1179,7 @@ async def _repair(
             repair_run_id=repair_run_id,
         ):
             return
-        rendered_url, rendered_html, rendered_bytes = await render_page(final_url)
-        rendered_signatures = set()
-        title, records = extract_page_records(
-            rendered_html, url=rendered_url, card_signatures=rendered_signatures
-        )
-        text = render_records(records)
-        page = RecoveredPage(rendered_url, title, text, "javascript_render", rendered_bytes)
-        page, records = await _follow_pagination(
-            page, rendered_html, records, rendered_signatures, fetch=_fetch_rendered
-        )
+        page, records = await _render_listing_records(final_url, set())
     if not await _set_stage(
         tenant_id,
         kb_id,
