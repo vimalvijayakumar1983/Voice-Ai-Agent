@@ -369,12 +369,12 @@ async def test_long_source_does_not_truncate_tail(monkeypatch):
     result = await compiler.compile_source_knowledge(
         title="Long PDF", url="", text=text, requested_mode="ai_verified", api_key="fake"
     )
-    assert len(visited) == 3
-    assert all(len(part) <= 120_000 for part in visited)
+    assert len(visited) >= 3
+    assert all(len(part) <= compiler._SEGMENT_CHARS for part in visited)
     assert RAW in visited[-1]
     assert result.content.endswith(text)
     assert result.structured["facts"] == [FACT]
-    assert result.input_tokens == 300
+    assert result.input_tokens == 100 * len(visited)
     assert result.structured["exact_fact_coverage"]["complete"] is False
 
 
@@ -539,9 +539,7 @@ async def test_pdf_compiler_failure_leaves_no_source_behind(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "length,expected", [(120_001, 2), (217_001, 2), (218_500, 2), (325_501, 3)]
-)
+@pytest.mark.parametrize("length,expected", [(12_001, 2), (23_800, 2), (23_801, 3), (35_601, 4)])
 async def test_segment_overlap_never_creates_an_already_covered_tail(monkeypatch, length, expected):
     segments = []
 
@@ -554,10 +552,11 @@ async def test_segment_overlap_never_creates_an_already_covered_tail(monkeypatch
     await compiler._compile_complete_source(
         title="Large", url="", text=source, api_key="fake", model="fake", client=None
     )
+    # One record longer than a segment is sliced with a 200-character overlap.
     assert len(segments) == expected
     assert segments[-1].endswith("TAIL")
-    assert all(len(segment) > 1_500 for segment in segments)
-    reconstructed = segments[0] + "".join(segment[1_500:] for segment in segments[1:])
+    assert all(200 < len(segment) <= compiler._SEGMENT_CHARS for segment in segments)
+    reconstructed = segments[0] + "".join(segment[200:] for segment in segments[1:])
     assert reconstructed == source
 
 

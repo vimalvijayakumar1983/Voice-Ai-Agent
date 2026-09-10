@@ -7,6 +7,7 @@ import html
 import io
 import ipaddress
 import json
+import re
 import socket
 from collections import Counter
 from collections.abc import Sequence
@@ -677,6 +678,42 @@ async def render_page(url: str) -> tuple[str, str, int]:
     resolve against where the browser ended up, as ``download_html`` already
     reports for static pages.
     """
+    return (await render_listing(url, max_pages=1))[0]
+
+
+_NEXT_CONTROL_PATTERN = re.compile(r"^\s*(next|next page|next\s*[»›]|[»›→])\s*$", re.IGNORECASE)
+
+
+async def _next_listing_control(page):
+    """The visible, enabled "Next" link or button of a listing, if it has one."""
+    for role in ("link", "button"):
+        locator = page.get_by_role(role, name=_NEXT_CONTROL_PATTERN)
+        count = await locator.count()
+        for index in range(min(count, 5)):
+            candidate = locator.nth(index)
+            try:
+                if not await candidate.is_visible() or not await candidate.is_enabled():
+                    continue
+                if str(await candidate.get_attribute("aria-disabled") or "").lower() == "true":
+                    continue
+            except Exception:  # pragma: no cover - a detached control is skipped
+                continue
+            return candidate
+    return None
+
+
+async def render_listing(
+    url: str, *, max_pages: int = MAX_PAGINATED_PAGES
+) -> list[tuple[str, str, int]]:
+    """Render a JavaScript page and, for a listing, the pages behind its "Next" control.
+
+    Client-side pagination often has no link to follow: "Next" is a button that
+    swaps the cards in place. The renderer clicks it, waits for the page to
+    settle and captures each state, up to ``max_pages``. The walk ends at the
+    first missing or disabled control, or when a click leaves the document
+    unchanged. A click that fails or leaves the site raises
+    ``pagination_incomplete`` so a truncated listing is never reported whole.
+    """
     hostname, address = await _resolve_public_destination(url)
     try:
         from playwright.async_api import TimeoutError as PlaywrightTimeoutError
@@ -804,7 +841,48 @@ async def render_page(url: str) -> tuple[str, str, int]:
                     "The rendered page is larger than the 5 MB recovery limit.",
                     code="page_too_large",
                 )
-            return final._replace(fragment="").geturl(), document, len(document.encode("utf-8"))
+            documents: list[tuple[str, str, int]] = [
+                (final._replace(fragment="").geturl(), document, len(document.encode("utf-8")))
+            ]
+            while len(documents) < max_pages:
+                control = await _next_listing_control(page)
+                if control is None:
+                    break
+                try:
+                    await control.click(timeout=5_000)
+                    with suppress(PlaywrightTimeoutError):
+                        await page.wait_for_load_state("networkidle", timeout=5_000)
+                    await page.wait_for_timeout(750)
+                except PlaywrightTimeoutError as exc:
+                    raise WebsiteRecoveryError(
+                        f"Page {len(documents) + 1} of this listing did not load after "
+                        "its Next control was activated, so the listing would be incomplete.",
+                        code="pagination_incomplete",
+                        retryable=True,
+                    ) from exc
+                current = urlsplit(page.url)
+                if current.scheme != "https" or current.hostname != hostname:
+                    raise WebsiteRecoveryError(
+                        "The listing's Next control left its approved website host.",
+                        code="pagination_incomplete",
+                    )
+                next_document = await page.content()
+                if len(next_document.encode("utf-8")) > MAX_WEBSITE_BYTES:
+                    raise WebsiteRecoveryError(
+                        f"Page {len(documents) + 1} of this listing is larger than the 5 MB "
+                        "recovery limit.",
+                        code="pagination_incomplete",
+                    )
+                if next_document == documents[-1][1]:
+                    break
+                documents.append(
+                    (
+                        current._replace(fragment="").geturl(),
+                        next_document,
+                        len(next_document.encode("utf-8")),
+                    )
+                )
+            return documents
     except WebsiteRecoveryError:
         raise
     except Exception as exc:

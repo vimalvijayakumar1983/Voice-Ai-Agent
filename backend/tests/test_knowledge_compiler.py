@@ -1,4 +1,5 @@
 import json
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -512,3 +513,106 @@ def test_failed_automatic_compilation_names_the_reason():
 
     assert _failure_reason(RateLimitedError("too many requests")) == "RateLimitedError 429"
     assert _failure_reason(TimeoutError()) == "TimeoutError"
+
+
+def _segment_payload(index: int) -> dict:
+    return {
+        "page_type": "directory",
+        "entities": [],
+        "facts": [
+            {
+                "subject": f"Dr Number{index}",
+                "predicate": "specialty",
+                "value": "General Practitioner",
+                "evidence": f"Dr Number{index} | General Practitioner",
+                "search_phrases": [f"Who is Dr Number{index}?"],
+            }
+        ],
+    }
+
+
+class _SegmentAwareCompletions:
+    """Answers each segment with the fact for the doctor that segment contains."""
+
+    def __init__(self):
+        self.requests = []
+
+    async def create(self, **kwargs):
+        self.requests.append(kwargs)
+        text = json.loads(kwargs["messages"][1]["content"])["source_text"]
+        indexes = [int(match) for match in re.findall(r"Dr Number(\d+)", text)]
+        payload = {
+            "page_type": "directory",
+            "entities": [],
+            "facts": [fact for index in indexes for fact in _segment_payload(index)["facts"]],
+        }
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content=json.dumps(payload)), finish_reason="stop"
+                )
+            ],
+            usage=SimpleNamespace(prompt_tokens=100, completion_tokens=40),
+        )
+
+
+@pytest.mark.asyncio
+async def test_large_pages_compile_in_record_aligned_segments(monkeypatch):
+    from app.services import knowledge_compiler
+
+    monkeypatch.setattr(knowledge_compiler, "_SEGMENT_CHARS", 120)
+    records = [f"Dr Number{index} | General Practitioner" for index in range(1, 9)]
+    text = "\n\n".join(records)
+    completions = _SegmentAwareCompletions()
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+
+    result = await compile_website_knowledge(
+        title="Our Doctors",
+        url="https://clinic.example/doctors",
+        text=text,
+        requested_mode="ai_verified",
+        api_key="fake",
+        client=client,
+    )
+
+    assert len(completions.requests) >= 3
+    for request in completions.requests:
+        segment = json.loads(request["messages"][1]["content"])["source_text"]
+        assert len(segment) <= 120
+        assert not segment.startswith("|") and not segment.endswith("|")  # records intact
+    assert sorted(fact["subject"] for fact in result.structured["facts"]) == sorted(
+        f"Dr Number{index}" for index in range(1, 9)
+    )
+    assert result.structured["validation"]["facts_accepted"] == 8
+    assert result.structured["exact_fact_coverage"]["segments_processed"] >= 3
+
+
+@pytest.mark.asyncio
+async def test_cut_off_model_reply_is_reported_not_parsed():
+    class TruncatedCompletions:
+        async def create(self, **kwargs):
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content='{"page_type": "directory", "fac'),
+                        finish_reason="length",
+                    )
+                ],
+                usage=SimpleNamespace(prompt_tokens=100, completion_tokens=16_000),
+            )
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=TruncatedCompletions()))
+    with pytest.raises(KnowledgeCompilerError) as failure:
+        await compile_website_knowledge(
+            title="Home",
+            url="https://clinic.example/",
+            text="Royal Medical Center | One Day Surgery",
+            requested_mode="ai_verified",
+            api_key="fake",
+            client=client,
+        )
+    assert "cut off" in str(failure.value)
+
+    from app.services.knowledge_compiler import _failure_reason
+
+    assert _failure_reason(failure.value).startswith("KnowledgeCompilerError: AI reply was cut off")
