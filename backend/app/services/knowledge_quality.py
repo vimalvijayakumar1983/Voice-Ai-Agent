@@ -69,11 +69,18 @@ def source_quality(source) -> tuple[str, list[str]]:
             "This looks like a doctor directory, but no named doctor entries were extracted. "
             "Headings and navigation are not a usable directory."
         ]
+    from app.services.knowledge_records import coverage_issue
+
+    coverage_note = coverage_issue(metadata.get("coverage"))
     if facts:
         return "not_tested", [
-            "Source-backed facts extracted. Agent retrieval must be checked before publication."
+            "Source-backed facts extracted. Agent retrieval must be checked before publication.",
+            *([coverage_note] if coverage_note else []),
         ]
-    return "text_only", ["Readable text extracted; answer coverage has not been verified."]
+    return "text_only", [
+        "Readable text extracted; answer coverage has not been verified.",
+        *([coverage_note] if coverage_note else []),
+    ]
 
 
 def retrieval_probes(source, *, maximum: int = 3) -> list[tuple[str, str, str]]:

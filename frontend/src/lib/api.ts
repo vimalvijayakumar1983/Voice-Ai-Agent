@@ -1834,10 +1834,10 @@ class ApiClient {
     return this.request<KnowledgeBase>(`/api/v1/knowledge/${id}/refresh`, { method: 'POST' });
   }
 
-  async approveKnowledgeBase(id: string, approved: boolean) {
+  async approveKnowledgeBase(id: string, approved: boolean, acceptPartialCoverage = false) {
     return this.request<KnowledgeBase>(`/api/v1/knowledge/${id}/approval`, {
       method: 'POST',
-      body: JSON.stringify({ approved }),
+      body: JSON.stringify({ approved, accept_partial_coverage: acceptPartialCoverage }),
     });
   }
 

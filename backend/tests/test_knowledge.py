@@ -3048,3 +3048,112 @@ async def test_ambiguous_remote_provisioning_blocks_duplicate_creation(tenant, d
 
     assert blocked.value.status_code == 409
     assert attempts == 1
+
+
+def _coverage_text_source(tenant, *, name: str, coverage: dict | None) -> KnowledgeSource:
+    return KnowledgeSource(
+        tenant_id=tenant.id,
+        source_type="text",
+        name=name,
+        content=f"{name} approved content for callers.",
+        raw_content=f"{name} approved content for callers.",
+        status="indexed",
+        source_metadata={"coverage": coverage} if coverage is not None else {},
+    )
+
+
+@pytest.mark.asyncio
+async def test_approval_blocks_uncompiled_sources_and_acknowledges_partial_coverage(
+    client,
+    auth_headers,
+    tenant,
+    db,
+):
+    knowledge = KnowledgeBase(
+        tenant_id=tenant.id,
+        name="Coverage-gated knowledge",
+        sync_status="ready",
+        approval_status="draft",
+    )
+    source = _coverage_text_source(
+        tenant,
+        name="Doctor directory",
+        coverage={"status": "not_compiled", "record_total": 4, "records_covered": 0},
+    )
+    knowledge.sources.append(source)
+    knowledge.source_count = 1
+    knowledge.indexed_source_count = 1
+    db.add(knowledge)
+    await db.commit()
+
+    blocked = await client.post(
+        f"/api/v1/knowledge/{knowledge.id}/approval",
+        headers=auth_headers,
+        json={"approved": True},
+    )
+    assert blocked.status_code == 409
+    assert "Recompile" in blocked.json()["detail"]
+    assert "Doctor directory" in blocked.json()["detail"]
+
+    source.source_metadata = {
+        "coverage": {
+            "status": "partial",
+            "record_total": 4,
+            "records_covered": 3,
+            "uncovered": ["Dr Dalia Hassan | General Practitioner | 23+ Years Experience"],
+            "uncovered_total": 1,
+            "facts_accepted": 6,
+        }
+    }
+    await db.commit()
+
+    listed = await client.get(f"/api/v1/knowledge/{knowledge.id}", headers=auth_headers)
+    issues = listed.json()["sources"][0]["quality_issues"]
+    assert any("Partial coverage: 3 of 4 records" in issue for issue in issues)
+
+    partial = await client.post(
+        f"/api/v1/knowledge/{knowledge.id}/approval",
+        headers=auth_headers,
+        json={"approved": True},
+    )
+    assert partial.status_code == 409
+    assert "accept_partial_coverage" in partial.json()["detail"]
+
+    acknowledged = await client.post(
+        f"/api/v1/knowledge/{knowledge.id}/approval",
+        headers=auth_headers,
+        json={"approved": True, "accept_partial_coverage": True},
+    )
+    assert acknowledged.status_code == 200
+    assert acknowledged.json()["approval_status"] == "approved"
+
+
+@pytest.mark.asyncio
+async def test_legacy_sources_without_coverage_still_approve_but_are_flagged(
+    client,
+    auth_headers,
+    tenant,
+    db,
+):
+    knowledge = KnowledgeBase(
+        tenant_id=tenant.id,
+        name="Legacy knowledge",
+        sync_status="ready",
+        approval_status="draft",
+    )
+    knowledge.sources.append(_coverage_text_source(tenant, name="Legacy FAQ", coverage=None))
+    knowledge.source_count = 1
+    knowledge.indexed_source_count = 1
+    db.add(knowledge)
+    await db.commit()
+
+    listed = await client.get(f"/api/v1/knowledge/{knowledge.id}", headers=auth_headers)
+    issues = listed.json()["sources"][0]["quality_issues"]
+    assert any("Coverage not measured" in issue for issue in issues)
+
+    approved = await client.post(
+        f"/api/v1/knowledge/{knowledge.id}/approval",
+        headers=auth_headers,
+        json={"approved": True},
+    )
+    assert approved.status_code == 200
