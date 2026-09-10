@@ -2040,3 +2040,21 @@ async def test_paginated_directory_pages_are_merged_into_one_source(monkeypatch)
     assert failure.value.code == "pagination_incomplete"
     assert failure.value.retryable is True
     assert "page=3" in str(failure.value)
+
+    # A JavaScript-rendered listing paginates through the renderer, not the
+    # static downloader.
+    rendered: list[str] = []
+
+    async def render(url):
+        rendered.append(url)
+        return pages[url], len(pages[url])
+
+    monkeypatch.setattr(knowledge_tasks, "render_html", render)
+    merged_rendered, _ = await knowledge_tasks._follow_pagination(
+        first, pages[first_url], records, set(), fetch=knowledge_tasks._fetch_rendered
+    )
+    assert rendered == [
+        "https://clinic.example/doctors?page=2",
+        "https://clinic.example/doctors?page=3",
+    ]
+    assert merged_rendered.pages == 3

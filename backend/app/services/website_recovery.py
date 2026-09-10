@@ -561,6 +561,9 @@ def extract_page_records(
             # Filter bars, search boxes and pagination widgets are controls,
             # not knowledge: "Specialty: All Specialties" is never a fact.
             "form",
+            "fieldset",
+            "legend",
+            "label",
             "select",
             "option",
             "input",
