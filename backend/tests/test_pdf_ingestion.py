@@ -75,3 +75,53 @@ def test_prepare_pdf_keeps_each_price_row_together_with_column_names():
     assert "All prices include VAT." in paragraphs
     assert "Cancellations require 24 hours notice." in paragraphs
     assert "Service: Consultation | Price: AED 150 | Duration: 20 min" in prepared.extracted_text
+
+
+def _two_branch_pdf() -> bytes:
+    document = pymupdf.open()
+    page = document.new_page()
+    page.insert_text((72, 60), "Opening hours", fontsize=18)
+    tables = (
+        (90, 120, "Branch A", [["Day", "Hours"], ["Monday", "9 AM to 5 PM"], ["Friday", "Closed"]]),
+        (
+            250,
+            280,
+            "Branch B",
+            [["Day", "Hours"], ["Monday", "9 AM to 5 PM"], ["Friday", "2 PM to 8 PM"]],
+        ),
+    )
+    for heading_y, table_y, branch, rows in tables:
+        page.insert_text((72, heading_y), branch, fontsize=14)
+        for row_index, row in enumerate(rows):
+            for column_index, cell in enumerate(row):
+                rect = pymupdf.Rect(
+                    72 + column_index * 150,
+                    table_y + row_index * 22,
+                    72 + (column_index + 1) * 150,
+                    table_y + (row_index + 1) * 22,
+                )
+                page.draw_rect(rect, color=(0, 0, 0), width=0.5)
+                page.insert_text((rect.x0 + 4, rect.y0 + 15), cell, fontsize=10)
+    page.insert_text((72, 215), "Branch A closes on public holidays.", fontsize=10)
+    content = document.tobytes()
+    document.close()
+    return content
+
+
+def test_prepare_pdf_places_each_table_under_its_own_heading():
+    prepared = prepare_pdf(_two_branch_pdf(), languages=["en"])
+
+    sequence = [(record.kind, record.text) for record in prepared.records]
+    assert sequence.index(("heading", "Branch A")) < sequence.index(
+        ("table_row", "Day: Monday | Hours: 9 AM to 5 PM")
+    )
+    assert sequence.index(("paragraph", "Branch A closes on public holidays.")) < sequence.index(
+        ("heading", "Branch B")
+    )
+    assert sequence.index(("heading", "Branch B")) < sequence.index(
+        ("table_row", "Day: Friday | Hours: 2 PM to 8 PM")
+    )
+    monday_rows = [
+        record for record in prepared.records if record.text == "Day: Monday | Hours: 9 AM to 5 PM"
+    ]
+    assert [record.heading_path for record in monday_rows] == [("Branch A",), ("Branch B",)]

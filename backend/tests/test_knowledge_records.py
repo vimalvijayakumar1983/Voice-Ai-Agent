@@ -98,3 +98,66 @@ def test_coverage_distinguishes_skipped_fast_mode_from_missing_compilation():
     assert missing["status"] == "not_compiled"
     assert coverage_blocks_approval(missing) is not None
     assert coverage_blocks_approval(None) is None
+
+
+def test_coverage_requires_one_fact_to_carry_every_field_of_a_record():
+    records = [
+        make_record("table_row", ["Service: Consultation", "Price: AED 100"]),
+    ]
+    scattered = {
+        "facts": [
+            {
+                "subject": "Consultation",
+                "predicate": "price",
+                "value": "AED 150",
+                "evidence": "Service: Consultation | Price: AED 150",
+            },
+            {
+                "subject": "X-ray",
+                "predicate": "price",
+                "value": "AED 100",
+                "evidence": "Service: X-ray | Price: AED 100",
+            },
+        ],
+        "entities": [],
+        "validation": {"facts_accepted": 2},
+    }
+
+    report = coverage_report(
+        records, scattered, requested_mode="automatic", effective_mode="ai_verified"
+    )
+
+    assert report["status"] == "partial"
+    assert report["records_covered"] == 0
+    assert report["uncovered"] == ["Service: Consultation | Price: AED 100"]
+
+    scattered["facts"].append(
+        {
+            "subject": "Consultation",
+            "predicate": "price",
+            "value": "AED 100",
+            "evidence": "Service: Consultation | Price: AED 100",
+        }
+    )
+    complete = coverage_report(
+        records, scattered, requested_mode="automatic", effective_mode="ai_verified"
+    )
+    assert complete["status"] == "complete"
+
+
+def test_dedupe_keeps_identical_rows_that_sit_under_different_headings():
+    records = records_from_text(
+        """# Branch A
+Opening hours: 9 AM to 5 PM
+# Branch B
+Opening hours: 9 AM to 5 PM
+Opening hours: 9 AM to 5 PM
+"""
+    )
+
+    assert [(record.heading_path, record.text) for record in records] == [
+        ((), "Branch A"),
+        (("Branch A",), "Opening hours: 9 AM to 5 PM"),
+        ((), "Branch B"),
+        (("Branch B",), "Opening hours: 9 AM to 5 PM"),
+    ]

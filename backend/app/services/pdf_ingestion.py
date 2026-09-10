@@ -75,27 +75,58 @@ def _ocr_language(languages: list[str] | None) -> str:
     return "+".join(requested)
 
 
-def _rect_overlaps(block_bbox: tuple[float, float, float, float], table_rects: list) -> bool:
-    if not table_rects:
-        return False
+def _overlapping_table(
+    block_bbox: tuple[float, float, float, float], tables: list[_PageTable]
+) -> _PageTable | None:
+    if not tables:
+        return None
     rect = pymupdf.Rect(*block_bbox)
-    for table_rect in table_rects:
-        intersection = rect & table_rect
-        if not intersection.is_empty and intersection.get_area() >= rect.get_area() * 0.5:
-            return True
-    return False
-
-
-def _table_records(
-    page: pymupdf.Page, *, page_number: int, heading_path: list[str]
-) -> tuple[list[KnowledgeRecord], list]:
-    records: list[KnowledgeRecord] = []
-    rects: list = []
-    try:
-        tables = page.find_tables()
-    except Exception:  # pragma: no cover - table detection is best effort
-        return records, rects
     for table in tables:
+        intersection = rect & table.rect
+        if not intersection.is_empty and intersection.get_area() >= rect.get_area() * 0.5:
+            return table
+    return None
+
+
+@dataclass
+class _PageTable:
+    rect: pymupdf.Rect
+    header_names: list[str]
+    rows: list[list[str]]
+    inserted: bool = False
+
+    def records(self, *, page_number: int, heading_path: list[str]) -> list[KnowledgeRecord]:
+        """Build this table's records under the heading that precedes it in layout."""
+        records: list[KnowledgeRecord] = []
+        if any(self.header_names):
+            record = make_record(
+                "heading",
+                [" | ".join(name for name in self.header_names if name)],
+                heading_path=heading_path,
+                page=page_number,
+            )
+            if record:
+                records.append(record)
+        for values in self.rows:
+            if self.header_names and len(self.header_names) == len(values):
+                values = [
+                    f"{name}: {value}" if name and value else value
+                    for name, value in zip(self.header_names, values, strict=True)
+                ]
+            record = make_record("table_row", values, heading_path=heading_path, page=page_number)
+            if record:
+                records.append(record)
+        return records
+
+
+def _page_tables(page: pymupdf.Page) -> list[_PageTable]:
+    """Detect the tables on a page, each kept with its own layout rectangle."""
+    tables: list[_PageTable] = []
+    try:
+        detected = page.find_tables()
+    except Exception:  # pragma: no cover - table detection is best effort
+        return tables
+    for table in detected:
         try:
             rows = table.extract()
         except Exception:  # pragma: no cover - a damaged table must not fail the page
@@ -106,31 +137,15 @@ def _table_records(
         external_header = bool(getattr(table.header, "external", False))
         if rows and not external_header and header_names and any(header_names):
             rows = rows[1:]
-        if not rows:
-            continue
-        rects.append(pymupdf.Rect(table.bbox))
-        if any(header_names):
-            record = make_record(
-                "heading",
-                [" | ".join(name for name in header_names if name)],
-                heading_path=heading_path,
-                page=page_number,
-            )
-            if record:
-                records.append(record)
+        cleaned_rows = []
         for row in rows:
             values = [" ".join(str(cell or "").split()) for cell in row]
-            if not any(values):
-                continue
-            if header_names and len(header_names) == len(values):
-                values = [
-                    f"{name}: {value}" if name and value else value
-                    for name, value in zip(header_names, values, strict=True)
-                ]
-            record = make_record("table_row", values, heading_path=heading_path, page=page_number)
-            if record:
-                records.append(record)
-    return records, rects
+            if any(values):
+                cleaned_rows.append(values)
+        if not cleaned_rows:
+            continue
+        tables.append(_PageTable(pymupdf.Rect(table.bbox), header_names, cleaned_rows))
+    return tables
 
 
 def _page_records(
@@ -141,13 +156,7 @@ def _page_records(
     detect_tables: bool,
 ) -> list[KnowledgeRecord]:
     records: list[KnowledgeRecord] = []
-    table_rects: list = []
-    if detect_tables:
-        table_records, table_rects = _table_records(
-            page, page_number=page_number, heading_path=heading_path
-        )
-    else:
-        table_records = []
+    tables = _page_tables(page) if detect_tables else []
     try:
         layout = page.get_text("dict", sort=True)
     except Exception:  # pragma: no cover - fall back to plain text on odd pages
@@ -173,7 +182,7 @@ def _page_records(
                     block_size = max(block_size, size)
         if lines:
             blocks.append((" ".join(lines), block_size, tuple(block.get("bbox", (0, 0, 0, 0)))))
-    if not blocks and not table_records:
+    if not blocks and not tables:
         text = _clean_page_text(page.get_text("text", sort=True))
         for paragraph in text.split("\n"):
             record = make_record(
@@ -183,12 +192,14 @@ def _page_records(
                 records.append(record)
         return records
     body_size = statistics.median(sizes) if sizes else 0.0
-    table_inserted = False
     for text, size, bbox in blocks:
-        if _rect_overlaps(bbox, table_rects):
-            if not table_inserted:
-                records.extend(table_records)
-                table_inserted = True
+        table = _overlapping_table(bbox, tables)
+        if table is not None:
+            # Each table is placed once, where its cells sit in reading order,
+            # under whichever heading precedes it on the page.
+            if not table.inserted:
+                records.extend(table.records(page_number=page_number, heading_path=heading_path))
+                table.inserted = True
             continue
         words = text.split()
         if (
@@ -202,8 +213,9 @@ def _page_records(
             record = make_record("paragraph", [text], heading_path=heading_path, page=page_number)
         if record:
             records.append(record)
-    if table_records and not table_inserted:
-        records.extend(table_records)
+    for table in tables:
+        if not table.inserted:
+            records.extend(table.records(page_number=page_number, heading_path=heading_path))
     return records
 
 
