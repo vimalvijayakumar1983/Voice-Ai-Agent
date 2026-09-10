@@ -118,7 +118,7 @@ async def _has_pending_smallest_cleanup(db: AsyncSession, tenant_id: UUID) -> bo
         .where(
             KnowledgeProviderCleanup.tenant_id == tenant_id,
             KnowledgeProviderCleanup.provider == _SMALLEST_CLEANUP_PROVIDER,
-            KnowledgeProviderCleanup.status != "completed",
+            KnowledgeProviderCleanup.status.notin_(("completed", "cancelled")),
         )
         .limit(1)
     )

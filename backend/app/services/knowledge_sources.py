@@ -46,14 +46,17 @@ def mark_native_bindings_live(knowledge_base: KnowledgeBase) -> None:
 
     VAV runtimes retrieve approved knowledge on every caller turn, so a source
     change is live as soon as it is indexed locally.  A legacy binding to an
-    agent on another voice provider is left exactly as it is: that agent never
-    reads VAV's local index, so it must never be reported as synced.
+    agent on another voice provider is explicitly not live: that agent never
+    reads VAV's local index, so it is moved to ``pending`` rather than left
+    reporting a historical success.
     """
     now = datetime.now(UTC)
     for binding in knowledge_base.agent_bindings:
         agent = binding.agent
         provider = str(getattr(agent, "voice_provider", "") or "").strip()
         if provider not in VAV_NATIVE_KNOWLEDGE_PROVIDERS:
+            binding.sync_status = "pending"
+            binding.last_synced_at = None
             continue
         binding.provider = provider
         binding.sync_status = "synced"

@@ -293,6 +293,7 @@ def _knowledge_response(kb: KnowledgeBase) -> KnowledgeBaseResponse:
             id=binding.id,
             agent_id=binding.agent_id,
             agent_name=binding.agent.name,
+            agent_voice_provider=str(binding.agent.voice_provider or ""),
             knowledge_base_id=binding.knowledge_base_id,
             sync_status=binding.sync_status,
             last_synced_at=binding.last_synced_at,

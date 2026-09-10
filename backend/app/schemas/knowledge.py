@@ -160,6 +160,7 @@ class KnowledgeAgentBindingResponse(BaseModel):
     id: UUID
     agent_id: UUID
     agent_name: str
+    agent_voice_provider: str
     knowledge_base_id: UUID
     sync_status: str
     last_synced_at: datetime | None

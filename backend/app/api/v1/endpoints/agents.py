@@ -40,11 +40,8 @@ from app.models.agent import (
     AgentKnowledgeBinding,
     AgentRuntimeProfile,
     KnowledgeBase,
-    KnowledgeCrawl,
-    KnowledgeProviderCleanup,
     KnowledgeServingRevision,
     KnowledgeServingRevisionSource,
-    KnowledgeSource,
 )
 from app.models.call import Call
 from app.models.campaign import Campaign, CampaignContactAttempt
@@ -637,9 +634,14 @@ async def _approved_bound_provider_knowledge_base_id(
     agent_id: UUID,
     tenant_id: UUID,
 ) -> str | None:
-    """Resolve one approved, provisioned KB bound to an agent."""
-    # Discover without a row lock so we can follow the global order below.
-    discovered_binding = await db.scalar(
+    """Refuse to publish a provider agent that is bound to VAV knowledge.
+
+    Knowledge is extracted, compiled and served by VAV only; there is no remote
+    copy to publish, and a copy uploaded before the change is stale.  An agent
+    on the provider runtime must be unbound (or moved to a VAV-native runtime)
+    before it can be published again.
+    """
+    binding = await db.scalar(
         select(AgentKnowledgeBinding)
         .where(
             AgentKnowledgeBinding.agent_id == agent_id,
@@ -647,107 +649,16 @@ async def _approved_bound_provider_knowledge_base_id(
         )
         .execution_options(populate_existing=True)
     )
-    if not discovered_binding:
+    if binding is None:
         return None
-    discovered_knowledge_base_id = discovered_binding.knowledge_base_id
-    bound_knowledge = await db.scalar(
-        select(KnowledgeBase)
-        .where(
-            KnowledgeBase.id == discovered_knowledge_base_id,
-            KnowledgeBase.tenant_id == tenant_id,
-        )
-        .with_for_update()
-        .execution_options(populate_existing=True)
+    raise HTTPException(
+        status_code=409,
+        detail=(
+            "This agent is bound to a knowledge base that VAV serves locally. Provider "
+            "agents cannot use VAV knowledge: unbind the knowledge base, or move the agent "
+            "to a VAV-native runtime (Inworld, Sarvam or ElevenLabs), then publish again."
+        ),
     )
-    if not bound_knowledge:
-        raise HTTPException(status_code=409, detail="Bound knowledge no longer exists")
-    knowledge_binding = await db.scalar(
-        select(AgentKnowledgeBinding)
-        .where(
-            AgentKnowledgeBinding.agent_id == agent_id,
-            AgentKnowledgeBinding.tenant_id == tenant_id,
-        )
-        .with_for_update()
-        .execution_options(populate_existing=True)
-    )
-    if (
-        knowledge_binding is None
-        or knowledge_binding.knowledge_base_id != discovered_knowledge_base_id
-    ):
-        raise HTTPException(
-            status_code=409,
-            detail="Knowledge binding changed during provider publication; retry",
-        )
-    pending_provider_cleanup = await db.scalar(
-        select(KnowledgeProviderCleanup.id).where(
-            KnowledgeProviderCleanup.tenant_id == tenant_id,
-            KnowledgeProviderCleanup.knowledge_base_id == bound_knowledge.id,
-            KnowledgeProviderCleanup.status != "completed",
-        )
-    )
-    if pending_provider_cleanup is not None:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "Bound knowledge has remote artifact cleanup pending. Wait for cleanup "
-                "before publishing the Smallest.ai agent."
-            ),
-        )
-    sources = list(
-        (
-            await db.scalars(
-                select(KnowledgeSource)
-                .where(
-                    KnowledgeSource.knowledge_base_id == bound_knowledge.id,
-                    KnowledgeSource.tenant_id == tenant_id,
-                )
-                .order_by(KnowledgeSource.id)
-                .with_for_update()
-                .execution_options(populate_existing=True)
-            )
-        ).all()
-    )
-    active_crawl = await db.scalar(
-        select(KnowledgeCrawl.id)
-        .where(
-            KnowledgeCrawl.knowledge_base_id == bound_knowledge.id,
-            KnowledgeCrawl.tenant_id == tenant_id,
-            KnowledgeCrawl.status.in_({"queued", "discovering", "indexing", "retrying"}),
-        )
-        .order_by(KnowledgeCrawl.id)
-        .with_for_update()
-    )
-    active_recovery = any(
-        isinstance(source.source_metadata, dict)
-        and isinstance(source.source_metadata.get("recovery"), dict)
-        and source.source_metadata["recovery"].get("status") in {"queued", "processing"}
-        for source in sources
-    )
-    if active_crawl is not None or active_recovery:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "Bound knowledge has website crawl or recovery work in progress. Wait for it "
-                "to finish before publishing a Smallest.ai agent."
-            ),
-        )
-    if (
-        bound_knowledge.approval_status != "approved"
-        or not bound_knowledge.provider_knowledge_base_id
-    ):
-        raise HTTPException(
-            status_code=409,
-            detail="Bound knowledge must be approved and provisioned before publishing",
-        )
-    if bound_knowledge.sync_status != "ready":
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "Bound knowledge is not retrieval-ready. Repair or finish indexing every "
-                "source before publishing."
-            ),
-        )
-    return bound_knowledge.provider_knowledge_base_id
 
 
 def _voice_configuration_snapshot(agent: Agent) -> tuple:

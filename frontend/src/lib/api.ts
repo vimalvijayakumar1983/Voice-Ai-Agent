@@ -320,6 +320,7 @@ export interface KnowledgeAgentBinding {
   id: string;
   agent_id: string;
   agent_name: string;
+  agent_voice_provider: string;
   knowledge_base_id: string;
   sync_status: string;
   last_synced_at: string | null;

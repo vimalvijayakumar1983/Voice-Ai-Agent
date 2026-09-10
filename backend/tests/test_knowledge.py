@@ -234,8 +234,8 @@ def test_legacy_binding_to_a_non_vav_agent_is_never_reported_as_synced():
     binding = SimpleNamespace(
         agent=agent,
         provider="smallest",
-        sync_status="pending",
-        last_synced_at=None,
+        sync_status="synced",
+        last_synced_at=datetime.now(UTC),
     )
 
     mark_native_bindings_live(SimpleNamespace(agent_bindings=[binding]))
