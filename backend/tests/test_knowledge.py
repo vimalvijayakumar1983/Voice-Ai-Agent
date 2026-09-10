@@ -1969,7 +1969,11 @@ async def test_approval_requires_measured_coverage_once_a_knowledge_base_is_rein
 
 @pytest.mark.asyncio
 async def test_paginated_directory_pages_are_merged_into_one_source(monkeypatch):
-    from app.services.website_recovery import RecoveredPage, extract_page_records
+    from app.services.website_recovery import (
+        RecoveredPage,
+        WebsiteRecoveryError,
+        extract_page_records,
+    )
     from app.tasks import knowledge_tasks
 
     def listing(page: int, names: list[str], *, next_page: int | None) -> str:
@@ -2005,7 +2009,9 @@ async def test_paginated_directory_pages_are_merged_into_one_source(monkeypatch)
     )
     first = RecoveredPage(first_url, title, "", "static_html", len(pages[first_url]))
 
-    merged = await knowledge_tasks._follow_pagination(first, pages[first_url], records, signatures)
+    merged, merged_records = await knowledge_tasks._follow_pagination(
+        first, pages[first_url], records, signatures
+    )
 
     assert fetched == [
         "https://clinic.example/doctors?page=2",
@@ -2015,3 +2021,22 @@ async def test_paginated_directory_pages_are_merged_into_one_source(monkeypatch)
     for name in ("Dr One", "Dr Two", "Dr Three", "Dr Four"):
         assert f"{name} | General Practitioner" in merged.text
     assert merged.text.count("Our Doctors") == 1  # the listing heading once, not per page
+    # Coverage is measured against the merged records, not the first page only.
+    assert [record.text for record in merged_records if record.kind == "card"] == [
+        "Dr One | General Practitioner",
+        "Dr Two | General Practitioner",
+        "Dr Three | General Practitioner",
+        "Dr Four | General Practitioner",
+    ]
+
+    async def failing_download(url):
+        if url.endswith("page=3"):
+            raise WebsiteRecoveryError("HTTP 503 after retries", code="http_error", retryable=True)
+        return url, pages[url], len(pages[url])
+
+    monkeypatch.setattr(knowledge_tasks, "download_html", failing_download)
+    with pytest.raises(WebsiteRecoveryError) as failure:
+        await knowledge_tasks._follow_pagination(first, pages[first_url], records, set())
+    assert failure.value.code == "pagination_incomplete"
+    assert failure.value.retryable is True
+    assert "page=3" in str(failure.value)

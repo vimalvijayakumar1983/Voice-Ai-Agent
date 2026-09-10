@@ -93,6 +93,7 @@ router = APIRouter(prefix="/knowledge", tags=["Knowledge Studio"])
 logger = structlog.get_logger()
 MAX_KNOWLEDGE_PDF_BYTES = 8 * 1024 * 1024
 MAX_SITEMAP_URLS = 500
+MAX_REINDEX_SOURCES = 250
 
 
 async def _compile_uploaded_content(
@@ -1551,14 +1552,25 @@ async def reindex_knowledge_base(
             status_code=409,
             detail="Sources are still being processed. Wait for them to finish, then re-index.",
         )
+    if len(kb.sources) > MAX_REINDEX_SOURCES:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"This knowledge base has {len(kb.sources)} sources; a re-index handles at most "
+                f"{MAX_REINDEX_SOURCES}. Split it into smaller knowledge bases first."
+            ),
+        )
+    # One re-index fans out into a paid compilation per source, so it is
+    # bounded separately from the per-request compile budget: a tenant may start
+    # two re-indexes per ten minutes, each of at most MAX_REINDEX_SOURCES jobs.
     await enforce_rate_limit(
         request,
-        scope="knowledge-source-compile",
-        limit=6,
-        window_seconds=60,
+        scope="knowledge-base-reindex",
+        limit=2,
+        window_seconds=600,
         subject=str(current_user.tenant_id),
         bind_to_client=False,
-        limit_detail="Too many knowledge compilations. Please retry in a minute.",
+        limit_detail="Too many re-index requests. Please retry in ten minutes.",
         unavailable_detail="Knowledge compilation is temporarily unavailable. Retry shortly.",
     )
     from app.tasks.knowledge_compile_tasks import job_for, queue_source, set_job

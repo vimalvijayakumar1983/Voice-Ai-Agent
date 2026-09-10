@@ -994,13 +994,18 @@ async def _follow_pagination(
     document: str,
     records: list[KnowledgeRecord],
     card_signatures: set[tuple[str, tuple[str, ...]]] | None = None,
-) -> RecoveredPage:
+) -> tuple[RecoveredPage, list[KnowledgeRecord]]:
     """Merge the records of a paginated listing's later pages into one source.
 
     A directory that shows twelve doctors and a "Next" link is one source to
     the caller, so its later pages are downloaded through the same safe path
     and their records appended.  The walk is bounded and stops at the first
-    page that repeats or leaves the site.
+    page that repeats or leaves the site.  A page that advertises a next page
+    which cannot be downloaded fails the whole source: a silently truncated
+    listing would otherwise be measured and reported as complete.
+
+    Returns the merged page and the merged records, which are the records the
+    coverage report must be measured against.
     """
     seen = {page.url}
     card_signatures = set() if card_signatures is None else card_signatures
@@ -1016,8 +1021,13 @@ async def _follow_pagination(
         seen.add(next_url)
         try:
             fetched_url, next_document, next_bytes = await download_html(next_url)
-        except WebsiteRecoveryError:
-            break
+        except WebsiteRecoveryError as exc:
+            raise WebsiteRecoveryError(
+                f"Page {pages + 1} of this listing ({next_url}) could not be downloaded, so "
+                f"the listing would be incomplete: {exc}",
+                code="pagination_incomplete",
+                retryable=exc.retryable,
+            ) from exc
         if fetched_url in seen and fetched_url != next_url:
             break
         seen.add(fetched_url)
@@ -1030,10 +1040,13 @@ async def _follow_pagination(
         total_bytes += next_bytes
         current_document, current_url = next_document, fetched_url
     if pages == 1:
-        return page
+        return page, records
     merged = dedupe_records(merged)
-    return RecoveredPage(
-        page.url, page.title, render_records(merged), page.method, total_bytes, pages=pages
+    return (
+        RecoveredPage(
+            page.url, page.title, render_records(merged), page.method, total_bytes, pages=pages
+        ),
+        merged,
     )
 
 
@@ -1086,7 +1099,7 @@ async def _repair(
         text = render_records(records)
         static_page = RecoveredPage(final_url, title, text, "static_html", downloaded_bytes)
         if not should_render_javascript(static_html, text):
-            static_page = await _follow_pagination(
+            static_page, records = await _follow_pagination(
                 static_page, static_html, records, card_signatures
             )
         if should_render_javascript(static_html, text):
