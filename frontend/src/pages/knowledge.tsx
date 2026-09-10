@@ -42,19 +42,14 @@ import {
 } from '@/lib/api';
 import {
   canBindKnowledgeAgent,
+  isVavNativeKnowledgeProvider,
   knowledgeBindingGuidance,
 } from '@/lib/knowledge-binding.cjs';
 import styles from '@/styles/Knowledge.module.css';
 
 type Notice = { type: 'success' | 'error' | 'info'; text: string };
 type SourceMode = 'crawl' | 'urls' | 'sitemap' | 'pdf' | 'text';
-type KnowledgeActionOptions = {
-  syncAgentIds?: string[];
-  syncPendingBindings?: boolean;
-};
 
-const AGENT_SYNC_POLL_MS = 1500;
-const AGENT_SYNC_MAX_ATTEMPTS = 40;
 const SOURCE_REPAIR_POLL_MS = 2000;
 const SOURCE_REPAIR_MAX_ATTEMPTS = 90;
 
@@ -89,7 +84,6 @@ export default function KnowledgeStudio() {
   const [rollbackRevisionId, setRollbackRevisionId] = useState('');
   const [rollbackReason, setRollbackReason] = useState('');
   const detailHeadingRef = useRef<HTMLHeadingElement>(null);
-  const completedCrawlSyncRef = useRef<Set<string>>(new Set());
   const selectedIdRef = useRef<string | null>(null);
 
   useEffect(() => {
@@ -180,77 +174,17 @@ export default function KnowledgeStudio() {
   }, [knowledgeBases, query, statusFilter]);
 
   const indexed = knowledgeBases.reduce((total, kb) => total + kb.indexed_source_count, 0);
-  const processing = knowledgeBases.filter((kb) => kb.sync_status === 'processing' || kb.sync_status === 'provisioning').length;
+  const processing = knowledgeBases.filter((kb) => kb.sync_status === 'processing').length;
   const boundAgents = new Set(knowledgeBases.flatMap((kb) => kb.agent_bindings.map((binding) => binding.agent_id))).size;
 
   const replaceKnowledgeBase = useCallback((updated: KnowledgeBase) => {
     setKnowledgeBases((current) => current.map((kb) => kb.id === updated.id ? updated : kb));
   }, []);
 
-  const replaceAgent = useCallback((updated: VoiceAgent) => {
-    setAgents((current) => current.map((agent) => agent.id === updated.id ? updated : agent));
-  }, []);
-
-  const syncAgentUntilSettled = useCallback(async (agentId: string) => {
-    let latest = await api.getAgent(agentId);
-    replaceAgent(latest);
-    if (!latest.provider_agent_id) return latest;
-
-    for (let attempt = 0; attempt < AGENT_SYNC_MAX_ATTEMPTS; attempt += 1) {
-      if (latest.sync_status === 'synced') return latest;
-      try {
-        latest = await api.syncSmallestAgent(agentId);
-        replaceAgent(latest);
-      } catch (error) {
-        const message = errorMessage(error, 'Provider synchronization failed.');
-        if (!message.toLowerCase().includes('still in progress')) throw error;
-      }
-      if (latest.sync_status === 'synced') return latest;
-      if (latest.sync_status === 'error') {
-        throw new Error(`${latest.name} could not publish its knowledge-base revision.`);
-      }
-      await new Promise((resolve) => window.setTimeout(resolve, AGENT_SYNC_POLL_MS));
-      latest = await api.getAgent(agentId);
-      replaceAgent(latest);
-    }
-    throw new Error(`${latest.name} is still being reviewed by Smallest.ai. Check status shortly.`);
-  }, [replaceAgent]);
-
-  const synchronizeAgents = useCallback(async (agentIds: string[]) => {
-    const uniqueAgentIds = Array.from(new Set(agentIds));
-    if (!uniqueAgentIds.length) return 0;
-    for (const agentId of uniqueAgentIds) await syncAgentUntilSettled(agentId);
-    return uniqueAgentIds.length;
-  }, [syncAgentUntilSettled]);
-
-  useEffect(() => {
-    const latest = selected?.crawls[0];
-    if (!selected || !latest || !canGovernKnowledge || selected.approval_status !== 'approved') return;
-    if (!['completed', 'completed_with_errors'].includes(latest.status)) return;
-    const pendingAgentIds = selected.agent_bindings
-      .filter((binding) => binding.sync_status !== 'synced')
-      .map((binding) => binding.agent_id);
-    if (!pendingAgentIds.length) return;
-    const syncKey = `${selected.id}:${latest.id}:${pendingAgentIds.sort().join(',')}`;
-    if (completedCrawlSyncRef.current.has(syncKey)) return;
-    completedCrawlSyncRef.current.add(syncKey);
-    setNotice({ type: 'info', text: 'Website indexing finished. Publishing the updated knowledge to bound agents…' });
-    synchronizeAgents(pendingAgentIds)
-      .then(async (syncedCount) => {
-        const refreshed = await api.getKnowledgeBase(selected.id);
-        replaceKnowledgeBase(refreshed);
-        setNotice({ type: 'success', text: `Website knowledge is indexed and live on ${syncedCount} bound agent${syncedCount === 1 ? '' : 's'}.` });
-      })
-      .catch((error) => {
-        setNotice({ type: 'error', text: `Website indexing completed, but agent publishing needs attention: ${errorMessage(error, 'Check the agent provider status.')}` });
-      });
-  }, [canGovernKnowledge, replaceKnowledgeBase, selected, synchronizeAgents]);
-
   const runAction = async (
     key: string,
     action: () => Promise<KnowledgeBase>,
     success: string,
-    options: KnowledgeActionOptions = {},
   ) => {
     setWorking(key);
     setNotice(null);
@@ -276,38 +210,8 @@ export default function KnowledgeStudio() {
       return;
     }
 
-    const pendingAgentIds = options.syncAgentIds
-      || (options.syncPendingBindings && updated.approval_status === 'approved'
-        ? updated.agent_bindings
-          .filter((binding) => binding.sync_status !== 'synced')
-          .map((binding) => binding.agent_id)
-        : []);
-    if (!pendingAgentIds.length) {
-      setNotice({ type: 'success', text: success });
-      setWorking(null);
-      return;
-    }
-
-    setNotice({
-      type: 'info',
-      text: `${success} Publishing the updated knowledge tool to ${pendingAgentIds.length} bound agent${pendingAgentIds.length === 1 ? '' : 's'}…`,
-    });
-    try {
-      const syncedCount = await synchronizeAgents(pendingAgentIds);
-      const refreshed = await api.getKnowledgeBase(updated.id);
-      replaceKnowledgeBase(refreshed);
-      setNotice({
-        type: 'success',
-        text: `${success} ${syncedCount} bound agent${syncedCount === 1 ? ' is' : 's are'} published and verified.`,
-      });
-    } catch (error) {
-      setNotice({
-        type: 'error',
-        text: `${success} Automatic agent synchronization did not complete: ${errorMessage(error, 'Check the agent provider status.')}`,
-      });
-    } finally {
-      setWorking(null);
-    }
+    setNotice({ type: 'success', text: success });
+    setWorking(null);
   };
 
   const reactivateRelease = async (event: FormEvent<HTMLFormElement>) => {
@@ -443,7 +347,6 @@ export default function KnowledgeStudio() {
       'add-urls',
       () => api.addKnowledgeUrls(selected.id, urls),
       `${urls.length} website source${urls.length === 1 ? '' : 's'} queued for indexing.`,
-      { syncPendingBindings: true },
     );
     event.currentTarget.reset();
   };
@@ -472,7 +375,6 @@ export default function KnowledgeStudio() {
       'index-sitemap',
       () => api.addKnowledgeUrls(selected.id, Array.from(selectedSitemapUrls)),
       `${selectedSitemapUrls.size} curated pages queued for indexing.`,
-      { syncPendingBindings: true },
     );
     setSitemapUrls([]);
     setSelectedSitemapUrls(new Set());
@@ -489,8 +391,7 @@ export default function KnowledgeStudio() {
     await runAction(
       'upload-pdf',
       () => api.uploadKnowledgePdf(selected.id, file, String(form.get('processing_mode') || 'automatic') as KnowledgeProcessingMode),
-      `${file.name} was extracted and compiled for review, then sent for provider indexing. Check any compiler warnings and approve the draft before agents use it.`,
-      { syncPendingBindings: true },
+      `${file.name} was extracted, compiled and indexed for review. Check any compiler warnings and approve the draft before agents use it.`,
     );
   };
 
@@ -516,13 +417,12 @@ export default function KnowledgeStudio() {
 
   const removeSource = async (source: KnowledgeSource) => {
     if (!selected || !window.confirm(
-      `Stage removal of ${source.name}? It will be removed from the editable source set and Smallest.ai now. If a VAV release is already live, new VAV calls keep using that approved release until you approve these changes or choose “Revoke live release now.” Historical releases remain for audit. If Smallest grouped multiple URLs into one crawl, those grouped URLs will also be removed.`,
+      `Stage removal of ${source.name}? It will be removed from the editable source set now. If a VAV release is already live, new VAV calls keep using that approved release until you approve these changes or choose “Revoke live release now.” Historical releases remain for audit.`,
     )) return;
     await runAction(
       `delete-source-${source.id}`,
       () => api.deleteKnowledgeSource(selected.id, source.id),
-      `${source.name} was removed from the draft and Smallest.ai. Approve the pending VAV release to make the removal live.`,
-      { syncPendingBindings: true },
+      `${source.name} was removed from the draft. Approve the pending VAV release to make the removal live.`,
     );
   };
 
@@ -566,17 +466,6 @@ export default function KnowledgeStudio() {
         const currentSource = updated.sources.find((item) => item.id === source.id);
         const recovery = currentSource ? sourceRecovery(currentSource) : null;
         if (currentSource && recovery?.status === 'completed') {
-          const pendingAgentIds = updated.approval_status === 'approved'
-            ? updated.agent_bindings
-              .filter((binding) => binding.sync_status !== 'synced')
-              .map((binding) => binding.agent_id)
-            : [];
-          if (pendingAgentIds.length) {
-            setNotice({ type: 'info', text: 'The page is recovered. Publishing the updated knowledge to bound agents…' });
-            await synchronizeAgents(pendingAgentIds);
-            updated = await api.getKnowledgeBase(knowledgeBaseId);
-            replaceKnowledgeBase(updated);
-          }
           setNotice({ type: 'success', text: `Recovered ${currentSource.name}: readable text was extracted, indexed and verified for agents.` });
           return;
         }
@@ -625,7 +514,7 @@ export default function KnowledgeStudio() {
           <p className="page-subtitle">Turn approved business content into traceable, provider-ready knowledge for every voice agent.</p>
         </div>
         <div className="header-actions">
-          <button type="button" className="btn btn-secondary" disabled={!selected || working !== null || !canEditKnowledge} onClick={() => selected && runAction('refresh', () => api.refreshKnowledgeBase(selected.id), 'Provider processing status refreshed.', { syncPendingBindings: true })}>
+          <button type="button" className="btn btn-secondary" disabled={!selected || working !== null || !canEditKnowledge} onClick={() => selected && runAction('refresh', () => api.refreshKnowledgeBase(selected.id), 'Source counts refreshed and duplicate pages merged.')}>
             <RefreshCw size={14} className={working === 'refresh' ? 'spin' : undefined} /> Refresh status
           </button>
           {canEditKnowledge && <button type="button" className="btn btn-secondary" disabled={working !== null} onClick={aiWizardVisible ? clearCreatePanels : openAIWizard}>
@@ -718,7 +607,6 @@ export default function KnowledgeStudio() {
                   </div>
                 </div>
                 <div className={styles.heroActions}>
-                  {canEditKnowledge && !selected.provider_knowledge_base_id && <button type="button" className="btn btn-secondary btn-sm" disabled={working !== null} onClick={() => runAction('provision', () => api.provisionKnowledgeBase(selected.id), 'A secure provider knowledge base was created.')}><CloudUpload size={12} /> Connect provider</button>}
                   {canEditKnowledge && <button type="button" className="btn btn-secondary btn-sm" disabled={working !== null} onClick={() => { setShowCreate(false); setShowAIWizard(false); setGeneratedDraft(null); setShowEdit(true); if (router.query.create === 'ai') void router.replace('/knowledge', undefined, { shallow: true }); }}><Pencil size={12} /> Edit details</button>}
                   {canGovernKnowledge && <button type="button" className="btn btn-ghost btn-sm" disabled={working !== null} onClick={deleteSelected} aria-label={`Delete ${selected.name}`}><Trash2 size={13} /> Delete</button>}
                 </div>
@@ -827,7 +715,7 @@ export default function KnowledgeStudio() {
                       </details>
                     )}
                   </div>
-                  <AgentBinding selected={selected} agents={agents} busy={working !== null} canManage={canGovernKnowledge} onBind={(agentId) => runAction('bind', () => api.bindKnowledgeAgent(selected.id, agentId), 'Agent binding saved.', { syncAgentIds: [agentId] })} onUnbind={(agentId) => runAction('unbind', () => api.unbindKnowledgeAgent(selected.id, agentId), 'Agent was unbound.', { syncAgentIds: [agentId] })} />
+                  <AgentBinding selected={selected} agents={agents} busy={working !== null} canManage={canGovernKnowledge} onBind={(agentId) => runAction('bind', () => api.bindKnowledgeAgent(selected.id, agentId), 'Agent binding saved. VAV-native agents retrieve the approved release immediately.')} onUnbind={(agentId) => runAction('unbind', () => api.unbindKnowledgeAgent(selected.id, agentId), 'Agent was unbound.')} />
                 </div>
               </section>
             </div>
@@ -931,7 +819,7 @@ function CrawlRuns({ crawls, busy, canRepair, onRetry }: { crawls: KnowledgeCraw
 }
 
 function TextForm({ busy, onSubmit }: { busy: boolean; onSubmit: (event: FormEvent<HTMLFormElement>) => void }) {
-  return <form onSubmit={onSubmit} className={styles.builderForm}><div><label htmlFor="text-name">Approved searchable text</label><p>Compiled for review before Inworld, Sarvam, and ElevenLabs VAV runtimes use it. Smallest.ai agents require provider-indexed sources.</p></div><input id="text-name" name="text_name" required maxLength={255} placeholder="Approved returns FAQ" /><textarea id="text-content" name="text_content" required minLength={20} maxLength={100000} placeholder="Paste approved question-and-answer content here…" /><ProcessingModeField /><button type="submit" className="btn btn-secondary" disabled={busy}>{busy ? <Loader2 className="spin" size={14} /> : <Plus size={14} />} {busy ? 'Compiling and validating…' : 'Add searchable text'}</button>{busy && <p role="status">Preparing source-backed knowledge. Your text and the approved release remain unchanged.</p>}</form>;
+  return <form onSubmit={onSubmit} className={styles.builderForm}><div><label htmlFor="text-name">Approved searchable text</label><p>Compiled for review before Inworld, Sarvam, and ElevenLabs VAV runtimes use it.</p></div><input id="text-name" name="text_name" required maxLength={255} placeholder="Approved returns FAQ" /><textarea id="text-content" name="text_content" required minLength={20} maxLength={100000} placeholder="Paste approved question-and-answer content here…" /><ProcessingModeField /><button type="submit" className="btn btn-secondary" disabled={busy}>{busy ? <Loader2 className="spin" size={14} /> : <Plus size={14} />} {busy ? 'Compiling and validating…' : 'Add searchable text'}</button>{busy && <p role="status">Preparing source-backed knowledge. Your text and the approved release remain unchanged.</p>}</form>;
 }
 
 function SourceReview({ source }: { source: KnowledgeSource }) {
@@ -1001,12 +889,12 @@ function AgentBinding({ selected, agents, busy, canManage, onBind, onUnbind }: {
   const selectedAgent = available.find((agent) => agent.id === agentId);
   const eligible = available.filter((agent) => canBindKnowledgeAgent(selected, agent));
   const guidance = knowledgeBindingGuidance(selected);
-  return <div className={styles.bindingCard}><div className={styles.bindingHeader}><div><span className={styles.miniLabel}>Agent access</span><strong>{selected.agent_bindings.length} agents bound</strong></div><Bot size={18} /></div><div className={styles.bindingList}>{selected.agent_bindings.map((binding) => <div key={binding.id}><span className={styles.agentAvatar}><Bot size={13} /></span><span><strong>{binding.agent_name}</strong><small>{binding.sync_status === 'synced' ? 'Live knowledge retrieval' : 'Publish agent to make binding live'}</small></span>{canManage && <button type="button" className="icon-button" disabled={busy} onClick={() => onUnbind(binding.agent_id)} aria-label={`Unbind ${binding.agent_name}`}><Unlink size={14} /></button>}</div>)}{selected.agent_bindings.length === 0 && <p className={styles.bindingEmpty}>No agents can use this knowledge yet.</p>}</div>{canManage && <div className={styles.bindControl}><select aria-label="Agent to bind" value={agentId} disabled={busy || eligible.length === 0} onChange={(event) => setAgentId(event.target.value)}><option value="">Select an agent…</option>{available.map((agent) => <option key={agent.id} value={agent.id} disabled={!canBindKnowledgeAgent(selected, agent)}>{agent.name}</option>)}</select><button type="button" className="btn btn-secondary btn-sm" disabled={busy || !agentId || !canBindKnowledgeAgent(selected, selectedAgent)} onClick={() => { onBind(agentId); setAgentId(''); }}><Link2 size={12} /> Bind</button>{guidance && <p className="form-hint">{guidance}</p>}</div>}</div>;
+  return <div className={styles.bindingCard}><div className={styles.bindingHeader}><div><span className={styles.miniLabel}>Agent access</span><strong>{selected.agent_bindings.length} agents bound</strong></div><Bot size={18} /></div><div className={styles.bindingList}>{selected.agent_bindings.map((binding) => <div key={binding.id}><span className={styles.agentAvatar}><Bot size={13} /></span><span><strong>{binding.agent_name}</strong><small>{binding.sync_status === 'synced' ? 'Live knowledge retrieval' : isVavNativeKnowledgeProvider(binding.agent_voice_provider) ? 'Approve the knowledge base to make this binding live' : 'Not live: this agent does not use VAV retrieval. Move it to Inworld, Sarvam or ElevenLabs, or unbind it.'}</small></span>{canManage && <button type="button" className="icon-button" disabled={busy} onClick={() => onUnbind(binding.agent_id)} aria-label={`Unbind ${binding.agent_name}`}><Unlink size={14} /></button>}</div>)}{selected.agent_bindings.length === 0 && <p className={styles.bindingEmpty}>No agents can use this knowledge yet.</p>}</div>{canManage && <div className={styles.bindControl}><select aria-label="Agent to bind" value={agentId} disabled={busy || eligible.length === 0} onChange={(event) => setAgentId(event.target.value)}><option value="">Select an agent…</option>{available.map((agent) => <option key={agent.id} value={agent.id} disabled={!canBindKnowledgeAgent(selected, agent)}>{agent.name}</option>)}</select><button type="button" className="btn btn-secondary btn-sm" disabled={busy || !agentId || !canBindKnowledgeAgent(selected, selectedAgent)} onClick={() => { onBind(agentId); setAgentId(''); }}><Link2 size={12} /> Bind</button>{guidance && <p className="form-hint">{guidance}</p>}</div>}</div>;
 }
 
 function StatusBadge({ status }: { status: KnowledgeBase['sync_status'] }) {
-  const labels: Record<KnowledgeBase['sync_status'], string> = { local_only: 'Local draft', provisioning: 'Connecting', processing: 'Processing', ready: 'Text extracted', error: 'Needs attention' };
-  return <span className={`badge ${status === 'error' ? 'badge-danger' : status === 'processing' || status === 'provisioning' ? 'badge-warning' : 'badge-neutral'}`}>{labels[status]}</span>;
+  const labels: Record<KnowledgeBase['sync_status'], string> = { local_only: 'Local draft', processing: 'Processing', ready: 'Text extracted', error: 'Needs attention' };
+  return <span className={`badge ${status === 'error' ? 'badge-danger' : status === 'processing' ? 'badge-warning' : 'badge-neutral'}`}>{labels[status]}</span>;
 }
 
 function StatusDot({ status }: { status: KnowledgeBase['sync_status'] }) { return <span className={`${styles.statusDot} ${styles[`status_${status}`]}`} title={status.replace('_', ' ')} />; }

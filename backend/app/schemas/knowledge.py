@@ -10,7 +10,7 @@ from app.services.integration_security import (
 )
 
 KnowledgeScope = Literal["workspace", "group", "division", "branch", "department"]
-KnowledgeStatus = Literal["local_only", "provisioning", "processing", "ready", "error"]
+KnowledgeStatus = Literal["local_only", "processing", "ready", "error"]
 SourceType = Literal["website", "sitemap", "url", "file", "text"]
 SourceStatus = Literal["pending", "processing", "indexed", "failed", "local_only"]
 KnowledgeProcessingMode = Literal["automatic", "fast", "ai_verified"]
@@ -160,6 +160,7 @@ class KnowledgeAgentBindingResponse(BaseModel):
     id: UUID
     agent_id: UUID
     agent_name: str
+    agent_voice_provider: str
     knowledge_base_id: UUID
     sync_status: str
     last_synced_at: datetime | None
@@ -238,7 +239,6 @@ class KnowledgeBaseResponse(BaseModel):
     name: str
     description: str | None
     provider: str
-    provider_knowledge_base_id: str | None
     sync_status: KnowledgeStatus
     sync_error: str | None
     approval_status: Literal["draft", "approved"]

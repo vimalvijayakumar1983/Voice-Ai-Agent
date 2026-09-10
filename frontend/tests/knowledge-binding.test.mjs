@@ -32,11 +32,10 @@ test('a retained live revision remains bindable to every VAV-native voice provid
   }
 });
 
-test('Smallest.ai remains approval-gated while native agents retain live access', () => {
-  const draftWithLiveRevision = knowledgeBase();
-
-  assert.equal(canBindKnowledgeAgent(draftWithLiveRevision, agent('smallest')), false);
-  assert.match(knowledgeBindingGuidance(draftWithLiveRevision), /Smallest\.ai requires the draft to be approved/);
+test('agents that do not use VAV retrieval can never bind, approved or not', () => {
+  assert.equal(canBindKnowledgeAgent(knowledgeBase(), agent('smallest')), false);
+  assert.equal(canBindKnowledgeAgent(knowledgeBase({ approval_status: 'approved' }), agent('smallest')), false);
+  assert.match(knowledgeBindingGuidance(knowledgeBase()), /keep using the retained live release/);
 });
 
 test('a first draft without a live revision cannot bind any provider', () => {
@@ -52,10 +51,10 @@ test('a first draft without a live revision cannot bind any provider', () => {
   assert.match(knowledgeBindingGuidance(firstDraft), /publish its first live release/);
 });
 
-test('an approved knowledge base can bind native and Smallest.ai agents', () => {
+test('an approved knowledge base can bind every VAV-native agent', () => {
   const approved = knowledgeBase({ approval_status: 'approved' });
 
-  for (const provider of ['smallest', 'sarvam', 'elevenlabs', 'inworld']) {
+  for (const provider of ['sarvam', 'elevenlabs', 'inworld']) {
     assert.equal(canBindKnowledgeAgent(approved, agent(provider)), true);
   }
   assert.equal(knowledgeBindingGuidance(approved), null);

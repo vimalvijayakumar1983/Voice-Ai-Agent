@@ -328,3 +328,27 @@ async def discover_website(
         skipped_count=skipped,
         warnings=tuple(dict.fromkeys(warnings)),
     )
+
+
+async def discover_sitemap_urls(sitemap_url: str, *, limit: int = MAX_CRAWL_PAGES) -> list[str]:
+    """Return the same-site page URLs declared by one public sitemap.
+
+    The sitemap host bounds the result: pages on other hosts are ignored so a
+    sitemap can never enrol third-party pages into a knowledge base.
+    """
+    candidate = sitemap_url.strip()
+    parsed = urlsplit(candidate)
+    if parsed.scheme.lower() != "https" or not parsed.hostname:
+        raise WebsiteRecoveryError("Enter a public HTTPS sitemap URL.", code="invalid_url")
+    allowed_host = parsed.hostname.rstrip(".").lower()
+    include_subdomains = False
+    if allowed_host.startswith("www."):
+        allowed_host = allowed_host[4:]
+        include_subdomains = True
+    pages, _warnings = await _discover_sitemap_pages(
+        [candidate],
+        allowed_host=allowed_host,
+        include_subdomains=include_subdomains,
+        limit=max(1, min(limit, MAX_CRAWL_PAGES)),
+    )
+    return pages

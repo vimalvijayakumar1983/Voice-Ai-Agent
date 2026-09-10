@@ -13,7 +13,6 @@ from app.services.website_recovery import (
     recovery_metadata,
     searchable_pdf,
 )
-from app.tasks.knowledge_tasks import _wait_for_provider_index
 
 
 def test_extract_readable_text_removes_scripts_and_keeps_structured_content():
@@ -140,108 +139,6 @@ async def test_download_rejects_redirect_to_private_network(monkeypatch):
         await download_html("https://clinic.example")
 
     assert error.value.code == "unsafe_url"
-
-
-@pytest.mark.asyncio
-async def test_provider_verification_waits_for_indexed_item(monkeypatch):
-    class Provider:
-        def __init__(self):
-            self.calls = 0
-
-        async def list_knowledge_items(self, _knowledge_base_id):
-            self.calls += 1
-            state = "processing" if self.calls == 1 else "completed"
-            return [
-                {
-                    "_id": "provider-item-1",
-                    "fileName": "recovered.pdf",
-                    "processingStatus": state,
-                }
-            ]
-
-    async def no_wait(_seconds):
-        return None
-
-    monkeypatch.setattr("app.tasks.knowledge_tasks._provider_poll_wait", no_wait)
-    provider = Provider()
-
-    item_id = await _wait_for_provider_index(
-        provider,
-        knowledge_base_id="provider-kb-1",
-        provider_item_id="provider-item-1",
-        artifact_name="recovered.pdf",
-    )
-
-    assert provider.calls == 2
-    assert item_id == "provider-item-1"
-
-
-@pytest.mark.asyncio
-async def test_provider_verification_discovers_item_when_upload_response_has_no_id(monkeypatch):
-    class Provider:
-        def __init__(self):
-            self.calls = 0
-
-        async def list_knowledge_items(self, _knowledge_base_id):
-            self.calls += 1
-            if self.calls == 1:
-                return []
-            return [
-                {
-                    "_id": "provider-item-from-list",
-                    "fileName": "recovered.pdf",
-                    "processingStatus": "completed",
-                }
-            ]
-
-    async def no_wait(_seconds):
-        return None
-
-    monkeypatch.setattr("app.tasks.knowledge_tasks._provider_poll_wait", no_wait)
-    provider = Provider()
-
-    item_id = await _wait_for_provider_index(
-        provider,
-        knowledge_base_id="provider-kb-1",
-        provider_item_id=None,
-        artifact_name="recovered.pdf",
-    )
-
-    assert provider.calls == 2
-    assert item_id == "provider-item-from-list"
-
-
-@pytest.mark.asyncio
-async def test_provider_verification_ignores_stale_artifact_when_upload_has_no_id(monkeypatch):
-    class Provider:
-        async def list_knowledge_items(self, _knowledge_base_id):
-            return [
-                {
-                    "_id": "stale-provider-item",
-                    "fileName": "recovered.pdf",
-                    "processingStatus": "completed",
-                },
-                {
-                    "_id": "new-provider-item",
-                    "fileName": "recovered.pdf",
-                    "processingStatus": "completed",
-                },
-            ]
-
-    async def no_wait(_seconds):
-        return None
-
-    monkeypatch.setattr("app.tasks.knowledge_tasks._provider_poll_wait", no_wait)
-
-    item_id = await _wait_for_provider_index(
-        Provider(),
-        knowledge_base_id="provider-kb-1",
-        provider_item_id=None,
-        artifact_name="recovered.pdf",
-        excluded_item_ids={"stale-provider-item"},
-    )
-
-    assert item_id == "new-provider-item"
 
 
 _DIRECTORY_HTML = """

@@ -8,19 +8,17 @@ function isVavNativeKnowledgeProvider(provider) {
 
 function canBindKnowledgeAgent(knowledgeBase, agent) {
   if (!knowledgeBase || !agent) return false;
+  if (!isVavNativeKnowledgeProvider(agent.voice_provider)) return false;
   if (knowledgeBase.approval_status === 'approved') return true;
-  return Boolean(
-    knowledgeBase.serving_revision
-      && isVavNativeKnowledgeProvider(agent.voice_provider),
-  );
+  return Boolean(knowledgeBase.serving_revision);
 }
 
 function knowledgeBindingGuidance(knowledgeBase) {
   if (knowledgeBase?.approval_status === 'approved') return null;
   if (knowledgeBase?.serving_revision) {
-    return 'Draft changes are pending. VAV-native agents can use the retained live release; Smallest.ai requires the draft to be approved and provider-indexed.';
+    return 'Draft changes are pending. Bound VAV-native agents keep using the retained live release until you approve the draft.';
   }
-  return 'Approve this knowledge base to publish its first live release before binding an agent.';
+  return 'Approve this knowledge base to publish its first live release before binding an agent. Only VAV-native agents (Inworld, Sarvam, ElevenLabs) retrieve VAV knowledge.';
 }
 
 module.exports = {

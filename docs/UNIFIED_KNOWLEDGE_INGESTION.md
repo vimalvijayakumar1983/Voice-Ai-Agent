@@ -65,8 +65,8 @@ every source's full contents into the inventory response.
 Changes remain drafts. Existing immutable serving revisions and their lexicons
 remain active until approval publishes a replacement. Compilation errors preserve
 the previous source and live revision. No mass recompile or automatic approval is
-performed by deployment. Pasted text remains VAV-native only; existing Smallest.ai
-provider binding restrictions and PDF cleanup barriers remain in force.
+performed by deployment. Every source type is VAV-native: nothing is uploaded to an
+external knowledge provider, and only VAV-native agents can be bound.
 
 ## Operational limits
 
