@@ -20,7 +20,7 @@ RecordKind = Literal["heading", "paragraph", "list_item", "table_row", "card", "
 RECORD_SEPARATOR = " | "
 RECORD_LIKE_KINDS: frozenset[str] = frozenset({"card", "table_row", "list_item", "field"})
 MAX_STORED_RECORDS = 2_000
-MAX_UNCOVERED_EXAMPLES = 12
+MAX_UNCOVERED_EXAMPLES = 300
 _SPACE_RE = re.compile(r"\s+")
 _GROUNDING_SEPARATOR_RE = re.compile(r"[^\w]+", re.UNICODE)
 _BULLET_RE = re.compile(r"^\s*(?:[-*•▪◦]|\d{1,3}[.)])\s+(.*)$")
@@ -58,6 +58,58 @@ CALL_TO_ACTION_FRAGMENTS: frozenset[str] = frozenset(
         "view more",
         "view profile",
         "whatsapp",
+        # Pagination and filter controls carry no knowledge either.
+        "next",
+        "next page",
+        "previous",
+        "previous page",
+        "prev",
+        "load more",
+        "show more",
+        "see all",
+        "show all",
+        "all specialties",
+        "all departments",
+        "all services",
+        "any",
+        "select",
+        "search",
+        "filter",
+        "reset",
+        "submit",
+        "close",
+        "menu",
+    }
+)
+# Words that name the kind of thing rather than the thing itself. A fact that
+# says "Physiotherapy" has captured the record "Physiotherapy Department".
+_COVERAGE_GENERIC_TOKENS: frozenset[str] = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "at",
+        "by",
+        "for",
+        "in",
+        "of",
+        "on",
+        "or",
+        "our",
+        "the",
+        "to",
+        "with",
+        "your",
+        "department",
+        "departments",
+        "centre",
+        "center",
+        "clinic",
+        "clinics",
+        "service",
+        "services",
+        "unit",
+        "section",
     }
 )
 
@@ -248,6 +300,30 @@ def records_from_payload(payload: object) -> list[KnowledgeRecord]:
     return records
 
 
+def _fragment_tokens(fragment: str) -> list[str]:
+    return [
+        token
+        for token in grounding_normalized(fragment).split()
+        if token not in _COVERAGE_GENERIC_TOKENS
+    ]
+
+
+def _fact_captures_record(record: KnowledgeRecord, bundle: str, bundle_tokens: set[str]) -> bool:
+    """Whether one fact carries every field of a record.
+
+    A field counts when the fact quotes it verbatim, or when every word that
+    identifies it (ignoring generic nouns such as "department") appears in
+    that same fact.  Words from different facts are never combined.
+    """
+    for fragment in record.fragments or (record.text,):
+        if f" {grounding_normalized(fragment)} " in bundle:
+            continue
+        tokens = _fragment_tokens(fragment)
+        if tokens and not all(token in bundle_tokens for token in tokens):
+            return False
+    return True
+
+
 def coverage_report(
     records: Sequence[KnowledgeRecord],
     structured: dict | None,
@@ -284,6 +360,7 @@ def coverage_report(
         + " "
         for fact in facts
     ]
+    bundle_tokens = [set(bundle.split()) for bundle in fact_bundles]
     subject_blob = " ".join(
         grounding_normalized(str(item.get("subject") or item.get("name") or ""))
         for item in (*facts, *entities)
@@ -295,10 +372,10 @@ def coverage_report(
     entities_found: list[str] = []
     entities_with_facts = 0
     for record in record_like:
-        fragments = [
-            f" {grounding_normalized(fragment)} " for fragment in record.fragments or (record.text,)
-        ]
-        if any(all(fragment in bundle for fragment in fragments) for bundle in fact_bundles):
+        if any(
+            _fact_captures_record(record, bundle, tokens)
+            for bundle, tokens in zip(fact_bundles, bundle_tokens, strict=True)
+        ):
             covered += 1
         else:
             uncovered.append(record.text[:200])
@@ -314,6 +391,10 @@ def coverage_report(
         status = "not_compiled"
     elif uncovered or (not record_like and facts_accepted == 0):
         status = "partial"
+    elif not record_like:
+        # Prose only: there is no denominator, so "complete" would overstate
+        # what was verified.
+        status = "unstructured"
     else:
         status = "complete"
     return {
@@ -364,6 +445,11 @@ def coverage_issue(coverage: object) -> str | None:
     if status == "complete":
         return (
             f"Coverage complete: {covered} of {total} records captured as {facts} verified facts."
+        )
+    if status == "unstructured":
+        return (
+            f"Prose only: {facts} verified facts were extracted, but the page has no cards, rows, "
+            "lists or fields to measure against, so completeness is not verified."
         )
     examples = [str(item) for item in (coverage.get("uncovered") or [])][:3]
     remaining = int(coverage.get("uncovered_total") or len(examples)) - len(examples)

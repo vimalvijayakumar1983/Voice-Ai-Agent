@@ -936,6 +936,7 @@ async def test_same_raw_v7_to_v8_compiler_change_creates_pending_draft_and_retai
         "repair_generation": 2,
         "recovery_attempts": 2,
         "staged_refresh": True,
+        "force_recompile": True,
     }
     await db.commit()
     monkeypatch.setattr(
@@ -974,6 +975,7 @@ async def test_same_raw_v7_to_v8_compiler_change_creates_pending_draft_and_retai
     assert refreshed_source.content_sha256 == raw_sha256
     assert refreshed_source.content == next_content
     assert "staged_refresh" not in refreshed_source.source_metadata
+    assert "force_recompile" not in refreshed_source.source_metadata
     assert refreshed_source.source_metadata["compiled_serving_signature_v1"] == (
         knowledge_tasks._compiled_serving_signature(
             content=next_content,
@@ -1786,3 +1788,230 @@ async def test_legacy_sources_without_coverage_still_approve_but_are_flagged(
         json={"approved": True},
     )
     assert approved.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_reindex_requeues_every_source_type_with_the_current_pipeline(
+    client,
+    auth_headers,
+    tenant,
+    db,
+    monkeypatch,
+):
+    from app.tasks import knowledge_compile_tasks as jobs
+    from app.tasks import knowledge_tasks
+
+    repairs: list[tuple[list[str], str]] = []
+    compiles: list[list[str]] = []
+    monkeypatch.setattr(
+        knowledge_tasks.repair_website_source,
+        "apply_async",
+        lambda *, args, queue: repairs.append((args, queue)),
+    )
+    monkeypatch.setattr(
+        jobs.compile_upload, "apply_async", lambda *, args, retry: compiles.append(args)
+    )
+    row = make_record("table_row", ["Service: Consultation", "Price: AED 150"], page=1)
+    monkeypatch.setattr(
+        jobs,
+        "prepare_pdf",
+        lambda *_args, **_kwargs: _prepared_pdf(
+            "Fee schedule\n\nService: Consultation | Price: AED 150", records=[row]
+        ),
+    )
+    tenant_id = tenant.id
+    knowledge = KnowledgeBase(
+        tenant_id=tenant.id,
+        name="Legacy pipeline knowledge",
+        sync_status="ready",
+        approval_status="approved",
+        published_at=datetime.now(UTC),
+        source_count=3,
+        indexed_source_count=3,
+    )
+    raw_page = "Doctors: Dr Randa Ahmed General Practitioner"
+    web = KnowledgeSource(
+        tenant_id=tenant.id,
+        source_type="website",
+        name="Doctors",
+        location="https://clinic.example/doctors",
+        raw_content=raw_page,
+        content="COMPILED: Dr Randa Ahmed is a General Practitioner.",
+        structured_content=_compiled_structure(),
+        content_sha256=hashlib.sha256(raw_page.encode()).hexdigest(),
+        status="indexed",
+    )
+    text = KnowledgeSource(
+        tenant_id=tenant.id,
+        source_type="text",
+        name="Legacy FAQ",
+        content="Opening hours: 9 AM to 9 PM daily",
+        status="indexed",
+    )
+    pdf = KnowledgeSource(
+        tenant_id=tenant.id,
+        source_type="file",
+        name="fees.pdf",
+        file_content=b"%PDF-1.4\nstored",
+        raw_content="Fee schedule Service Price Consultation AED 150",
+        content="Flat old extraction",
+        mime_type="application/pdf",
+        status="indexed",
+        source_metadata={"extraction_method": "native", "page_count": 1},
+    )
+    knowledge.sources.extend([web, text, pdf])
+    db.add(knowledge)
+    await db.commit()
+    knowledge_id, web_id, text_id, pdf_id = knowledge.id, web.id, text.id, pdf.id
+
+    response = await client.post(f"/api/v1/knowledge/{knowledge_id}/reindex", headers=auth_headers)
+
+    assert response.status_code == 202, response.text
+    body = response.json()
+    assert body["approval_status"] == "draft"
+    assert body["sync_status"] == "processing"
+    sources = {source["id"]: source for source in body["sources"]}
+    web_body = sources[str(web_id)]
+    assert web_body["status"] == "indexed"  # staged: the approved page stays live
+    assert web_body["source_metadata"]["staged_refresh"] is True
+    assert web_body["source_metadata"]["force_recompile"] is True
+    assert web_body["source_metadata"]["recovery"]["stage"] == "queued"
+    repair_run_id = web_body["source_metadata"]["repair_run_id"]
+    assert repairs == [
+        ([str(tenant_id), str(knowledge_id), str(web_id), repair_run_id], "knowledge")
+    ]
+    for source_id in (text_id, pdf_id):
+        job = sources[str(source_id)]["source_metadata"]["upload_compile"]
+        assert sources[str(source_id)]["status"] == "processing"
+        assert job["status"] == "queued"
+        assert job["enqueued_at"]
+    assert {args[2] for args in compiles} == {str(text_id), str(pdf_id)}
+    db.expire_all()
+    refreshed = await db.get(KnowledgeBase, knowledge_id)
+    assert refreshed.reindex_requested_at is not None
+
+    again = await client.post(f"/api/v1/knowledge/{knowledge_id}/reindex", headers=auth_headers)
+    assert again.status_code == 409
+
+    pdf_run_id = sources[str(pdf_id)]["source_metadata"]["upload_compile"]["run_id"]
+
+    async def compile_knowledge(*, title, text, requested_mode, **_kwargs):
+        structured = _compiled_structure(value="AED 150")
+        structured["facts"] = [
+            {
+                "subject": "Consultation",
+                "predicate": "price",
+                "value": "AED 150",
+                "evidence": "Service: Consultation | Price: AED 150",
+                "search_phrases": ["consultation fee"],
+            }
+        ]
+        structured["compiler"]["requested_mode"] = requested_mode
+        return _compiled_result(f"COMPILED {title}: {text}", structured)
+
+    monkeypatch.setattr(jobs, "compile_source_knowledge", compile_knowledge)
+    monkeypatch.setattr(
+        jobs, "async_session_factory", async_sessionmaker(db.bind, expire_on_commit=False)
+    )
+    await db.commit()
+    await jobs._compile(str(tenant_id), str(knowledge_id), str(pdf_id), pdf_run_id)
+
+    db.expire_all()
+    stored = await db.get(KnowledgeSource, pdf_id)
+    assert stored.status == "indexed"
+    assert stored.raw_content == "Fee schedule\n\nService: Consultation | Price: AED 150"
+    assert stored.content.startswith("COMPILED fees.pdf")
+    assert [record["text"] for record in stored.structured_content["records"]] == [
+        "Service: Consultation | Price: AED 150"
+    ]
+    assert stored.source_metadata["coverage"]["status"] == "complete"
+    assert stored.source_metadata["coverage"]["record_total"] == 1
+    assert stored.source_metadata["upload_compile"]["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_approval_requires_measured_coverage_once_a_knowledge_base_is_reindexed(
+    client,
+    auth_headers,
+    tenant,
+    db,
+):
+    knowledge = KnowledgeBase(
+        tenant_id=tenant.id,
+        name="Re-indexed knowledge",
+        sync_status="ready",
+        approval_status="draft",
+        reindex_requested_at=datetime.now(UTC),
+    )
+    knowledge.sources.append(_coverage_text_source(tenant, name="Unmeasured FAQ", coverage=None))
+    knowledge.source_count = 1
+    knowledge.indexed_source_count = 1
+    db.add(knowledge)
+    await db.commit()
+
+    blocked = await client.post(
+        f"/api/v1/knowledge/{knowledge.id}/approval",
+        headers=auth_headers,
+        json={"approved": True},
+    )
+    assert blocked.status_code == 409
+    assert "never measured" in blocked.json()["detail"]
+
+    knowledge.reindex_requested_at = None
+    await db.commit()
+    tolerated = await client.post(
+        f"/api/v1/knowledge/{knowledge.id}/approval",
+        headers=auth_headers,
+        json={"approved": True},
+    )
+    assert tolerated.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_paginated_directory_pages_are_merged_into_one_source(monkeypatch):
+    from app.services.website_recovery import RecoveredPage, extract_page_records
+    from app.tasks import knowledge_tasks
+
+    def listing(page: int, names: list[str], *, next_page: int | None) -> str:
+        cards = "".join(
+            f'<div class="card"><h3>{name}</h3><p>General Practitioner</p></div>' for name in names
+        )
+        link = f'<a href="/doctors?page={next_page}">Next</a>' if next_page else ""
+        intro = (
+            "<p>Our doctors provide family medicine, paediatrics and dental care across "
+            "Abu Dhabi with same-day appointments and insurance support for every patient.</p>"
+        )
+        return (
+            "<html><head><title>Our Doctors</title></head><body><main><h1>Our Doctors</h1>"
+            f'{intro}{cards}<div class="pagination">{link}</div></main></body></html>'
+        )
+
+    pages = {
+        "https://clinic.example/doctors": listing(1, ["Dr One", "Dr Two"], next_page=2),
+        "https://clinic.example/doctors?page=2": listing(2, ["Dr Three"], next_page=3),
+        "https://clinic.example/doctors?page=3": listing(3, ["Dr Four"], next_page=None),
+    }
+    fetched: list[str] = []
+
+    async def download(url):
+        fetched.append(url)
+        return url, pages[url], len(pages[url])
+
+    monkeypatch.setattr(knowledge_tasks, "download_html", download)
+    first_url = "https://clinic.example/doctors"
+    signatures: set = set()
+    title, records = extract_page_records(
+        pages[first_url], url=first_url, card_signatures=signatures
+    )
+    first = RecoveredPage(first_url, title, "", "static_html", len(pages[first_url]))
+
+    merged = await knowledge_tasks._follow_pagination(first, pages[first_url], records, signatures)
+
+    assert fetched == [
+        "https://clinic.example/doctors?page=2",
+        "https://clinic.example/doctors?page=3",
+    ]
+    assert merged.pages == 3
+    for name in ("Dr One", "Dr Two", "Dr Three", "Dr Four"):
+        assert f"{name} | General Practitioner" in merged.text
+    assert merged.text.count("Our Doctors") == 1  # the listing heading once, not per page

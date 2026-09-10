@@ -60,6 +60,9 @@ class RecoveredPage:
     text: str
     method: str
     downloaded_bytes: int
+    # Directory pages often paginate ("Next"); the count of pages whose
+    # records were merged into ``text``.
+    pages: int = 1
 
 
 def recovery_metadata(
@@ -368,6 +371,7 @@ def _walk_records(
     *,
     heading_path: list[str],
     records: list[KnowledgeRecord],
+    card_signatures: set[tuple[str, tuple[str, ...]]],
 ) -> None:
     children = [child for child in element.children if isinstance(child, Tag)]
     signatures = Counter(_element_signature(child) for child in children)
@@ -415,7 +419,12 @@ def _walk_records(
             continue
         if name == "li":
             if child.find(["ul", "ol"]) is not None and len(fragments) > _CARD_MAX_FRAGMENTS:
-                _walk_records(child, heading_path=heading_path, records=records)
+                _walk_records(
+                    child,
+                    heading_path=heading_path,
+                    records=records,
+                    card_signatures=card_signatures,
+                )
                 continue
             record = make_record(
                 "card" if len(fragments) > 1 else "list_item",
@@ -430,10 +439,16 @@ def _walk_records(
             if record:
                 records.append(record)
             continue
-        if repeated and _looks_like_card(child, fragments):
+        signature = _element_signature(child)
+        known_card = bool(signature[1]) and signature in card_signatures
+        if (repeated or known_card) and _looks_like_card(child, fragments):
             # Sibling components with the same tag and classes are one repeated
             # layout: a doctor card, a price tile, a service block. Keep each
             # one whole so a label shared by several cards is never removed.
+            # A layout seen as a card once (on this page or an earlier page of
+            # the same listing) stays a card even when it appears alone.
+            if signature[1]:
+                card_signatures.add(signature)
             record = make_record("card", fragments, heading_path=heading_path)
             if record:
                 records.append(record)
@@ -447,17 +462,78 @@ def _walk_records(
             if record:
                 records.append(record)
             continue
-        _walk_records(child, heading_path=heading_path, records=records)
+        _walk_records(
+            child, heading_path=heading_path, records=records, card_signatures=card_signatures
+        )
 
 
-def extract_page_records(document: str, *, url: str) -> tuple[str, list[KnowledgeRecord]]:
+_PAGINATION_MARKERS = ("pagination", "pager", "page-numbers", "page-nav")
+_NEXT_LINK_TEXTS = frozenset({"next", "next page", "next »", "next ›", "›", "»", "→", "older"})
+MAX_PAGINATED_PAGES = 12
+
+
+def _is_pagination_control(tag: Tag) -> bool:
+    if not isinstance(tag, Tag) or tag.name in {"html", "body", "main", "article"}:
+        return False
+    classes = tag.get("class") or []
+    if isinstance(classes, str):
+        classes = classes.split()
+    haystack = " ".join(
+        [
+            *(str(value) for value in classes),
+            str(tag.get("id") or ""),
+            str(tag.get("aria-label") or ""),
+            str(tag.get("role") or ""),
+        ]
+    ).casefold()
+    return any(marker in haystack for marker in _PAGINATION_MARKERS)
+
+
+def find_next_page_url(document: str, *, url: str) -> str | None:
+    """Return the next page of a paginated listing on the same site, if any."""
+    soup = BeautifulSoup(document, "html.parser")
+    candidates: list[str] = []
+    for tag in soup.find_all(["link", "a"], rel=True):
+        rel = tag.get("rel") or []
+        if isinstance(rel, str):
+            rel = rel.split()
+        if "next" in [str(value).casefold() for value in rel] and tag.get("href"):
+            candidates.append(str(tag["href"]))
+    for anchor in soup.find_all("a", href=True):
+        text = " ".join(anchor.get_text(" ", strip=True).split()).casefold()
+        label = str(anchor.get("aria-label") or "").casefold()
+        if text in _NEXT_LINK_TEXTS or label in _NEXT_LINK_TEXTS:
+            candidates.append(str(anchor["href"]))
+    current = urlsplit(url)
+    for href in candidates:
+        resolved = urljoin(url, href)
+        parsed = urlsplit(resolved)
+        if parsed.scheme != "https" or not parsed.hostname:
+            continue
+        if parsed.hostname.casefold() != (current.hostname or "").casefold():
+            continue
+        cleaned = parsed._replace(fragment="").geturl()
+        if cleaned != current._replace(fragment="").geturl():
+            return cleaned
+    return None
+
+
+def extract_page_records(
+    document: str,
+    *,
+    url: str,
+    card_signatures: set[tuple[str, tuple[str, ...]]] | None = None,
+) -> tuple[str, list[KnowledgeRecord]]:
     """Extract structured records from static or rendered HTML.
 
     Repeated sibling components become one record each with their fragments
     kept together; tables become rows; headings carry context. Only whole
     records repeated verbatim are removed, never a label that several records
-    legitimately share.
+    legitimately share.  ``card_signatures`` is read and extended so a
+    paginated listing recognises a lone card on its last page.
     """
+    if card_signatures is None:
+        card_signatures = set()
     soup = BeautifulSoup(document, "html.parser")
     title = " ".join((soup.title.get_text(" ", strip=True) if soup.title else "").split())
     description_tag = soup.find("meta", attrs={"name": "description"})
@@ -482,8 +558,18 @@ def extract_page_records(document: str, *, url: str) -> tuple[str, list[Knowledg
             "header",
             "footer",
             "aside",
+            # Filter bars, search boxes and pagination widgets are controls,
+            # not knowledge: "Specialty: All Specialties" is never a fact.
+            "form",
+            "select",
+            "option",
+            "input",
+            "textarea",
+            "button",
         )
     ):
+        tag.decompose()
+    for tag in soup.find_all(_is_pagination_control):
         tag.decompose()
     semantic_root = soup.find("main") or soup.find("article") or soup.find(attrs={"role": "main"})
     body_root = soup.body or soup
@@ -505,7 +591,7 @@ def extract_page_records(document: str, *, url: str) -> tuple[str, list[Knowledg
         if record:
             records.append(record)
     if isinstance(root, Tag):
-        _walk_records(root, heading_path=[], records=records)
+        _walk_records(root, heading_path=[], records=records, card_signatures=card_signatures)
     for value in structured:
         record = make_record("field", [value])
         if record:

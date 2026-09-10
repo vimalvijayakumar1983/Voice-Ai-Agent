@@ -14,6 +14,7 @@ from app.core.database import async_session_factory
 from app.models.agent import KnowledgeSource
 from app.models.user import User
 from app.services.knowledge_compiler import compile_source_knowledge
+from app.services.pdf_ingestion import PdfIngestionError, PreparedPdf, prepare_pdf
 from app.services.provider_credentials import ProviderCredentialError, load_provider_config
 from app.tasks.async_runner import run_async
 from app.tasks.worker import celery_app
@@ -67,7 +68,15 @@ async def _load(db, tenant_id, kb_id, source_id):
     return kb, source
 
 
-async def _finish(tenant_id, kb_id, source_id, run_id, compiled=None, error=None):
+async def _finish(
+    tenant_id,
+    kb_id,
+    source_id,
+    run_id,
+    compiled=None,
+    error=None,
+    prepared: PreparedPdf | None = None,
+):
     from app.api.v1.endpoints.knowledge import (
         _apply_uploaded_compilation,
         _mark_native_bindings_live,
@@ -96,7 +105,23 @@ async def _finish(tenant_id, kb_id, source_id, run_id, compiled=None, error=None
             )
             job.update(status="failed", message=source.error_message)
         else:
-            _apply_uploaded_compilation(source, raw_text=source.raw_content, compiled=compiled)
+            records = None
+            if prepared is not None:
+                # The PDF was re-read from the stored file: its text, table
+                # rows and extraction details replace what the old pipeline kept.
+                source.raw_content = prepared.extracted_text
+                source.source_metadata = {
+                    **(source.source_metadata or {}),
+                    "retrieval_content_source": "vav_pdf_ingestion",
+                    "extraction_method": prepared.extraction_method,
+                    "page_count": prepared.page_count,
+                    "ocr_page_count": prepared.ocr_page_count,
+                    "sha256": prepared.sha256,
+                }
+                records = prepared.records
+            _apply_uploaded_compilation(
+                source, raw_text=source.raw_content, compiled=compiled, records=records
+            )
             source.status = "indexed"
             source.error_message = None
             job.update(
@@ -135,6 +160,12 @@ async def _compile(tenant_id, kb_id, source_id, run_id):
             )
             set_job(source, job)
             text, title = source.raw_content, source.name
+            file_content = (
+                bytes(source.file_content)
+                if source.source_type == "file" and source.file_content
+                else None
+            )
+            languages = list(kb.languages or ["en"])
             await db.commit()  # Claim before inference; duplicate deliveries do no paid work.
             await _authorized(db, kb, job)
             try:
@@ -145,6 +176,16 @@ async def _compile(tenant_id, kb_id, source_id, run_id):
                 config = None
             api_key = str((config or {}).get("api_key") or settings.openai_api_key).strip() or None
             await db.rollback()  # Do not hold a DB connection or publication lock during AI.
+        prepared: PreparedPdf | None = None
+        if file_content is not None:
+            # Re-read the stored PDF so table rows and headings are records again
+            # instead of the flat text an earlier extraction left behind.
+            try:
+                prepared = await asyncio.to_thread(prepare_pdf, file_content, languages=languages)
+            except PdfIngestionError as exc:
+                await _finish(tenant_id, kb_id, source_id, run_id, error=str(exc))
+                return
+            text = prepared.extracted_text
         compiled = await compile_source_knowledge(
             title=title,
             url="",
@@ -158,7 +199,7 @@ async def _compile(tenant_id, kb_id, source_id, run_id):
             timeout_seconds=120.0,
             max_retries=0,
         )
-        await _finish(tenant_id, kb_id, source_id, run_id, compiled=compiled)
+        await _finish(tenant_id, kb_id, source_id, run_id, compiled=compiled, prepared=prepared)
     except Exception as exc:
         # Never expose provider response bodies, credentials or uploaded text in logs/UI.
         logger.warning("knowledge_compilation_failed", source_id=source_id, run_id=run_id)
