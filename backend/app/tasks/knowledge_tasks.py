@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 from datetime import UTC, datetime
 from uuid import UUID
@@ -20,7 +19,6 @@ from app.models.agent import (
     KnowledgeCrawlPage,
     KnowledgeSource,
 )
-from app.providers.smallest import SmallestAIClient, SmallestAIError, get_smallest_client
 from app.services.audit import record_audit_event
 from app.services.knowledge_compiler import (
     COMPILER_VERSION,
@@ -29,14 +27,11 @@ from app.services.knowledge_compiler import (
     compile_website_knowledge,
 )
 from app.services.knowledge_sources import (
-    VAV_NATIVE_KNOWLEDGE_PROVIDERS,
     canonical_source_url,
     consolidate_duplicate_url_sources,
-    consolidate_smallest_url_duplicates,
     has_searchable_content,
     invalidate_knowledge_approval,
-    mark_remote_creation_outcome_unknown,
-    remote_creation_outcome_unknown,
+    mark_knowledge_bindings_live,
 )
 from app.services.provider_credentials import ProviderCredentialError, load_provider_config
 from app.services.website_crawler import discover_website
@@ -47,92 +42,12 @@ from app.services.website_recovery import (
     extract_readable_text,
     recovery_metadata,
     render_html,
-    searchable_pdf,
     should_render_javascript,
 )
 from app.tasks.async_runner import run_async as _run_async
 from app.tasks.worker import celery_app
 
 logger = structlog.get_logger()
-PROVIDER_READY = {"complete", "completed", "indexed", "processed", "ready", "success", "succeeded"}
-PROVIDER_FAILED = {"error", "failed", "failure"}
-
-
-def _provider_item_id(value: dict | None) -> str | None:
-    current: object = value
-    for _ in range(4):
-        if not isinstance(current, dict):
-            return None
-        item_id = current.get("_id") or current.get("id")
-        if item_id:
-            return str(item_id)
-        current = current.get("data") or current.get("item")
-    return None
-
-
-def _provider_file_name(item: dict) -> str:
-    metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
-    return str(item.get("fileName") or metadata.get("fileName") or "")
-
-
-def _provider_status(item: dict) -> str:
-    value = str(item.get("processingStatus") or item.get("status") or "processing")
-    return value.strip().lower().replace("-", "_").replace(" ", "_")
-
-
-async def _wait_for_provider_index(
-    provider: SmallestAIClient,
-    *,
-    knowledge_base_id: str,
-    provider_item_id: str | None,
-    artifact_name: str,
-    excluded_item_ids: set[str] | None = None,
-) -> str:
-    """Do not report success until the provider item itself is indexed."""
-    for attempt in range(30):
-        items = await provider.list_knowledge_items(knowledge_base_id)
-        excluded = excluded_item_ids or set()
-        item = next(
-            (
-                candidate
-                for candidate in items
-                if (
-                    str(candidate.get("_id") or candidate.get("id") or "") == provider_item_id
-                    or (
-                        _provider_file_name(candidate) == artifact_name
-                        and str(candidate.get("_id") or candidate.get("id") or "") not in excluded
-                    )
-                )
-            ),
-            None,
-        )
-        if item is not None:
-            provider_state = _provider_status(item)
-            if provider_state in PROVIDER_READY:
-                indexed_item_id = _provider_item_id(item)
-                if indexed_item_id:
-                    return indexed_item_id
-                raise WebsiteRecoveryError(
-                    "The provider indexed the recovered page but returned no item identifier.",
-                    code="provider_response_invalid",
-                    retryable=True,
-                )
-            if provider_state in PROVIDER_FAILED:
-                raise WebsiteRecoveryError(
-                    "The provider rejected the recovered searchable document.",
-                    code="provider_indexing_failed",
-                )
-        if attempt < 29:
-            await _provider_poll_wait(2)
-    raise WebsiteRecoveryError(
-        "The recovered page is still waiting for provider indexing.",
-        code="provider_indexing_timeout",
-        retryable=True,
-    )
-
-
-async def _provider_poll_wait(seconds: float) -> None:
-    await asyncio.sleep(seconds)
 
 
 def _recount(knowledge_base: KnowledgeBase) -> None:
@@ -377,21 +292,6 @@ async def _mark_non_content_skipped(
         await _refresh_crawl(crawl_id)
 
 
-def _invalidate_crawl_bindings(knowledge_base: KnowledgeBase) -> None:
-    now = datetime.now(UTC)
-    for binding in knowledge_base.agent_bindings:
-        agent = binding.agent
-        if getattr(agent, "voice_provider", "smallest") in VAV_NATIVE_KNOWLEDGE_PROVIDERS:
-            binding.provider = agent.voice_provider
-            binding.sync_status = "synced"
-            binding.last_synced_at = now
-            continue
-        binding.sync_status = "pending"
-        binding.last_synced_at = None
-        if agent.provider_agent_id and agent.sync_status != "error":
-            agent.sync_status = "dirty"
-
-
 async def _crawl_website(tenant_id: UUID, kb_id: UUID, crawl_id: UUID) -> None:
     session = async_session_factory()
     try:
@@ -445,11 +345,7 @@ async def _crawl_website(tenant_id: UUID, kb_id: UUID, crawl_id: UUID) -> None:
         if crawl is None or knowledge_base is None or crawl.status == "cancelled":
             return
         invalidate_knowledge_approval(knowledge_base)
-        if knowledge_base.provider_knowledge_base_id:
-            provider = await _tenant_client(session, tenant_id)
-            await consolidate_smallest_url_duplicates(session, knowledge_base, provider)
-        else:
-            await consolidate_duplicate_url_sources(session, knowledge_base)
+        await consolidate_duplicate_url_sources(session, knowledge_base)
         existing_by_url = {
             canonical: source
             for source in knowledge_base.sources
@@ -535,7 +431,7 @@ async def _crawl_website(tenant_id: UUID, kb_id: UUID, crawl_id: UUID) -> None:
             crawl.completed_at = datetime.now(UTC)
         _recount(knowledge_base)
         if discovery.pages:
-            _invalidate_crawl_bindings(knowledge_base)
+            mark_knowledge_bindings_live(knowledge_base)
         await record_audit_event(
             session,
             tenant_id=tenant_id,
@@ -581,72 +477,6 @@ async def _mark_crawl_failed(crawl_id: UUID, message: str) -> None:
             await session.commit()
     finally:
         await session.close()
-
-
-async def _tenant_client(session, tenant_id: UUID) -> SmallestAIClient:
-    config = await load_provider_config(session, tenant_id, "smallest")
-    api_key = str((config or {}).get("api_key") or "").strip()
-    return SmallestAIClient(api_key=api_key) if api_key else get_smallest_client()
-
-
-async def _ensure_remote_locked(
-    session,
-    knowledge_base: KnowledgeBase,
-    provider: SmallestAIClient,
-) -> str:
-    """Create one provider KB across all concurrent page-repair workers."""
-    locked = await session.scalar(
-        select(KnowledgeBase)
-        .where(
-            KnowledgeBase.id == knowledge_base.id,
-            KnowledgeBase.tenant_id == knowledge_base.tenant_id,
-        )
-        .options(
-            selectinload(KnowledgeBase.sources),
-            selectinload(KnowledgeBase.agent_bindings).selectinload(AgentKnowledgeBinding.agent),
-        )
-        .with_for_update()
-        .execution_options(populate_existing=True)
-    )
-    if locked is None:
-        raise WebsiteRecoveryError(
-            "The knowledge base no longer exists.",
-            code="knowledge_base_missing",
-        )
-    if locked.provider_knowledge_base_id:
-        remote_id = locked.provider_knowledge_base_id
-        await session.commit()
-        return remote_id
-    if remote_creation_outcome_unknown(locked):
-        await session.commit()
-        raise WebsiteRecoveryError(
-            "Provider knowledge-base creation has an unresolved outcome; automatic creation is "
-            "paused to prevent duplicates.",
-            code="provider_provision_unknown",
-        )
-
-    locked.sync_status = "provisioning"
-    locked.sync_error = None
-    await session.flush()
-    try:
-        remote_id = await provider.create_knowledge_base(
-            name=locked.name,
-            description=locked.description or "",
-        )
-    except SmallestAIError as exc:
-        if exc.ambiguous:
-            mark_remote_creation_outcome_unknown(locked)
-        else:
-            locked.sync_status = "error"
-            locked.sync_error = str(exc)
-        locked.last_synced_at = datetime.now(UTC)
-        await session.commit()
-        raise
-    locked.provider_knowledge_base_id = remote_id
-    locked.sync_status = "processing" if locked.source_count else "local_only"
-    locked.last_synced_at = datetime.now(UTC)
-    await session.commit()
-    return remote_id
 
 
 async def _repair(tenant_id: UUID, kb_id: UUID, source_id: UUID) -> None:
@@ -775,71 +605,16 @@ async def _repair(tenant_id: UUID, kb_id: UUID, source_id: UUID) -> None:
             requested_mode=requested_mode,
             api_key=openai_api_key or None,
         )
-    provider_document = await asyncio.to_thread(
-        searchable_pdf,
-        title=page.title,
-        url=page.url,
-        text=compiled.content,
-    )
-
     await _set_stage(
         tenant_id,
         kb_id,
         source_id,
-        "provider_indexing",
-        "Sending the recovered searchable document to the knowledge provider.",
+        "indexing",
+        "Storing the compiled knowledge for VAV retrieval.",
     )
     session, knowledge_base, source = await _context(tenant_id, kb_id, source_id)
     try:
-        provider = await _tenant_client(session, tenant_id)
-        remote_id = await _ensure_remote_locked(session, knowledge_base, provider)
-
         content_sha256 = hashlib.sha256(compiled.content.encode("utf-8")).hexdigest()
-        artifact_prefix = f"vav-web-recovery-{source.id}-"
-        legacy_artifact_name = f"vav-web-recovery-{source.id}.pdf"
-        artifact_name = f"{artifact_prefix}{content_sha256[:16]}.pdf"
-        existing_items = await provider.list_knowledge_items(remote_id)
-        reusable_item = next(
-            (
-                item
-                for item in existing_items
-                if _provider_file_name(item) == artifact_name
-                and _provider_status(item) in PROVIDER_READY
-                and _provider_item_id(item)
-            ),
-            None,
-        )
-        excluded_item_ids: set[str] = set()
-        if reusable_item is not None:
-            provider_item_id = _provider_item_id(reusable_item)
-        else:
-            upload = await provider.upload_knowledge_pdf(
-                knowledge_base_id=remote_id,
-                file_name=artifact_name,
-                content=provider_document,
-            )
-            provider_item_id = _provider_item_id(upload)
-            if not provider_item_id:
-                excluded_item_ids = {
-                    item_id
-                    for item in existing_items
-                    if (item_id := _provider_item_id(item)) is not None
-                }
-        await _set_stage(
-            tenant_id,
-            kb_id,
-            source_id,
-            "verifying",
-            "The searchable document was accepted. VAV is verifying provider indexing.",
-        )
-        provider_item_id = await _wait_for_provider_index(
-            provider,
-            knowledge_base_id=remote_id,
-            provider_item_id=provider_item_id,
-            artifact_name=artifact_name,
-            excluded_item_ids=excluded_item_ids,
-        )
-
         source.name = page.title[:255]
         source.location = page.url
         source.raw_content = page.text
@@ -849,15 +624,15 @@ async def _repair(tenant_id: UUID, kb_id: UUID, source_id: UUID) -> None:
         source.mime_type = "text/html"
         source.size_bytes = page.downloaded_bytes
         source.status = "indexed"
-        source.provider_item_id = provider_item_id
+        source.provider_item_id = None
         source.error_message = None
         metadata = dict(source.source_metadata or {})
         metadata.pop("staged_refresh", None)
+        metadata.pop("provider_artifact_name", None)
         metadata.update(
             {
                 "extraction_method": page.method,
                 "content_sha256": content_sha256,
-                "provider_artifact_name": artifact_name,
                 "retrieval_content_source": "vav_website_recovery",
                 "compiler": {
                     **(compiled.structured.get("compiler") or {}),
@@ -869,7 +644,7 @@ async def _repair(tenant_id: UUID, kb_id: UUID, source_id: UUID) -> None:
             metadata,
             stage="verified",
             status="completed",
-            message="Readable text was extracted, indexed and verified for agent retrieval.",
+            message="Readable text was extracted, compiled and indexed for agent retrieval.",
             method=page.method,
             extracted_characters=len(page.text),
         )
@@ -878,31 +653,13 @@ async def _repair(tenant_id: UUID, kb_id: UUID, source_id: UUID) -> None:
         source.last_synced_at = now
         knowledge_base.last_synced_at = now
 
-        affected_agent_ids: list[str] = []
-        for binding in knowledge_base.agent_bindings:
-            agent = binding.agent
-            if agent.voice_provider in VAV_NATIVE_KNOWLEDGE_PROVIDERS:
-                binding.provider = agent.voice_provider
-                binding.sync_status = "synced"
-                binding.last_synced_at = now
-                continue
-            binding.sync_status = "pending"
-            binding.last_synced_at = None
-            if agent.provider_agent_id and agent.sync_status != "error":
-                agent.sync_status = "dirty"
-                affected_agent_ids.append(str(agent.id))
-
-        cleanup_scraped = await provider.list_scraped_knowledge_urls(remote_id)
-        cleanup_items = await provider.list_knowledge_items(remote_id)
-        await consolidate_smallest_url_duplicates(
+        await consolidate_duplicate_url_sources(
             session,
             knowledge_base,
-            provider,
-            scraped=cleanup_scraped,
-            items=cleanup_items,
             preferred_source=source,
         )
         _recount(knowledge_base)
+        mark_knowledge_bindings_live(knowledge_base)
         await record_audit_event(
             session,
             tenant_id=tenant_id,
@@ -920,36 +677,13 @@ async def _repair(tenant_id: UUID, kb_id: UUID, source_id: UUID) -> None:
                 "compiler_output_tokens": compiled.output_tokens,
                 "compiler_estimated_cost_usd": round(compiled.estimated_cost_usd, 8),
                 "compilation_reused": reused_compilation,
-                "agents_requiring_sync": affected_agent_ids,
             },
         )
         await session.commit()
-
-        await _mark_crawl_pages_for_source(source_id, status="indexed")
-
-        for item in existing_items:
-            old_id = str(item.get("_id") or item.get("id") or "")
-            if (
-                old_id
-                and old_id != provider_item_id
-                and (
-                    _provider_file_name(item).startswith(artifact_prefix)
-                    or _provider_file_name(item) == legacy_artifact_name
-                )
-            ):
-                try:
-                    await provider.delete_knowledge_item(
-                        knowledge_base_id=remote_id,
-                        item_id=old_id,
-                    )
-                except SmallestAIError:
-                    logger.warning(
-                        "knowledge_repair_stale_artifact_cleanup_failed",
-                        knowledge_base_id=str(kb_id),
-                        source_id=str(source_id),
-                    )
     finally:
         await session.close()
+
+    await _mark_crawl_pages_for_source(source_id, status="indexed")
 
 
 async def _mark_failed(
@@ -1087,21 +821,6 @@ def repair_website_source(self, tenant_id: str, knowledge_base_id: str, source_i
             knowledge_base_id=knowledge_base_id,
             source_id=source_id,
             error_code=exc.code,
-        )
-    except SmallestAIError as exc:
-        retryable = (exc.upstream_status_code or exc.status_code) >= 500 or (
-            exc.upstream_status_code == 429
-        )
-        if retryable and self.request.retries < self.max_retries and not exc.ambiguous:
-            raise self.retry(exc=exc, countdown=5 * (self.request.retries + 1))
-        _run_async(
-            _mark_failed(
-                tenant_uuid,
-                knowledge_uuid,
-                source_uuid,
-                message=f"Provider indexing failed: {exc}",
-                code="provider_indexing_failed",
-            )
         )
     except Exception:
         logger.exception(

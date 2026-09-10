@@ -1006,3 +1006,71 @@ def test_query_excerpt_keeps_substantive_middle_between_navigation_and_footer():
     )
 
     assert "clinician-led" in excerpt
+
+
+_DIRECTORY_DOCUMENT = """VERIFIED STRUCTURED FACTS
+
+SUBJECT: Dr Rana Youssef
+- specialty: Family Medicine
+  Search phrases: family medicine doctor | family doctor | GP
+  Evidence: Dr Rana Youssef Family Medicine Specialist
+
+SUBJECT: Dr Dalia Hassan
+- specialty: General Practitioner
+  Search phrases: GP | general practitioner
+  Evidence: Dr Dalia Hassan General Practitioner 23+ Years Experience
+- experience: 23+ Years
+  Evidence: Dr Dalia Hassan General Practitioner 23+ Years Experience
+
+SOURCE CONTENT
+Our doctors."""
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "Do you have a family medicine doctor?",
+        # Speech recognition capitalises specialties like proper nouns. A
+        # capitalised phrase that is not a compiled SUBJECT must not filter out
+        # every record whose subject is a person.
+        "Do you have a Family Medicine doctor?",
+        "Which doctor does family medicine?",
+    ],
+)
+def test_specialty_questions_reach_the_doctor_record_regardless_of_wording(query):
+    matches = rank_knowledge(query, [("Our Doctors", _DIRECTORY_DOCUMENT)])
+
+    assert matches
+    assert "Dr Rana Youssef" in matches[0].text
+    assert "Family Medicine" in matches[0].text
+
+
+def test_count_and_question_words_are_not_required_in_evidence():
+    matches = rank_knowledge(
+        "How many general practitioners do you have?",
+        [("Our Doctors", _DIRECTORY_DOCUMENT)],
+    )
+
+    assert matches
+    assert "General Practitioner" in matches[0].text
+
+
+def test_experience_question_with_auxiliary_verbs_reaches_the_named_doctor():
+    matches = rank_knowledge(
+        "how many years of experience does Dr Dalia have",
+        [("Our Doctors", _DIRECTORY_DOCUMENT)],
+    )
+
+    assert matches
+    assert "Dr Dalia Hassan" in matches[0].text
+    assert "23+ Years" in matches[0].text
+
+
+def test_named_subject_still_narrows_to_that_compiled_record():
+    matches = rank_knowledge(
+        "What is Dr Rana's specialty?",
+        [("Our Doctors", _DIRECTORY_DOCUMENT)],
+    )
+
+    assert matches
+    assert all("Dr Rana Youssef" in match.text for match in matches)

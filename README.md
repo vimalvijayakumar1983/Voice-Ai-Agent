@@ -247,21 +247,21 @@ record; temporary failures retry automatically, and terminal failures can be
 repaired individually or as one crawl. Re-crawls refresh existing content while
 content-addressed artifacts avoid uploading unchanged pages again. PDF uploads
 are validated and capped at 8 MiB. A knowledge base cannot be approved until
-every source is retrieval-ready, and agent bindings are republished after an
-approved crawl completes.
+every source is retrieval-ready. Ingestion and retrieval are local to VAV: no
+external knowledge provider is provisioned, and bound agents read the approved
+sources directly on every turn.
 
 | Action | Endpoint | Guardrail |
 | --- | --- | --- |
 | Create governed draft | `POST /api/v1/knowledge` | Tenant-scoped; no provider call |
-| Connect provider copy | `POST /api/v1/knowledge/{id}/provision` | Durable remote mapping and error state |
 | Crawl complete website | `POST /api/v1/knowledge/{id}/crawls` | Public HTTPS, DNS-pinned requests, robots-aware, same-site, bounded pages/depth |
 | Repair failed crawl | `POST /api/v1/knowledge/{id}/crawls/{crawl_id}/retry` | Requeues discovery or only failed page ledgers |
 | Discover sitemap | `POST /api/v1/knowledge/{id}/sitemap/discover` | Public HTTPS sitemap only; selection required before indexing |
-| Index selected pages | `POST /api/v1/knowledge/{id}/sources/urls` | Public HTTPS URLs, de-duplicated, maximum 100 per request |
+| Index selected pages | `POST /api/v1/knowledge/{id}/sources/urls` | Public HTTPS URLs, de-duplicated, maximum 100 per request; each page is downloaded, compiled and indexed by VAV |
 | Upload PDF | `POST /api/v1/knowledge/{id}/sources/pdf` | PDF signature/type check; maximum 8 MiB |
-| Refresh processing | `POST /api/v1/knowledge/{id}/refresh` | Provider status remains authoritative |
-| Approve knowledge | `POST /api/v1/knowledge/{id}/approval` | Owner/admin; all provider sources must be indexed |
-| Bind to agent | `POST /api/v1/knowledge/{id}/bindings` | Owner/admin; one knowledge base per Smallest agent |
+| Refresh | `POST /api/v1/knowledge/{id}/refresh` | Recounts sources and merges canonical URL duplicates locally |
+| Approve knowledge | `POST /api/v1/knowledge/{id}/approval` | Owner/admin; every source must have VAV-searchable text |
+| Bind to agent | `POST /api/v1/knowledge/{id}/bindings` | Owner/admin; VAV-native agents only; one knowledge base per agent |
 
 ## Verification
 

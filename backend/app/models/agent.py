@@ -133,7 +133,9 @@ class KnowledgeBase(TenantScopedModel):
     content: Mapped[str | None] = mapped_column(Text)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
 
-    provider: Mapped[str] = mapped_column(String(50), default="smallest")
+    provider: Mapped[str] = mapped_column(String(50), default="vav")
+    # Retained for historical rows only. VAV no longer provisions or reads a
+    # remote knowledge base; retrieval is local for every agent runtime.
     provider_knowledge_base_id: Mapped[str | None] = mapped_column(String(100), index=True)
     sync_status: Mapped[str] = mapped_column(String(30), default="local_only")
     sync_error: Mapped[str | None] = mapped_column(Text)

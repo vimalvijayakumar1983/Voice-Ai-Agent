@@ -113,7 +113,7 @@ case.
 |---|---|---|
 | End-of-turn detection | 200 ms | Semantic turn detection already on; tune endpointing delay per language |
 | Speech to text final | 150 ms | Streaming recognition; act on interim transcripts |
-| Knowledge hook | 150 ms | Indexed records, hybrid query with deadline, cached query embedding, no second retrieval on tool call |
+| Knowledge hook | 150 ms | Indexed records, hybrid query with deadline, cached query embedding |
 | Language model first token | 250 ms | Short system prompt, prompt caching, speculative generation on interim transcript |
 | Speech synthesis first byte | 150 ms | Streaming synthesis from the first sentence |
 | Network | 50 ms | Co-locate Railway, LiveKit and providers after measurement |
@@ -131,11 +131,12 @@ condition; nothing ships without them.
 ### PR 1. Local-only knowledge and immediate latency fixes
 
 - Remove Smallest.ai calls from PDF upload, crawl, repair and delete. Remove the pasted-text restriction and remote sync states.
-- Align the full-text index expression with the query, or exclude structured content from lexical search.
-- Cache the hook's retrieval for the turn so the tool call does not search again.
+- Align the full-text index expression with the query.
 - Fix the capitalised-subject filter and question-word handling in the ranker (interim, until the ranker is replaced).
 
-Acceptance: PDF upload and crawl succeed with no provider key configured; `EXPLAIN` shows the GIN index used; the four reproduced queries from §1 return the stored fact; existing tests pass.
+Acceptance: PDF upload, URL sources and crawl succeed with no provider key configured; the four reproduced queries from §1 return the stored fact; existing tests pass. `EXPLAIN` confirming GIN index use is checked on the Railway database after deploy, since the sandbox has no PostgreSQL.
+
+Note: the pipeline runtime retrieves once in the turn hook and the native realtime runtime retrieves once through the tool, so there is no double retrieval to cache. The earlier plan item for a per-turn cache was withdrawn.
 
 ### PR 2. Records-based extraction and compilation for every source type
 
