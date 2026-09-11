@@ -521,16 +521,19 @@ async def test_company_location_question_prefers_the_company_fact_over_item_phra
         indexed_source_count=4,
     )
     address = "Al Najda Street, opposite the central bus station, Abu Dhabi, United Arab Emirates"
+    # The About page compiles the owner under its page-qualified name; the
+    # company-first ranking must still recognise it as the owner.
+    page_qualified = "Royal Medical Center Abu Dhabi"
     kb.sources.append(
         KnowledgeSource(
             tenant_id=tenant.id,
             source_type="web",
             name="About Us | Royal Medical Center Abu Dhabi",
-            content=f"Royal Medical Center location: {address}",
+            content=f"{page_qualified} location: {address}",
             structured_content={
                 "facts": [
                     _company_fact(
-                        company,
+                        page_qualified,
                         "location",
                         address,
                         [
@@ -555,6 +558,17 @@ async def test_company_location_question_prefers_the_company_fact_over_item_phra
         ("Offers | Royal Medical Center Abu Dhabi", "Offer"),
     ):
         kb.sources.append(_item_source(tenant.id, name, prefix))
+    # A directory page also names the owner (page-qualified) in short facts, so
+    # the probe's subject appears in the context even when the About fact is
+    # crowded out; only the value then reveals the gap.
+    kb.sources[-1].structured_content["facts"].append(
+        _company_fact(
+            page_qualified,
+            "department",
+            "Dentistry",
+            ["Which departments does Royal Medical Center have?"],
+        )
+    )
     db.add(kb)
     await db.flush()
     lexicon = await publish_speech_lexicon(
