@@ -448,3 +448,137 @@ async def test_failed_retrieval_check_does_not_move_live_pointer(db, tenant, mon
             allow_draft_for_approval=True,
         )
     assert kb.serving_revision_id == first.id
+
+
+def test_publication_probe_compares_words_and_names_retrieved_sources():
+    from app.services.knowledge_serving import _probe_missing_term, _probe_sources
+
+    context = (
+        "Source: About Us | Royal Medical Center\n"
+        "VERIFIED STRUCTURED FACTS\nSUBJECT: Royal Medical Center\n"
+        "- location: Al Najda Street, Abu Dhabi – UAE\n\n"
+        "Source: Doctors\nSUBJECT: Dr. Hayam Aly\n- specialty: General practitioner"
+    )
+
+    assert _probe_missing_term(context, "Royal Medical Center", "Abu Dhabi, UAE") is None
+    assert _probe_missing_term(context, "Royal Medical Center", "Dubai") == "Dubai"
+    assert _probe_missing_term(None, "Royal Medical Center", "Abu Dhabi") == (
+        "Royal Medical Center"
+    )
+    assert _probe_sources(context) == "'About Us | Royal Medical Center', 'Doctors'"
+    assert _probe_sources(None) == "no evidence"
+
+
+def _company_fact(subject, predicate, value, phrases):
+    return {
+        "subject": subject,
+        "predicate": predicate,
+        "value": value,
+        "evidence": f"{subject} {predicate}: {value}",
+        "search_phrases": phrases,
+    }
+
+
+def _item_source(tenant_id, name, prefix):
+    """A directory-like source whose short facts all carry location phrasing."""
+    facts = [
+        _company_fact(
+            f"{prefix} {index}",
+            "location",
+            f"Room {index}",
+            [f"{prefix} {index} location", f"Where is {prefix} {index}?"],
+        )
+        for index in range(12)
+    ]
+    return KnowledgeSource(
+        tenant_id=tenant_id,
+        source_type="web",
+        name=name,
+        content="\n".join(fact["evidence"] for fact in facts),
+        structured_content={"facts": facts},
+        status="indexed",
+    )
+
+
+@pytest.mark.asyncio
+async def test_company_location_question_prefers_the_company_fact_over_item_phrases(db, tenant):
+    """A caller naming the clinic gets its own location fact, not a denser item fact.
+
+    Directory pages carry many short facts whose search phrases mention
+    "location" or "where". With two chunks per source and six slots, those
+    denser chunks used to crowd the company's own (longer) location fact out
+    of the retrieved context, so the publication probe for the About page
+    failed even though the fact was compiled correctly.
+    """
+    company = "Royal Medical Center"
+    kb = KnowledgeBase(
+        tenant_id=tenant.id,
+        name="Royal Medical",
+        owner_company=company,
+        sync_status="ready",
+        approval_status="draft",
+        source_count=4,
+        indexed_source_count=4,
+    )
+    address = "Al Najda Street, opposite the central bus station, Abu Dhabi, United Arab Emirates"
+    kb.sources.append(
+        KnowledgeSource(
+            tenant_id=tenant.id,
+            source_type="web",
+            name="About Us | Royal Medical Center Abu Dhabi",
+            content=f"Royal Medical Center location: {address}",
+            structured_content={
+                "facts": [
+                    _company_fact(
+                        company,
+                        "location",
+                        address,
+                        [
+                            "What is the location of Royal Medical Center?",
+                            "Where is Royal Medical Center located?",
+                            "Royal Medical Center address",
+                            "How do I get to Royal Medical Center?",
+                            "Which street is Royal Medical Center on?",
+                            "Royal Medical Center directions",
+                            "Is Royal Medical Center in Abu Dhabi?",
+                            "Royal Medical Center location details",
+                        ],
+                    )
+                ]
+            },
+            status="indexed",
+        )
+    )
+    for name, prefix in (
+        ("Doctors | Royal Medical Center Abu Dhabi", "Dr. Person"),
+        ("Departments | Royal Medical Center Abu Dhabi", "Department"),
+        ("Offers | Royal Medical Center Abu Dhabi", "Offer"),
+    ):
+        kb.sources.append(_item_source(tenant.id, name, prefix))
+    db.add(kb)
+    await db.flush()
+    lexicon = await publish_speech_lexicon(
+        db, tenant_id=tenant.id, knowledge_base=kb, allow_draft_for_approval=True
+    )
+    revision = await publish_serving_revision(
+        db,
+        tenant_id=tenant.id,
+        knowledge_base=kb,
+        speech_lexicon=lexicon,
+        allow_draft_for_approval=True,
+    )
+    assert all(report["status"] == "passed" for report in kb.readiness_report.values())
+
+    context = await retrieve_knowledge_context(
+        db,
+        tenant_id=tenant.id,
+        agent_id=uuid4(),
+        query="What is the location of Royal Medical Center?",
+        knowledge_base_id=kb.id,
+        serving_revision_id=revision.id,
+        company_subject=company,
+    )
+    assert context is not None
+    first_block = context.split("\n\n")[0]
+    assert "SUBJECT: Royal Medical Center" in first_block
+    assert address in first_block

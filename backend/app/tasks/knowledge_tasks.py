@@ -1234,6 +1234,7 @@ async def _repair(
             # longer budget as background text and PDF compilation.
             timeout_seconds=120.0,
             max_retries=1,
+            records=records,
         )
     content_sha256 = hashlib.sha256(compiled.content.encode("utf-8")).hexdigest()
     if not await _set_stage(

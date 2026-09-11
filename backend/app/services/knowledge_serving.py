@@ -799,12 +799,12 @@ async def publish_serving_revision(
                     serving_revision_id=revision.id,
                     company_subject=knowledge_base.owner_company,
                 )
-                normalized = " ".join((context or "").casefold().split())
-                if any(
-                    " ".join(term.casefold().split()) not in normalized for term in (subject, value)
-                ):
+                missing = _probe_missing_term(context, subject, value)
+                if missing is not None:
                     raise KnowledgeServingError(
                         f"Retrieval check failed for '{source.name}': {query}. "
+                        f"Expected '{missing}' in the retrieved evidence; retrieval returned "
+                        f"{_probe_sources(context)}. "
                         "The previous published release has not been replaced."
                     )
             readiness_report[str(source.id)] = {
@@ -820,6 +820,38 @@ async def publish_serving_revision(
     knowledge_base.serving_revision_id = revision.id
     knowledge_base.speech_lexicon_artifact_id = speech_lexicon.id
     return revision
+
+
+_PROBE_TOKEN_RE = re.compile(r"[^\W_]+", re.UNICODE)
+
+
+def _probe_missing_term(context: str | None, subject: str, value: str) -> str | None:
+    """Return the first expected term whose words are absent from the retrieved context.
+
+    Words are compared rather than the raw string so presentation-only
+    punctuation ("Abu Dhabi – UAE" versus "Abu Dhabi, UAE") does not fail a
+    release; every word of the subject and of the value must still be present.
+    """
+    context_tokens = set(_PROBE_TOKEN_RE.findall((context or "").casefold()))
+    for term in (subject, value):
+        term_tokens = _PROBE_TOKEN_RE.findall(term.casefold())
+        if not term_tokens or not set(term_tokens) <= context_tokens:
+            return term
+    return None
+
+
+def _probe_sources(context: str | None) -> str:
+    """Name the sources a failed probe retrieved so the gap is diagnosable."""
+    names = list(
+        dict.fromkeys(
+            line[len("Source: ") :].strip()
+            for line in (context or "").splitlines()
+            if line.startswith("Source: ")
+        )
+    )
+    if not names:
+        return "no evidence"
+    return ", ".join(f"'{name}'" for name in names[:6])
 
 
 async def load_agent_serving_revision(

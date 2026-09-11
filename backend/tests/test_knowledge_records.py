@@ -236,3 +236,39 @@ def test_every_uncovered_record_is_kept_for_review():
     assert report["uncovered_total"] == 40
     assert len(report["uncovered"]) == 40
     assert "(+37 more)" in coverage_issue(report)
+
+
+def test_uncovered_records_and_focused_rendering_carry_page_context():
+    from app.services.knowledge_records import (
+        make_record,
+        render_focused_records,
+        uncovered_records,
+    )
+
+    heading = make_record("heading", ["Departments"])
+    dentistry = make_record("list_item", ["Dentistry"], heading_path=("Departments",))
+    radiology = make_record("list_item", ["Radiology"], heading_path=("Departments",))
+    card = make_record(
+        "card",
+        ["Dr. Hayam Aly", "General practitioner", "21+ Years"],
+        heading_path=("Our Doctors",),
+    )
+    facts = [
+        {
+            "subject": "Royal Medical Center",
+            "predicate": "department",
+            "value": "Radiology",
+            "evidence": "Departments › Radiology",
+        }
+    ]
+
+    missing = uncovered_records([heading, dentistry, radiology, card], facts)
+
+    assert [record.text for record in missing] == [dentistry.text, card.text]
+    rendered = render_focused_records("Departments | Royal Medical Center Abu Dhabi", missing)
+    assert rendered.split("\n\n") == [
+        "Departments - Royal Medical Center Abu Dhabi › Departments › Dentistry",
+        "Departments - Royal Medical Center Abu Dhabi › Our Doctors › "
+        "Dr. Hayam Aly | General practitioner | 21+ Years",
+    ]
+    assert render_focused_records("", [dentistry]) == "Departments › Dentistry"

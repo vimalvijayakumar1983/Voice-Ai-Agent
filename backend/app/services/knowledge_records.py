@@ -324,6 +324,62 @@ def _fact_captures_record(record: KnowledgeRecord, bundle: str, bundle_tokens: s
     return True
 
 
+def uncovered_records(
+    records: Sequence[KnowledgeRecord], facts: Sequence[dict]
+) -> list[KnowledgeRecord]:
+    """Return the record-like records that no single accepted fact captures.
+
+    One bundle per fact: a record counts as captured only when a single fact
+    carries all of its fields together. Matching fragments across unrelated
+    facts would let an omitted row pass because its name appears in one fact
+    and its price in another.
+    """
+    fact_bundles = [
+        " "
+        + grounding_normalized(
+            " ".join(
+                str(fact.get(key) or "") for key in ("subject", "predicate", "value", "evidence")
+            )
+        )
+        + " "
+        for fact in facts
+        if isinstance(fact, dict)
+    ]
+    bundle_tokens = [set(bundle.split()) for bundle in fact_bundles]
+    return [
+        record
+        for record in records
+        if record.kind in RECORD_LIKE_KINDS
+        and not any(
+            _fact_captures_record(record, bundle, tokens)
+            for bundle, tokens in zip(fact_bundles, bundle_tokens, strict=True)
+        )
+    ]
+
+
+def render_focused_records(
+    title: str, records: Sequence[KnowledgeRecord], *, separator: str = " › "
+) -> str:
+    """Render records for a second compile pass with their page context inline.
+
+    A single-entry record such as a department name under a "Departments"
+    heading carries no explicit subject of its own. Prefixing each line with
+    the page title and heading path keeps the organization and the heading
+    inside the record's own evidence span, so the compiler can attribute the
+    entry without inferring anything the page did not present together.
+    """
+    context_title = " ".join(title.replace(" | ", " - ").split())
+    lines = []
+    for record in records:
+        text = record.text.strip()
+        if not text:
+            continue
+        context = [context_title] if context_title else []
+        context.extend(record.heading_path)
+        lines.append(separator.join((*context, text)) if context else text)
+    return "\n\n".join(lines).strip()
+
+
 def coverage_report(
     records: Sequence[KnowledgeRecord],
     structured: dict | None,
@@ -346,21 +402,7 @@ def coverage_report(
     facts_rejected = int(validation.get("facts_rejected", 0) or 0)
 
     record_like = [record for record in records if record.kind in RECORD_LIKE_KINDS]
-    # One bundle per fact: a record counts as captured only when a single fact
-    # carries all of its fields together. Matching fragments across unrelated
-    # facts would let an omitted row pass because its name appears in one fact
-    # and its price in another.
-    fact_bundles = [
-        " "
-        + grounding_normalized(
-            " ".join(
-                str(fact.get(key) or "") for key in ("subject", "predicate", "value", "evidence")
-            )
-        )
-        + " "
-        for fact in facts
-    ]
-    bundle_tokens = [set(bundle.split()) for bundle in fact_bundles]
+    missing = {id(record) for record in uncovered_records(record_like, facts)}
     subject_blob = " ".join(
         grounding_normalized(str(item.get("subject") or item.get("name") or ""))
         for item in (*facts, *entities)
@@ -372,13 +414,10 @@ def coverage_report(
     entities_found: list[str] = []
     entities_with_facts = 0
     for record in record_like:
-        if any(
-            _fact_captures_record(record, bundle, tokens)
-            for bundle, tokens in zip(fact_bundles, bundle_tokens, strict=True)
-        ):
-            covered += 1
-        else:
+        if id(record) in missing:
             uncovered.append(record.text[:200])
+        else:
+            covered += 1
         if record.kind in {"card", "table_row"} and record.fragments:
             entity = record.fragments[0]
             entities_found.append(entity)

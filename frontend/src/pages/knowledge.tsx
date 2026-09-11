@@ -556,8 +556,8 @@ export default function KnowledgeStudio() {
 
       <section className={styles.stats} aria-label="Knowledge health">
         <Metric icon={BookOpenCheck} label="Knowledge bases" value={knowledgeBases.length} detail={`${knowledgeBases.filter((kb) => kb.approval_status === 'approved').length} approved`} />
-        <Metric icon={BadgeCheck} label="Indexed sources" value={indexed} detail="Provider-confirmed" tone="success" />
-        <Metric icon={RefreshCw} label="Processing" value={processing} detail="Awaiting provider" tone={processing ? 'warning' : 'neutral'} />
+        <Metric icon={BadgeCheck} label="Indexed sources" value={indexed} detail="Compiled and searchable" tone="success" />
+        <Metric icon={RefreshCw} label="Processing" value={processing} detail="Extracting or compiling" tone={processing ? 'warning' : 'neutral'} />
         <Metric
           icon={Bot}
           label="Bound agents"
@@ -632,7 +632,7 @@ export default function KnowledgeStudio() {
                   <span><strong>{selected.indexed_source_count}/{selected.source_count}</strong> extracted</span>
                   <span><strong>{selected.languages.join(', ').toUpperCase()}</strong> languages</span>
                   <span><strong>{selected.agent_bindings.length}</strong> bound agents</span>
-                  <span><strong>{selected.last_synced_at ? formatDate(selected.last_synced_at) : 'Never'}</strong> provider check</span>
+                  <span><strong>{selected.last_synced_at ? formatDate(selected.last_synced_at) : 'Never'}</strong> last refresh</span>
                 </div>
                 {selected.sync_error && <div className={styles.inlineError} role="alert"><CircleAlert size={14} /><span>{selected.sync_error}</span></div>}
               </section>

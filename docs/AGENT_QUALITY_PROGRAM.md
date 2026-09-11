@@ -211,6 +211,29 @@ Completeness fixes from the Royal Medical verification on 10 September:
   is paginated by the renderer clicking the control and capturing each state,
   up to 12 pages; a click that fails or leaves the site fails the source.
 
+Approval and coverage fixes from the Royal Medical re-index on 11 September:
+
+- The records a first compile pass leaves uncovered are compiled once more in
+  a focused pass. Each uncovered record is presented on its own line prefixed
+  with the page title and heading path, so a single-entry item such as a
+  department name carries the organization and the heading inside its own
+  evidence and can become a subject-grounded fact. The pass runs for website,
+  PDF and pasted-text sources; a failure keeps the first pass and records the
+  reason under `focused_pass`.
+- A question that names the owner company ranks the company's own facts ahead
+  of person or item facts that merely share the topic word. Directory pages
+  carry many short facts whose search phrases mention "location" or "where",
+  and with two chunks per source those denser chunks crowded the About page's
+  location fact out of the six retrieved chunks. That is why the publication
+  retrieval check failed for "What is the location of Royal Medical Center?"
+  and blocked approval. The semantic expansion of "location" no longer
+  produces a "where" variant, which carried no topic word and matched any
+  fact about the subject.
+- The publication retrieval check compares words rather than the raw string,
+  so presentation punctuation cannot fail a release, and a failure names the
+  expected term and the sources that were retrieved instead.
+- Knowledge Studio no longer describes indexed sources as provider-confirmed.
+
 Acceptance: an existing knowledge base re-indexes end to end and shows complete
 coverage on the Royal Medical doctor directory.
 

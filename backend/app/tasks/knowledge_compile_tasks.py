@@ -14,6 +14,7 @@ from app.core.database import async_session_factory
 from app.models.agent import KnowledgeSource
 from app.models.user import User
 from app.services.knowledge_compiler import compile_source_knowledge
+from app.services.knowledge_records import records_from_text
 from app.services.pdf_ingestion import PdfIngestionError, PreparedPdf, prepare_pdf
 from app.services.provider_credentials import ProviderCredentialError, load_provider_config
 from app.tasks.async_runner import run_async
@@ -186,6 +187,7 @@ async def _compile(tenant_id, kb_id, source_id, run_id):
                 await _finish(tenant_id, kb_id, source_id, run_id, error=str(exc))
                 return
             text = prepared.extracted_text
+        records = prepared.records if prepared is not None else records_from_text(text)
         compiled = await compile_source_knowledge(
             title=title,
             url="",
@@ -198,6 +200,7 @@ async def _compile(tenant_id, kb_id, source_id, run_id):
             # The task deadline and stale-job watchdog still bound total work.
             timeout_seconds=120.0,
             max_retries=0,
+            records=records,
         )
         await _finish(tenant_id, kb_id, source_id, run_id, compiled=compiled, prepared=prepared)
     except Exception as exc:
