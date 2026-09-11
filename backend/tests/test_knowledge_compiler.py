@@ -639,3 +639,185 @@ def test_segments_after_the_first_open_with_the_active_heading_context():
     joined = "\n\n".join(segments)
     for record in doctors + nurses:
         assert joined.count(record) == 1
+
+
+class _SequencedCompletions:
+    """Return the first payload to the main pass and the second to the focused pass."""
+
+    def __init__(self, main: dict, focused: dict | None, *, fail_focused: bool = False):
+        self.main = main
+        self.focused = focused
+        self.fail_focused = fail_focused
+        self.requests = []
+
+    async def create(self, **kwargs):
+        self.requests.append(kwargs)
+        system_prompt = kwargs["messages"][0]["content"]
+        if "FOCUSED PASS" in system_prompt:
+            if self.fail_focused:
+                raise TimeoutError("focused pass timed out")
+            payload = self.focused
+        else:
+            payload = self.main
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(payload)))],
+            usage=SimpleNamespace(prompt_tokens=100, completion_tokens=50),
+        )
+
+
+def _departments_page():
+    from app.services.knowledge_records import make_record, render_records
+
+    records = [
+        make_record("heading", ["Royal Medical Center Abu Dhabi"]),
+        make_record("heading", ["Departments"], heading_path=("Royal Medical Center Abu Dhabi",)),
+        make_record(
+            "list_item",
+            ["Radiology"],
+            heading_path=("Royal Medical Center Abu Dhabi", "Departments"),
+        ),
+        make_record(
+            "list_item",
+            ["Dentistry"],
+            heading_path=("Royal Medical Center Abu Dhabi", "Departments"),
+        ),
+    ]
+    return records, render_records(records)
+
+
+def _main_payload():
+    return {
+        "page_type": "service",
+        "entities": [
+            {
+                "name": "Royal Medical Center Abu Dhabi",
+                "entity_type": "organization",
+                "evidence": "Royal Medical Center Abu Dhabi",
+            }
+        ],
+        "facts": [
+            {
+                "subject": "Royal Medical Center Abu Dhabi",
+                "predicate": "department",
+                "value": "Radiology",
+                "evidence": "Royal Medical Center Abu Dhabi\n\nDepartments\n\nRadiology",
+                "search_phrases": ["Does Royal Medical Center have radiology?"],
+            }
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_focused_pass_compiles_only_the_uncovered_records_with_context():
+    records, text = _departments_page()
+    completions = _SequencedCompletions(
+        _main_payload(),
+        {
+            "page_type": "service",
+            "entities": [],
+            "facts": [
+                {
+                    "subject": "Royal Medical Center Abu Dhabi",
+                    "predicate": "department",
+                    "value": "Dentistry",
+                    "evidence": (
+                        "Departments - Royal Medical Center Abu Dhabi › "
+                        "Royal Medical Center Abu Dhabi › Departments › Dentistry"
+                    ),
+                    "search_phrases": ["Does Royal Medical Center have a dentistry department?"],
+                }
+            ],
+        },
+    )
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+
+    result = await compile_website_knowledge(
+        title="Departments | Royal Medical Center Abu Dhabi",
+        url="https://royalmedical.example/departments",
+        text=text,
+        requested_mode="ai_verified",
+        api_key="test-key",
+        client=client,
+        records=records,
+    )
+
+    assert len(completions.requests) == 2
+    focused_payload = json.loads(completions.requests[1]["messages"][1]["content"])
+    # Only Dentistry was uncovered; Radiology was captured in the first pass.
+    assert focused_payload["source_text"] == (
+        "Departments - Royal Medical Center Abu Dhabi › "
+        "Royal Medical Center Abu Dhabi › Departments › Dentistry"
+    )
+    values = {fact["value"] for fact in result.structured["facts"]}
+    assert values == {"Radiology", "Dentistry"}
+    assert result.structured["focused_pass"] == {
+        "uncovered_records": 1,
+        "facts_added": 1,
+        "segments_processed": 1,
+    }
+    assert result.structured["validation"]["facts_accepted"] == 2
+    assert result.input_tokens == 200 and result.output_tokens == 100
+    from app.services.knowledge_records import coverage_report
+
+    coverage = coverage_report(
+        records, result.structured, requested_mode="ai_verified", effective_mode="ai_verified"
+    )
+    assert coverage["status"] == "complete"
+    assert coverage["records_covered"] == 2
+
+
+@pytest.mark.asyncio
+async def test_focused_pass_is_skipped_when_every_record_is_covered():
+    records, text = _departments_page()
+    payload = _main_payload()
+    payload["facts"].append(
+        {
+            "subject": "Royal Medical Center Abu Dhabi",
+            "predicate": "department",
+            "value": "Dentistry",
+            "evidence": "Royal Medical Center Abu Dhabi\n\nDepartments\n\nRadiology\n\nDentistry",
+            "search_phrases": ["Does Royal Medical Center have dentistry?"],
+        }
+    )
+    completions = _SequencedCompletions(payload, None)
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+
+    result = await compile_website_knowledge(
+        title="Departments | Royal Medical Center Abu Dhabi",
+        url="https://royalmedical.example/departments",
+        text=text,
+        requested_mode="ai_verified",
+        api_key="test-key",
+        client=client,
+        records=records,
+    )
+
+    assert len(completions.requests) == 1
+    assert "focused_pass" not in result.structured
+    assert len(result.structured["facts"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_focused_pass_failure_keeps_the_first_pass_facts():
+    records, text = _departments_page()
+    completions = _SequencedCompletions(_main_payload(), None, fail_focused=True)
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+
+    result = await compile_website_knowledge(
+        title="Departments | Royal Medical Center Abu Dhabi",
+        url="https://royalmedical.example/departments",
+        text=text,
+        requested_mode="ai_verified",
+        api_key="test-key",
+        client=client,
+        records=records,
+    )
+
+    assert len(completions.requests) == 2
+    assert result.effective_mode == "ai_verified"
+    assert [fact["value"] for fact in result.structured["facts"]] == ["Radiology"]
+    assert result.structured["focused_pass"] == {
+        "uncovered_records": 1,
+        "facts_added": 0,
+        "error": "TimeoutError",
+    }

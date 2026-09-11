@@ -365,6 +365,7 @@ _SEMANTIC_CONCEPT_GROUPS: tuple[tuple[str, ...], ...] = (
     ("address", "location", "where", "based"),
 )
 _SEMANTIC_CONCEPTS = {term: group for group in _SEMANTIC_CONCEPT_GROUPS for term in group}
+_QUESTION_WORD_CONCEPTS = frozenset({"where"})
 
 
 @dataclass(frozen=True)
@@ -500,7 +501,10 @@ def _semantic_query_variants(query: str) -> tuple[str, ...]:
         if concepts is None:
             continue
         for concept in concepts:
-            if concept == token:
+            if concept == token or concept in _QUESTION_WORD_CONCEPTS:
+                # "What is the where of the clinic?" carries no topic word, so
+                # it would match any fact about the subject. Question words are
+                # expanded from, never substituted in.
                 continue
             variants.append(
                 " ".join(f"{query[: match.start()]}{concept}{query[match.end() :]}".split())
@@ -1134,7 +1138,16 @@ def rank_knowledge(
     documents: list[tuple[str, str]],
     *,
     limit: int = 6,
+    preferred_subject: str | None = None,
 ) -> list[KnowledgeMatch]:
+    """Rank chunks for one query.
+
+    ``preferred_subject`` names the organization the caller asked about (the
+    owner company, already removed from ``query``). Facts whose SUBJECT is that
+    organization rank ahead of person or item facts that merely share the
+    topic word, so a company-level question is answered by the company's own
+    fact rather than a doctor's "where"/"location" search phrase.
+    """
     query_tokens = _query_tokens(query)
     phone_query = _is_phone_query(query, query_tokens)
     if phone_query:
@@ -1153,6 +1166,11 @@ def rank_knowledge(
     service_capability_query = _is_service_capability_query(query)
     directory_query = bool(query_tokens & _DIRECTORY_QUERY_TOKENS)
     requested_subject_tokens = _known_subject_filter(query, documents)
+    preferred_subject_key = ""
+    if preferred_subject and not directory_query:
+        from app.services.conversation_scope import company_key
+
+        preferred_subject_key = company_key(preferred_subject)
     matches: list[KnowledgeMatch] = []
     for source, content in documents:
         if service_capability_query and (
@@ -1269,6 +1287,12 @@ def rank_knowledge(
             authority_bonus = 0.14 if structured_facts else 0.0
             if requested_subject_tokens and requested_subject_tokens <= structured_subject_tokens:
                 authority_bonus += 0.18
+            if preferred_subject_key and structured_facts:
+                subject_line = _SUBJECT_LINE.search(chunk)
+                if subject_line is not None and (
+                    _company_key(subject_line.group(1)) == preferred_subject_key
+                ):
+                    authority_bonus += 0.12
             score = (
                 coverage * 0.76
                 + content_coverage * 0.18
@@ -1461,14 +1485,27 @@ def _rank_bounded_knowledge(
     query: str,
     documents: list[tuple[str, str]],
     limit: int = 6,
+    preferred_subject: str | None = None,
 ) -> list[KnowledgeMatch]:
-    return rank_knowledge(query, _bounded_ranking_documents(query, documents), limit=limit)
+    return rank_knowledge(
+        query,
+        _bounded_ranking_documents(query, documents),
+        limit=limit,
+        preferred_subject=preferred_subject,
+    )
+
+
+def _company_key(value: str) -> str:
+    from app.services.conversation_scope import company_key
+
+    return company_key(value)
 
 
 def _rank_contextual_knowledge(
     queries: Sequence[str],
     documents: list[tuple[str, str]],
     limit: int,
+    preferred_subject: str | None = None,
 ) -> list[KnowledgeMatch]:
     """Merge independently ranked alternatives without weakening match safety."""
     best_matches: dict[tuple[str, str], KnowledgeMatch] = {}
@@ -1477,7 +1514,9 @@ def _rank_contextual_knowledge(
         # as strong as the literal transcript. The tiny penalty is deterministic
         # and keeps an exact raw-query result ahead on a tie.
         variant_penalty = query_index * 0.004
-        for match in _rank_bounded_knowledge(query, documents, limit=max(limit, 6)):
+        for match in _rank_bounded_knowledge(
+            query, documents, limit=max(limit, 6), preferred_subject=preferred_subject
+        ):
             key = (match.source.casefold(), match.text)
             adjusted = KnowledgeMatch(match.source, match.text, match.score - variant_penalty)
             existing = best_matches.get(key)
@@ -2246,6 +2285,7 @@ async def _retrieve_serving_revision_context(
     if revision.knowledge_content and company_subject is None:
         documents.append((revision.knowledge_name, revision.knowledge_content))
     rank_variants = query_plan.variants
+    preferred_subject = None
     if owner_company:
         from app.services.conversation_scope import company_key
 
@@ -2261,6 +2301,7 @@ async def _retrieve_serving_revision_context(
                 without_owner = re.sub(re.escape(owner_company), " ", variant, flags=re.I)
                 if without_owner != variant:
                     normalized_variants.append(without_owner)
+                    preferred_subject = owner_company
                     continue
                 named_subject = _requested_subject_tokens(variant)
                 for width in range(len(owner_words), 2, -1):
@@ -2272,6 +2313,7 @@ async def _retrieve_serving_revision_context(
                             variant,
                             flags=re.I,
                         )
+                        preferred_subject = owner_company
                         break
                 normalized_variants.append(variant)
             rank_variants = tuple(normalized_variants)
@@ -2280,6 +2322,7 @@ async def _retrieve_serving_revision_context(
         rank_variants,
         documents,
         limit,
+        preferred_subject,
     )
     if not matches:
         return None

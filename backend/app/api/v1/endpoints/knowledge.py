@@ -104,6 +104,7 @@ async def _compile_uploaded_content(
     name: str,
     text: str,
     processing_mode: KnowledgeProcessingMode,
+    records=None,
 ) -> CompiledKnowledge:
     """Compile before publication locks or remote uploads; failures leave drafts intact."""
     api_key = None
@@ -140,6 +141,7 @@ async def _compile_uploaded_content(
             requested_mode=processing_mode,
             api_key=api_key,
             require_structured_facts=True,
+            records=records,
         )
     except KnowledgeCompilerError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -1089,6 +1091,7 @@ async def add_text_source(
             actor=current_user,
             request=request,
         )
+    text_records = records_from_text(data.content)
     compiled = await _compile_uploaded_content(
         db,
         current_user.tenant_id,
@@ -1096,6 +1099,7 @@ async def add_text_source(
         name=data.name,
         text=data.content,
         processing_mode=data.processing_mode,
+        records=text_records,
     )
     # Recheck authorization/bindings after external inference, under the same
     # publication barrier used by approval. Never hold that lock during inference.
@@ -1124,7 +1128,9 @@ async def add_text_source(
             source_metadata={"retrieval_content_source": "vav_text"},
         )
         kb.sources.append(source)
-    _apply_uploaded_compilation(source, raw_text=data.content, compiled=compiled)
+    _apply_uploaded_compilation(
+        source, raw_text=data.content, compiled=compiled, records=text_records
+    )
     _recount(kb)
     _mark_native_bindings_live(kb)
     await db.flush()
@@ -1224,6 +1230,7 @@ async def compile_existing_uploaded_source(
             actor=current_user,
             request=request,
         )
+    text_records = records_from_text(raw_text)
     compiled = await _compile_uploaded_content(
         db,
         current_user.tenant_id,
@@ -1231,13 +1238,14 @@ async def compile_existing_uploaded_source(
         name=source_name,
         text=raw_text,
         processing_mode=data.processing_mode,
+        records=text_records,
     )
     kb = await _get_knowledge_base(db, current_user.tenant_id, kb_id)
     source = next((item for item in kb.sources if item.id == source_id), None)
     if source is None or source.updated_at != previous_updated_at:
         raise HTTPException(status_code=409, detail="The source changed. Refresh and retry.")
     approval_invalidated = invalidate_knowledge_approval(kb)
-    _apply_uploaded_compilation(source, raw_text=raw_text, compiled=compiled)
+    _apply_uploaded_compilation(source, raw_text=raw_text, compiled=compiled, records=text_records)
     _mark_native_bindings_live(kb)
     _recount(kb)
     await db.flush()
@@ -1383,6 +1391,7 @@ async def upload_pdf_source(
         name=filename,
         text=prepared.extracted_text,
         processing_mode=processing_mode,
+        records=prepared.records,
     )
 
     kb = await _get_knowledge_base(db, current_user.tenant_id, kb_id)
