@@ -230,7 +230,11 @@ Approval and coverage fixes from the Royal Medical re-index on 11 September:
   produces a "where" variant, which carried no topic word and matched any
   fact about the subject. The owner is recognised under any page-qualified
   name ("Royal Medical Center Abu Dhabi" for "Royal Medical Center"), since
-  each page compiles the same organization slightly differently.
+  each page compiles the same organization slightly differently. The same
+  rule (`same_company`) now decides source ownership, the structured-fact
+  filter and the exact-fact index filter when an agent carries a company
+  scope, so a scope naming the short form still reads a page-qualified
+  fact and a scope naming another organization stays fenced.
 - The publication retrieval check compares words rather than the raw string,
   so presentation punctuation cannot fail a release, and a failure names the
   expected term and the sources that were retrieved instead.

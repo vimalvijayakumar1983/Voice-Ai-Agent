@@ -9,6 +9,26 @@ def company_key(value: str) -> str:
     return " ".join(re.findall(r"[^\W_]+", value.casefold().replace("&", " and ")))
 
 
+def same_company(first: str, second: str) -> bool:
+    """Whether two names identify one organization under page-qualified spellings.
+
+    Pages of one site compile the owner as "Royal Medical Center", "Royal
+    Medical Center Abu Dhabi" or "Royal Medical Center LLC". The names match
+    when their keys are equal or one contains the other as a contiguous word
+    sequence; the contained name must have at least two words so a shared
+    single word ("Royal") never joins two companies. "Northstar Group" and
+    "Northstar Trading" remain distinct.
+    """
+    first_key = company_key(first)
+    second_key = company_key(second)
+    if not first_key or not second_key:
+        return False
+    if first_key == second_key:
+        return True
+    shorter, longer = sorted((first_key, second_key), key=len)
+    return " " in shorter and f" {shorter} " in f" {longer} "
+
+
 def routing_text(value: str) -> str:
     """Remove discourse noise without changing stored/provider transcripts or constraints."""
     value = value.strip().replace("’", "'")
