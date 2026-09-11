@@ -35,7 +35,7 @@ from app.models.agent import (
     KnowledgeServingRevisionSource,
     KnowledgeSource,
 )
-from app.services.conversation_scope import company_key
+from app.services.conversation_scope import company_key, same_company
 from app.services.exact_fact_protocol import ExactFactWireFact, encode_exact_fact_evidence
 from app.services.knowledge_collections import CollectionRecord, collection_record
 
@@ -1499,9 +1499,7 @@ def resolve_exact_fact(
         index = replace(
             index,
             facts=tuple(
-                fact
-                for fact in index.facts
-                if company_key(fact.subject) == company_key(company_subject)
+                fact for fact in index.facts if same_company(fact.subject, company_subject)
             ),
         )
     queries = _deduplicated_text((query, *query_variants), limit=8)

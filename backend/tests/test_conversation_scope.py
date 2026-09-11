@@ -261,3 +261,44 @@ async def test_older_same_company_audio_cannot_replace_newer_answer(db, tenant, 
     old("The number is +971 2 665 9998.")
     reply = await runtime.retrieve_single_pass_evidence("Repeat slowly")
     assert deterministic_grounded_reply(reply) == "The address is Main Street."
+
+
+def test_same_company_accepts_page_qualified_names_only():
+    from app.services.conversation_scope import same_company
+
+    assert same_company("Royal Medical Center", "Royal Medical Center Abu Dhabi")
+    assert same_company("Royal Medical Center LLC", "royal medical center")
+    assert same_company("Sun & Moon Clinic", "Sun and Moon Clinic")
+    assert not same_company("Northstar Group", "Northstar Trading")
+    assert not same_company("Royal", "Royal Medical Center")
+    assert not same_company("", "Royal Medical Center")
+
+
+def test_scoped_retrieval_serves_page_qualified_owner_facts():
+    """An agent scoped to the short owner name still reads the About page's facts."""
+    facts = {
+        "facts": [
+            {
+                "subject": "Royal Medical Center Abu Dhabi",
+                "predicate": "location",
+                "value": "the city of Shakhbout, Abu Dhabi",
+                "evidence": "Royal Medical Center Abu Dhabi is located in the city of Shakhbout.",
+            },
+            phone_fact("Northstar Trading", "123456789"),
+        ]
+    }
+    docs = _source_retrieval_documents(
+        name="About Us | Royal Medical Center Abu Dhabi",
+        content="Royal Medical Center Abu Dhabi is located in the city of Shakhbout.",
+        structured_content=facts,
+        company_subject="Royal Medical Center",
+        owner_company="Royal Medical Center Abu Dhabi",
+    )
+    assert docs and "Shakhbout" in docs[0][1]
+    scoped_only = _source_retrieval_documents(
+        name="Mixed",
+        content="raw",
+        structured_content=facts,
+        company_subject="Royal Medical Center",
+    )
+    assert "Shakhbout" in str(scoped_only) and "123456789" not in str(scoped_only)

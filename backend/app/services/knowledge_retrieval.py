@@ -996,9 +996,9 @@ def _structured_retrieval_content(
             continue
         subject = " ".join(str(fact.get("subject") or "").split()).strip()
         if company_subject is not None:
-            from app.services.conversation_scope import company_key
+            from app.services.conversation_scope import same_company
 
-            if company_key(subject) != company_key(company_subject):
+            if not same_company(subject, company_subject):
                 continue
         predicate = " ".join(str(fact.get("predicate") or "").split()).strip()
         fact_value = " ".join(str(fact.get("value") or "").split()).strip()
@@ -1063,13 +1063,9 @@ def _source_retrieval_documents(
 ) -> list[tuple[str, str]]:
     """Keep verified facts fast without hiding facts an AI extractor omitted."""
 
-    from app.services.conversation_scope import company_key
+    from app.services.conversation_scope import same_company
 
-    owned = bool(
-        owner_company
-        and company_subject
-        and company_key(owner_company) == company_key(company_subject)
-    )
+    owned = bool(owner_company and company_subject and same_company(owner_company, company_subject))
     if owner_company and company_subject and not owned:
         return []
     structured = _structured_retrieval_content(
@@ -1502,22 +1498,10 @@ def _company_key(value: str) -> str:
 
 
 def _subject_names_company(subject: str, company_key_value: str) -> bool:
-    """Whether a fact's SUBJECT is the owner company under any page-qualified name.
+    """Whether a fact's SUBJECT is the owner company under any page-qualified name."""
+    from app.services.conversation_scope import same_company
 
-    Different pages of one site compile the owner as "Royal Medical Center",
-    "Royal Medical Center Abu Dhabi" or "Royal Medical Center LLC". Each is the
-    same organization for ranking purposes, so a subject that contains the
-    owner's words as a contiguous sequence (or a multi-word subject that the
-    owner name contains) counts as the company. A single word never does.
-    """
-    subject_key = _company_key(subject)
-    if not subject_key or not company_key_value:
-        return False
-    if subject_key == company_key_value:
-        return True
-    if f" {company_key_value} " in f" {subject_key} ":
-        return True
-    return " " in subject_key and f" {subject_key} " in f" {company_key_value} "
+    return same_company(subject, company_key_value)
 
 
 def _rank_contextual_knowledge(
