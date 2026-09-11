@@ -228,7 +228,9 @@ Approval and coverage fixes from the Royal Medical re-index on 11 September:
   retrieval check failed for "What is the location of Royal Medical Center?"
   and blocked approval. The semantic expansion of "location" no longer
   produces a "where" variant, which carried no topic word and matched any
-  fact about the subject.
+  fact about the subject. The owner is recognised under any page-qualified
+  name ("Royal Medical Center Abu Dhabi" for "Royal Medical Center"), since
+  each page compiles the same organization slightly differently.
 - The publication retrieval check compares words rather than the raw string,
   so presentation punctuation cannot fail a release, and a failure names the
   expected term and the sources that were retrieved instead.
