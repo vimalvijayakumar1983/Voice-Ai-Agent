@@ -601,7 +601,7 @@ export default function Agents() {
               </div>
               <div className="agent-card-actions">
                 <button className="btn btn-secondary btn-sm" disabled={!catalogReady || providerOperationUnresolved(agent.sync_status)} onClick={() => openEdit(agent)}><Pencil size={12} /> Edit</button>
-                {['sarvam', 'elevenlabs', 'inworld'].includes(agent.voice_provider) ? (
+                {['sarvam', 'elevenlabs', 'inworld', 'soniox'].includes(agent.voice_provider) ? (
                   <button
                     className={`btn btn-sm ${runtimeProfiles[agent.id]?.enabled ? 'btn-primary' : 'btn-secondary'}`}
                     disabled={!runtimeProfiles[agent.id]}
@@ -620,7 +620,7 @@ export default function Agents() {
                 {agent.sync_status === 'publish_unknown' && (
                   <button className="btn btn-secondary btn-sm" disabled={working === `resolve-${agent.id}`} onClick={() => resolveProviderOperation(agent)}><RefreshCw size={12} /> Resolve unknown</button>
                 )}
-                {agent.voice_provider === 'inworld' && runtimeProfiles[agent.id]?.id && runtimeProfiles[agent.id]?.status !== 'inactive' ? (
+                {['inworld', 'soniox'].includes(agent.voice_provider) && runtimeProfiles[agent.id]?.id && runtimeProfiles[agent.id]?.status !== 'inactive' ? (
                   <Link href={`/playground?agent=${agent.id}`} className="btn btn-secondary btn-sm"><FlaskConical size={12} /> Browser test</Link>
                 ) : isAgentCallReady(agent, runtimeProfiles[agent.id]) ? (
                   <Link href={`/playground?agent=${agent.id}`} className="btn btn-secondary btn-sm"><FlaskConical size={12} /> Test</Link>
@@ -707,7 +707,7 @@ function providerOperationUnresolved(status: VoiceAgent['sync_status']) {
 }
 
 function isVAVRuntimeAgent(agent: VoiceAgent) {
-  return ['sarvam', 'elevenlabs', 'inworld'].includes(agent.voice_provider);
+  return ['sarvam', 'elevenlabs', 'inworld', 'soniox'].includes(agent.voice_provider);
 }
 
 function agentStateLabel(agent: VoiceAgent, runtime?: RuntimeProfile) {
@@ -746,6 +746,7 @@ function syncStatusLabel(status: VoiceAgent['sync_status']) {
 function deploymentDescription(agent: VoiceAgent) {
   if (agent.voice_provider === 'sarvam') return 'Sarvam AI · VAV realtime runtime';
   if (agent.voice_provider === 'elevenlabs') return 'ElevenLabs voice · VAV realtime runtime';
+  if (agent.voice_provider === 'soniox') return 'LiveKit · Soniox speech';
   if (agent.voice_provider === 'inworld') return 'LiveKit · Native Inworld Realtime available';
   if (!agent.provider_agent_id) return 'Local draft · not provisioned';
   const providerId = `Atoms ID · ${agent.provider_agent_id.slice(0, 12)}…`;
@@ -757,6 +758,7 @@ function deploymentDescription(agent: VoiceAgent) {
 function voiceProviderName(provider: string) {
   if (provider === 'sarvam') return 'Sarvam AI';
   if (provider === 'elevenlabs') return 'ElevenLabs';
+  if (provider === 'soniox') return 'Soniox';
   if (provider === 'inworld') return 'Inworld AI';
   return 'Smallest.ai';
 }

@@ -16,6 +16,7 @@ InworldSTTModel = Literal[
     "auto",
     "assemblyai/u3-rt-pro",
     "soniox/stt-rt-v4",
+    "stt-rt-v5",
     "inworld/inworld-stt-1",
 ]
 InworldRealtimeTTSModel = Literal[
@@ -32,8 +33,10 @@ class RuntimeProfileUpdate(BaseModel):
     staff_browser_only: bool = False
     knowledge_source_mode: Literal["knowledge_base", "tools_only"] = "knowledge_base"
     telephony_provider: Literal["twilio", "livekit_sip"] = "twilio"
-    primary_speech_provider: Literal["sarvam", "elevenlabs", "inworld"] = "sarvam"
-    fallback_speech_provider: Literal["smallest", "sarvam", "elevenlabs", "inworld"] | None = None
+    primary_speech_provider: Literal["sarvam", "elevenlabs", "inworld", "soniox"] = "sarvam"
+    fallback_speech_provider: (
+        Literal["smallest", "sarvam", "elevenlabs", "inworld", "soniox"] | None
+    ) = None
     llm_provider: Literal["openai", "inworld"] = "openai"
     llm_model: str = Field("gpt-4o-mini", min_length=2, max_length=100)
     voice_runtime: Literal["pipeline", "inworld_realtime"] = "pipeline"
@@ -68,16 +71,27 @@ class RuntimeProfileUpdate(BaseModel):
 
     @model_validator(mode="after")
     def validate_llm_route(self):
+        if self.primary_speech_provider == "soniox" and (
+            self.telephony_provider != "livekit_sip"
+            or self.voice_runtime != "pipeline"
+            or self.llm_provider != "openai"
+            or self.knowledge_turn_mode != "tool_loop"
+            or self.stt_model not in {"auto", "stt-rt-v5"}
+        ):
+            raise ValueError("Soniox requires LiveKit, pipeline, direct OpenAI and tool-loop mode")
         if self.staff_browser_only and (
             self.telephony_provider != "livekit_sip"
-            or self.primary_speech_provider != "inworld"
-            or self.voice_runtime != "inworld_realtime"
+            or self.primary_speech_provider not in {"inworld", "soniox"}
+            or (
+                self.primary_speech_provider == "inworld"
+                and self.voice_runtime != "inworld_realtime"
+            )
             or self.knowledge_turn_mode != "tool_loop"
             or self.assigned_numbers
             or self.diagnostic_recording_mode != "off"
         ):
             raise ValueError(
-                "Staff browser mode requires Inworld tool loop, no phone numbers and recording off"
+                "Staff browser mode requires a supported tool loop, no numbers and recording off"
             )
         if self.knowledge_source_mode == "tools_only" and not self.staff_browser_only:
             raise ValueError("MCP-only knowledge is restricted to staff browser mode")

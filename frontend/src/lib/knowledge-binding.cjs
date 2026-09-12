@@ -1,6 +1,6 @@
 'use strict';
 
-const VAV_NATIVE_KNOWLEDGE_PROVIDERS = new Set(['sarvam', 'elevenlabs', 'inworld']);
+const VAV_NATIVE_KNOWLEDGE_PROVIDERS = new Set(['sarvam', 'elevenlabs', 'inworld', 'soniox']);
 
 function isVavNativeKnowledgeProvider(provider) {
   return VAV_NATIVE_KNOWLEDGE_PROVIDERS.has(provider);
@@ -18,7 +18,7 @@ function knowledgeBindingGuidance(knowledgeBase) {
   if (knowledgeBase?.serving_revision) {
     return 'Draft changes are pending. Bound VAV-native agents keep using the retained live release until you approve the draft.';
   }
-  return 'Approve this knowledge base to publish its first live release before binding an agent. Only VAV-native agents (Inworld, Sarvam, ElevenLabs) retrieve VAV knowledge.';
+  return 'Approve this knowledge base to publish its first live release before binding an agent. Only VAV-native agents (Inworld, Soniox, Sarvam, ElevenLabs) retrieve VAV knowledge.';
 }
 
 module.exports = {

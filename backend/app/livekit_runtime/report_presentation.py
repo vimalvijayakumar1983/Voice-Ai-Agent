@@ -294,7 +294,8 @@ def render_plan(brief: Brief, plan: object) -> str:
 class InworldNarrativePlanner:
     """Small bounded request to the same Inworld LLM account as the voice call."""
 
-    def __init__(self, *, api_key, model, base_url, transport=None):
+    def __init__(self, *, api_key, model, base_url, transport=None, auth_scheme="Basic"):
+        self.auth_scheme = auth_scheme
         self.api_key, self.model, self.base_url, self.transport = (
             api_key,
             model,
@@ -339,7 +340,7 @@ class InworldNarrativePlanner:
             async with client.stream(
                 "POST",
                 self.base_url.rstrip("/") + "/v1/chat/completions",
-                headers={"Authorization": f"Basic {self.api_key}"},
+                headers={"Authorization": f"{self.auth_scheme} {self.api_key}"},
                 json=body,
             ) as response:
                 if response.status_code != 200:

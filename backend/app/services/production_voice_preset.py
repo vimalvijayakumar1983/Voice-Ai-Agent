@@ -5,6 +5,28 @@ from app.models.agent import Agent, AgentRuntimeProfile
 PRODUCTION_VOICE_PRESET = "vav-grounded-20260906"
 
 
+def new_soniox_profile(agent: Agent) -> AgentRuntimeProfile:
+    apply_conversation_baseline(agent)
+    return AgentRuntimeProfile(
+        tenant_id=agent.tenant_id,
+        agent_id=agent.id,
+        enabled=False,
+        status="draft",
+        telephony_provider="livekit_sip",
+        primary_speech_provider="soniox",
+        llm_provider="openai",
+        llm_model="gpt-4o-mini",
+        stt_language="auto",
+        assigned_numbers=[],
+        runtime_config={
+            "voice_runtime": "pipeline",
+            "stt_model": "stt-rt-v5",
+            "inworld_single_pass": False,
+            "diagnostic_recording_mode": "off",
+        },
+    )
+
+
 def apply_conversation_baseline(agent: Agent) -> None:
     """Install the accepted generic conversation features, not QA experiments."""
     agent.agent_metadata = {

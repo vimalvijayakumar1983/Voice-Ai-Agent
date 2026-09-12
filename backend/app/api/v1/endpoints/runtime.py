@@ -40,6 +40,7 @@ from app.providers.inworld import (
 )
 from app.providers.openai import OpenAIProviderClient, OpenAIProviderError
 from app.providers.sarvam import SarvamAIClient, SarvamAIError
+from app.providers.soniox import SonioxClient, SonioxError
 from app.realtime.sarvam_stream import SarvamStreamError, SarvamSTTStream
 from app.schemas.runtime import (
     ApiKeyCredentialRequest,
@@ -488,6 +489,17 @@ def _runtime_provider_blocker(
     """Reject route combinations the deployed runtime does not implement."""
     if profile is None:
         return "Save a supported runtime provider route before testing readiness."
+    if agent.voice_provider == "soniox":
+        config = profile.runtime_config or {}
+        if (
+            profile.telephony_provider != "livekit_sip"
+            or profile.primary_speech_provider != "soniox"
+            or profile.llm_provider != "openai"
+            or config.get("voice_runtime", "pipeline") != "pipeline"
+            or config.get("inworld_single_pass") is True
+        ):
+            return "Soniox requires LiveKit, direct OpenAI, and pipeline tool-loop mode."
+        return None
     if agent.voice_provider == "inworld":
         runtime_config = profile.runtime_config if isinstance(profile.runtime_config, dict) else {}
         voice_runtime = str(runtime_config.get("voice_runtime") or "pipeline")
@@ -621,7 +633,7 @@ def _runtime_dependency_providers(profile: AgentRuntimeProfile) -> set[str]:
     if profile.primary_speech_provider == "elevenlabs":
         providers.add("sarvam")
     return providers.intersection(
-        {"sarvam", "elevenlabs", "inworld", "openai", "twilio", "livekit_sip"}
+        {"sarvam", "elevenlabs", "inworld", "soniox", "openai", "twilio", "livekit_sip"}
     )
 
 
@@ -912,7 +924,7 @@ async def runtime_readiness(
     # mutable approval-only rows remain a bounded compatibility concern only
     # for already-persisted legacy jobs.
     immutable_knowledge_required = bool(
-        profile and profile.primary_speech_provider in {"sarvam", "elevenlabs", "inworld"}
+        profile and profile.primary_speech_provider in {"sarvam", "elevenlabs", "inworld", "soniox"}
     )
     knowledge_ready = not immutable_knowledge_required
     if knowledge_binding is not None:
@@ -1018,15 +1030,23 @@ async def runtime_readiness(
         verify_legacy_twilio_claims=verify_legacy_twilio_claims,
     )
 
-    vav_speech_agent = agent.voice_provider in {"sarvam", "elevenlabs", "inworld"}
+    try:
+        soniox_config = await load_provider_config(db, agent.tenant_id, "soniox")
+        soniox_ready = _api_key_configured(soniox_config, settings.soniox_api_key)
+    except ProviderCredentialError:
+        soniox_ready = False
+    vav_speech_agent = agent.voice_provider in {"sarvam", "elevenlabs", "inworld", "soniox"}
     tts_ready = {
         "sarvam": sarvam_ready,
         "elevenlabs": elevenlabs_ready,
         "inworld": inworld_ready,
+        "soniox": soniox_ready,
     }.get(agent.voice_provider, False)
     stt_ready = (
         inworld_ready if profile and profile.primary_speech_provider == "inworld" else sarvam_ready
     )
+    if profile and profile.primary_speech_provider == "soniox":
+        stt_ready = soniox_ready
     llm_ready = (
         inworld_ready
         if profile and profile.llm_provider == "inworld"
@@ -1309,6 +1329,59 @@ async def live_runtime_readiness(
             blockers,
             checks,
         )
+    if agent.voice_provider == "soniox":
+        from app.livekit_runtime.soniox_pipeline import language_hints
+        from app.providers.soniox import tenant_soniox_client
+
+        checks["speech_catalog_live"] = False
+        checks["tts_provider_live"] = False
+        checks["stt_provider_live"] = False
+        checks["llm_provider_live"] = False
+        if profile is None or not checks.get("provider_compatibility"):
+            blockers.append("Select the Soniox LiveKit pipeline before testing.")
+            return blockers, checks
+        try:
+            soniox = await tenant_soniox_client(db, agent.tenant_id)
+            await soniox.validate_connection()
+            voices = await soniox.list_voices()
+            if not any(voice["id"] == agent.voice_id for voice in voices):
+                raise SonioxError("Selected Soniox voice is unavailable", status_code=422)
+            checks["speech_catalog_live"] = True
+        except (SonioxError, ProviderCredentialError) as exc:
+            blockers.append(f"Soniox validation failed: {exc}")
+            return blockers, checks
+        openai_key, unreadable = await _live_api_key(
+            db, agent.tenant_id, "openai", settings.openai_api_key
+        )
+        probes = {
+            "tts_provider_live": soniox.voice_preview(
+                voice_id=agent.voice_id, language=agent.language, speed=agent.speech_rate
+            ),
+            "stt_provider_live": soniox.stt_readiness_probe(
+                languages=language_hints(agent, profile)
+            ),
+        }
+        if unreadable or not openai_key:
+            blockers.append("Configure a readable OpenAI key for Soniox's conversation model.")
+        else:
+            probes["llm_provider_live"] = OpenAIProviderClient(
+                api_key=openai_key
+            ).tool_readiness_probe(model_id=profile.llm_model)
+        names = list(probes)
+        results = await asyncio.gather(
+            *(_bounded_native_live_probe(probes[name]) for name in names)
+        )
+        for name, error in zip(names, results, strict=True):
+            checks[name] = error is None
+            if error is not None:
+                blockers.append(
+                    _native_live_probe_failure(
+                        label=name.replace("_", " "),
+                        error=error,
+                        provider_errors=(SonioxError, OpenAIProviderError),
+                    )
+                )
+        return blockers, checks
     if agent.voice_provider != "inworld":
         return blockers, checks
 
@@ -1425,10 +1498,12 @@ def _response(
     values = {
         "staff_browser_only": False,
         "knowledge_source_mode": "knowledge_base",
-        "telephony_provider": "livekit_sip" if agent.voice_provider == "inworld" else "twilio",
+        "telephony_provider": "livekit_sip"
+        if agent.voice_provider in {"inworld", "soniox"}
+        else "twilio",
         "primary_speech_provider": (
             agent.voice_provider
-            if agent.voice_provider in {"sarvam", "elevenlabs", "inworld"}
+            if agent.voice_provider in {"sarvam", "elevenlabs", "inworld", "soniox"}
             else "sarvam"
         ),
         "fallback_speech_provider": None,
@@ -1482,6 +1557,7 @@ def _response(
                 "auto",
                 "assemblyai/u3-rt-pro",
                 "soniox/stt-rt-v4",
+                "stt-rt-v5",
                 "inworld/inworld-stt-1",
             }
             else "auto"
@@ -1975,6 +2051,8 @@ async def deactivate_runtime_profile(
 
 
 def _platform_credential_config(provider: str) -> dict[str, str]:
+    if provider == "soniox":
+        return {"api_key": settings.soniox_api_key}
     if provider == "smallest":
         return {"api_key": settings.smallest_api_key}
     if provider == "sarvam":
@@ -2042,7 +2120,7 @@ async def list_workspace_credentials(
     db: AsyncSession = Depends(get_db),
 ):
     providers = {}
-    for provider in ("smallest", "sarvam", "elevenlabs", "inworld", "openai", "twilio"):
+    for provider in ("smallest", "sarvam", "elevenlabs", "inworld", "soniox", "openai", "twilio"):
         providers[provider] = await _workspace_credential_status(
             db, current_user.tenant_id, provider
         )
@@ -2056,8 +2134,13 @@ async def save_api_key_credential(
     current_user: CurrentUser = Depends(require_role("owner", "admin")),
     db: AsyncSession = Depends(get_db),
 ):
-    if provider not in {"smallest", "sarvam", "elevenlabs", "inworld", "openai"}:
+    if provider not in {"smallest", "sarvam", "elevenlabs", "inworld", "soniox", "openai"}:
         raise HTTPException(status_code=404, detail="Unsupported API-key provider")
+    if provider == "soniox":
+        try:
+            await SonioxClient(api_key=data.api_key).validate_connection()
+        except SonioxError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
     if provider == "elevenlabs":
         try:
             await ElevenLabsClient(api_key=data.api_key).validate_connection()
@@ -2162,7 +2245,15 @@ async def delete_workspace_credential(
     current_user: CurrentUser = Depends(require_role("owner", "admin")),
     db: AsyncSession = Depends(get_db),
 ):
-    if provider not in {"smallest", "sarvam", "elevenlabs", "inworld", "openai", "twilio"}:
+    if provider not in {
+        "smallest",
+        "sarvam",
+        "elevenlabs",
+        "inworld",
+        "soniox",
+        "openai",
+        "twilio",
+    }:
         raise HTTPException(status_code=404, detail="Unsupported credential provider")
     await lock_provider_runtime_boundaries(db, current_user.tenant_id, provider)
     if provider == _SMALLEST_CLEANUP_PROVIDER:

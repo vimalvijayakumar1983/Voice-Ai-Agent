@@ -160,6 +160,7 @@ export default function Settings() {
     sarvam: '',
     elevenlabs: '',
     inworld: '',
+    soniox: '',
     openai: '',
   });
   const [twilioForm, setTwilioForm] = useState({
@@ -643,10 +644,10 @@ export default function Settings() {
                 <p>Connect provider credentials for this workspace. Keys are encrypted on the server and are never returned to the browser.</p>
               </div>
               <span className={`badge ${connectedProviders ? 'badge-success' : 'badge-warning'}`}>
-                {connectedProviders}/6 connected
+                {connectedProviders}/7 connected
               </span>
             </div>
-            {(['smallest', 'sarvam', 'elevenlabs', 'inworld', 'openai'] as const).map((provider) => {
+            {(['smallest', 'sarvam', 'elevenlabs', 'inworld', 'soniox', 'openai'] as const).map((provider) => {
               const providerName = provider === 'smallest'
                 ? 'Smallest.ai'
                 : provider === 'sarvam'
@@ -655,7 +656,7 @@ export default function Settings() {
                     ? 'ElevenLabs'
                     : provider === 'inworld'
                       ? 'Inworld AI'
-                      : 'OpenAI';
+                      : provider === 'soniox' ? 'Soniox' : 'OpenAI';
               const status = credentialStatuses?.providers[provider];
               return (
                 <div className="settings-subtable" key={provider}>
@@ -671,7 +672,9 @@ export default function Settings() {
                     <div className="form-group">
                       <label htmlFor={`${provider}-api-key`}>{providerName} API key</label>
                       <input id={`${provider}-api-key`} type="password" autoComplete="new-password" placeholder={status?.configured ? 'Enter a new key to rotate' : 'Paste API key'} value={providerKeys[provider]} onChange={(event) => setProviderKeys((current) => ({ ...current, [provider]: event.target.value }))} minLength={20} maxLength={512} required />
-                      <p className="form-hint">{provider === 'inworld'
+                      <p className="form-hint">{provider === 'soniox'
+                        ? 'One encrypted key for speech recognition and voice generation. Connecting checks model access; calls also require a separately configured LLM.'
+                        : provider === 'inworld'
                         ? 'Direct key for native Inworld Realtime and the component-pipeline rollback. VAV does not route these services through LiveKit Inference.'
                         : provider === 'elevenlabs'
                         ? 'Used only for outgoing speech. VAV verifies catalog access before storing the key; Sarvam remains the live transcription provider and VAV keeps the knowledge and agent behavior.'

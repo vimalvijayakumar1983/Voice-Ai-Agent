@@ -127,6 +127,10 @@ def configured_inworld_stt_model(*, profile: Any) -> str:
 def resolve_inworld_stt_model(*, model: Any, profile: Any) -> str:
     """Select the recognizer once so reservation, diagnostics and worker agree."""
 
+    if getattr(profile, "primary_speech_provider", None) == "soniox":
+        from app.providers.soniox import SONIOX_STT_MODEL
+
+        return SONIOX_STT_MODEL
     configured = configured_inworld_stt_model(profile=profile)
     if configured in INWORLD_STT_MODELS:
         return configured

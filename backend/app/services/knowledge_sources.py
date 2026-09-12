@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.agent import KnowledgeBase, KnowledgeCrawlPage, KnowledgeSource
 
-VAV_NATIVE_KNOWLEDGE_PROVIDERS = frozenset({"sarvam", "elevenlabs", "inworld"})
+VAV_NATIVE_KNOWLEDGE_PROVIDERS = frozenset({"sarvam", "elevenlabs", "inworld", "soniox"})
 WEBSITE_SOURCE_TYPES = frozenset({"url", "website", "sitemap"})
 KNOWLEDGE_PROVIDER = "vav"
 _TRACKING_QUERY_KEYS = frozenset({"fbclid", "gclid", "dclid", "msclkid", "mc_cid", "mc_eid"})

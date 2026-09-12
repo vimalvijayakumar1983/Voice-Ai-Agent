@@ -109,7 +109,7 @@ export interface VoiceAgent {
 
 export interface AgentAIDraftRequest {
   brief: string;
-  provider_preference: 'auto' | 'smallest' | 'sarvam' | 'elevenlabs' | 'inworld';
+  provider_preference: 'auto' | 'smallest' | 'sarvam' | 'elevenlabs' | 'inworld' | 'soniox';
   primary_language: string;
   timezone: string;
 }
@@ -124,7 +124,7 @@ export interface AgentAIDraftResponse {
     model_name: string;
     disposition_profile: 'general' | 'receptionist' | 'customer_support' | 'appointment' | 'sales' | 'collections';
     post_call_analysis_mode: 'provider_first' | 'vav_ai' | 'disabled';
-    voice_provider: 'smallest' | 'sarvam' | 'elevenlabs' | 'inworld';
+    voice_provider: 'smallest' | 'sarvam' | 'elevenlabs' | 'inworld' | 'soniox';
     voice_id: string;
     temperature: number;
     language: string;
@@ -146,7 +146,7 @@ export interface ProviderStatus {
   configured: boolean;
   webhook_configured: boolean;
   base_url: string;
-  providers?: Record<'smallest' | 'sarvam' | 'elevenlabs' | 'inworld', {
+  providers?: Record<'smallest' | 'sarvam' | 'elevenlabs' | 'inworld' | 'soniox', {
     configured: boolean;
     agent_runtime: boolean;
     voice_preview: boolean;
@@ -162,7 +162,7 @@ export interface ProviderCredentialStatus {
   updated_at: string | null;
 }
 
-export type WorkspaceProviderName = 'smallest' | 'sarvam' | 'elevenlabs' | 'inworld' | 'openai' | 'twilio';
+export type WorkspaceProviderName = 'smallest' | 'sarvam' | 'elevenlabs' | 'inworld' | 'soniox' | 'openai' | 'twilio';
 
 export interface WorkspaceCredentialStatus {
   provider: WorkspaceProviderName;
@@ -184,14 +184,14 @@ export interface RuntimeProfile {
   agent_id: string;
   enabled: boolean;
   telephony_provider: 'twilio' | 'livekit_sip';
-  primary_speech_provider: 'sarvam' | 'elevenlabs' | 'inworld';
-  fallback_speech_provider: 'smallest' | 'sarvam' | 'elevenlabs' | 'inworld' | null;
+  primary_speech_provider: 'sarvam' | 'elevenlabs' | 'inworld' | 'soniox';
+  fallback_speech_provider: 'smallest' | 'sarvam' | 'elevenlabs' | 'inworld' | 'soniox' | null;
   llm_provider: 'openai' | 'inworld';
   llm_model: string;
   voice_runtime: 'pipeline' | 'inworld_realtime';
   knowledge_turn_mode: 'tool_loop' | 'single_pass_experimental';
   stt_language: string;
-  stt_model: 'auto' | 'assemblyai/u3-rt-pro' | 'soniox/stt-rt-v4' | 'inworld/inworld-stt-1';
+  stt_model: 'auto' | 'assemblyai/u3-rt-pro' | 'soniox/stt-rt-v4' | 'inworld/inworld-stt-1' | 'stt-rt-v5';
   tts_delivery_mode: 'stable' | 'balanced' | 'creative';
   inworld_realtime_tts_model: 'inworld-tts-1.5-max' | 'inworld-tts-1.5-mini' | 'inworld-tts-2';
   diagnostic_recording_mode: 'off' | 'livekit_egress_explicit_consent';
@@ -227,7 +227,7 @@ export interface SipCredentialStatus {
 }
 
 export interface VoiceCatalogItem {
-  provider: 'smallest' | 'sarvam' | 'elevenlabs' | 'inworld';
+  provider: 'smallest' | 'sarvam' | 'elevenlabs' | 'inworld' | 'soniox';
   id: string;
   name: string;
   languages: string[];
@@ -861,7 +861,7 @@ export interface BillingPlan {
 export interface CostReportFilters {
   days?: number;
   provider?: 'twilio' | 'smallest' | 'livekit_sip' | 'livekit_webrtc' | '';
-  speech_provider?: 'inworld' | 'sarvam' | 'elevenlabs' | 'smallest' | '';
+  speech_provider?: 'inworld' | 'soniox' | 'sarvam' | 'elevenlabs' | 'smallest' | '';
   agent_id?: string;
   direction?: 'inbound' | 'outbound' | '';
   status?: string;
@@ -1671,7 +1671,7 @@ class ApiClient {
     return this.request<AgentProviderCatalog>('/api/v1/agents/provider/catalog');
   }
 
-  async previewVoice(provider: 'smallest' | 'sarvam' | 'elevenlabs' | 'inworld', voiceId: string, language?: string) {
+  async previewVoice(provider: 'smallest' | 'sarvam' | 'elevenlabs' | 'inworld' | 'soniox', voiceId: string, language?: string) {
     return this.requestBlob('/api/v1/agents/provider/voice-preview', {
       method: 'POST',
       body: JSON.stringify({ provider, voice_id: voiceId, language }),

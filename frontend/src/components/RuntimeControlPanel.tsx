@@ -24,11 +24,11 @@ type Props = {
 export default function RuntimeControlPanel({ agent, profile, onClose, onChange }: Props) {
   const speechProvider: RuntimeProfile['primary_speech_provider'] = agent.voice_provider === 'inworld'
     ? 'inworld'
-    : agent.voice_provider === 'elevenlabs' ? 'elevenlabs' : 'sarvam';
+    : agent.voice_provider === 'soniox' ? 'soniox' : agent.voice_provider === 'elevenlabs' ? 'elevenlabs' : 'sarvam';
   const inworldRuntime = speechProvider === 'inworld';
   const [form, setForm] = useState({
     ...profile,
-    telephony_provider: inworldRuntime ? 'livekit_sip' as const : profile.telephony_provider,
+    telephony_provider: inworldRuntime || speechProvider === 'soniox' ? 'livekit_sip' as const : profile.telephony_provider,
     primary_speech_provider: speechProvider,
   });
   const [numbers, setNumbers] = useState(profile.assigned_numbers.join('\n'));
@@ -124,7 +124,7 @@ export default function RuntimeControlPanel({ agent, profile, onClose, onChange 
         <div>
           <span className="page-kicker">Production serving</span>
           <h2 id="runtime-panel-title">{agent.name} runtime</h2>
-          <p>Configure the VAV-owned {inworldRuntime ? 'LiveKit SIP + Inworld voice runtime' : speechProvider === 'elevenlabs' ? 'ElevenLabs voice and Sarvam transcription' : 'Sarvam speech'} pipeline, capacity, and spend guardrails.</p>
+          <p>Configure the VAV-owned {speechProvider === 'soniox' ? 'LiveKit + Soniox speech + OpenAI' : inworldRuntime ? 'LiveKit SIP + Inworld voice runtime' : speechProvider === 'elevenlabs' ? 'ElevenLabs voice and Sarvam transcription' : 'Sarvam speech'} pipeline, capacity, and spend guardrails.</p>
         </div>
         <span className={`badge ${profile.enabled ? 'badge-success' : profile.ready ? 'badge-info' : 'badge-warning'}`}>
           {profile.enabled ? 'Active' : profile.ready ? 'Ready' : profile.status}
@@ -140,7 +140,7 @@ export default function RuntimeControlPanel({ agent, profile, onClose, onChange 
       ) : null}
 
       <div className={styles.grid}>
-        {inworldRuntime ? <div className="form-group">
+        {inworldRuntime || speechProvider === 'soniox' ? <div className="form-group">
           <label htmlFor="runtime-staff-browser">Browser access policy</label>
           <select id="runtime-staff-browser" value={form.staff_browser_only ? 'staff' : 'standard'} onChange={(event) => {
             const staff = event.target.value === 'staff';
@@ -150,8 +150,8 @@ export default function RuntimeControlPanel({ agent, profile, onClose, onChange 
             }
             setForm({ ...form, staff_browser_only: staff,
               knowledge_source_mode: staff ? form.knowledge_source_mode : 'knowledge_base',
-              ...(staff ? { voice_runtime: 'inworld_realtime' as const, knowledge_turn_mode: 'tool_loop' as const,
-                llm_provider: 'inworld' as const, llm_model: 'openai/gpt-4o-mini', diagnostic_recording_mode: 'off' as const } : {}),
+              ...(staff ? { voice_runtime: inworldRuntime ? 'inworld_realtime' as const : 'pipeline' as const, knowledge_turn_mode: 'tool_loop' as const,
+                llm_provider: speechProvider === 'soniox' ? 'openai' as const : 'inworld' as const, llm_model: inworldRuntime ? 'openai/gpt-4o-mini' : 'gpt-4o-mini', diagnostic_recording_mode: 'off' as const } : {}),
             });
           }}>
             <option value="standard">Standard workspace browser + separate phone activation</option>
@@ -212,7 +212,7 @@ export default function RuntimeControlPanel({ agent, profile, onClose, onChange 
         ) : null}
         <div className="form-group">
           <label htmlFor="runtime-telephony">Telephony edge</label>
-          <select id="runtime-telephony" value={form.telephony_provider} disabled={inworldRuntime} onChange={(event) => {
+          <select id="runtime-telephony" value={form.telephony_provider} disabled={inworldRuntime || speechProvider === 'soniox'} onChange={(event) => {
             const telephonyProvider = event.target.value as RuntimeProfile['telephony_provider'];
             setForm({
               ...form,
@@ -251,7 +251,7 @@ export default function RuntimeControlPanel({ agent, profile, onClose, onChange 
           <label htmlFor="runtime-speech-provider">Speech output</label>
           <input
             id="runtime-speech-provider"
-            value={inworldRuntime ? (form.voice_runtime === 'inworld_realtime' ? `Inworld Realtime + ${form.inworld_realtime_tts_model}` : 'Inworld STT + TTS-2 components') : speechProvider === 'elevenlabs' ? 'ElevenLabs Flash v2.5' : 'Sarvam Bulbul v3'}
+            value={speechProvider === 'soniox' ? 'Soniox STT v5 + TTS v1' : inworldRuntime ? (form.voice_runtime === 'inworld_realtime' ? `Inworld Realtime + ${form.inworld_realtime_tts_model}` : 'Inworld STT + TTS-2 components') : speechProvider === 'elevenlabs' ? 'ElevenLabs Flash v2.5' : 'Sarvam Bulbul v3'}
             readOnly
             aria-readonly="true"
           />
@@ -350,7 +350,7 @@ export default function RuntimeControlPanel({ agent, profile, onClose, onChange 
 
       <div className={styles.readiness}>
         <div><strong>{profile.staff_browser_only ? 'Browser testing' : 'Phone readiness gates'}</strong></div>
-        {profile.staff_browser_only ? <p>Phone activation is intentionally disabled. Browser start checks Inworld, LiveKit worker, your current staff role, capacity and budget. An MCP-only agent does not require a knowledge base. Passing a browser test does not enable ERP permissions.</p> : profile.blockers.length ? <ul>{profile.blockers.map((blocker) => <li key={blocker}>{blocker}</li>)}</ul> : <CheckCircle2 size={20} />}
+        {profile.staff_browser_only ? <p>Phone activation is intentionally disabled. Browser start checks the selected speech provider, LiveKit worker, your current staff role, capacity and budget. An MCP-only agent does not require a knowledge base. Passing a browser test does not enable ERP permissions.</p> : profile.blockers.length ? <ul>{profile.blockers.map((blocker) => <li key={blocker}>{blocker}</li>)}</ul> : <CheckCircle2 size={20} />}
       </div>
 
       <footer className={styles.actions}>

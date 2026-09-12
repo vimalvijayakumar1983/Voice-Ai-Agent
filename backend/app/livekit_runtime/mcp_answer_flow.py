@@ -235,7 +235,18 @@ class InworldAnswerVerifier:
     Arithmetic comes from server evidence, and a failed/unavailable verifier denies speech.
     """
 
-    def __init__(self, *, api_key, model, base_url, metrics, transport=None, reasoning_effort=None):
+    def __init__(
+        self,
+        *,
+        api_key,
+        model,
+        base_url,
+        metrics,
+        transport=None,
+        reasoning_effort=None,
+        auth_scheme="Basic",
+    ):
+        self.auth_scheme = auth_scheme
         if reasoning_effort not in (None, "none"):
             raise ValueError("Checked MCP reasoning supports only explicit 'none' or omission")
         self.api_key, self.model, self.base_url = api_key, model, base_url
@@ -344,7 +355,7 @@ class InworldAnswerVerifier:
                 async with client.stream(
                     "POST",
                     self.base_url.rstrip("/") + "/v1/chat/completions",
-                    headers={"Authorization": f"Basic {self.api_key}"},
+                    headers={"Authorization": f"{self.auth_scheme} {self.api_key}"},
                     json=payload,
                 ) as response:
                     response.raise_for_status()

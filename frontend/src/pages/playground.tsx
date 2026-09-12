@@ -237,14 +237,14 @@ export default function Playground() {
   );
   const selectedRuntimeProfile = selected ? runtimeProfiles[selected.id] : undefined;
   const selectedReady = isAgentCallReady(selected, selectedRuntimeProfile);
-  const selectedIsVav = ['sarvam', 'elevenlabs', 'inworld'].includes(selected?.voice_provider ?? '');
+  const selectedIsVav = ['sarvam', 'elevenlabs', 'inworld', 'soniox'].includes(selected?.voice_provider ?? '');
   const selectedUsesLiveKitBrowser = Boolean(
     selected?.is_active
-    && selected.voice_provider === 'inworld'
+    && ['inworld', 'soniox'].includes(selected.voice_provider)
     && selectedRuntimeProfile?.id
     && selectedRuntimeProfile.status !== 'inactive'
     && selectedRuntimeProfile.telephony_provider === 'livekit_sip'
-    && selectedRuntimeProfile.primary_speech_provider === 'inworld'
+    && selectedRuntimeProfile.primary_speech_provider === selected.voice_provider
     && isLiveKitBrowserLlmProvider(selectedRuntimeProfile.llm_provider),
   );
   const browserTransport: BrowserTransport = selectedUsesLiveKitBrowser
@@ -951,14 +951,14 @@ export default function Playground() {
                 const ready = isAgentCallReady(agent, runtime);
                 const liveKitBrowser = Boolean(
                   agent.is_active
-                  && agent.voice_provider === 'inworld'
+                  && ['inworld', 'soniox'].includes(agent.voice_provider)
                   && runtime?.id
                   && runtime.status !== 'inactive'
                   && runtime.telephony_provider === 'livekit_sip'
-                  && runtime.primary_speech_provider === 'inworld'
+                  && runtime.primary_speech_provider === agent.voice_provider
                   && isLiveKitBrowserLlmProvider(runtime.llm_provider),
                 );
-                const isVav = ['sarvam', 'elevenlabs', 'inworld'].includes(agent.voice_provider);
+                const isVav = ['sarvam', 'elevenlabs', 'inworld', 'soniox'].includes(agent.voice_provider);
                 const status = liveKitBrowser && !ready
                   ? ' — browser candidate · phone not ready'
                   : !ready
@@ -979,10 +979,10 @@ export default function Playground() {
               <div>
                 <strong>{selected.name}</strong>
                 <p>{selectedUsesLiveKitBrowser
-                  ? `LiveKit + ${selectedRuntimeProfile?.voice_runtime === 'inworld_realtime' ? 'native Inworld Realtime' : 'Inworld component pipeline'} browser test candidate, independent from e& SIP; live checks run when you start${phoneTestReady ? ` · phone ready at ${selectedPhoneNumber}` : ` · phone not ready: ${agentTestReadinessMessage(selected, selectedRuntimeProfile)}`}`
+                  ? `LiveKit + ${selectedRuntimeProfile?.voice_runtime === 'inworld_realtime' ? 'native Inworld Realtime' : selected?.voice_provider === 'soniox' ? 'Soniox speech' : 'Inworld component pipeline'} browser test candidate, independent from e& SIP; live checks run when you start${phoneTestReady ? ` · phone ready at ${selectedPhoneNumber}` : ` · phone not ready: ${agentTestReadinessMessage(selected, selectedRuntimeProfile)}`}`
                   : selectedReady
                   ? selectedIsVav
-                    ? `${selected.voice_provider === 'inworld' ? 'Inworld phone' : selected.voice_provider === 'elevenlabs' ? 'ElevenLabs voice phone' : 'Sarvam AI phone'} runtime active${selectedPhoneNumber ? ` · ${selectedPhoneNumber}` : ''}`
+                    ? `${selected.voice_provider === 'soniox' ? 'Soniox phone' : selected.voice_provider === 'inworld' ? 'Inworld phone' : selected.voice_provider === 'elevenlabs' ? 'ElevenLabs voice phone' : 'Sarvam AI phone'} runtime active${selectedPhoneNumber ? ` · ${selectedPhoneNumber}` : ''}`
                     : `Smallest.ai · ${languageName(selected.language)} · ${selected.model_name}`
                   : agentTestReadinessMessage(selected, selectedRuntimeProfile)}</p>
               </div>
@@ -1080,10 +1080,10 @@ export default function Playground() {
               <p>{browserTransport === 'livekit'
                 ? selectedRuntimeProfile?.voice_runtime === 'inworld_realtime'
                   ? 'LiveKit WebRTC · Native Inworld Realtime speech-to-speech'
-                  : `LiveKit WebRTC · Inworld STT/TTS · ${selectedRuntimeProfile?.llm_provider === 'openai' ? 'OpenAI' : 'Inworld Router'} reasoning`
+                  : `LiveKit WebRTC · ${selected?.voice_provider === 'soniox' ? 'Soniox' : 'Inworld'} STT/TTS · ${selectedRuntimeProfile?.llm_provider === 'openai' ? 'OpenAI' : 'Inworld Router'} reasoning`
                 : browserTransport === 'smallest'
                   ? 'Smallest.ai Atoms browser session'
-                  : `${selected?.voice_provider === 'inworld' ? 'Inworld' : selected?.voice_provider === 'elevenlabs' ? 'ElevenLabs' : 'Sarvam AI'} phone session`}</p>
+                  : `${selected?.voice_provider === 'soniox' ? 'Soniox' : selected?.voice_provider === 'inworld' ? 'Inworld' : selected?.voice_provider === 'elevenlabs' ? 'ElevenLabs' : 'Sarvam AI'} phone session`}</p>
             </div>
             <span className={`badge ${state === 'error' ? 'badge-danger' : active || browserTransport === 'smallest' && selectedReady || !browserTransport && selectedReady ? 'badge-success' : 'badge-neutral'}`}>
               {browserTransport ? active || state === 'ended' || state === 'error' ? state : browserTestAvailable ? browserTransport === 'livekit' ? 'checks pending' : 'ready' : 'not ready' : selectedReady ? 'active' : 'not ready'}
@@ -1117,7 +1117,7 @@ export default function Playground() {
               </div>
               <div className={styles.diagnosticLine} aria-live="polite">
                 <span>{selectedRuntimeProfile?.telephony_provider === 'livekit_sip' ? 'LiveKit SIP' : 'Twilio Media Streams'}</span>
-                <span>{selected?.voice_provider === 'inworld' ? (selectedRuntimeProfile?.voice_runtime === 'inworld_realtime' ? 'Native Inworld Realtime' : 'Inworld STT · TTS components') : selected?.voice_provider === 'elevenlabs' ? 'ElevenLabs speech · Sarvam transcription' : 'Sarvam speech'}</span>
+                <span>{selected?.voice_provider === 'soniox' ? 'Soniox transcription and speech' : selected?.voice_provider === 'inworld' ? (selectedRuntimeProfile?.voice_runtime === 'inworld_realtime' ? 'Native Inworld Realtime' : 'Inworld STT · TTS components') : selected?.voice_provider === 'elevenlabs' ? 'ElevenLabs speech · Sarvam transcription' : 'Sarvam speech'}</span>
                 <span>{selectedRuntimeProfile?.voice_runtime === 'inworld_realtime' ? 'Grounded VAV knowledge tool' : selectedRuntimeProfile?.llm_provider === 'inworld' ? 'Inworld Router response engine' : 'OpenAI response engine'}</span>
                 <span>Completed calls appear in Conversations</span>
               </div>

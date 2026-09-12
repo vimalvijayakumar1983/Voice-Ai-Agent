@@ -25,7 +25,7 @@ DISPATCH_RECONCILE_DELAY_SECONDS = 15 * 60
 DIRECT_TERMINAL_CALLBACK_GRACE_SECONDS = 120
 DIRECT_CALL_WATCHDOG_STATUSES = frozenset({"ringing", "in_progress"})
 DIRECT_CALL_UNKNOWN_STATUS = "terminal_unknown"
-REALTIME_CALL_WATCHDOG_PROVIDERS = frozenset({"sarvam", "elevenlabs", "inworld"})
+REALTIME_CALL_WATCHDOG_PROVIDERS = frozenset({"sarvam", "elevenlabs", "inworld", "soniox"})
 
 
 def _has_substantive_caller_input(turns: object) -> bool:

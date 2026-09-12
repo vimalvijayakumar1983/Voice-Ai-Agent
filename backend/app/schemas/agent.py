@@ -60,7 +60,7 @@ class AgentCreate(BaseModel):
         "general", "receptionist", "customer_support", "appointment", "sales", "collections"
     ] = "general"
     post_call_analysis_mode: Literal["provider_first", "vav_ai", "disabled"] = "provider_first"
-    voice_provider: Literal["smallest", "sarvam", "elevenlabs", "inworld"] = "smallest"
+    voice_provider: Literal["smallest", "sarvam", "elevenlabs", "inworld", "soniox"] = "smallest"
     voice_id: str = Field("", max_length=100)
     language: str = Field("en", min_length=2, max_length=63)
     supported_languages: list[str] = Field(default_factory=lambda: ["en"], min_length=1)
@@ -126,7 +126,7 @@ class AgentUpdate(BaseModel):
         | None
     ) = None
     post_call_analysis_mode: Literal["provider_first", "vav_ai", "disabled"] | None = None
-    voice_provider: Literal["smallest", "sarvam", "elevenlabs", "inworld"] | None = None
+    voice_provider: Literal["smallest", "sarvam", "elevenlabs", "inworld", "soniox"] | None = None
     voice_id: str | None = Field(None, max_length=100)
     language: str | None = Field(None, min_length=2, max_length=63)
     supported_languages: list[str] | None = Field(None, min_length=1)
@@ -225,7 +225,9 @@ class AgentResponse(BaseModel):
 
 class AgentAIDraftRequest(BaseModel):
     brief: str = Field(min_length=20, max_length=4000)
-    provider_preference: Literal["auto", "smallest", "sarvam", "elevenlabs", "inworld"] = "auto"
+    provider_preference: Literal[
+        "auto", "smallest", "sarvam", "elevenlabs", "inworld", "soniox"
+    ] = "auto"
     primary_language: str = Field("en", min_length=2, max_length=63)
     timezone: str = Field("Asia/Dubai", max_length=64)
 
@@ -297,7 +299,7 @@ class LiveKitSessionResponse(BaseModel):
 
 
 class VoicePreviewRequest(BaseModel):
-    provider: Literal["smallest", "sarvam", "elevenlabs", "inworld"] = "smallest"
+    provider: Literal["smallest", "sarvam", "elevenlabs", "inworld", "soniox"] = "smallest"
     voice_id: str = Field(min_length=1, max_length=100)
     language: str | None = Field(None, min_length=2, max_length=63)
 
@@ -371,7 +373,7 @@ class SmallestProviderResolution(BaseModel):
 
 
 class VoiceCatalogItem(BaseModel):
-    provider: Literal["smallest", "sarvam", "elevenlabs", "inworld"] = "smallest"
+    provider: Literal["smallest", "sarvam", "elevenlabs", "inworld", "soniox"] = "smallest"
     id: str
     name: str
     languages: list[str]

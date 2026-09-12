@@ -621,7 +621,14 @@ async def initiate_outbound_call(
         raise HTTPException(status_code=404, detail="Agent not found")
     if not agent.is_active:
         raise HTTPException(status_code=409, detail="Agent is inactive")
-    if agent.voice_provider not in {"smallest", "sarvam", "elevenlabs", "inworld", "twilio"}:
+    if agent.voice_provider not in {
+        "smallest",
+        "sarvam",
+        "elevenlabs",
+        "inworld",
+        "soniox",
+        "twilio",
+    }:
         raise HTTPException(status_code=422, detail="Agent voice provider is not supported")
 
     if await is_number_on_tenant_dnc(db, current_user.tenant_id, data.to_number):
@@ -636,7 +643,7 @@ async def initiate_outbound_call(
         )
 
     is_smallest = agent.voice_provider == "smallest"
-    is_inworld = agent.voice_provider == "inworld"
+    is_inworld = agent.voice_provider in {"inworld", "soniox"}
     is_native_twilio = agent.voice_provider in {"sarvam", "elevenlabs"}
     uses_twilio = not is_smallest and not is_inworld
     smallest_config = (
@@ -691,7 +698,7 @@ async def initiate_outbound_call(
     knowledge_serving_revision = None
     knowledge_serving_revocation_generation = None
     knowledge_reservation_metadata: dict[str, str | int] | None = None
-    if agent.voice_provider in {"sarvam", "elevenlabs", "inworld"}:
+    if agent.voice_provider in {"sarvam", "elevenlabs", "inworld", "soniox"}:
         runtime_profile = await db.scalar(
             select(AgentRuntimeProfile).where(
                 AgentRuntimeProfile.agent_id == agent.id,
@@ -918,7 +925,9 @@ async def initiate_outbound_call(
                                 profile=runtime_profile,
                             ),
                             "stt_language_configured": runtime_profile.stt_language,
-                            "tts_model": "inworld-tts-2",
+                            "tts_model": (
+                                "tts-rt-v1" if agent.voice_provider == "soniox" else "inworld-tts-2"
+                            ),
                             "tts_delivery_mode": str(
                                 (
                                     runtime_profile.runtime_config.get("tts_delivery_mode")
@@ -950,7 +959,7 @@ async def initiate_outbound_call(
     )
     db.add(call)
     try:
-        if agent.voice_provider in {"sarvam", "elevenlabs", "inworld"}:
+        if agent.voice_provider in {"sarvam", "elevenlabs", "inworld", "soniox"}:
             try:
                 call = await pre_admit_outbound_knowledge_call(
                     db,
@@ -1047,7 +1056,12 @@ async def initiate_outbound_call(
             )
         ).scalar_one_or_none()
         current_runtime_profile = None
-        if current_agent and current_agent.voice_provider in {"sarvam", "elevenlabs", "inworld"}:
+        if current_agent and current_agent.voice_provider in {
+            "sarvam",
+            "elevenlabs",
+            "inworld",
+            "soniox",
+        }:
             current_runtime_profile = await db.scalar(
                 select(AgentRuntimeProfile)
                 .where(
@@ -1163,13 +1177,17 @@ async def initiate_outbound_call(
         )
         runtime_not_ready = bool(
             current_agent
-            and current_agent.voice_provider in {"sarvam", "elevenlabs", "inworld"}
+            and current_agent.voice_provider in {"sarvam", "elevenlabs", "inworld", "soniox"}
             and (
                 current_runtime_profile is None
                 or not current_runtime_profile.enabled
                 or current_runtime_profile.status != "active"
                 or current_runtime_profile.telephony_provider
-                != ("livekit_sip" if current_agent.voice_provider == "inworld" else "twilio")
+                != (
+                    "livekit_sip"
+                    if current_agent.voice_provider in {"inworld", "soniox"}
+                    else "twilio"
+                )
                 or current_runtime_profile.primary_speech_provider != current_agent.voice_provider
                 or (
                     current_agent.voice_provider in {"sarvam", "elevenlabs"}

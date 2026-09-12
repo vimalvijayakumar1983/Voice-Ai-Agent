@@ -639,6 +639,10 @@ def _call_components(
         else:
             missing.append(f"{speech.title()} TTS characters")
 
+    if speech == "soniox":
+        missing.append("Soniox STT/TTS usage and account rate reconciliation")
+    if speech in {"sarvam", "elevenlabs", "inworld", "soniox"} and media_stream_started:
+        inworld_speech = speech == "inworld"
         llm_provider = str(
             runtime.get("llm_provider") or ("inworld" if inworld_speech else "openai")
         )

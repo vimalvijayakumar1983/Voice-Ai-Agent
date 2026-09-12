@@ -23,7 +23,7 @@ function agent(voiceProvider) {
 test('a retained live revision remains bindable to every VAV-native voice provider', () => {
   const draftWithLiveRevision = knowledgeBase();
 
-  for (const provider of ['sarvam', 'elevenlabs', 'inworld']) {
+  for (const provider of ['sarvam', 'elevenlabs', 'inworld', 'soniox']) {
     assert.equal(
       canBindKnowledgeAgent(draftWithLiveRevision, agent(provider)),
       true,
@@ -41,7 +41,7 @@ test('agents that do not use VAV retrieval can never bind, approved or not', () 
 test('a first draft without a live revision cannot bind any provider', () => {
   const firstDraft = knowledgeBase({ serving_revision: null });
 
-  for (const provider of ['smallest', 'sarvam', 'elevenlabs', 'inworld']) {
+  for (const provider of ['smallest', 'sarvam', 'elevenlabs', 'inworld', 'soniox']) {
     assert.equal(
       canBindKnowledgeAgent(firstDraft, agent(provider)),
       false,
@@ -54,7 +54,7 @@ test('a first draft without a live revision cannot bind any provider', () => {
 test('an approved knowledge base can bind every VAV-native agent', () => {
   const approved = knowledgeBase({ approval_status: 'approved' });
 
-  for (const provider of ['sarvam', 'elevenlabs', 'inworld']) {
+  for (const provider of ['sarvam', 'elevenlabs', 'inworld', 'soniox']) {
     assert.equal(canBindKnowledgeAgent(approved, agent(provider)), true);
   }
   assert.equal(knowledgeBindingGuidance(approved), null);

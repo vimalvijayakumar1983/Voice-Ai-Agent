@@ -1208,8 +1208,10 @@ def test_inworld_agent_requires_context_resolved_knowledge_searches():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("speech_provider", ["inworld", "soniox"])
 async def test_worker_browser_branch_uses_signed_identity_not_participant_metadata(
     monkeypatch,
+    speech_provider,
 ):
     _configure_platform(monkeypatch)
     tenant_id = uuid4()
@@ -1239,6 +1241,26 @@ async def test_worker_browser_branch_uses_signed_identity_not_participant_metada
         llm_provider="inworld",
         llm_model="openai/gpt-4o-mini",
     )
+    if speech_provider == "soniox":
+        model.voice_id = "soniox:Maya"
+        model.voice_provider = "soniox"
+        model.supported_languages = ["en-GB"]
+        model.language_switching_enabled = False
+        profile.primary_speech_provider = "soniox"
+        profile.llm_provider = "openai"
+        profile.llm_model = "gpt-4o-mini"
+        profile.runtime_config = {"voice_runtime": "pipeline", "stt_model": "stt-rt-v5"}
+        from app.livekit_runtime import mcp_tools
+
+        monkeypatch.setattr(mcp_tools, "load_mcp_tools", AsyncMock(return_value=[]))
+        monkeypatch.setattr(
+            livekit_worker,
+            "_load_runtime_recognition_context",
+            AsyncMock(return_value=livekit_worker._RuntimeRecognitionContext()),
+        )
+        monkeypatch.setattr(livekit_worker.soniox, "TTS", lambda **_kwargs: object())
+        monkeypatch.setattr(livekit_worker.soniox_pipeline, "build_stt", lambda *args: object())
+        monkeypatch.setattr(livekit_worker.soniox_pipeline, "build_vad", lambda: object())
     shutdown_callbacks = []
 
     class Room:
