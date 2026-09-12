@@ -243,6 +243,13 @@ Approval and coverage fixes from the Royal Medical re-index on 11 September:
   word ("handling fee"). Ordinary words never expand ("clinic" is not
   "clinician"). Before this, every specialty question returned no evidence
   because the strict content rule compared "urology" with "urologist".
+- Knowledge Studio has "Search this knowledge base"
+  (`GET /knowledge/{id}/search?q=`): a text scan of every source's extracted
+  text and verified facts (with plural and specialty word forms, so "urology"
+  finds a "Urologist" card), plus a retrieval preview that runs the runtime's
+  own retrieval against the approved release, or the draft sources before
+  approval, and shows the evidence an agent would answer from. An operator
+  can confirm "the knowledge base does not mention MRI" before a test call.
 - Every knowledge lookup writes one content-free log line
   (`livekit_knowledge_lookup`: turn, result, path, evidence size, timing) so a
   production call can be diagnosed from the agent service logs.

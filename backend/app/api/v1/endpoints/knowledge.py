@@ -8,7 +8,17 @@ from urllib.parse import urlsplit
 from uuid import UUID
 
 import structlog
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+    status,
+)
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -39,6 +49,7 @@ from app.schemas.knowledge import (
     KnowledgeCrawlResponse,
     KnowledgeProcessingMode,
     KnowledgeReleaseReactivationRequest,
+    KnowledgeSearchResponse,
     KnowledgeServingRevisionResponse,
     KnowledgeSourceCompileRequest,
     KnowledgeSourcePreviewResponse,
@@ -66,6 +77,7 @@ from app.services.knowledge_records import (
     records_from_text,
     records_to_payload,
 )
+from app.services.knowledge_search import retrieval_preview, scan_sources
 from app.services.knowledge_serving import (
     KnowledgeServingError,
     publish_serving_revision,
@@ -613,6 +625,59 @@ async def get_knowledge_base(
             kb_id,
             for_update=False,
         )
+    )
+
+
+@router.get("/{kb_id}/search", response_model=KnowledgeSearchResponse)
+async def search_knowledge_base(
+    kb_id: UUID,
+    request: Request,
+    q: str = Query(min_length=2, max_length=200),
+    current_user: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Where a term appears in the sources, and what the agent would retrieve for it.
+
+    The text scan reads every source's extracted text and verified facts. The
+    retrieval preview runs the runtime's own retrieval against the approved
+    release when one exists, otherwise against the draft sources, so an
+    operator can see the evidence an agent would answer from before a call.
+    """
+    await enforce_rate_limit(
+        request,
+        scope="knowledge-base-search",
+        limit=60,
+        window_seconds=60,
+        subject=str(current_user.tenant_id),
+        bind_to_client=False,
+        limit_detail="Too many knowledge searches. Please retry in a minute.",
+        unavailable_detail="Knowledge search is temporarily unavailable. Retry shortly.",
+    )
+    kb = await _get_knowledge_base(db, current_user.tenant_id, kb_id, for_update=False)
+    query = " ".join(q.split())
+    terms, matches = scan_sources(list(kb.sources), query)
+    preview = await retrieval_preview(db, kb, query)
+    return KnowledgeSearchResponse(
+        query=query,
+        terms=terms,
+        sources=[
+            {
+                "source_id": match.source_id,
+                "name": match.name,
+                "source_type": match.source_type,
+                "matched_terms": match.matched_terms,
+                "match_count": match.match_count,
+                "snippets": match.snippets,
+                "facts": [fact.__dict__ for fact in match.facts],
+            }
+            for match in matches
+        ],
+        retrieval={
+            "scope": preview.scope,
+            "status": preview.status,
+            "chunks": [chunk.__dict__ for chunk in preview.chunks],
+            "note": preview.note,
+        },
     )
 
 
