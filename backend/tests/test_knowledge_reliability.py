@@ -724,3 +724,38 @@ def test_department_questions_match_a_specialties_listing(query):
     )
     assert matches, query
     assert "Pediatrics" in matches[0].text, query
+
+
+def test_listing_synonyms_apply_only_to_plural_listing_questions():
+    """Codex review on #51: a person's specialty is not their department."""
+    from app.services.knowledge_retrieval import (
+        _is_service_capability_query,
+        _query_tokens,
+        _rank_contextual_knowledge,
+        _semantic_query_variants,
+        build_contextual_query_plan,
+    )
+
+    assert _semantic_query_variants("What is Dr Lee's specialty?") == ()
+    assert _semantic_query_variants("Which department is Dr Lee in?") == ()
+    assert "What kind of specialty do you have?" in _semantic_query_variants(
+        "What kind of departments do you have?"
+    )
+
+    document = (
+        "VERIFIED STRUCTURED FACTS\n"
+        "SUBJECT: Dr. Lee\n"
+        "- department: Emergency Department\n"
+        "  Search phrases: Which department is Dr. Lee in?\n"
+        "  Evidence: Dr. Lee | Emergency Department"
+    )
+    plan = build_contextual_query_plan("What is Dr Lee's specialty?")
+    matches = _rank_contextual_knowledge(
+        plan.variants, [("Doctors", document)], 6, "Adam & Eve Specialized Medical Centre"
+    )
+    assert not any("Emergency Department" in match.text for match in matches)
+
+    # "offering" as a noun stays a topic word.
+    assert _is_service_capability_query("What is the offering price?") is False
+    assert "offering" in _query_tokens("What is the offering price?")
+    assert _is_service_capability_query("What are you offering there?") is True

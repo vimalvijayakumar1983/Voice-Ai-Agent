@@ -368,9 +368,6 @@ _SEMANTIC_CONCEPT_GROUPS: tuple[tuple[str, ...], ...] = (
     ("cost", "price", "pricing", "fee"),
     ("hour", "timing", "schedule", "opening"),
     ("address", "location", "where", "based"),
-    # A caller asks for "departments"; a clinic's site lists "specialties"
-    # or "services" and a group's site lists "divisions".
-    ("department", "specialty", "speciality", "division", "service"),
     ("child", "children", "kid", "kids", "pediatric", "paediatric", "pediatrician"),
     ("skin", "dermatology", "dermatologist"),
     ("teeth", "tooth", "dental", "dentist", "dentistry"),
@@ -379,6 +376,12 @@ _SEMANTIC_CONCEPT_GROUPS: tuple[tuple[str, ...], ...] = (
 )
 _SEMANTIC_CONCEPTS = {term: group for group in _SEMANTIC_CONCEPT_GROUPS for term in group}
 _QUESTION_WORD_CONCEPTS = frozenset({"where"})
+# A caller asks for "departments"; a clinic's site lists "specialties" or
+# "services" and a group's site lists "divisions". Only the plural, listing
+# form expands: "What is Dr Lee's specialty?" must never match a fact that
+# merely places Dr Lee in a department.
+_LISTING_CONCEPT_GROUP = ("department", "specialty", "speciality", "division", "service")
+_LISTING_CONCEPTS = {term: _LISTING_CONCEPT_GROUP for term in _LISTING_CONCEPT_GROUP}
 
 
 @dataclass(frozen=True)
@@ -516,9 +519,16 @@ def _is_service_capability_query(value: str) -> bool:
     normalized = " ".join(_base_tokens(value))
     return bool(
         re.search(
-            r"\b(?:can|could|do|does|will|would|are|is)\b.{0,80}\b"
-            r"(?:offer|offers|offering|provide|provides|providing|"
-            r"specialise|specialises|specialising|specialize|specializes|specializing)\b",
+            r"\b(?:can|could|do|does|will|would)\b.{0,80}\b"
+            r"(?:offer|offers|provide|provides|specialise|specialises|"
+            r"specialize|specializes)\b",
+            normalized,
+        )
+        # "What are you offering?" is a capability question; "What is the
+        # offering price?" names a price, so the verb form needs its subject.
+        or re.search(
+            r"\b(?:are|is)\s+(?:you|we|they)\s+"
+            r"(?:offering|providing|specialising|specializing)\b",
             normalized,
         )
         or re.search(
@@ -558,8 +568,11 @@ def _semantic_query_variants(query: str) -> tuple[str, ...]:
     matches = list(_TOKEN.finditer(query))
     variants: list[str] = []
     for match in matches:
-        token = _singular(match.group(0).casefold())
+        surface = match.group(0).casefold()
+        token = _singular(surface)
         concepts = _SEMANTIC_CONCEPTS.get(token)
+        if concepts is None and surface != token:
+            concepts = _LISTING_CONCEPTS.get(token)
         if concepts is None:
             continue
         for concept in concepts:
