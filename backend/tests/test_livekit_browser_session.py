@@ -1314,7 +1314,7 @@ async def test_worker_browser_branch_uses_signed_identity_not_participant_metada
     monkeypatch.setattr(
         livekit_worker,
         "production_room_options",
-        lambda: expected_room_options,
+        lambda **_kwargs: expected_room_options,
     )
 
     with pytest.raises(RuntimeError, match="session startup failed"):
