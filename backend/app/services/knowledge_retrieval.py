@@ -532,7 +532,7 @@ def _is_service_capability_query(value: str) -> bool:
             normalized,
         )
         or re.search(
-            r"\b(?:what|which)\b.{0,40}\b(?:services?|offerings?)\b",
+            r"\b(?:what|which)\b.{0,40}\b(?:services?|offerings)\b",
             normalized,
         )
     )
