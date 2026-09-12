@@ -4425,7 +4425,10 @@ async def _load_browser_runtime(
                 metadata.get("browser_variables") or {}, label="Session variables"
             )
             api_keys = await _load_runtime_api_keys(
-                db, tenant_id=tenant_id, llm_provider=profile.llm_provider
+                db,
+                tenant_id=tenant_id,
+                llm_provider=profile.llm_provider,
+                speech_provider=profile.primary_speech_provider,
             )
             return (
                 model,

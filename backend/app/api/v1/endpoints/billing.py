@@ -125,7 +125,9 @@ async def get_cost_report(
         None,
         pattern="^(twilio|smallest|livekit_sip|livekit_webrtc)$",
     ),
-    speech_provider: str | None = Query(None, pattern="^(inworld|sarvam|elevenlabs|smallest)$"),
+    speech_provider: str | None = Query(
+        None, pattern="^(inworld|sarvam|elevenlabs|smallest|soniox)$"
+    ),
     agent_id: UUID | None = None,
     direction: str | None = Query(None, pattern="^(inbound|outbound)$"),
     status: str | None = Query(None, max_length=30),
@@ -152,7 +154,9 @@ async def export_cost_report(
         None,
         pattern="^(twilio|smallest|livekit_sip|livekit_webrtc)$",
     ),
-    speech_provider: str | None = Query(None, pattern="^(inworld|sarvam|elevenlabs|smallest)$"),
+    speech_provider: str | None = Query(
+        None, pattern="^(inworld|sarvam|elevenlabs|smallest|soniox)$"
+    ),
     agent_id: UUID | None = None,
     direction: str | None = Query(None, pattern="^(inbound|outbound)$"),
     status: str | None = Query(None, max_length=30),

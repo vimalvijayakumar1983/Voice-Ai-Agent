@@ -122,17 +122,19 @@ async def test_cost_report_converts_provider_components_to_usd_and_aed(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("speech_provider", ["elevenlabs", "soniox"])
 async def test_cost_report_filters_speech_provider_and_exports_csv(
     client,
     auth_headers,
     db,
     tenant,
+    speech_provider,
 ):
     agent = Agent(
         tenant_id=tenant.id,
         name="ElevenLabs support",
         system_prompt="Help callers.",
-        voice_provider="elevenlabs",
+        voice_provider=speech_provider,
     )
     db.add(agent)
     await db.flush()
@@ -145,23 +147,23 @@ async def test_cost_report_filters_speech_provider_and_exports_csv(
         to_number="+14142934703",
         provider="twilio",
         duration_seconds=30,
-        call_metadata={"runtime": {"speech_provider": "elevenlabs", "tts_characters": 200}},
+        call_metadata={"runtime": {"speech_provider": speech_provider, "tts_characters": 200}},
     )
     db.add(call)
     await db.commit()
 
     response = await client.get(
-        "/api/v1/billing/cost-report?speech_provider=elevenlabs&days=30",
+        f"/api/v1/billing/cost-report?speech_provider={speech_provider}&days=30",
         headers=auth_headers,
     )
     exported = await client.get(
-        "/api/v1/billing/cost-report.csv?speech_provider=elevenlabs&days=30",
+        f"/api/v1/billing/cost-report.csv?speech_provider={speech_provider}&days=30",
         headers=auth_headers,
     )
 
     assert response.status_code == 200
     assert response.json()["summary"]["total_calls"] == 1
-    assert response.json()["calls"][0]["speech_provider"] == "elevenlabs"
+    assert response.json()["calls"][0]["speech_provider"] == speech_provider
     assert exported.status_code == 200
     assert exported.headers["content-type"].startswith("text/csv")
     assert "estimated_cost_aed" in exported.text

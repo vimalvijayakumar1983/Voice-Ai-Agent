@@ -59,8 +59,9 @@ def wire_probes(monkeypatch):
     return probe
 
 
+@pytest.mark.parametrize("speech_provider", ["inworld", "soniox"])
 async def test_staff_owner_browser_without_phone_or_kb(
-    client, auth_headers, user, tenant, db, monkeypatch
+    client, auth_headers, user, tenant, db, monkeypatch, speech_provider
 ):
     agent, profile = await setup_staff(db, tenant, monkeypatch)
     wire_probes(monkeypatch)
@@ -77,6 +78,24 @@ async def test_staff_owner_browser_without_phone_or_kb(
     assert call.call_metadata["browser_user_id"] == str(user.id)
     assert call.call_metadata["staff_browser_only"] is True
     assert call.call_metadata["runtime"]["knowledge_serving_revision_id"] is None
+    if speech_provider == "soniox":
+        agent.voice_provider = "soniox"
+        agent.voice_id = "soniox:Maya"
+        profile.primary_speech_provider = "soniox"
+        profile.llm_provider = "openai"
+        profile.llm_model = "gpt-4o-mini"
+        profile.runtime_config = {**profile.runtime_config, "voice_runtime": "pipeline"}
+        call.call_metadata = {
+            **call.call_metadata,
+            "runtime": {
+                **call.call_metadata["runtime"],
+                "speech_provider": "soniox",
+                "llm_provider": "openai",
+            },
+        }
+        await db.commit()
+        lookup = AsyncMock(side_effect=[{"api_key": "soniox-key"}, {"api_key": "openai-key"}])
+        monkeypatch.setattr(worker, "load_provider_config", lookup)
     loaded = await worker._load_browser_runtime(
         tenant_id=tenant.id,
         agent_id=agent.id,
@@ -86,6 +105,10 @@ async def test_staff_owner_browser_without_phone_or_kb(
     )
     assert loaded[4]["knowledge_source_count"] == 0
     assert loaded[5].revision_id is None
+    if speech_provider == "soniox":
+        assert loaded[2].speech == "soniox-key"
+        assert loaded[2].llm == "openai-key"
+        assert [entry.args[2] for entry in lookup.await_args_list] == ["soniox", "openai"]
     await worker._open_browser_call(
         model=loaded[0],
         profile=loaded[1],
