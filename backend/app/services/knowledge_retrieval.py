@@ -77,6 +77,7 @@ _QUERY_STOP_WORDS = {
     "from",
     "give",
     "have",
+    "having",
     "has",
     "had",
     "hello",
@@ -367,6 +368,9 @@ _SEMANTIC_CONCEPT_GROUPS: tuple[tuple[str, ...], ...] = (
     ("cost", "price", "pricing", "fee"),
     ("hour", "timing", "schedule", "opening"),
     ("address", "location", "where", "based"),
+    # A caller asks for "departments"; a clinic's site lists "specialties"
+    # or "services" and a group's site lists "divisions".
+    ("department", "specialty", "speciality", "division", "service"),
     ("child", "children", "kid", "kids", "pediatric", "paediatric", "pediatrician"),
     ("skin", "dermatology", "dermatologist"),
     ("teeth", "tooth", "dental", "dentist", "dentistry"),
@@ -464,7 +468,22 @@ def _query_tokens(value: str) -> set[str]:
     if _is_service_capability_query(value):
         # These verbs express a request for a service, not an additional fact.
         # Preserve the service, price, negation, date and other constraints.
-        tokens.difference_update({"offer", "provide", "specialise", "specialize"})
+        tokens.difference_update(
+            {
+                "offer",
+                "offering",
+                "provide",
+                "providing",
+                "specialise",
+                "specialising",
+                "specialize",
+                "specializing",
+            }
+        )
+        if not tokens:
+            # "What are you offering?" names no service; it asks for the
+            # service listing itself.
+            tokens.add("service")
     if re.search(r"\b(?:is|are)\b.+\bavailable\b", value, re.I) and not re.search(
         r"\b(?:today|tomorrow|now|currently|appointment|slot|schedule|\d+)\b", value, re.I
     ):
@@ -497,9 +516,9 @@ def _is_service_capability_query(value: str) -> bool:
     normalized = " ".join(_base_tokens(value))
     return bool(
         re.search(
-            r"\b(?:can|could|do|does|will|would)\b.{0,80}\b"
-            r"(?:offer|offers|provide|provides|specialise|specialises|"
-            r"specialize|specializes)\b",
+            r"\b(?:can|could|do|does|will|would|are|is)\b.{0,80}\b"
+            r"(?:offer|offers|offering|provide|provides|providing|"
+            r"specialise|specialises|specialising|specialize|specializes|specializing)\b",
             normalized,
         )
         or re.search(

@@ -677,3 +677,50 @@ def test_specialty_forms_never_widen_ordinary_words_or_framing_nouns():
     )
     assert not rank_knowledge("What is the handling fee?", [("Policies", fees)])
     assert not rank_knowledge("Who is the clinician?", [("About", company)])
+
+
+def _specialties_document():
+    return (
+        "VERIFIED STRUCTURED FACTS\n"
+        "SUBJECT: Adam & Eve Specialized Medical Centre\n"
+        "- specialties: Pediatrics, Pediatric Dentistry, Internal Medicine, Dermatology\n"
+        "  Search phrases: What specialties does Adam & Eve Specialized Medical Centre "
+        "have? | Which services are provided? | Is pediatrics available?\n"
+        "  Evidence: Our Specialties: Pediatrics, Pediatric Dentistry, Internal Medicine, "
+        "Dermatology\n"
+        "- address: Al Nahyan, Abu Dhabi\n"
+        "  Search phrases: Where is Adam & Eve Specialized Medical Centre?\n"
+        "  Evidence: Located in Al Nahyan, Abu Dhabi"
+    )
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "What kind of departments you are having there?",
+        "Which departments do you have?",
+        "What divisions are there?",
+        "What kind of services you are providing there?",
+        "What are you offering there?",
+    ],
+)
+def test_department_questions_match_a_specialties_listing(query):
+    """Adam & Eve call on 12 September: "departments" found nothing, "services" did.
+
+    The site lists its "specialties"; a caller says "departments" and adds a
+    framing verb such as "having" or "providing" that the card never states.
+    """
+    from app.services.knowledge_retrieval import (
+        _rank_contextual_knowledge,
+        build_contextual_query_plan,
+    )
+
+    plan = build_contextual_query_plan(query)
+    matches = _rank_contextual_knowledge(
+        plan.variants,
+        [("Adam & Eve Specialized Medical Centre", _specialties_document())],
+        6,
+        "Adam & Eve Specialized Medical Centre",
+    )
+    assert matches, query
+    assert "Pediatrics" in matches[0].text, query

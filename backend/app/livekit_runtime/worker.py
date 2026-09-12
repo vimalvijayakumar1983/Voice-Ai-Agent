@@ -2408,6 +2408,9 @@ Knowledge policy:
 - When interrupted, never restart or complete the abandoned response. Answer
   only the caller's replacement request. Use compact prose for lists unless the
   caller explicitly asks for a detailed explanation.
+- Every reply is spoken aloud: never use markdown, asterisks, bullet points,
+  numbered lists or headings. Name several items in one sentence separated by
+  commas.
 """
         from app.livekit_runtime.reporting import FINANCIAL_SPEECH_INSTRUCTIONS
 
