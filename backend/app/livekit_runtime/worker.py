@@ -1390,6 +1390,25 @@ class _LiveKitRuntimeTelemetry:
                 "knowledge_fallback_used": bool(fallback_used),
             }
         )
+        # One content-free line per lookup so a production call can be
+        # diagnosed from service logs without reading the stored transcript.
+        detail_fields = details if isinstance(details, dict) else {}
+        logger.info(
+            "livekit_knowledge_lookup",
+            extra={
+                "turn": trace_sequence,
+                "knowledge_result": normalized_result,
+                "knowledge_tool_ms": max(0, int(elapsed_ms)),
+                "knowledge_evidence_chars": max(0, int(evidence_chars)),
+                "knowledge_query_variant_count": max(0, int(query_variant_count)),
+                "knowledge_fallback_used": bool(fallback_used),
+                "knowledge_retrieval_path": str(
+                    detail_fields.get("knowledge_retrieval_path") or ""
+                )[:100],
+                "exact_fact_action": str(detail_fields.get("exact_fact_action") or "")[:100],
+                "exact_fact_reason": str(detail_fields.get("exact_fact_reason") or "")[:100],
+            },
+        )
         if isinstance(details, dict):
             for key in (
                 "knowledge_retrieval_path",

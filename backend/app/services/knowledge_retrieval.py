@@ -263,6 +263,9 @@ _CONTACT_QUERY_TOKENS = {
     "phone",
     "telephone",
 }
+# "Which doctor treats children?" asks for a specialty; the verb is request
+# framing, not a fact the card must state.
+_REQUEST_FRAMING_TOKENS = frozenset({"handle", "handling", "treat", "treating"})
 _QUERY_INTENT_TOKENS = (
     _BROAD_QUERY_TOKENS
     | _DIRECTORY_QUERY_TOKENS
@@ -273,6 +276,7 @@ _QUERY_INTENT_TOKENS = (
         "available",
         "book",
         "booking",
+        *_REQUEST_FRAMING_TOKENS,
         "consultation",
         "cost",
         "detail",
@@ -363,6 +367,11 @@ _SEMANTIC_CONCEPT_GROUPS: tuple[tuple[str, ...], ...] = (
     ("cost", "price", "pricing", "fee"),
     ("hour", "timing", "schedule", "opening"),
     ("address", "location", "where", "based"),
+    ("child", "children", "kid", "kids", "pediatric", "paediatric", "pediatrician"),
+    ("skin", "dermatology", "dermatologist"),
+    ("teeth", "tooth", "dental", "dentist", "dentistry"),
+    ("heart", "cardiology", "cardiologist"),
+    ("eye", "eyes", "ophthalmology", "ophthalmologist"),
 )
 _SEMANTIC_CONCEPTS = {term: group for group in _SEMANTIC_CONCEPT_GROUPS for term in group}
 _QUESTION_WORD_CONCEPTS = frozenset({"where"})
@@ -400,11 +409,37 @@ def _tokens(value: str) -> set[str]:
     return _token_forms(_base_tokens(value))
 
 
+# Specialty vocabulary is morphological: a directory card says "Consultant
+# Urologist" while a caller asks for "urology"; a "Pediatrician" is asked for
+# as "pediatric" or "pediatrics". Each family maps to the same searchable forms
+# so the exact-match content rule is not defeated by a suffix.
+_SPECIALTY_SUFFIX_FAMILIES: tuple[tuple[str, ...], ...] = (
+    ("ologist", "ology", "ological", "ologists"),
+    ("iatrician", "iatric", "iatrics", "iatricians"),
+    ("iatrist", "iatry", "iatric", "iatrists"),
+    ("ician", "ic", "ics", "icians"),
+    ("dentist", "dental", "dentistry", "dentists"),
+    ("surgeon", "surgery", "surgical", "surgeons"),
+)
+_SPECIALTY_MIN_STEM = 2  # "urologist" keeps stem "ur"
+
+
+def _specialty_forms(token: str) -> set[str]:
+    """Return the other word forms of a medical specialty token, or nothing."""
+    for family in _SPECIALTY_SUFFIX_FAMILIES:
+        for suffix in family:
+            if token.endswith(suffix) and len(token) - len(suffix) >= _SPECIALTY_MIN_STEM:
+                stem = token[: -len(suffix)]
+                return {stem + other for other in family if other != suffix}
+    return set()
+
+
 def _token_forms(base_tokens: list[str]) -> set[str]:
     tokens: set[str] = set()
     for token in base_tokens:
         tokens.add(token)
         tokens.add(_singular(token))
+        tokens.update(_specialty_forms(token))
         if token == "dr":
             tokens.add("doctor")
     return tokens
@@ -1206,7 +1241,14 @@ def rank_knowledge(
                 # Company/title matches cannot satisfy the requested topic.
                 # Healthcare, pricing, dates etc must occur in this fact's
                 # searchable core, not only in another fact's shared quotation.
-                topic_tokens = query_tokens - structured_subject_tokens - _BROAD_QUERY_TOKENS
+                # A framing verb ("which doctor treats") is not a fact the
+                # card must state; contact and directory nouns still are.
+                topic_tokens = (
+                    query_tokens
+                    - structured_subject_tokens
+                    - _BROAD_QUERY_TOKENS
+                    - _REQUEST_FRAMING_TOKENS
+                )
                 if topic_tokens and not topic_tokens <= chunk_tokens:
                     continue
             chunk_has_phone = _has_phone_evidence(chunk, chunk_tokens)

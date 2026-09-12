@@ -596,3 +596,57 @@ async def test_company_location_question_prefers_the_company_fact_over_item_phra
     first_block = context.split("\n\n")[0]
     assert "SUBJECT: Royal Medical Center" in first_block
     assert address in first_block
+
+
+def _directory_document(specialties):
+    blocks = []
+    for index, specialty in enumerate(specialties):
+        name = f"Dr. Person {index}"
+        role = specialty.split()[-1].lower()
+        blocks.append(
+            "VERIFIED STRUCTURED FACTS\n"
+            f"SUBJECT: {name}\n"
+            f"- specialty: {specialty}\n"
+            f"  Search phrases: What is {name}'s specialty? | Is {name} a {role}? | "
+            f"Who is the {specialty.lower()} at Royal Medical Center?\n"
+            f"  Evidence: {name} | {specialty} | Arabic, English | 10+ Years"
+        )
+    return "\n\n".join(blocks)
+
+
+@pytest.mark.parametrize(
+    "query,expected",
+    [
+        ("Which doctor is in urology?", "Dr. Person 0"),
+        ("Do you have a urology doctor?", "Dr. Person 0"),
+        ("Who is the cardiology doctor?", "Dr. Person 3"),
+        ("Is there a dermatology specialist?", "Dr. Person 4"),
+        ("Which doctor treats children?", "Dr. Person 6"),
+        ("Do you have a psychiatry doctor?", "Dr. Person 1"),
+    ],
+)
+def test_specialty_questions_match_the_directory_card_word_forms(query, expected):
+    """A caller says "urology"; the card says "Consultant Urologist"."""
+    from app.services.knowledge_retrieval import (
+        _rank_contextual_knowledge,
+        build_contextual_query_plan,
+    )
+
+    document = _directory_document(
+        [
+            "Consultant Urologist",
+            "Specialist Psychiatrist",
+            "General Practitioner",
+            "Consultant Cardiologist",
+            "Specialist Dermatologist",
+            "Consultant Otolaryngology",
+            "Specialist Pediatrician",
+            "Consultant Plastic Surgeon",
+        ]
+    )
+    plan = build_contextual_query_plan(query)
+    matches = _rank_contextual_knowledge(
+        plan.variants, [("Best Doctors Near Me in Abu Dhabi", document)], 6, "Royal Medical Center"
+    )
+    assert matches, query
+    assert f"SUBJECT: {expected}" in matches[0].text, query
