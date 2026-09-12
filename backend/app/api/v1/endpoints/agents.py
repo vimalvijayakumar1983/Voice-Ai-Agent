@@ -70,6 +70,7 @@ from app.providers.smallest import (
     get_smallest_client,
     resolve_active_knowledge_base_id,
 )
+from app.providers.soniox import SONIOX_TTS_MODEL, SonioxError, tenant_soniox_client
 from app.schemas.agent import (
     AgentAIDraftRequest,
     AgentAIDraftResponse,
@@ -114,7 +115,7 @@ from app.services.integration_security import (
     IntegrationConfigUnavailableError,
     decrypt_integration_config,
 )
-from app.services.production_voice_preset import new_inworld_profile
+from app.services.production_voice_preset import new_inworld_profile, new_soniox_profile
 from app.services.provider_credentials import (
     ProviderCredentialError,
     invalidate_active_runtimes_for_credential,
@@ -1011,21 +1012,23 @@ async def _livekit_browser_runtime(
     profile = await db.scalar(profile_query)
     if not agent.is_active:
         raise HTTPException(status_code=409, detail="Agent is inactive")
-    if agent.voice_provider != "inworld" or not agent.voice_id.startswith("inworld:"):
+    if agent.voice_provider not in {"inworld", "soniox"} or not agent.voice_id.startswith(
+        f"{agent.voice_provider}:"
+    ):
         raise HTTPException(
             status_code=409,
-            detail="LiveKit browser testing currently requires an Inworld voice agent",
+            detail="LiveKit browser testing requires an Inworld or Soniox voice agent",
         )
     if (
         profile is None
         or profile.status == "inactive"
         or profile.telephony_provider != "livekit_sip"
-        or profile.primary_speech_provider != "inworld"
+        or profile.primary_speech_provider != agent.voice_provider
         or profile.llm_provider not in {"inworld", "openai"}
     ):
         raise HTTPException(
             status_code=409,
-            detail=("Save a compatible LiveKit + Inworld runtime profile before browser testing"),
+            detail="Save a matching LiveKit speech runtime profile before browser testing",
         )
     if not (
         settings.livekit_url.strip()
@@ -1038,9 +1041,19 @@ async def _livekit_browser_runtime(
             status_code=503,
             detail="LiveKit browser runtime credentials or worker health routing are unavailable",
         )
-    inworld, _source, _updated_at = await _tenant_inworld_client(db, tenant_id)
-    if not inworld.is_configured:
-        raise HTTPException(status_code=409, detail="Add a valid Inworld API key first")
+    if agent.voice_provider == "soniox":
+        speech = await tenant_soniox_client(db, tenant_id)
+        if not speech.is_configured:
+            raise HTTPException(409, "Add a Soniox API key in Settings first")
+        if (
+            profile.llm_provider != "openai"
+            or (profile.runtime_config or {}).get("voice_runtime") != "pipeline"
+        ):
+            raise HTTPException(409, "Soniox requires the direct OpenAI pipeline")
+    else:
+        inworld, _source, _updated_at = await _tenant_inworld_client(db, tenant_id)
+        if not inworld.is_configured:
+            raise HTTPException(status_code=409, detail="Add a valid Inworld API key first")
     if profile.llm_provider == "openai":
         try:
             openai_config = await load_provider_config(db, tenant_id, "openai")
@@ -1385,6 +1398,25 @@ async def _require_provider_voice(
     if provider == "elevenlabs":
         client, _, _ = await _tenant_elevenlabs_client(db, tenant_id)
         return await _require_elevenlabs_voice(client, voice_id, selected_languages)
+    if provider == "soniox":
+        try:
+            client = await tenant_soniox_client(db, tenant_id)
+            voices = await client.list_voices()
+        except SonioxError as exc:
+            raise HTTPException(exc.status_code, str(exc)) from exc
+        if not any(voice["id"] == voice_id for voice in voices):
+            raise HTTPException(422, "Choose a voice from the Soniox catalog")
+        compatibility, unsupported = voice_language_compatibility(
+            voices, voice_id, selected_languages
+        )
+        if compatibility != LanguageCompatibilityStatus.COMPATIBLE:
+            raise HTTPException(422, "Soniox does not support all selected languages")
+        return VoiceResolution(
+            requested_voice_id=voice_id,
+            resolved_voice_id=voice_id,
+            synthesizer_model=SONIOX_TTS_MODEL,
+            source="operator",
+        )
     if provider == "inworld":
         client, _, _ = await _tenant_inworld_client(db, tenant_id)
         return await _require_inworld_voice(client, voice_id, selected_languages)
@@ -2540,6 +2572,8 @@ async def create_agent(
     agent = Agent(tenant_id=current_user.tenant_id, **data.model_dump())
     db.add(agent)
     await db.flush()
+    if agent.voice_provider == "soniox":
+        db.add(new_soniox_profile(agent))
     if agent.voice_provider == "inworld":
         db.add(new_inworld_profile(agent))
         await db.flush()
@@ -2651,6 +2685,7 @@ async def get_provider_status(
     inworld, inworld_source, inworld_updated_at = await _tenant_inworld_client(
         db, current_user.tenant_id
     )
+    soniox = await tenant_soniox_client(db, current_user.tenant_id)
     return {
         "provider": "smallest",
         "configured": client.is_configured,
@@ -2659,6 +2694,13 @@ async def get_provider_status(
         ),
         "base_url": settings.smallest_base_url,
         "providers": {
+            "soniox": {
+                "configured": soniox.is_configured,
+                "agent_runtime": True,
+                "voice_preview": soniox.is_configured,
+                "source": soniox.source,
+                "updated_at": None,
+            },
             "smallest": {
                 "configured": client.is_configured,
                 "agent_runtime": True,
@@ -2813,6 +2855,13 @@ async def get_provider_catalog(
             combined_voices.extend(await elevenlabs.list_voices())
         except ElevenLabsError as exc:
             elevenlabs_error = HTTPException(status_code=exc.status_code, detail=str(exc))
+    soniox_error: HTTPException | None = None
+    soniox = await tenant_soniox_client(db, current_user.tenant_id)
+    if soniox.is_configured:
+        try:
+            combined_voices.extend(await soniox.list_voices())
+        except SonioxError as exc:
+            soniox_error = HTTPException(exc.status_code, str(exc))
     inworld_error: HTTPException | None = None
     inworld, _, _ = await _tenant_inworld_client(db, current_user.tenant_id)
     if inworld.is_configured:
@@ -2821,6 +2870,8 @@ async def get_provider_catalog(
         except InworldError as exc:
             inworld_error = HTTPException(status_code=exc.status_code, detail=str(exc))
     if not combined_voices:
+        if soniox_error is not None:
+            raise soniox_error
         if inworld_error is not None:
             raise inworld_error
         if elevenlabs_error is not None:
@@ -3132,6 +3183,20 @@ async def preview_provider_voice(
         subject=str(current_user.id),
         bind_to_client=False,
     )
+    if data.provider == "soniox":
+        try:
+            soniox = await tenant_soniox_client(db, current_user.tenant_id)
+            voices = await soniox.list_voices()
+            language = data.language or "en"
+            compatibility, _ = voice_language_compatibility(voices, data.voice_id, [language])
+            if compatibility != LanguageCompatibilityStatus.COMPATIBLE:
+                raise HTTPException(422, "Selected Soniox voice or language is unavailable")
+            audio = await soniox.voice_preview(voice_id=data.voice_id, language=language)
+        except SonioxError as exc:
+            raise HTTPException(exc.status_code, str(exc)) from exc
+        return Response(
+            content=audio, media_type="audio/wav", headers={"Cache-Control": "no-store"}
+        )
     if data.provider == "sarvam":
         sarvam, _, _ = await _tenant_sarvam_client(db, current_user.tenant_id)
         voice = next(
@@ -3993,10 +4058,10 @@ async def create_livekit_browser_session(
             "browser_participant_identity": participant_identity,
             "join_expires_at": join_expires_at.isoformat(),
             "reserved_max_duration_seconds": reserved_max_duration_seconds,
-            "speech_provider": "inworld",
+            "speech_provider": agent.voice_provider,
             "runtime": {
                 "transport": "livekit_webrtc",
-                "speech_provider": "inworld",
+                "speech_provider": agent.voice_provider,
                 "voice_runtime": str(
                     (
                         profile.runtime_config.get("voice_runtime")
@@ -4011,7 +4076,9 @@ async def create_livekit_browser_session(
                 "stt_model_configured": configured_inworld_stt_model(profile=profile),
                 "stt_language": resolve_inworld_stt_language(model=agent, profile=profile),
                 "stt_language_configured": profile.stt_language,
-                "tts_model": "inworld-tts-2",
+                "tts_model": SONIOX_TTS_MODEL
+                if agent.voice_provider == "soniox"
+                else "inworld-tts-2",
                 "tts_delivery_mode": str(
                     (
                         profile.runtime_config.get("tts_delivery_mode")
@@ -4359,12 +4426,22 @@ async def update_agent(
         if runtime_profile is not None:
             runtime_profile.enabled = False
             runtime_profile.status = "draft"
-            if agent.voice_provider in {"sarvam", "elevenlabs", "inworld"}:
+            if agent.voice_provider in {"sarvam", "elevenlabs", "inworld", "soniox"}:
                 runtime_profile.primary_speech_provider = agent.voice_provider
-                if agent.voice_provider == "inworld" and voice_provider_changed:
+                if agent.voice_provider == "soniox" and voice_provider_changed:
+                    runtime_profile.runtime_config = {
+                        **(runtime_profile.runtime_config or {}),
+                        "voice_runtime": "pipeline",
+                        "inworld_single_pass": False,
+                        "stt_model": "stt-rt-v5",
+                    }
+                    runtime_profile.runtime_config.pop("llm_reasoning_effort", None)
+                if agent.voice_provider in {"inworld", "soniox"} and voice_provider_changed:
                     runtime_profile.telephony_provider = "livekit_sip"
                     runtime_profile.llm_provider = "openai"
                     runtime_profile.llm_model = "gpt-4o-mini"
+        elif agent.voice_provider == "soniox":
+            db.add(new_soniox_profile(agent))
 
     if agent.provider_agent_id and SMALLEST_SYNC_FIELDS.intersection(effective_changes):
         agent.sync_status = "dirty"

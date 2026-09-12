@@ -88,6 +88,7 @@ class Settings(BaseSettings):
     # media and SIP only; VAV supplies this key directly to Inworld's STT,
     # Router, and TTS APIs so LiveKit Inference is never billed accidentally.
     inworld_api_key: str = ""
+    soniox_api_key: str = ""
     inworld_base_url: str = "https://api.inworld.ai"
     inworld_request_timeout_seconds: float = 30.0
     # One VAV deployment connects its workers to one LiveKit project. Tenant

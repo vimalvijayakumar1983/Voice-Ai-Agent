@@ -55,7 +55,7 @@ test('LiveKit browser token uses the authenticated agent endpoint and stays memo
 test('active Inworld and LiveKit agents expose independent browser and phone tests', () => {
   assert.match(playgroundSource, /selected\?\.voice_provider === 'inworld'/);
   assert.match(playgroundSource, /selectedRuntimeProfile\.telephony_provider === 'livekit_sip'/);
-  assert.match(playgroundSource, /selectedRuntimeProfile\.primary_speech_provider === 'inworld'/);
+  assert.match(playgroundSource, /selectedRuntimeProfile\.primary_speech_provider === selected\.voice_provider/);
   assert.match(playgroundSource, /selectedRuntimeProfile\.status !== 'inactive'/);
   assert.match(playgroundSource, /const browserTestAvailable = browserTransport === 'livekit'\s*\? selectedUsesLiveKitBrowser/);
   assert.match(playgroundSource, /const phoneTestReady = selectedReady/);

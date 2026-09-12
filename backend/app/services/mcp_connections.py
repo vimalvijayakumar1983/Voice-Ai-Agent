@@ -228,8 +228,17 @@ def runtime_compatible(profile: AgentRuntimeProfile | None) -> bool:
         profile
         and (profile.enabled or (staff_browser(profile) and profile.status != "inactive"))
         and profile.telephony_provider == "livekit_sip"
-        and profile.primary_speech_provider == "inworld"
-        and config.get("voice_runtime") == "inworld_realtime"
+        and (
+            (
+                profile.primary_speech_provider == "inworld"
+                and config.get("voice_runtime") == "inworld_realtime"
+            )
+            or (
+                profile.primary_speech_provider == "soniox"
+                and profile.llm_provider == "openai"
+                and config.get("voice_runtime") == "pipeline"
+            )
+        )
         and config.get("inworld_single_pass") is not True
     )
 
@@ -268,7 +277,7 @@ async def validate_agent_grants(db, tenant_id: UUID, config: dict) -> None:
     ).all()
     if len(rows) != len(ids) or any(not runtime_compatible(profile) for _, profile in rows):
         raise IntegrationConfigError(
-            "Choose tenant-owned LiveKit/Inworld tool-loop agents. Single-pass and other "
+            "Choose tenant-owned LiveKit Inworld or Soniox tool-loop agents. Single-pass and other "
             "runtimes cannot call MCP tools; their settings have not been changed."
         )
     if private_mcp(config) and any(

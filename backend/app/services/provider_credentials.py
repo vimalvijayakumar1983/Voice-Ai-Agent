@@ -73,6 +73,10 @@ def runtime_profile_depends_on_credential(
         )
     if provider == "openai":
         return profile.llm_provider == "openai"
+    if provider == "soniox":
+        return profile.primary_speech_provider == "soniox" or (
+            profile.fallback_speech_provider == "soniox"
+        )
     return False
 
 

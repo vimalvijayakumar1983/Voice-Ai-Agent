@@ -28,13 +28,14 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from livekit import agents
 from livekit.agents import Agent, AgentServer, AgentSession, JobContext, inference, llm
-from livekit.plugins import inworld, openai
+from livekit.plugins import inworld, openai, soniox
 from openai.types.realtime import AudioTranscription
 from openai.types.realtime.realtime_audio_input_turn_detection import SemanticVad
 from sqlalchemy import func, select
 
 from app.core.config import settings
 from app.core.database import async_session_factory
+from app.livekit_runtime import soniox_pipeline
 from app.livekit_runtime.audio import production_room_options
 from app.livekit_runtime.browser_session import delete_browser_room
 from app.livekit_runtime.dispatch_auth import verify_browser_dispatch_metadata
@@ -71,6 +72,7 @@ from app.models.agent import (
 )
 from app.models.call import Call, CallTranscript
 from app.models.provider_credential import ProviderCredential
+from app.providers.soniox import SONIOX_STT_MODEL, SONIOX_TTS_MODEL
 from app.services.call_metadata import agent_configuration_snapshot
 from app.services.conversation_foundation import (
     FOUNDATION_FLAG,
@@ -885,6 +887,7 @@ async def _load_runtime_api_keys(
     *,
     tenant_id: UUID,
     llm_provider: str,
+    speech_provider: str = "inworld",
 ) -> _RuntimeApiKeys:
     """Resolve only server-side tenant credentials, with an explicit platform fallback."""
     if llm_provider not in {"inworld", "openai"}:
@@ -908,7 +911,14 @@ async def _load_runtime_api_keys(
             raise RuntimeError(f"{provider_name} credential is unavailable")
         return key
 
-    speech_key = await selected_key("inworld", settings.inworld_api_key)
+    if speech_provider not in {"inworld", "soniox"}:
+        raise RuntimeError("Unsupported LiveKit speech provider")
+    if speech_provider == "soniox" and llm_provider != "openai":
+        raise RuntimeError("Soniox requires a direct OpenAI LLM")
+    speech_key = await selected_key(
+        speech_provider,
+        settings.soniox_api_key if speech_provider == "soniox" else settings.inworld_api_key,
+    )
     llm_key = (
         speech_key
         if llm_provider == "inworld"
@@ -1979,6 +1989,8 @@ def _effective_stt_language(*, model: AgentModel, profile: AgentRuntimeProfile) 
 
 
 def _inworld_stt_model(*, model: AgentModel, profile: AgentRuntimeProfile) -> str:
+    if getattr(profile, "primary_speech_provider", "inworld") == "soniox":
+        return SONIOX_STT_MODEL
     return resolve_inworld_stt_model(model=model, profile=profile)
 
 
@@ -3929,6 +3941,13 @@ Knowledge policy:
 class VAVInworldRealtimeAgent(VAVInworldAgent):
     """Native agent for the grounded tool-loop and explicit single-pass policies."""
 
+    def llm_node(self, chat_ctx, tools, model_settings):
+        chunks = super().llm_node(chat_ctx, tools, model_settings)
+        metrics = getattr(self, "_mcp_checked_output_metrics", None)
+        if metrics is not None:
+            return soniox_pipeline.gate_unchecked_text(chunks, metrics)
+        return chunks
+
     def realtime_audio_output_node(self, audio, model_settings):
         metrics = getattr(self, "_mcp_checked_output_metrics", None)
         if metrics is not None:
@@ -4253,7 +4272,7 @@ async def _load_runtime(
                     AgentRuntimeProfile.enabled.is_(True),
                     AgentRuntimeProfile.status == "active",
                     AgentRuntimeProfile.telephony_provider == "livekit_sip",
-                    AgentRuntimeProfile.primary_speech_provider == "inworld",
+                    AgentRuntimeProfile.primary_speech_provider.in_(("inworld", "soniox")),
                     AgentRuntimeProfile.llm_provider.in_(("inworld", "openai")),
                 )
             )
@@ -4310,6 +4329,7 @@ async def _load_runtime(
             db,
             tenant_id=model.tenant_id,
             llm_provider=profile.llm_provider,
+            speech_provider=profile.primary_speech_provider,
         )
         return model, profile, api_keys, knowledge_pin
 
@@ -4347,11 +4367,11 @@ async def _load_browser_runtime(
                     AgentModel.id == agent_id,
                     AgentModel.tenant_id == tenant_id,
                     AgentModel.is_active.is_(True),
-                    AgentModel.voice_provider == "inworld",
-                    AgentModel.voice_id.like("inworld:%"),
+                    AgentModel.voice_provider.in_(("inworld", "soniox")),
+                    (AgentModel.voice_id.like("inworld:%") | AgentModel.voice_id.like("soniox:%")),
                     AgentRuntimeProfile.status != "inactive",
                     AgentRuntimeProfile.telephony_provider == "livekit_sip",
-                    AgentRuntimeProfile.primary_speech_provider == "inworld",
+                    AgentRuntimeProfile.primary_speech_provider.in_(("inworld", "soniox")),
                     AgentRuntimeProfile.llm_provider.in_(("inworld", "openai")),
                     Call.id == call_id,
                     Call.direction == "inbound",
@@ -4373,7 +4393,7 @@ async def _load_browser_runtime(
             or metadata.get("browser_participant_identity") != participant_identity
             or not isinstance(runtime, dict)
             or runtime.get("transport") != "livekit_webrtc"
-            or runtime.get("speech_provider") != "inworld"
+            or runtime.get("speech_provider") != profile.primary_speech_provider
             or runtime.get("llm_provider") not in {None, profile.llm_provider}
         ):
             raise RuntimeError("The browser dispatch does not match its durable VAV reservation")
@@ -4510,6 +4530,7 @@ async def _load_browser_runtime(
             db,
             tenant_id=model.tenant_id,
             llm_provider=profile.llm_provider,
+            speech_provider=profile.primary_speech_provider,
         )
         served_configuration = _served_browser_configuration(
             model=model,
@@ -4576,7 +4597,7 @@ async def _resolve_inbound_route(
                     AgentRuntimeProfile.enabled.is_(True),
                     AgentRuntimeProfile.status == "active",
                     AgentRuntimeProfile.telephony_provider == "livekit_sip",
-                    AgentRuntimeProfile.primary_speech_provider == "inworld",
+                    AgentRuntimeProfile.primary_speech_provider.in_(("inworld", "soniox")),
                     AgentRuntimeProfile.llm_provider.in_(("inworld", "openai")),
                 )
             )
@@ -4607,13 +4628,13 @@ async def _load_inbound_runtime(
                     AgentModel.id == agent_id,
                     AgentModel.tenant_id == tenant_id,
                     AgentModel.is_active.is_(True),
-                    AgentModel.voice_provider == "inworld",
-                    AgentModel.voice_id.like("inworld:%"),
+                    AgentModel.voice_provider.in_(("inworld", "soniox")),
+                    (AgentModel.voice_id.like("inworld:%") | AgentModel.voice_id.like("soniox:%")),
                     AgentRuntimeProfile.tenant_id == tenant_id,
                     AgentRuntimeProfile.enabled.is_(True),
                     AgentRuntimeProfile.status == "active",
                     AgentRuntimeProfile.telephony_provider == "livekit_sip",
-                    AgentRuntimeProfile.primary_speech_provider == "inworld",
+                    AgentRuntimeProfile.primary_speech_provider.in_(("inworld", "soniox")),
                     AgentRuntimeProfile.llm_provider.in_(("inworld", "openai")),
                 )
             )
@@ -4630,6 +4651,7 @@ async def _load_inbound_runtime(
             db,
             tenant_id=tenant_id,
             llm_provider=profile.llm_provider,
+            speech_provider=profile.primary_speech_provider,
         )
         return model, profile, api_keys, knowledge_pin
 
@@ -4762,12 +4784,12 @@ async def _reserve_inbound_call(
                 "agent_configuration": agent_configuration_snapshot(model),
                 "conversation_type": "telephonyInbound",
                 "channel": "phone",
-                "speech_provider": "inworld",
+                "speech_provider": getattr(profile, "primary_speech_provider", "inworld"),
                 "livekit_room": room_name,
                 "sip_trunk_id": attributes.get("sip.trunkID"),
                 "runtime": {
                     "transport": "livekit_sip",
-                    "speech_provider": "inworld",
+                    "speech_provider": getattr(profile, "primary_speech_provider", "inworld"),
                     "voice_runtime": _inworld_voice_runtime(profile),
                     "llm_provider": profile.llm_provider,
                     "llm_model": profile.llm_model,
@@ -4775,7 +4797,9 @@ async def _reserve_inbound_call(
                     "stt_model_configured": configured_inworld_stt_model(profile=profile),
                     "stt_language": _effective_stt_language(model=model, profile=profile),
                     "stt_language_configured": profile.stt_language,
-                    "tts_model": "inworld-tts-2",
+                    "tts_model": SONIOX_TTS_MODEL
+                    if getattr(profile, "primary_speech_provider", "inworld") == "soniox"
+                    else "inworld-tts-2",
                     "tts_delivery_mode": _inworld_delivery_mode(profile),
                     "media_stream_started": False,
                     "runtime_setup_state": "reserved_before_dependency_load",
@@ -4942,13 +4966,13 @@ async def _open_call(
                 "agent_configuration": agent_configuration_snapshot(model),
                 "conversation_type": f"telephony{direction.title()}",
                 "channel": "phone",
-                "speech_provider": "inworld",
+                "speech_provider": getattr(profile, "primary_speech_provider", "inworld"),
                 "livekit_room": room_name,
                 "sip_trunk_id": attributes.get("sip.trunkID"),
                 "runtime": {
                     **dict((existing.call_metadata or {}).get("runtime") or {}),
                     "transport": "livekit_sip",
-                    "speech_provider": "inworld",
+                    "speech_provider": getattr(profile, "primary_speech_provider", "inworld"),
                     "voice_runtime": _inworld_voice_runtime(profile),
                     "llm_provider": profile.llm_provider,
                     "llm_model": profile.llm_model,
@@ -4956,7 +4980,9 @@ async def _open_call(
                     "stt_model_configured": configured_inworld_stt_model(profile=profile),
                     "stt_language": _effective_stt_language(model=model, profile=profile),
                     "stt_language_configured": profile.stt_language,
-                    "tts_model": "inworld-tts-2",
+                    "tts_model": SONIOX_TTS_MODEL
+                    if getattr(profile, "primary_speech_provider", "inworld") == "soniox"
+                    else "inworld-tts-2",
                     "tts_delivery_mode": _inworld_delivery_mode(profile),
                     "media_stream_started": False,
                     **recording_runtime_metadata(profile, transport="livekit_sip"),
@@ -4996,10 +5022,10 @@ async def _open_call(
                 "agent_configuration": agent_configuration_snapshot(model),
                 "conversation_type": f"telephony{direction.title()}",
                 "channel": "phone",
-                "speech_provider": "inworld",
+                "speech_provider": getattr(profile, "primary_speech_provider", "inworld"),
                 "runtime": {
                     "transport": "livekit_sip",
-                    "speech_provider": "inworld",
+                    "speech_provider": getattr(profile, "primary_speech_provider", "inworld"),
                     "voice_runtime": _inworld_voice_runtime(profile),
                     "llm_provider": profile.llm_provider,
                     "llm_model": profile.llm_model,
@@ -5007,7 +5033,9 @@ async def _open_call(
                     "stt_model_configured": configured_inworld_stt_model(profile=profile),
                     "stt_language": _effective_stt_language(model=model, profile=profile),
                     "stt_language_configured": profile.stt_language,
-                    "tts_model": "inworld-tts-2",
+                    "tts_model": SONIOX_TTS_MODEL
+                    if getattr(profile, "primary_speech_provider", "inworld") == "soniox"
+                    else "inworld-tts-2",
                     "tts_delivery_mode": _inworld_delivery_mode(profile),
                     "media_stream_started": False,
                     **recording_runtime_metadata(profile, transport="livekit_sip"),
@@ -5090,13 +5118,13 @@ async def _open_browser_call(
             **metadata,
             "agent_configuration": agent_configuration_snapshot(model),
             "served_configuration": served_configuration,
-            "speech_provider": "inworld",
+            "speech_provider": getattr(profile, "primary_speech_provider", "inworld"),
             "session_issuance": "connected",
             "effective_max_duration_seconds": model.max_call_duration_seconds,
             "runtime": {
                 **dict(metadata.get("runtime") or {}),
                 "transport": "livekit_webrtc",
-                "speech_provider": "inworld",
+                "speech_provider": getattr(profile, "primary_speech_provider", "inworld"),
                 "voice_runtime": _inworld_voice_runtime(profile),
                 "llm_provider": profile.llm_provider,
                 "llm_model": profile.llm_model,
@@ -5104,7 +5132,9 @@ async def _open_browser_call(
                 "stt_model_configured": configured_inworld_stt_model(profile=profile),
                 "stt_language": _effective_stt_language(model=model, profile=profile),
                 "stt_language_configured": profile.stt_language,
-                "tts_model": "inworld-tts-2",
+                "tts_model": SONIOX_TTS_MODEL
+                if getattr(profile, "primary_speech_provider", "inworld") == "soniox"
+                else "inworld-tts-2",
                 "tts_delivery_mode": _inworld_delivery_mode(profile),
                 "media_stream_started": False,
                 **recording_runtime_metadata(profile, transport="livekit_webrtc"),
@@ -5412,7 +5442,7 @@ async def _fail_outbound_preopen_call(
         if (
             not isinstance(runtime, dict)
             or runtime.get("transport") != "livekit_sip"
-            or metadata.get("speech_provider") != "inworld"
+            or metadata.get("speech_provider") not in {"inworld", "soniox"}
             or reserved_room not in (None, expected_room)
         ):
             return False
@@ -5959,6 +5989,9 @@ async def vav_inworld_session(ctx: JobContext) -> None:
         ctx.add_shutdown_callback(_shutdown)
         voice_runtime = _inworld_voice_runtime(profile)
         native_realtime = voice_runtime == "inworld_realtime"
+        soniox_active = getattr(profile, "primary_speech_provider", "inworld") == "soniox"
+        if soniox_active and (native_realtime or profile.llm_provider != "openai"):
+            raise RuntimeError("Soniox requires a direct OpenAI pipeline")
         usage_totals["usage_components_expected"] = (
             ["llm"] if native_realtime else ["llm", "tts", "stt"]
         )
@@ -5984,12 +6017,12 @@ async def vav_inworld_session(ctx: JobContext) -> None:
         # Greeting synthesis is independent of recognition context and the LLM.
         # Start it at the first billable, durably admitted boundary so its
         # provider latency overlaps lexicon loading and session construction.
-        tts_options = _inworld_tts_options(
-            model=model,
-            api_key=api_keys.speech,
-            profile=profile,
+        tts_options = (
+            soniox_pipeline.tts_options(model, api_keys.speech)
+            if soniox_active
+            else _inworld_tts_options(model=model, api_key=api_keys.speech, profile=profile)
         )
-        tts_engine = inworld.TTS(**tts_options)
+        tts_engine = soniox.TTS(**tts_options) if soniox_active else inworld.TTS(**tts_options)
         tts_preconnect_enabled = (
             single_pass_decision.enabled
             and runtime_config.get("tts_transport_preconnect_enabled", True) is True
@@ -6035,7 +6068,7 @@ async def vav_inworld_session(ctx: JobContext) -> None:
         recognition_context = _RuntimeRecognitionContext()
         from app.services.browser_access import tools_only
 
-        if native_realtime and not tools_only(profile):
+        if (native_realtime or soniox_active) and not tools_only(profile):
             terminology_started_at = time.monotonic()
             try:
                 recognition_context = await _load_runtime_recognition_context(
@@ -6079,6 +6112,9 @@ async def vav_inworld_session(ctx: JobContext) -> None:
         usage_totals["stt_model"] = resolved_stt_model
         usage_totals["stt_model_configured"] = configured_inworld_stt_model(profile=profile)
         usage_totals["stt_language"] = _effective_stt_language(model=model, profile=profile)
+        if soniox_active:
+            usage_totals["stt_language_hints"] = soniox_pipeline.language_hints(model, profile)
+            usage_totals["stt_language_hints_strict"] = True
         normal_endpointing = (
             ASSEMBLYAI_ENDPOINTING
             if resolved_stt_model == INWORLD_STT_FAST_ACCURATE
@@ -6086,7 +6122,7 @@ async def vav_inworld_session(ctx: JobContext) -> None:
         )
         turn_detection: Any = (
             "stt"
-            if resolved_stt_model == INWORLD_STT_FAST_ACCURATE
+            if resolved_stt_model == INWORLD_STT_FAST_ACCURATE or soniox_active
             else inference.TurnDetector(version=LIVEKIT_TURN_DETECTOR_VERSION)
         )
         if native_realtime:
@@ -6159,11 +6195,17 @@ async def vav_inworld_session(ctx: JobContext) -> None:
             if getattr(profile, "llm_provider", "inworld") == "inworld":
                 llm_options["base_url"] = f"{settings.inworld_base_url.rstrip('/')}/v1"
             session = AgentSession(
-                stt=inworld.STT(**stt_options),
+                stt=soniox_pipeline.build_stt(
+                    model, profile, api_keys.speech, knowledge_terminology
+                )
+                if soniox_active
+                else inworld.STT(**stt_options),
+                vad=soniox_pipeline.build_vad() if soniox_active else None,
+                max_tool_steps=8 if soniox_active else 3,
                 llm=openai.LLM(**llm_options),
                 tts=tts_engine,
                 turn_handling={
-                    "turn_detection": turn_detection,
+                    "turn_detection": "stt" if soniox_active else turn_detection,
                     "endpointing": {
                         **normal_endpointing,
                     },
@@ -6205,7 +6247,7 @@ async def vav_inworld_session(ctx: JobContext) -> None:
                 knowledge_base_id=knowledge_pin.knowledge_base_id,
                 telemetry=telemetry,
             )
-            if native_realtime
+            if native_realtime or soniox_active
             else VAVInworldAgent(
                 model=model,
                 variables=variables,
@@ -6215,7 +6257,7 @@ async def vav_inworld_session(ctx: JobContext) -> None:
             )
         )
         # Never change the accepted single-pass runtime merely to enable MCP.
-        if native_realtime and not single_pass_decision.enabled:
+        if (native_realtime or soniox_active) and not single_pass_decision.enabled:
             from app.livekit_runtime.mcp_tools import (
                 MCP_INSTRUCTIONS,
                 PRIVATE_MCP_INSTRUCTIONS,
@@ -6229,9 +6271,12 @@ async def vav_inworld_session(ctx: JobContext) -> None:
             report_presenter = ReportPresenter(
                 usage_totals,
                 InworldNarrativePlanner(
-                    api_key=api_keys.speech,
+                    api_key=api_keys.llm,
                     model=profile.llm_model,
-                    base_url=settings.inworld_base_url,
+                    base_url="https://api.openai.com"
+                    if soniox_active
+                    else settings.inworld_base_url,
+                    auth_scheme="Bearer" if soniox_active else "Basic",
                 ),
             )
             from app.livekit_runtime.mcp_answer_flow import (
@@ -6247,9 +6292,12 @@ async def vav_inworld_session(ctx: JobContext) -> None:
                 runtime_agent._mcp_checked_output_metrics = usage_totals
             answer_verifier = (
                 InworldAnswerVerifier(
-                    api_key=api_keys.speech,
+                    api_key=api_keys.llm,
                     model=profile.llm_model,
-                    base_url=settings.inworld_base_url,
+                    base_url="https://api.openai.com"
+                    if soniox_active
+                    else settings.inworld_base_url,
+                    auth_scheme="Bearer" if soniox_active else "Basic",
                     metrics=usage_totals,
                     reasoning_effort=runtime_config.get("llm_reasoning_effort"),
                 )
@@ -6726,6 +6774,10 @@ async def vav_inworld_session(ctx: JobContext) -> None:
                 ):
                     single_pass_controller.on_meaningful_user_speech()
                 return
+            if soniox_active and model.language_switching_enabled and reported_language:
+                language = reported_language.split("-")[0].lower()
+                if language in soniox_pipeline.language_hints(model, profile):
+                    tts_engine.update_options(language=language)
             if getattr(event, "is_final", False):
                 raw_transcript = str(getattr(event, "transcript", "") or "")
                 transcript = raw_transcript.strip()
