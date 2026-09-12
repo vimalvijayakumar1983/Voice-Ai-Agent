@@ -2118,3 +2118,159 @@ async def test_rendered_listing_pages_behind_a_next_button_become_one_source(mon
         "Dr Four | General Practitioner",
     ]
     assert page.text.count("Our Doctors") == 1
+
+
+async def test_knowledge_search_scans_sources_and_previews_retrieval(
+    client, auth_headers, tenant, db
+):
+    """An operator can see where a term appears and what the agent would retrieve."""
+    knowledge = KnowledgeBase(
+        tenant_id=tenant.id,
+        name="Imaging knowledge",
+        owner_company="Royal Medical Center",
+        sync_status="local_only",
+        approval_status="draft",
+    )
+    db.add(knowledge)
+    await db.commit()
+
+    added = await client.post(
+        f"/api/v1/knowledge/{knowledge.id}/sources/text",
+        headers=auth_headers,
+        json={
+            "name": "Radiology services",
+            "processing_mode": "fast",
+            "content": (
+                "Royal Medical Center radiology department. "
+                "MRI scans and CT scans are available every weekday with a referral. "
+                "Ultrasound is available without a referral."
+            ),
+        },
+    )
+    assert added.status_code == 200
+
+    response = await client.get(
+        f"/api/v1/knowledge/{knowledge.id}/search",
+        headers=auth_headers,
+        params={"q": "Do you have CT and MRI services?"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["terms"] == ["ct", "mri", "services"]
+    assert len(body["sources"]) == 1
+    match = body["sources"][0]
+    assert match["name"] == "Radiology services"
+    assert match["matched_terms"] == ["ct", "mri"]
+    assert match["match_count"] == 2
+    assert any("MRI scans and CT scans" in snippet for snippet in match["snippets"])
+    assert body["retrieval"]["scope"] == "draft"
+    assert body["retrieval"]["status"] == "verified"
+    assert any("CT scans" in chunk["text"] for chunk in body["retrieval"]["chunks"])
+
+    missing = await client.get(
+        f"/api/v1/knowledge/{knowledge.id}/search",
+        headers=auth_headers,
+        params={"q": "Do you offer dialysis?"},
+    )
+    assert missing.status_code == 200
+    assert missing.json()["sources"] == []
+    assert missing.json()["retrieval"]["status"] == "no_match"
+
+    approved = await client.post(
+        f"/api/v1/knowledge/{knowledge.id}/approval",
+        headers=auth_headers,
+        json={"approved": True},
+    )
+    assert approved.status_code == 200
+    released = await client.get(
+        f"/api/v1/knowledge/{knowledge.id}/search",
+        headers=auth_headers,
+        params={"q": "MRI"},
+    )
+    assert released.status_code == 200
+    assert released.json()["retrieval"]["scope"] == "approved_release"
+    assert released.json()["retrieval"]["status"] == "verified"
+
+    too_short = await client.get(
+        f"/api/v1/knowledge/{knowledge.id}/search", headers=auth_headers, params={"q": "x"}
+    )
+    assert too_short.status_code == 422
+    # Padding must not get a one-character query past the two-character minimum.
+    padded = await client.get(
+        f"/api/v1/knowledge/{knowledge.id}/search", headers=auth_headers, params={"q": "  x  "}
+    )
+    assert padded.status_code == 422
+    blank = await client.get(
+        f"/api/v1/knowledge/{knowledge.id}/search", headers=auth_headers, params={"q": "    "}
+    )
+    assert blank.status_code == 422
+
+
+def test_knowledge_search_scan_matches_verified_facts_and_inflections():
+    from types import SimpleNamespace
+    from uuid import uuid4
+
+    from app.services.knowledge_search import scan_sources, search_terms
+
+    source = SimpleNamespace(
+        id=uuid4(),
+        name="Doctors",
+        source_type="url",
+        raw_content="Dr. Ahmed Ali | Consultant Urologist | Arabic, English | 12+ Years",
+        content=None,
+        structured_content={
+            "facts": [
+                {
+                    "subject": "Dr. Ahmed Ali",
+                    "predicate": "specialty",
+                    "value": "Consultant Urologist",
+                    "evidence": "Dr. Ahmed Ali | Consultant Urologist",
+                    "search_phrases": ["urology doctor"],
+                },
+                {
+                    "subject": "Dr. Sara Noor",
+                    "predicate": "specialty",
+                    "value": "Dermatologist",
+                    "evidence": "Dr. Sara Noor | Dermatologist",
+                },
+            ]
+        },
+    )
+    assert search_terms("Which doctor is in urology?") == ["doctor", "urology"]
+    terms, matches = scan_sources([source], "urology")
+    assert terms == ["urology"]
+    assert len(matches) == 1
+    assert matches[0].matched_terms == ["urology"]
+    # One text hit ("Urologist" by prefix) and one fact.
+    assert matches[0].match_count == 2
+    assert [fact.subject for fact in matches[0].facts] == ["Dr. Ahmed Ali"]
+    assert "Consultant Urologist" in matches[0].snippets[0]
+    assert scan_sources([source], "ct")[1] == []
+
+
+def test_knowledge_search_snippets_show_every_matched_term():
+    """A term that repeats early must not crowd the other matched terms out."""
+    from types import SimpleNamespace
+    from uuid import uuid4
+
+    from app.services.knowledge_search import scan_sources
+
+    filler = " ".join(["word"] * 80)
+    text = (
+        f"MRI suite one. {filler} MRI suite two. {filler} MRI suite three. {filler} "
+        f"MRI suite four. {filler} CT scanner room."
+    )
+    source = SimpleNamespace(
+        id=uuid4(),
+        name="Imaging",
+        source_type="text",
+        raw_content=text,
+        content=None,
+        structured_content={},
+    )
+    _terms, matches = scan_sources([source], "MRI CT")
+    assert matches[0].matched_terms == ["mri", "ct"]
+    assert len(matches[0].snippets) == 3
+    assert "MRI suite one" in matches[0].snippets[0]
+    assert "CT scanner room" in matches[0].snippets[1]
+    assert "MRI suite two" in matches[0].snippets[2]

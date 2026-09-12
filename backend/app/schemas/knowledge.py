@@ -328,6 +328,41 @@ class AgentKnowledgeBindRequest(BaseModel):
     agent_id: UUID
 
 
+class KnowledgeSearchFact(BaseModel):
+    subject: str
+    predicate: str
+    value: str
+
+
+class KnowledgeSearchSourceMatch(BaseModel):
+    source_id: UUID
+    name: str
+    source_type: str
+    matched_terms: list[str]
+    match_count: int
+    snippets: list[str]
+    facts: list[KnowledgeSearchFact]
+
+
+class KnowledgeRetrievalChunk(BaseModel):
+    source: str
+    text: str
+
+
+class KnowledgeRetrievalPreview(BaseModel):
+    scope: Literal["approved_release", "draft"]
+    status: Literal["verified", "no_match"]
+    chunks: list[KnowledgeRetrievalChunk]
+    note: str | None = None
+
+
+class KnowledgeSearchResponse(BaseModel):
+    query: str
+    terms: list[str]
+    sources: list[KnowledgeSearchSourceMatch]
+    retrieval: KnowledgeRetrievalPreview
+
+
 class KnowledgeApprovalRequest(BaseModel):
     approved: bool
     # Explicit acknowledgement that some records were not captured as facts.

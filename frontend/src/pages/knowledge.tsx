@@ -1,5 +1,5 @@
 import { useRouter } from 'next/router';
-import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { FormEvent, Fragment, ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   BadgeCheck,
   BookOpenCheck,
@@ -38,6 +38,7 @@ import {
   KnowledgeProcessingMode,
   KnowledgeServingRevision,
   KnowledgeScope,
+  KnowledgeSearchResult,
   KnowledgeSource,
   VoiceAgent,
 } from '@/lib/api';
@@ -666,6 +667,8 @@ export default function KnowledgeStudio() {
                 />
               )}
 
+              <KnowledgeSearchSection key={selected.id} knowledgeId={selected.id} approved={Boolean(selected.serving_revision)} />
+
               <SourcesSection
                 sources={selected.sources}
                 canRepair={canEditKnowledge}
@@ -868,6 +871,80 @@ function SourceReview({ source }: { source: KnowledgeSource }) {
       <pre style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>{preview.raw_text || 'Original extraction unavailable; re-upload this source.'}</pre>
     </div>}
   </details>;
+}
+
+function highlightTerms(text: string, terms: string[]): ReactNode {
+  if (terms.length === 0) return text;
+  const escaped = terms.map((term) => term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+  const pattern = new RegExp(`(${escaped.join('|')})`, 'gi');
+  return text.split(pattern).map((part, index) => (
+    terms.some((term) => part.toLowerCase().startsWith(term)) && index % 2 === 1
+      ? <mark key={index}>{part}</mark>
+      : <Fragment key={index}>{part}</Fragment>
+  ));
+}
+
+function KnowledgeSearchSection({ knowledgeId, approved }: { knowledgeId: string; approved: boolean }) {
+  const [query, setQuery] = useState('');
+  const [result, setResult] = useState<KnowledgeSearchResult | null>(null);
+  const [searching, setSearching] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const runSearch = async (event?: FormEvent) => {
+    event?.preventDefault();
+    const trimmed = query.trim();
+    if (trimmed.length < 2) return;
+    setSearching(true);
+    setError(null);
+    try {
+      setResult(await api.searchKnowledgeBase(knowledgeId, trimmed));
+    } catch (caught) {
+      setError(errorMessage(caught, 'VAV could not search this knowledge base.'));
+    } finally {
+      setSearching(false);
+    }
+  };
+
+  const retrievalLabel = result?.retrieval.scope === 'approved_release' ? 'approved release' : 'draft sources';
+  return <section className={styles.section} aria-labelledby="search-heading">
+    <div className={styles.sectionHeading}>
+      <div><span className={styles.sectionIcon}><Search size={15} /></span><div><h3 id="search-heading">Search this knowledge base</h3><p>Check what the sources contain and what the agent would retrieve for a caller&apos;s question before you test a call.</p></div></div>
+    </div>
+    <div className={styles.searchPanel}>
+      <form className={styles.searchForm} onSubmit={runSearch}>
+        <label className={styles.searchField}>
+          <Search size={13} />
+          <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="e.g. Do you have CT and MRI services?" aria-label="Search knowledge base" maxLength={200} />
+        </label>
+        <button type="submit" className="btn btn-secondary" disabled={searching || query.trim().length < 2}>
+          {searching ? <Loader2 size={14} className="spin" /> : <Search size={14} />} Search
+        </button>
+      </form>
+      {error && <div className={styles.inlineError} role="alert"><CircleAlert size={14} /><span>{error}</span></div>}
+      {result && <div className={styles.searchResults}>
+        <div className={styles.searchGroup}>
+          <h4>
+            {result.retrieval.status === 'verified' ? <CheckCircle2 size={14} /> : <CircleAlert size={14} />}
+            What the agent would retrieve ({retrievalLabel})
+          </h4>
+          {result.retrieval.note && <p className={styles.searchFact}>{result.retrieval.note}</p>}
+          {result.retrieval.status === 'no_match'
+            ? <p className={styles.searchSnippet}>No verified evidence for this question. The agent would say it cannot confirm it{approved ? '' : ' once approved'}. Add a source that states it, then re-approve.</p>
+            : result.retrieval.chunks.map((chunk, index) => <div key={index} className={styles.searchChunk}><strong>{chunk.source}</strong><pre>{chunk.text}</pre></div>)}
+        </div>
+        <div className={styles.searchGroup}>
+          <h4><FileText size={14} /> Where it appears in the sources</h4>
+          {result.sources.length === 0
+            ? <p className={styles.searchSnippet}>No source mentions {result.terms.length ? result.terms.map((term) => `"${term}"`).join(', ') : 'this'}.</p>
+            : result.sources.map((source) => <div key={source.source_id} className={styles.searchSource}>
+              <header><strong>{source.name}</strong><span>{source.match_count} {source.match_count === 1 ? 'match' : 'matches'} · {source.matched_terms.join(', ')}</span></header>
+              {source.snippets.map((snippet, index) => <p key={index} className={styles.searchSnippet}>{highlightTerms(snippet, result.terms)}</p>)}
+              {source.facts.map((fact, index) => <p key={`fact-${index}`} className={styles.searchFact}><b>{highlightTerms(fact.subject, result.terms)}</b> · {highlightTerms(fact.predicate, result.terms)}: {highlightTerms(fact.value, result.terms)}</p>)}
+            </div>)}
+        </div>
+      </div>}
+    </div>
+  </section>;
 }
 
 function SourcesSection({ sources, canRepair, canRemove, busy, onRepair, onCompile, onRemove }: { sources: KnowledgeSource[]; canRepair: boolean; canRemove: boolean; busy: boolean; onRepair: (source: KnowledgeSource) => void; onCompile: (source: KnowledgeSource) => void; onRemove: (source: KnowledgeSource) => void }) {

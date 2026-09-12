@@ -335,6 +335,39 @@ export interface KnowledgeSourcePreview {
   compiled_at: string | null;
 }
 
+export interface KnowledgeSearchFact {
+  subject: string;
+  predicate: string;
+  value: string;
+}
+
+export interface KnowledgeSearchSourceMatch {
+  source_id: string;
+  name: string;
+  source_type: string;
+  matched_terms: string[];
+  match_count: number;
+  snippets: string[];
+  facts: KnowledgeSearchFact[];
+}
+
+export interface KnowledgeRetrievalChunk {
+  source: string;
+  text: string;
+}
+
+export interface KnowledgeSearchResult {
+  query: string;
+  terms: string[];
+  sources: KnowledgeSearchSourceMatch[];
+  retrieval: {
+    scope: 'approved_release' | 'draft';
+    status: 'verified' | 'no_match';
+    chunks: KnowledgeRetrievalChunk[];
+    note: string | null;
+  };
+}
+
 export interface KnowledgeCrawlPage {
   id: string;
   knowledge_source_id: string | null;
@@ -1828,6 +1861,12 @@ class ApiClient {
 
   async refreshKnowledgeBase(id: string) {
     return this.request<KnowledgeBase>(`/api/v1/knowledge/${id}/refresh`, { method: 'POST' });
+  }
+
+  async searchKnowledgeBase(id: string, query: string) {
+    return this.request<KnowledgeSearchResult>(
+      `/api/v1/knowledge/${id}/search?q=${encodeURIComponent(query)}`,
+    );
   }
 
   async reindexKnowledgeBase(id: string) {

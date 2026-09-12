@@ -321,3 +321,22 @@
 @media (prefers-reduced-motion: reduce) {
   .progressRail > div { transition: none; }
 }
+
+.searchPanel { display: grid; gap: 12px; }
+.searchForm { display: flex; gap: 8px; align-items: center; }
+.searchForm .searchField { flex: 1; }
+.searchResults { display: grid; gap: 12px; }
+.searchGroup { border: 1px solid var(--border); border-radius: 10px; padding: 12px; background: white; display: grid; gap: 8px; }
+.searchGroup h4 { margin: 0; font-size: 11px; font-weight: 750; color: var(--text-primary); display: flex; align-items: center; gap: 8px; }
+.searchChunk { padding: 9px 10px; border: 1px solid var(--border); border-radius: 8px; background: #fcfcfe; font-size: 11px; line-height: 1.5; }
+.searchChunk strong { display: block; margin-bottom: 4px; color: var(--accent); font-size: 10px; }
+.searchChunk pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; color: var(--text-secondary); max-height: 240px; overflow-y: auto; }
+.searchSource { display: grid; gap: 6px; padding: 9px 0; border-top: 1px solid var(--border); }
+.searchSource:first-of-type { border-top: 0; padding-top: 0; }
+.searchSource header { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; font-size: 11px; }
+.searchSource header strong { color: var(--text-primary); }
+.searchSource header span { color: var(--text-tertiary); font-size: 10px; }
+.searchSnippet { margin: 0; color: var(--text-secondary); font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
+.searchSnippet mark, .searchFact mark { background: #fff1a8; color: inherit; padding: 0 1px; border-radius: 2px; }
+.searchFact { margin: 0; color: var(--text-secondary); font-size: 10px; }
+.searchFact b { color: var(--text-primary); font-weight: 650; }
