@@ -238,8 +238,10 @@ Approval and coverage fixes from the Royal Medical re-index on 11 September:
 - Specialty questions match the directory card's word forms: "urology" finds
   a "Consultant Urologist", "pediatric" a "Pediatrician", "psychiatry" a
   "Psychiatrist", and "children", "skin", "heart", "teeth" and "eyes" expand
-  to their specialty. A framing verb such as "treats" is not a fact the card
-  must state. Before this, every specialty question returned no evidence
+  to their specialty. In a directory question a framing verb such as
+  "treats" is not a fact the card must state; any other question keeps every
+  word ("handling fee"). Ordinary words never expand ("clinic" is not
+  "clinician"). Before this, every specialty question returned no evidence
   because the strict content rule compared "urology" with "urologist".
 - Every knowledge lookup writes one content-free log line
   (`livekit_knowledge_lookup`: turn, result, path, evidence size, timing) so a

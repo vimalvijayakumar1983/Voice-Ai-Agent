@@ -623,6 +623,8 @@ def _directory_document(specialties):
         ("Is there a dermatology specialist?", "Dr. Person 4"),
         ("Which doctor treats children?", "Dr. Person 6"),
         ("Do you have a psychiatry doctor?", "Dr. Person 1"),
+        ("Which doctor does plastic surgery?", "Dr. Person 7"),
+        ("Is there a dental doctor?", "Dr. Person 8"),
     ],
 )
 def test_specialty_questions_match_the_directory_card_word_forms(query, expected):
@@ -642,6 +644,7 @@ def test_specialty_questions_match_the_directory_card_word_forms(query, expected
             "Consultant Otolaryngology",
             "Specialist Pediatrician",
             "Consultant Plastic Surgeon",
+            "General Dentist",
         ]
     )
     plan = build_contextual_query_plan(query)
@@ -650,3 +653,27 @@ def test_specialty_questions_match_the_directory_card_word_forms(query, expected
     )
     assert matches, query
     assert f"SUBJECT: {expected}" in matches[0].text, query
+
+
+def test_specialty_forms_never_widen_ordinary_words_or_framing_nouns():
+    """Codex review on #49: no "-ic" family, and framing verbs only for directory questions."""
+    from app.services.knowledge_retrieval import _specialty_forms, rank_knowledge
+
+    assert _specialty_forms("clinic") == set()
+    assert _specialty_forms("electric") == set()
+    assert _specialty_forms("nondental") == set()
+    assert _specialty_forms("surgeon") == {"surgery", "surgical", "surgeons"}
+    assert _specialty_forms("urology") == {"urologist", "urological", "urologists"}
+
+    fees = (
+        "VERIFIED STRUCTURED FACTS\nSUBJECT: Royal Medical Center\n"
+        "- cancellation fee: AED 100\n  Search phrases: cancellation fee\n"
+        "  Evidence: Cancellation fee: AED 100"
+    )
+    company = (
+        "VERIFIED STRUCTURED FACTS\nSUBJECT: Royal Medical Center\n"
+        "- description: a clinic in Abu Dhabi\n  Search phrases: about the clinic\n"
+        "  Evidence: Royal Medical Center is a clinic in Abu Dhabi"
+    )
+    assert not rank_knowledge("What is the handling fee?", [("Policies", fees)])
+    assert not rank_knowledge("Who is the clinician?", [("About", company)])
