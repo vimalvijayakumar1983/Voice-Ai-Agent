@@ -235,6 +235,17 @@ Approval and coverage fixes from the Royal Medical re-index on 11 September:
   filter and the exact-fact index filter when an agent carries a company
   scope, so a scope naming the short form still reads a page-qualified
   fact and a scope naming another organization stays fenced.
+- Specialty questions match the directory card's word forms: "urology" finds
+  a "Consultant Urologist", "pediatric" a "Pediatrician", "psychiatry" a
+  "Psychiatrist", and "children", "skin", "heart", "teeth" and "eyes" expand
+  to their specialty. In a directory question a framing verb such as
+  "treats" is not a fact the card must state; any other question keeps every
+  word ("handling fee"). Ordinary words never expand ("clinic" is not
+  "clinician"). Before this, every specialty question returned no evidence
+  because the strict content rule compared "urology" with "urologist".
+- Every knowledge lookup writes one content-free log line
+  (`livekit_knowledge_lookup`: turn, result, path, evidence size, timing) so a
+  production call can be diagnosed from the agent service logs.
 - The publication retrieval check compares words rather than the raw string,
   so presentation punctuation cannot fail a release, and a failure names the
   expected term and the sources that were retrieved instead.

@@ -263,6 +263,10 @@ _CONTACT_QUERY_TOKENS = {
     "phone",
     "telephone",
 }
+# "Which doctor treats children?" asks for a specialty; the verb is request
+# framing, not a fact the card must state. Only a directory question drops
+# these words: "What is the handling fee?" keeps "handling" as its topic.
+_REQUEST_FRAMING_TOKENS = frozenset({"handle", "handling", "treat", "treating"})
 _QUERY_INTENT_TOKENS = (
     _BROAD_QUERY_TOKENS
     | _DIRECTORY_QUERY_TOKENS
@@ -363,6 +367,11 @@ _SEMANTIC_CONCEPT_GROUPS: tuple[tuple[str, ...], ...] = (
     ("cost", "price", "pricing", "fee"),
     ("hour", "timing", "schedule", "opening"),
     ("address", "location", "where", "based"),
+    ("child", "children", "kid", "kids", "pediatric", "paediatric", "pediatrician"),
+    ("skin", "dermatology", "dermatologist"),
+    ("teeth", "tooth", "dental", "dentist", "dentistry"),
+    ("heart", "cardiology", "cardiologist"),
+    ("eye", "eyes", "ophthalmology", "ophthalmologist"),
 )
 _SEMANTIC_CONCEPTS = {term: group for group in _SEMANTIC_CONCEPT_GROUPS for term in group}
 _QUESTION_WORD_CONCEPTS = frozenset({"where"})
@@ -400,11 +409,45 @@ def _tokens(value: str) -> set[str]:
     return _token_forms(_base_tokens(value))
 
 
+# Specialty vocabulary is morphological: a directory card says "Consultant
+# Urologist" while a caller asks for "urology"; a "Pediatrician" is asked for
+# as "pediatric" or "pediatrics". Each family maps to the same searchable forms
+# so the exact-match content rule is not defeated by a suffix. Suffix families
+# need a stem ("ur" for urologist) so that no bare suffix expands; whole-word
+# families (dentist, surgeon) match the word itself with an empty stem. There
+# is deliberately no generic "-ic"/"-ician" family: "clinic" must not become
+# "clinician" nor "electric" an "electrician".
+_SPECIALTY_SUFFIX_FAMILIES: tuple[tuple[int, tuple[str, ...]], ...] = (
+    (2, ("ologist", "ology", "ological", "ologists")),
+    (2, ("iatrician", "iatric", "iatrics", "iatricians")),
+    (2, ("iatrist", "iatry", "iatric", "iatrists")),
+    (0, ("dentist", "dental", "dentistry", "dentists")),
+    (0, ("surgeon", "surgery", "surgical", "surgeons")),
+    (0, ("obstetrician", "obstetric", "obstetrics", "obstetricians")),
+    (0, ("dietician", "dietitian", "dietetic", "dietetics", "dieticians", "dietitians")),
+)
+
+
+def _specialty_forms(token: str) -> set[str]:
+    """Return the other word forms of a medical specialty token, or nothing."""
+    for min_stem, family in _SPECIALTY_SUFFIX_FAMILIES:
+        for suffix in family:
+            if token.endswith(suffix) and len(token) - len(suffix) >= min_stem:
+                stem = token[: -len(suffix)]
+                if min_stem == 0 and stem:
+                    # Whole-word families never expand a longer word that merely
+                    # ends with the term ("nondental" is not "dental").
+                    continue
+                return {stem + other for other in family if other != suffix}
+    return set()
+
+
 def _token_forms(base_tokens: list[str]) -> set[str]:
     tokens: set[str] = set()
     for token in base_tokens:
         tokens.add(token)
         tokens.add(_singular(token))
+        tokens.update(_specialty_forms(token))
         if token == "dr":
             tokens.add("doctor")
     return tokens
@@ -1161,6 +1204,10 @@ def rank_knowledge(
     broad_query = _is_broad_query(query, query_tokens)
     service_capability_query = _is_service_capability_query(query)
     directory_query = bool(query_tokens & _DIRECTORY_QUERY_TOKENS)
+    # A directory question ("which doctor treats children") may leave its
+    # framing verb off the card; any other question keeps every word.
+    framing_tokens = _REQUEST_FRAMING_TOKENS if directory_query else frozenset()
+    non_substantive_tokens = _QUERY_INTENT_TOKENS | framing_tokens
     requested_subject_tokens = _known_subject_filter(query, documents)
     preferred_subject_key = ""
     if preferred_subject and not directory_query:
@@ -1206,7 +1253,9 @@ def rank_knowledge(
                 # Company/title matches cannot satisfy the requested topic.
                 # Healthcare, pricing, dates etc must occur in this fact's
                 # searchable core, not only in another fact's shared quotation.
-                topic_tokens = query_tokens - structured_subject_tokens - _BROAD_QUERY_TOKENS
+                topic_tokens = (
+                    query_tokens - structured_subject_tokens - _BROAD_QUERY_TOKENS - framing_tokens
+                )
                 if topic_tokens and not topic_tokens <= chunk_tokens:
                     continue
             chunk_has_phone = _has_phone_evidence(chunk, chunk_tokens)
@@ -1259,7 +1308,7 @@ def rank_knowledge(
                     substantive_topic_indexes = [
                         index
                         for index in unexplained_topic_indexes
-                        if ordered_query_tokens[index] not in _QUERY_INTENT_TOKENS
+                        if ordered_query_tokens[index] not in non_substantive_tokens
                     ]
                     if substantive_topic_indexes:
                         if not all(

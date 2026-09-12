@@ -3733,3 +3733,29 @@ async def test_livekit_route_verification_rejects_unusable_outbound_route(
             agent_name="vav-inworld",
             assigned_numbers=["+97141234567"],
         )
+
+
+def test_knowledge_lookup_writes_one_content_free_log_line(caplog):
+    """A production call is diagnosable from service logs without its transcript."""
+    telemetry = _LiveKitRuntimeTelemetry(
+        runtime_metrics={"barge_in_count": 0},
+        end_to_end_samples=[],
+        opened_at=1.0,
+    )
+    telemetry.on_final_transcript("Which doctor is in urology?")
+    with caplog.at_level("INFO", logger="app.livekit_runtime.worker"):
+        telemetry.record_knowledge_lookup(
+            elapsed_ms=42,
+            result="no_match",
+            evidence_chars=0,
+            query_variant_count=3,
+            details={"knowledge_retrieval_path": "general_knowledge"},
+        )
+    records = [record for record in caplog.records if record.msg == "livekit_knowledge_lookup"]
+    assert len(records) == 1
+    record = records[0]
+    assert record.knowledge_result == "no_match"
+    assert record.knowledge_tool_ms == 42
+    assert record.knowledge_query_variant_count == 3
+    assert record.knowledge_retrieval_path == "general_knowledge"
+    assert "urology" not in caplog.text

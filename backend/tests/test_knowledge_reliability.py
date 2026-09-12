@@ -596,3 +596,84 @@ async def test_company_location_question_prefers_the_company_fact_over_item_phra
     first_block = context.split("\n\n")[0]
     assert "SUBJECT: Royal Medical Center" in first_block
     assert address in first_block
+
+
+def _directory_document(specialties):
+    blocks = []
+    for index, specialty in enumerate(specialties):
+        name = f"Dr. Person {index}"
+        role = specialty.split()[-1].lower()
+        blocks.append(
+            "VERIFIED STRUCTURED FACTS\n"
+            f"SUBJECT: {name}\n"
+            f"- specialty: {specialty}\n"
+            f"  Search phrases: What is {name}'s specialty? | Is {name} a {role}? | "
+            f"Who is the {specialty.lower()} at Royal Medical Center?\n"
+            f"  Evidence: {name} | {specialty} | Arabic, English | 10+ Years"
+        )
+    return "\n\n".join(blocks)
+
+
+@pytest.mark.parametrize(
+    "query,expected",
+    [
+        ("Which doctor is in urology?", "Dr. Person 0"),
+        ("Do you have a urology doctor?", "Dr. Person 0"),
+        ("Who is the cardiology doctor?", "Dr. Person 3"),
+        ("Is there a dermatology specialist?", "Dr. Person 4"),
+        ("Which doctor treats children?", "Dr. Person 6"),
+        ("Do you have a psychiatry doctor?", "Dr. Person 1"),
+        ("Which doctor does plastic surgery?", "Dr. Person 7"),
+        ("Is there a dental doctor?", "Dr. Person 8"),
+    ],
+)
+def test_specialty_questions_match_the_directory_card_word_forms(query, expected):
+    """A caller says "urology"; the card says "Consultant Urologist"."""
+    from app.services.knowledge_retrieval import (
+        _rank_contextual_knowledge,
+        build_contextual_query_plan,
+    )
+
+    document = _directory_document(
+        [
+            "Consultant Urologist",
+            "Specialist Psychiatrist",
+            "General Practitioner",
+            "Consultant Cardiologist",
+            "Specialist Dermatologist",
+            "Consultant Otolaryngology",
+            "Specialist Pediatrician",
+            "Consultant Plastic Surgeon",
+            "General Dentist",
+        ]
+    )
+    plan = build_contextual_query_plan(query)
+    matches = _rank_contextual_knowledge(
+        plan.variants, [("Best Doctors Near Me in Abu Dhabi", document)], 6, "Royal Medical Center"
+    )
+    assert matches, query
+    assert f"SUBJECT: {expected}" in matches[0].text, query
+
+
+def test_specialty_forms_never_widen_ordinary_words_or_framing_nouns():
+    """Codex review on #49: no "-ic" family, and framing verbs only for directory questions."""
+    from app.services.knowledge_retrieval import _specialty_forms, rank_knowledge
+
+    assert _specialty_forms("clinic") == set()
+    assert _specialty_forms("electric") == set()
+    assert _specialty_forms("nondental") == set()
+    assert _specialty_forms("surgeon") == {"surgery", "surgical", "surgeons"}
+    assert _specialty_forms("urology") == {"urologist", "urological", "urologists"}
+
+    fees = (
+        "VERIFIED STRUCTURED FACTS\nSUBJECT: Royal Medical Center\n"
+        "- cancellation fee: AED 100\n  Search phrases: cancellation fee\n"
+        "  Evidence: Cancellation fee: AED 100"
+    )
+    company = (
+        "VERIFIED STRUCTURED FACTS\nSUBJECT: Royal Medical Center\n"
+        "- description: a clinic in Abu Dhabi\n  Search phrases: about the clinic\n"
+        "  Evidence: Royal Medical Center is a clinic in Abu Dhabi"
+    )
+    assert not rank_knowledge("What is the handling fee?", [("Policies", fees)])
+    assert not rank_knowledge("Who is the clinician?", [("About", company)])
