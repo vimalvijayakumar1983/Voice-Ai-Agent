@@ -6870,7 +6870,7 @@ async def vav_inworld_session(ctx: JobContext) -> None:
         await session.start(
             room=ctx.room,
             agent=runtime_agent,
-            room_options=production_room_options(),
+            room_options=production_room_options(telephony=not browser_session),
         )
         usage_totals["media_stream_started"] = True
         telemetry.mark_session_ready()

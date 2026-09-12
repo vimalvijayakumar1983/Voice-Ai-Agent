@@ -1605,7 +1605,7 @@ async def test_inbound_session_start_failure_after_greeting_provider_request_is_
     monkeypatch.setattr(livekit_worker.inference, "TurnDetector", lambda **_kwargs: object())
     monkeypatch.setattr(livekit_worker, "AgentSession", build_session)
     monkeypatch.setattr(livekit_worker, "prepare_greeting_audio", lambda **_kwargs: prepared)
-    monkeypatch.setattr(livekit_worker, "production_room_options", lambda: object())
+    monkeypatch.setattr(livekit_worker, "production_room_options", lambda **_kwargs: object())
     outbox_kick = Mock()
     monkeypatch.setattr(
         "app.tasks.campaign_tasks.dispatch_provider_callback_outbox.delay",
