@@ -3942,7 +3942,27 @@ class VAVInworldRealtimeAgent(VAVInworldAgent):
     """Native agent for the grounded tool-loop and explicit single-pass policies."""
 
     def llm_node(self, chat_ctx, tools, model_settings):
+        latency_metrics = getattr(self, "_pipeline_latency_metrics", None)
+        if latency_metrics is not None:
+            from app.livekit_runtime.pipeline_latency import request_context
+
+            chat_ctx, omitted_chars = request_context(
+                chat_ctx,
+                enabled=getattr(self, "_soniox_context_window_enabled", False),
+            )
         chunks = super().llm_node(chat_ctx, tools, model_settings)
+        if latency_metrics is not None:
+            from app.livekit_runtime.pipeline_latency import observe_requests
+
+            telemetry = getattr(self, "_telemetry", None)
+            trace = telemetry._latest_trace() if telemetry is not None else None
+            chunks = observe_requests(
+                chunks,
+                metrics=latency_metrics,
+                chat_ctx=chat_ctx,
+                removed_chars=omitted_chars,
+                turn_number=trace.get("turn") if trace else None,
+            )
         metrics = getattr(self, "_mcp_checked_output_metrics", None)
         if metrics is not None:
             return soniox_pipeline.gate_unchecked_text(chunks, metrics)
@@ -6355,6 +6375,18 @@ async def vav_inworld_session(ctx: JobContext) -> None:
                 await runtime_agent.update_tools([*runtime_agent.tools, *mcp_tools])
                 await runtime_agent.update_instructions(
                     runtime_agent.instructions + mcp_instructions
+                )
+            if soniox_active:
+                from app.livekit_runtime.pipeline_latency import context_window_enabled
+
+                runtime_agent._pipeline_latency_metrics = usage_totals
+                runtime_agent._soniox_context_window_enabled = context_window_enabled(
+                    model.agent_metadata,
+                    has_mcp_tools=bool(mcp_tools),
+                    tools_only=tools_only(profile),
+                )
+                usage_totals["soniox_knowledge_context_window_enabled"] = (
+                    runtime_agent._soniox_context_window_enabled
                 )
         if (
             single_pass_decision.enabled

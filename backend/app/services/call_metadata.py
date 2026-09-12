@@ -1,6 +1,7 @@
 """Safe per-call configuration snapshots and their API projection."""
 
 import hashlib
+import math
 from typing import Any
 
 
@@ -128,6 +129,7 @@ def public_call_metadata(value: Any) -> dict[str, Any] | None:
             "recording_blocker",
         }
         numeric_fields = {
+            "pipeline_llm_request_count",
             "mcp_source_delivery_count",
             "mcp_retry_count",
             "mcp_presentation_requests",
@@ -252,6 +254,8 @@ def public_call_metadata(value: Any) -> dict[str, Any] | None:
             ):
                 safe_runtime[field] = runtime[field]
         for field in (
+            "pipeline_llm_requests_truncated",
+            "soniox_knowledge_context_window_enabled",
             "runtime_usage_components_complete",
             "knowledge_interpretation_usage_incomplete",
             "knowledge_repair_transport_close_failed",
@@ -309,6 +313,48 @@ def public_call_metadata(value: Any) -> dict[str, Any] | None:
         }:
             if field in runtime and runtime[field] is None:
                 safe_runtime[field] = None
+        requests = runtime.get("pipeline_llm_requests")
+        if isinstance(requests, list):
+            # Expose measurements only, never prompt text, tool payloads or raw IDs.
+            numeric_request_fields = {
+                "sequence",
+                "turn",
+                "instruction_chars",
+                "message_chars",
+                "tool_output_chars",
+                "omitted_history_chars",
+                "first_text_ms",
+                "first_tool_call_ms",
+                "duration_ms",
+                "prompt_tokens",
+                "cached_prompt_tokens",
+                "completion_tokens",
+            }
+            safe_requests = []
+            for request in requests[-128:]:
+                if not isinstance(request, dict):
+                    continue
+                safe_request = {}
+                for key in numeric_request_fields:
+                    if key not in request:
+                        continue
+                    measurement = request[key]
+                    if measurement is None or (
+                        isinstance(measurement, (int, float))
+                        and not isinstance(measurement, bool)
+                        and 0 <= measurement <= 1e12
+                        and math.isfinite(measurement)
+                    ):
+                        safe_request[key] = measurement
+                if isinstance(request.get("status"), str) and request["status"] in {
+                    "running",
+                    "completed",
+                    "cancelled",
+                    "failed",
+                }:
+                    safe_request["status"] = request["status"]
+                safe_requests.append(safe_request)
+            safe_runtime["pipeline_llm_requests"] = safe_requests
         turn_diagnostics = runtime.get("turn_diagnostics")
         if isinstance(turn_diagnostics, list):
             safe_turns: list[dict[str, Any]] = []
