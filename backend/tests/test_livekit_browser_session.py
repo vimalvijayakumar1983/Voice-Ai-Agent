@@ -1235,6 +1235,7 @@ async def test_worker_browser_branch_uses_signed_identity_not_participant_metada
         system_prompt="Welcome {{ customer_name }}.",
         greeting_message="Hello {{ customer_name }}",
         max_call_duration_seconds=60,
+        agent_metadata={},
     )
     profile = SimpleNamespace(
         stt_language="auto",
