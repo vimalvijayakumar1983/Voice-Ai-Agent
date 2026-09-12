@@ -2195,6 +2195,15 @@ async def test_knowledge_search_scans_sources_and_previews_retrieval(
         f"/api/v1/knowledge/{knowledge.id}/search", headers=auth_headers, params={"q": "x"}
     )
     assert too_short.status_code == 422
+    # Padding must not get a one-character query past the two-character minimum.
+    padded = await client.get(
+        f"/api/v1/knowledge/{knowledge.id}/search", headers=auth_headers, params={"q": "  x  "}
+    )
+    assert padded.status_code == 422
+    blank = await client.get(
+        f"/api/v1/knowledge/{knowledge.id}/search", headers=auth_headers, params={"q": "    "}
+    )
+    assert blank.status_code == 422
 
 
 def test_knowledge_search_scan_matches_verified_facts_and_inflections():
@@ -2237,3 +2246,31 @@ def test_knowledge_search_scan_matches_verified_facts_and_inflections():
     assert [fact.subject for fact in matches[0].facts] == ["Dr. Ahmed Ali"]
     assert "Consultant Urologist" in matches[0].snippets[0]
     assert scan_sources([source], "ct")[1] == []
+
+
+def test_knowledge_search_snippets_show_every_matched_term():
+    """A term that repeats early must not crowd the other matched terms out."""
+    from types import SimpleNamespace
+    from uuid import uuid4
+
+    from app.services.knowledge_search import scan_sources
+
+    filler = " ".join(["word"] * 80)
+    text = (
+        f"MRI suite one. {filler} MRI suite two. {filler} MRI suite three. {filler} "
+        f"MRI suite four. {filler} CT scanner room."
+    )
+    source = SimpleNamespace(
+        id=uuid4(),
+        name="Imaging",
+        source_type="text",
+        raw_content=text,
+        content=None,
+        structured_content={},
+    )
+    _terms, matches = scan_sources([source], "MRI CT")
+    assert matches[0].matched_terms == ["mri", "ct"]
+    assert len(matches[0].snippets) == 3
+    assert "MRI suite one" in matches[0].snippets[0]
+    assert "CT scanner room" in matches[0].snippets[1]
+    assert "MRI suite two" in matches[0].snippets[2]

@@ -160,11 +160,19 @@ def scan_source(source: Any, terms: list[str]) -> SourceMatch | None:
     if not match.matched_terms:
         return None
 
-    # One snippet per distinct term first, so a source matching two terms
-    # shows both; later windows that overlap an earlier one are skipped.
+    # The first hit of every matched term comes first, so a source matching
+    # two terms shows both even when the first term repeats; the remaining
+    # slots go to later hits in document order. Windows overlapping an
+    # earlier snippet are skipped.
+    hits.sort(key=lambda item: item[0])
+    first_hits: list[tuple[int, int, str]] = []
+    for term in terms:
+        first = next((hit for hit in hits if hit[2] == term), None)
+        if first is not None:
+            first_hits.append(first)
+    ordered = first_hits + [hit for hit in hits if hit not in first_hits]
     covered: list[tuple[int, int]] = []
-    seen_terms: set[str] = set()
-    for start, end, term in sorted(hits, key=lambda item: (item[2] in seen_terms, item[0])):
+    for start, end, _term in ordered:
         if len(match.snippets) >= MAX_SNIPPETS_PER_SOURCE:
             break
         overlaps = any(
@@ -175,7 +183,6 @@ def scan_source(source: Any, terms: list[str]) -> SourceMatch | None:
             continue
         match.snippets.append(_snippet(text, start, end))
         covered.append((start, end))
-        seen_terms.add(term)
     match.matched_terms.sort(key=terms.index)
     return match
 

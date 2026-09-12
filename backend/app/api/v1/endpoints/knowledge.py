@@ -643,6 +643,12 @@ async def search_knowledge_base(
     release when one exists, otherwise against the draft sources, so an
     operator can see the evidence an agent would answer from before a call.
     """
+    query = " ".join(q.split())
+    if len(query) < 2:
+        raise HTTPException(
+            status_code=422,
+            detail="Search for at least two characters.",
+        )
     await enforce_rate_limit(
         request,
         scope="knowledge-base-search",
@@ -654,8 +660,9 @@ async def search_knowledge_base(
         unavailable_detail="Knowledge search is temporarily unavailable. Retry shortly.",
     )
     kb = await _get_knowledge_base(db, current_user.tenant_id, kb_id, for_update=False)
-    query = " ".join(q.split())
-    terms, matches = scan_sources(list(kb.sources), query)
+    # The text scan is CPU-bound regex work over every source; keep it off the
+    # event loop so one large knowledge base cannot stall other requests.
+    terms, matches = await asyncio.to_thread(scan_sources, list(kb.sources), query)
     preview = await retrieval_preview(db, kb, query)
     return KnowledgeSearchResponse(
         query=query,
