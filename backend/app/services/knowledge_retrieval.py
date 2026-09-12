@@ -77,6 +77,7 @@ _QUERY_STOP_WORDS = {
     "from",
     "give",
     "have",
+    "having",
     "has",
     "had",
     "hello",
@@ -375,6 +376,12 @@ _SEMANTIC_CONCEPT_GROUPS: tuple[tuple[str, ...], ...] = (
 )
 _SEMANTIC_CONCEPTS = {term: group for group in _SEMANTIC_CONCEPT_GROUPS for term in group}
 _QUESTION_WORD_CONCEPTS = frozenset({"where"})
+# A caller asks for "departments"; a clinic's site lists "specialties" or
+# "services" and a group's site lists "divisions". Only the plural, listing
+# form expands: "What is Dr Lee's specialty?" must never match a fact that
+# merely places Dr Lee in a department.
+_LISTING_CONCEPT_GROUP = ("department", "specialty", "speciality", "division", "service")
+_LISTING_CONCEPTS = {term: _LISTING_CONCEPT_GROUP for term in _LISTING_CONCEPT_GROUP}
 
 
 @dataclass(frozen=True)
@@ -464,7 +471,22 @@ def _query_tokens(value: str) -> set[str]:
     if _is_service_capability_query(value):
         # These verbs express a request for a service, not an additional fact.
         # Preserve the service, price, negation, date and other constraints.
-        tokens.difference_update({"offer", "provide", "specialise", "specialize"})
+        tokens.difference_update(
+            {
+                "offer",
+                "offering",
+                "provide",
+                "providing",
+                "specialise",
+                "specialising",
+                "specialize",
+                "specializing",
+            }
+        )
+        if not tokens:
+            # "What are you offering?" names no service; it asks for the
+            # service listing itself.
+            tokens.add("service")
     if re.search(r"\b(?:is|are)\b.+\bavailable\b", value, re.I) and not re.search(
         r"\b(?:today|tomorrow|now|currently|appointment|slot|schedule|\d+)\b", value, re.I
     ):
@@ -502,8 +524,15 @@ def _is_service_capability_query(value: str) -> bool:
             r"specialize|specializes)\b",
             normalized,
         )
+        # "What are you offering?" is a capability question; "What is the
+        # offering price?" names a price, so the verb form needs its subject.
         or re.search(
-            r"\b(?:what|which)\b.{0,40}\b(?:services?|offerings?)\b",
+            r"\b(?:are|is)\s+(?:you|we|they)\s+"
+            r"(?:offering|providing|specialising|specializing)\b",
+            normalized,
+        )
+        or re.search(
+            r"\b(?:what|which)\b.{0,40}\b(?:services?|offerings)\b",
             normalized,
         )
     )
@@ -539,8 +568,11 @@ def _semantic_query_variants(query: str) -> tuple[str, ...]:
     matches = list(_TOKEN.finditer(query))
     variants: list[str] = []
     for match in matches:
-        token = _singular(match.group(0).casefold())
+        surface = match.group(0).casefold()
+        token = _singular(surface)
         concepts = _SEMANTIC_CONCEPTS.get(token)
+        if concepts is None and surface != token:
+            concepts = _LISTING_CONCEPTS.get(token)
         if concepts is None:
             continue
         for concept in concepts:

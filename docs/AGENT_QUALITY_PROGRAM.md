@@ -257,6 +257,15 @@ Approval and coverage fixes from the Royal Medical re-index on 11 September:
   so presentation punctuation cannot fail a release, and a failure names the
   expected term and the sources that were retrieved instead.
 - Knowledge Studio no longer describes indexed sources as provider-confirmed.
+- Adam & Eve test call on 12 September: "What kind of departments you are
+  having there?" found nothing while "What kind of services you are providing
+  there?" found the specialty list. "having", "providing" and "offering" are
+  request framing, not facts a card must state, and "department" now expands
+  to "specialty", "service" and "division", which is how clinic and group
+  sites label the same listing. A bare "What are you offering?" asks for the
+  service listing itself. The same call read a markdown list aloud
+  ("- **Pediatrics**"); the single-pass reply policy and the agent prompt now
+  require plain spoken sentences with items separated by commas.
 
 Acceptance: an existing knowledge base re-indexes end to end and shows complete
 coverage on the Royal Medical doctor directory.

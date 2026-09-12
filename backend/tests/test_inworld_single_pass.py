@@ -260,6 +260,8 @@ def test_evidence_instructions_are_bounded_json_data_and_never_need_a_transcript
     assert "tools" in instructions
     assert "Answer only the latest caller message" in instructions
     assert "without directly proving" in instructions
+    # Adam & Eve call on 12 September: the reply was read aloud as "- **Pediatrics**".
+    assert "never use markdown, asterisks, bullet points" in instructions
 
     with pytest.raises(ValueError, match="exceeds the single-pass bound"):
         build_evidence_only_instructions("x" * (MAX_SINGLE_PASS_EVIDENCE_CHARS + 1))

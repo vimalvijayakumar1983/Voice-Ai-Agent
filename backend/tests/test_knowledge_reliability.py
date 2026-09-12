@@ -677,3 +677,85 @@ def test_specialty_forms_never_widen_ordinary_words_or_framing_nouns():
     )
     assert not rank_knowledge("What is the handling fee?", [("Policies", fees)])
     assert not rank_knowledge("Who is the clinician?", [("About", company)])
+
+
+def _specialties_document():
+    return (
+        "VERIFIED STRUCTURED FACTS\n"
+        "SUBJECT: Adam & Eve Specialized Medical Centre\n"
+        "- specialties: Pediatrics, Pediatric Dentistry, Internal Medicine, Dermatology\n"
+        "  Search phrases: What specialties does Adam & Eve Specialized Medical Centre "
+        "have? | Which services are provided? | Is pediatrics available?\n"
+        "  Evidence: Our Specialties: Pediatrics, Pediatric Dentistry, Internal Medicine, "
+        "Dermatology\n"
+        "- address: Al Nahyan, Abu Dhabi\n"
+        "  Search phrases: Where is Adam & Eve Specialized Medical Centre?\n"
+        "  Evidence: Located in Al Nahyan, Abu Dhabi"
+    )
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "What kind of departments you are having there?",
+        "Which departments do you have?",
+        "What divisions are there?",
+        "What kind of services you are providing there?",
+        "What are you offering there?",
+    ],
+)
+def test_department_questions_match_a_specialties_listing(query):
+    """Adam & Eve call on 12 September: "departments" found nothing, "services" did.
+
+    The site lists its "specialties"; a caller says "departments" and adds a
+    framing verb such as "having" or "providing" that the card never states.
+    """
+    from app.services.knowledge_retrieval import (
+        _rank_contextual_knowledge,
+        build_contextual_query_plan,
+    )
+
+    plan = build_contextual_query_plan(query)
+    matches = _rank_contextual_knowledge(
+        plan.variants,
+        [("Adam & Eve Specialized Medical Centre", _specialties_document())],
+        6,
+        "Adam & Eve Specialized Medical Centre",
+    )
+    assert matches, query
+    assert "Pediatrics" in matches[0].text, query
+
+
+def test_listing_synonyms_apply_only_to_plural_listing_questions():
+    """Codex review on #51: a person's specialty is not their department."""
+    from app.services.knowledge_retrieval import (
+        _is_service_capability_query,
+        _query_tokens,
+        _rank_contextual_knowledge,
+        _semantic_query_variants,
+        build_contextual_query_plan,
+    )
+
+    assert _semantic_query_variants("What is Dr Lee's specialty?") == ()
+    assert _semantic_query_variants("Which department is Dr Lee in?") == ()
+    assert "What kind of specialty do you have?" in _semantic_query_variants(
+        "What kind of departments do you have?"
+    )
+
+    document = (
+        "VERIFIED STRUCTURED FACTS\n"
+        "SUBJECT: Dr. Lee\n"
+        "- department: Emergency Department\n"
+        "  Search phrases: Which department is Dr. Lee in?\n"
+        "  Evidence: Dr. Lee | Emergency Department"
+    )
+    plan = build_contextual_query_plan("What is Dr Lee's specialty?")
+    matches = _rank_contextual_knowledge(
+        plan.variants, [("Doctors", document)], 6, "Adam & Eve Specialized Medical Centre"
+    )
+    assert not any("Emergency Department" in match.text for match in matches)
+
+    # "offering" as a noun stays a topic word.
+    assert _is_service_capability_query("What is the offering price?") is False
+    assert "offering" in _query_tokens("What is the offering price?")
+    assert _is_service_capability_query("What are you offering there?") is True
