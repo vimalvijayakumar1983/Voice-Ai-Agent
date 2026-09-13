@@ -2214,6 +2214,7 @@ async def test_native_realtime_tool_passes_semantic_terms_to_shared_retrieval(mo
     retrieval.assert_awaited_once_with(
         query="When was Al Zaabi Group formed?",
         query_variants=("What is the Al Zaabi Group inception year?",),
+        directory_query=None,
     )
 
 
@@ -3114,6 +3115,7 @@ def test_pipeline_server_speaking_event_does_not_duplicate_chat_e2e_sample(monke
 
 
 def test_livekit_native_events_capture_exact_turn_and_interruption_metrics(monkeypatch):
+    monkeypatch.setattr(livekit_worker.time, "time", lambda: 100.0)
     timestamps = iter([10.0, 10.2, 10.7, 11.0, 12.0, 12.4])
     monkeypatch.setattr(livekit_worker.time, "monotonic", lambda: next(timestamps))
     runtime_metrics = {"barge_in_count": 0}
@@ -3158,6 +3160,7 @@ def test_livekit_native_events_capture_exact_turn_and_interruption_metrics(monke
             {
                 "turn": 1,
                 "user_speech_ms": 300,
+                "turn_started_at_unix": 100.0,
                 "barge_in": True,
                 "transcript_words": 0,
                 "transcript_after_speech_ms": 1000,
@@ -3242,6 +3245,7 @@ def test_adaptive_barge_in_accepts_single_word_from_bound_knowledge():
 
 
 def test_livekit_native_fragment_is_consumed_once_and_recorded(monkeypatch):
+    monkeypatch.setattr(livekit_worker.time, "time", lambda: 100.0)
     timestamps = iter([20.0])
     monkeypatch.setattr(livekit_worker.time, "monotonic", lambda: next(timestamps))
     runtime_metrics = {"barge_in_count": 0}
@@ -3263,6 +3267,7 @@ def test_livekit_native_fragment_is_consumed_once_and_recorded(monkeypatch):
                 "turn": 1,
                 "transcript_words": 1,
                 "stabilization_ms": 500,
+                "turn_started_at_unix": 100.0,
                 "outcome": "fragment_suppressed",
             }
         ],

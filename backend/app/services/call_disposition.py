@@ -27,6 +27,7 @@ GROUNDING_QUALITY_FLAGS = frozenset(
         "clarified_despite_verified_exact_fact",
         "conversation_recovery_failure",
         "unresolved_requests",
+        "reported_missing_information",
     }
 )
 
@@ -352,6 +353,8 @@ def summarize_runtime_grounding(call_metadata: object) -> dict[str, int]:
             continue
         if trace.get("conversation_recovery_failure"):
             counts["conversation_recovery_failure"] += 1
+        if trace.get("reported_missing_information") is True:
+            counts["reported_missing_information"] += 1
         outcome = trace.get("grounding_outcome")
         if outcome in counts:
             counts[outcome] += 1
@@ -397,6 +400,7 @@ def apply_grounding_quality_guard(
     verified_exact_clarification_count = safe_counts["clarified_despite_verified_exact_fact"]
     recovery_failure_count = safe_counts["conversation_recovery_failure"]
     unresolved_count = safe_counts["unresolved_requests"]
+    missing_information_count = safe_counts["reported_missing_information"]
     grounding_issue_count = (
         unsupported_count
         + knowledge_error_count
@@ -405,6 +409,7 @@ def apply_grounding_quality_guard(
         + verified_exact_clarification_count
         + recovery_failure_count
         + unresolved_count
+        + missing_information_count
     )
     if grounding_issue_count <= 0:
         return analysis
@@ -420,6 +425,11 @@ def apply_grounding_quality_guard(
     if not isinstance(evidence, list):
         evidence = []
     warning_parts: list[str] = []
+    if missing_information_count:
+        warning_parts.append(
+            f"{missing_information_count} response(s) reported missing information; "
+            "retrieval success does not establish full resolution"
+        )
     if unresolved_count:
         warning_parts.append(
             f"{unresolved_count} request(s) remained unanswered or awaiting clarification"

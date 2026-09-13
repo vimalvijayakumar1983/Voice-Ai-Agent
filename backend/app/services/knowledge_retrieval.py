@@ -8,6 +8,8 @@ from collections import Counter
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from difflib import SequenceMatcher
+from functools import lru_cache
+from time import perf_counter
 from urllib.parse import unquote, urlsplit
 from uuid import UUID
 
@@ -418,6 +420,7 @@ class ContextualQueryPlan:
     primary_query: str
     variants: tuple[str, ...]
     recovered_terms: tuple[str, ...]
+    scope_queries: tuple[str, ...] = ()
 
 
 def _base_tokens(value: str) -> list[str]:
@@ -455,7 +458,8 @@ _SPECIALTY_SUFFIX_FAMILIES: tuple[tuple[int, tuple[str, ...]], ...] = (
 )
 
 
-def _specialty_forms(token: str) -> set[str]:
+@lru_cache(maxsize=4096)
+def _specialty_forms(token: str) -> frozenset[str]:
     """Return the other word forms of a medical specialty token, or nothing."""
     for min_stem, family in _SPECIALTY_SUFFIX_FAMILIES:
         for suffix in family:
@@ -465,13 +469,13 @@ def _specialty_forms(token: str) -> set[str]:
                     # Whole-word families never expand a longer word that merely
                     # ends with the term ("nondental" is not "dental").
                     continue
-                return {stem + other for other in family if other != suffix}
-    return set()
+                return frozenset(stem + other for other in family if other != suffix)
+    return frozenset()
 
 
 def _token_forms(base_tokens: list[str]) -> set[str]:
     tokens: set[str] = set()
-    for token in base_tokens:
+    for token in set(base_tokens):
         tokens.add(token)
         tokens.add(_singular(token))
         tokens.update(_specialty_forms(token))
@@ -762,30 +766,31 @@ def _phrase_similarity(query_tokens: Sequence[str], canonical_tokens: Sequence[s
         return _spoken_compound_similarity(query_tokens[0], canonical_tokens)
     if len(query_tokens) != len(canonical_tokens):
         return 0.0
-    token_scores = [
-        SequenceMatcher(None, query_token, canonical_token).ratio()
-        for query_token, canonical_token in zip(query_tokens, canonical_tokens, strict=True)
-    ]
     exact_count = sum(
         query_token == canonical_token
         for query_token, canonical_token in zip(query_tokens, canonical_tokens, strict=True)
     )
     if len(query_tokens) == 1:
-        if query_tokens[0][:1] != canonical_tokens[0][:1] or token_scores[0] < 0.86:
+        if query_tokens[0][:1] != canonical_tokens[0][:1]:
             return 0.0
-        return token_scores[0]
+        score = SequenceMatcher(None, query_tokens[0], canonical_tokens[0]).ratio()
+        return score if score >= 0.86 else 0.0
     same_initials = all(
         query_token[:1] == canonical_token[:1]
         for query_token, canonical_token in zip(query_tokens, canonical_tokens, strict=True)
     )
+    if exact_count == 0 and not same_initials:
+        return 0.0
+    token_scores = [
+        SequenceMatcher(None, query_token, canonical_token).ratio()
+        for query_token, canonical_token in zip(query_tokens, canonical_tokens, strict=True)
+    ]
     compact_score = SequenceMatcher(
         None,
         "".join(query_tokens),
         "".join(canonical_tokens),
     ).ratio()
     average_score = sum(token_scores) / len(token_scores)
-    if exact_count == 0 and not same_initials:
-        return 0.0
     one_uncertain_word = len(query_tokens) >= 3 and exact_count >= len(query_tokens) - 1
     minimum_score = 0.7 if one_uncertain_word else 0.78
     if compact_score < minimum_score or average_score < minimum_score:
@@ -886,6 +891,7 @@ def build_contextual_query_plan(
         primary_query=base_variants[0],
         variants=variants,
         recovered_terms=tuple(dict.fromkeys(recovered_terms)),
+        scope_queries=base_variants,
     )
 
 
@@ -2356,17 +2362,31 @@ async def _retrieve_serving_revision_context(
     limit: int,
     max_context_chars: int,
     company_subject: str | None = None,
+    diagnostics: dict | None = None,
+    directory_query: str | None = None,
 ) -> str | None:
     """Search only an immutable release while a newer draft is being edited."""
 
     from app.services.conversation_scope import same_company
-    from app.services.knowledge_directory import published_doctor_names, requests_doctor_count
+    from app.services.knowledge_directory import published_doctor_names, shared_directory_request
 
     owner = (getattr(revision, "manifest", None) or {}).get("owner_company")
+    # Name-recovery/semantic search expansions are clues, not new caller
+    # constraints. Only original/model-supplied queries define aggregate scope.
+    directory_request = (
+        shared_directory_request(
+            (directory_query,)
+            if directory_query
+            else query_plan.scope_queries or query_plan.variants,
+            owner,
+        )
+        if owner
+        else None
+    )
     if (
         owner
         and (company_subject is None or same_company(owner, company_subject))
-        and all(requests_doctor_count(variant, owner) for variant in query_plan.variants)
+        and directory_request is not None
     ):
         # Counts must scan the pinned catalogue, never the top-k matches. Bound
         # the scan and fail closed rather than counting a truncated result.
@@ -2384,7 +2404,9 @@ async def _retrieve_serving_revision_context(
             )
         ).all()
         if len(catalogue) <= 256:
-            directory = published_doctor_names(list(catalogue), max_chars=max_context_chars)
+            directory = published_doctor_names(
+                list(catalogue), max_chars=max_context_chars, role=directory_request.role
+            )
             if directory and len(directory) <= max_context_chars:
                 return directory
 
@@ -2459,7 +2481,10 @@ async def _retrieve_serving_revision_context(
         # tsvector path.  Fetch every predicate match so the in-process ranker
         # can choose the best 48, rather than truncating by creation time first.
         source_query = source_query.order_by(*order_by)
+    stage_started = perf_counter()
     source_rows = (await db.execute(source_query)).all()
+    if diagnostics is not None:
+        diagnostics["knowledge_source_query_ms"] = (perf_counter() - stage_started) * 1000
 
     # A fuzzy name fallback stays bounded and never switches to mutable draft
     # rows. It catches ASR spelling variants without widening tenant scope.
@@ -2492,6 +2517,7 @@ async def _retrieve_serving_revision_context(
             )
         ]
 
+    stage_started = perf_counter()
     documents: list[tuple[str, str]] = []
     owner_company = (revision.manifest or {}).get("owner_company")
     for row in source_rows:
@@ -2539,6 +2565,9 @@ async def _retrieve_serving_revision_context(
                         break
                 normalized_variants.append(variant)
             rank_variants = tuple(normalized_variants)
+    if diagnostics is not None:
+        diagnostics["knowledge_document_prepare_ms"] = (perf_counter() - stage_started) * 1000
+    stage_started = perf_counter()
     matches = await asyncio.to_thread(
         _rank_contextual_knowledge,
         rank_variants,
@@ -2546,6 +2575,8 @@ async def _retrieve_serving_revision_context(
         limit,
         preferred_subject,
     )
+    if diagnostics is not None:
+        diagnostics["knowledge_rank_ms"] = (perf_counter() - stage_started) * 1000
     if not matches:
         return None
     interpretation = ""
@@ -2577,6 +2608,8 @@ async def retrieve_knowledge_context(
     serving_revision_id: UUID | None = None,
     knowledge_base_id: UUID | None = None,
     company_subject: str | None = None,
+    diagnostics: dict | None = None,
+    directory_query: str | None = None,
 ) -> str | None:
     """Retrieve only from the call-pinned or currently published corpus.
 
@@ -2643,7 +2676,9 @@ async def retrieve_knowledge_context(
     terminology_name = revision.knowledge_name if revision is not None else knowledge_base.name
     terminology_scope = revision.scope_label if revision is not None else knowledge_base.scope_label
     terminology_tags = revision.tags if revision is not None else knowledge_base.tags
-    query_plan = build_contextual_query_plan(
+    stage_started = perf_counter()
+    query_plan = await asyncio.to_thread(
+        build_contextual_query_plan,
         query,
         supplied_variants=query_variants,
         terminology=(
@@ -2653,6 +2688,8 @@ async def retrieve_knowledge_context(
             *(terminology_tags if isinstance(terminology_tags, list) else []),
         ),
     )
+    if diagnostics is not None:
+        diagnostics["knowledge_query_plan_ms"] = (perf_counter() - stage_started) * 1000
     if not query_plan.variants:
         return None
     if revision is not None:
@@ -2664,6 +2701,8 @@ async def retrieve_knowledge_context(
             limit=limit,
             max_context_chars=max_context_chars,
             company_subject=company_subject,
+            diagnostics=diagnostics,
+            directory_query=directory_query,
         )
     combined_query = " ".join(query_plan.variants)
     candidate_ids = await _candidate_source_ids(

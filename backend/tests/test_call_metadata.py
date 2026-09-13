@@ -7,6 +7,60 @@ from app.schemas.call import CallResponse
 from app.services.call_metadata import public_call_metadata, public_transport_identity_ref
 
 
+def test_public_metadata_preserves_missing_information_and_stage_timings():
+    timings = {
+        "knowledge_query_plan_ms": 12.5,
+        "knowledge_source_query_ms": 20,
+        "knowledge_document_prepare_ms": 30,
+        "knowledge_rank_ms": 40,
+    }
+    trace = {
+        **timings,
+        "reported_missing_information": True,
+        "response_action": "reported_missing_information",
+        "grounding_response_observation": "assistant_item_interrupted",
+        "outcome": "superseded_by_caller",
+    }
+    latest = {f"last_{key}": value for key, value in timings.items()}
+    projected = public_call_metadata(
+        {
+            "agent_configuration": {},
+            "runtime": {
+                **latest,
+                "turn_diagnostics": [
+                    {
+                        **trace,
+                        "turn_started_at_unix": 1700000000,
+                        "private_transcript": "not public",
+                    },
+                    {
+                        "reported_missing_information": "not a boolean",
+                        "knowledge_rank_ms": True,
+                        "response_action": "unapproved action",
+                        "grounding_response_observation": "private content",
+                    },
+                    {
+                        "reported_missing_information": False,
+                        "grounding_response_observation": "assistant_item_completed",
+                    },
+                ],
+            },
+        }
+    )
+    assert projected == {
+        "runtime": {
+            **latest,
+            "turn_diagnostics": [
+                trace,
+                {
+                    "reported_missing_information": False,
+                    "grounding_response_observation": "assistant_item_completed",
+                },
+            ],
+        }
+    }
+
+
 def test_call_response_projects_only_safe_agent_configuration_metadata():
     response = CallResponse.model_validate(
         {

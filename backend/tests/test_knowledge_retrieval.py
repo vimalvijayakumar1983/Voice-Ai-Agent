@@ -752,8 +752,8 @@ async def test_retrieval_bounds_candidates_and_offloads_ranking(db, tenant, monk
         ranked_document_sets.append(ranked_documents)
         return ranked_documents
 
-    async def capture_to_thread(function, *args):
-        return function(*args)
+    async def capture_to_thread(function, *args, **kwargs):
+        return function(*args, **kwargs)
 
     monkeypatch.setattr(
         knowledge_retrieval,

@@ -5,8 +5,14 @@ import pytest
 from sqlalchemy import select
 
 from app.models.agent import Agent, KnowledgeServingRevisionSource
-from app.services.knowledge_directory import published_doctor_names, requests_doctor_count
-from app.services.knowledge_retrieval import retrieve_knowledge_context
+from app.services.knowledge_directory import (
+    DirectoryRequest,
+    directory_request,
+    published_doctor_names,
+    requests_doctor_count,
+    shared_directory_request,
+)
+from app.services.knowledge_retrieval import build_contextual_query_plan, retrieve_knowledge_context
 from tests.knowledge_test_utils import publish_test_knowledge
 
 
@@ -40,7 +46,14 @@ def test_counts_source_names_not_top_k_or_inferred_medical_roles():
 
 
 @pytest.mark.parametrize(
-    "question", ["How many doctors do you have?", "What is the total number of doctors?"]
+    "question",
+    [
+        "How many doctors do you have?",
+        "What is the total number of doctors?",
+        "How many doctors are listed in your directory?",
+        "What is the number of doctors listed on your website?",
+        "Please count all the doctors in the published directory.",
+    ],
 )
 def test_count_request(question):
     # 'What is' is deliberately kept explicit as normal count framing.
@@ -54,10 +67,60 @@ def test_count_request(question):
         "How many doctors were there in 2020?",
         "How many female doctors?",
         "How many doctors at Other Clinic?",
+        "How many doctors are not listed in your directory?",
+        "How many doctors are listed in the Dubai directory?",
+        "How many doctors are available tomorrow?",
+        "How many doctors are listed in your directory and speak Arabic?",
     ],
 )
 def test_does_not_drop_filters(question):
     assert not requests_doctor_count(question, "Example Clinic")
+
+
+def test_operation_and_role_scope_are_independent_of_source_wording():
+    assert directory_request("How many general practitioners do you have?", "Clinic") == (
+        DirectoryRequest("count", "general_practitioner")
+    )
+    assert directory_request("Which general practitioner can I consult?", "Clinic") == (
+        DirectoryRequest("list", "general_practitioner")
+    )
+    assert shared_directory_request(
+        ("How many doctors are listed in your directory?", "List all doctors at Clinic"), "Clinic"
+    ) == DirectoryRequest("count", "doctor")
+    assert (
+        shared_directory_request(("How many general practitioners?", "How many doctors?"), "Clinic")
+        is None
+    )
+
+
+def test_generated_search_expansions_are_not_new_count_constraints():
+    question = "How many doctors are listed in your directory?"
+    plan = build_contextual_query_plan(question, terminology=("Doctors Directory",))
+    assert plan.scope_queries == (question,)
+    assert shared_directory_request(plan.scope_queries, "Clinic") == DirectoryRequest(
+        "count", "doctor"
+    )
+
+
+def test_role_count_requires_explicit_evidence_and_not_inferred_specialty():
+    result = json.loads(
+        published_doctor_names(
+            [
+                (
+                    "Directory",
+                    {
+                        "entities": [
+                            person("Dr Amina Ali"),
+                            person("Dr Ben Jones", "Dr Ben Jones | Cardiologist"),
+                        ]
+                    },
+                )
+            ],
+            role="general_practitioner",
+        )
+    )
+    assert result["published_name_count"] == 1
+    assert result["role_filter"] == "general_practitioner"
 
 
 def test_no_names_is_not_zero_doctors():
@@ -90,13 +153,34 @@ async def test_count_uses_pinned_release_not_draft_and_honours_tenant(db, tenant
     await db.flush()
     args = dict(
         agent_id=agent.id,
-        query="How many doctors do you have?",
+        query="How many doctors are listed in your directory?",
         serving_revision_id=revision.id,
         knowledge_base_id=knowledge.id,
     )
     result = await retrieve_knowledge_context(db, tenant_id=tenant.id, **args)
     assert json.loads(result)["published_name_count"] == 2
     assert "Draft Only" not in result
+    model_rewording = await retrieve_knowledge_context(
+        db,
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        serving_revision_id=revision.id,
+        knowledge_base_id=knowledge.id,
+        query="number of doctors in Example directory",
+        directory_query="How many doctors are listed in your directory?",
+    )
+    assert json.loads(model_rewording)["published_name_count"] == 2
+    foreign_caller = await retrieve_knowledge_context(
+        db,
+        tenant_id=tenant.id,
+        directory_query="How many doctors at Other Clinic?",
+        **args,
+    )
+    assert not foreign_caller or "published_name_count" not in foreign_caller
+    reformulated = await retrieve_knowledge_context(
+        db, tenant_id=tenant.id, query_variants=("List all doctors at Example Clinic",), **args
+    )
+    assert json.loads(reformulated)["published_name_count"] == 2
     filtered = await retrieve_knowledge_context(
         db,
         tenant_id=tenant.id,

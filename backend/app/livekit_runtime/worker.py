@@ -1312,6 +1312,10 @@ class _LiveKitRuntimeTelemetry:
     pending_grounding_not_before: float | None = None
     suspended_grounding_trace: dict[str, Any] | None = None
     suspended_grounding_not_before: float | None = None
+    suspended_grounding_until: float | None = None
+    completed_grounding_windows: list[tuple[dict[str, Any], float, float]] = field(
+        default_factory=list
+    )
     turn_diagnostics: list[dict[str, Any]] = field(default_factory=list)
     turn_sequence: int = 0
     latest_knowledge_sequence: int = -1
@@ -1323,7 +1327,10 @@ class _LiveKitRuntimeTelemetry:
     def _trace(self) -> dict[str, Any]:
         if self.current_turn_trace is None:
             self.turn_sequence += 1
-            self.current_turn_trace = {"turn": self.turn_sequence}
+            self.current_turn_trace = {
+                "turn": self.turn_sequence,
+                "turn_started_at_unix": time.time(),
+            }
         return self.current_turn_trace
 
     def _finish_trace(self, outcome: str) -> None:
@@ -1433,6 +1440,10 @@ class _LiveKitRuntimeTelemetry:
                     trace[key] = value[:100]
             for key in (
                 "knowledge_entity_resolution_ms",
+                "knowledge_query_plan_ms",
+                "knowledge_source_query_ms",
+                "knowledge_document_prepare_ms",
+                "knowledge_rank_ms",
                 "exact_fact_preclassification_ms",
                 "exact_fact_binding_lookup_ms",
                 "exact_fact_revision_lookup_ms",
@@ -1476,7 +1487,10 @@ class _LiveKitRuntimeTelemetry:
         # cannot attach its grounding verdict to a newer caller turn.
         if is_current_turn:
             self.pending_grounding_trace = trace
-            self.pending_grounding_not_before = time.time()
+            # LiveKit timestamps the assistant item at generation START, which
+            # precedes tool completion. A tool-finish lower bound incorrectly
+            # rejects the very answer produced using this tool result.
+            self.pending_grounding_not_before = trace.get("turn_started_at_unix", time.time())
         else:
             trace["knowledge_result_late"] = True
             self.runtime_metrics["late_knowledge_result_count"] = (
@@ -1656,9 +1670,26 @@ class _LiveKitRuntimeTelemetry:
     ) -> None:
         """Classify how the assistant handled the latest grounded tool result."""
         trace = self.pending_grounding_trace
+        not_before = self.pending_grounding_not_before
+        historical = False
+        timestamped = isinstance(created_at, (int, float)) and not isinstance(created_at, bool)
+        if timestamped:
+            windows = list(self.completed_grounding_windows)
+            if self.suspended_grounding_trace is not None:
+                windows.append(
+                    (
+                        self.suspended_grounding_trace,
+                        self.suspended_grounding_not_before or 0.0,
+                        self.suspended_grounding_until or time.time(),
+                    )
+                )
+            for candidate, start, end in reversed(windows):
+                if start <= created_at < end:
+                    trace, not_before, historical = candidate, start, True
+                    break
         if trace is None:
             return
-        if interrupted:
+        if interrupted and not timestamped:
             # ``interrupted`` is also emitted when a browser participant leaves
             # after hearing the complete answer and the session is torn down.
             # It is therefore not evidence of caller barge-in by itself.  Keep
@@ -1673,8 +1704,8 @@ class _LiveKitRuntimeTelemetry:
         if (
             isinstance(created_at, (int, float))
             and not isinstance(created_at, bool)
-            and self.pending_grounding_not_before is not None
-            and float(created_at) < self.pending_grounding_not_before
+            and not_before is not None
+            and float(created_at) < not_before
         ):
             # A cancelled response may be published after a newer lookup. Its
             # immutable creation timestamp still identifies it as the older
@@ -1684,15 +1715,23 @@ class _LiveKitRuntimeTelemetry:
             )
             return
         knowledge_result = trace.get("retrieval_result", trace.get("knowledge_result"))
+        response_class = _no_match_response_outcome(content)
+        if response_class == "no_match_correctly_refused":
+            # This also catches a partial answer followed by "I couldn't
+            # confirm Botox". Successful search is not full request resolution.
+            trace["reported_missing_information"] = True
         if knowledge_result == "verified":
             # Retrieval is proven here; semantic entailment of a generative
             # response is not. Keep the label deliberately narrower than
             # "verified answer" so QA and operators never confuse a successful
             # lookup with a pre-playout factuality gate.
             outcome = "response_after_verified_retrieval"
-            response_class = _no_match_response_outcome(content)
             response_action = {
-                "no_match_correctly_refused": "refused_despite_verified_evidence",
+                "no_match_correctly_refused": (
+                    "refused_despite_verified_evidence"
+                    if trace.get("exact_fact_action") == "answer"
+                    else "reported_missing_information"
+                ),
                 "no_match_clarification": "asked_clarification_despite_verified_evidence",
                 "no_match_unverified_response": "responded_after_verified_retrieval",
             }[response_class]
@@ -1710,11 +1749,14 @@ class _LiveKitRuntimeTelemetry:
             return
         trace["grounding_outcome"] = outcome
         trace["response_action"] = response_action
-        trace["grounding_response_observation"] = "assistant_item_completed"
+        trace["grounding_response_observation"] = (
+            "assistant_item_interrupted" if interrupted else "assistant_item_completed"
+        )
         if item_id:
             trace["grounding_response_item_id"] = str(item_id)[:128]
-        self.pending_grounding_trace = None
-        self.pending_grounding_not_before = None
+        if not historical:
+            self.pending_grounding_trace = None
+            self.pending_grounding_not_before = None
         if outcome == "no_match_unverified_response":
             self.runtime_metrics["unsupported_knowledge_response_count"] = (
                 int(self.runtime_metrics.get("unsupported_knowledge_response_count", 0)) + 1
@@ -1732,6 +1774,7 @@ class _LiveKitRuntimeTelemetry:
             if self.pending_grounding_trace is not None:
                 self.suspended_grounding_trace = self.pending_grounding_trace
                 self.suspended_grounding_not_before = self.pending_grounding_not_before
+                self.suspended_grounding_until = time.time()
             self.pending_grounding_trace = None
             self.pending_grounding_not_before = None
             if self.current_turn_trace is not None:
@@ -1783,6 +1826,16 @@ class _LiveKitRuntimeTelemetry:
 
         trace = self.suspended_grounding_trace
         if trace is not None:
+            # Keep the old generation's time window for late assistant items.
+            # Never attach their text to the new caller's pending lookup.
+            self.completed_grounding_windows.append(
+                (
+                    trace,
+                    self.suspended_grounding_not_before or 0.0,
+                    self.suspended_grounding_until or time.time(),
+                )
+            )
+            del self.completed_grounding_windows[:-50]
             if trace.get("grounding_response_observation") == "audio_started":
                 trace.pop("grounding_outcome", None)
                 trace.pop("response_action", None)
@@ -2475,6 +2528,7 @@ Knowledge policy:
         query_variants: tuple[str, ...] = (),
         allow_semantic_repair: bool = True,
         collection_offset: int = 0,
+        directory_query: str | None = None,
     ) -> str:
         started_at = time.perf_counter()
         originating_trace = (
@@ -2653,6 +2707,8 @@ Knowledge policy:
                     terminology=self._knowledge_terminology,
                     limit=VOICE_KNOWLEDGE_MATCH_LIMIT,
                     max_context_chars=VOICE_KNOWLEDGE_CONTEXT_CHARS,
+                    diagnostics=trace_details,
+                    directory_query=directory_query,
                     serving_revision_id=self._knowledge_serving_revision_id,
                     knowledge_base_id=self._knowledge_base_id,
                     **({"company_subject": company_subject} if company_subject else {}),
@@ -4129,6 +4185,9 @@ class VAVInworldRealtimeAgent(VAVInworldAgent):
         return await self._retrieve_approved_knowledge(
             query=query,
             query_variants=query_variants,
+            # A model reformulation is a search clue, not authority to change
+            # the explicit caller's company/role/count constraints.
+            directory_query=caller_query,
         )
 
 
