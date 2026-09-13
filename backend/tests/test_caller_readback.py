@@ -259,6 +259,37 @@ def test_payload_free_confirmation_without_a_value_asks_for_it():
     )
 
 
+def test_requested_reference_value_accepts_unlabelled_numeric_answer():
+    memory = caller_readback.CallerReferenceMemory()
+    memory.handle("Please remember my reference number.")
+    assert memory.handle("42, 9, 15, 4.") == (
+        "You said four two nine one five four. Is that correct?"
+    )
+    assert "Which occurrence" in memory.handle("Change the four to seven.")
+
+
+def test_waiting_for_reference_does_not_capture_numbers_after_topic_change():
+    memory = caller_readback.CallerReferenceMemory()
+    memory.handle("Please remember my reference number.")
+    memory.handle("When is the next appointment?")
+    assert memory.handle("Four") is None
+    assert memory.value is None
+
+
+@pytest.mark.parametrize("identifier", ["12:34", "12;34", "one:two", "12!34", "one.two"])
+def test_embedded_reference_punctuation_is_not_silently_erased(identifier):
+    assert caller_readback.numeric_reference(identifier) is None
+
+
+def test_explicit_natural_reference_correction_invalidates_value_after_topic_change():
+    memory = caller_readback.CallerReferenceMemory()
+    memory.handle("My reference is 123.")
+    memory.handle("Tell me about your doctors.")
+    assert memory.handle("Change the one in my reference to four") is None
+    assert memory.value is None and memory.delegated
+    assert memory.handle("Read back my reference") is None
+
+
 def test_stt_sentence_punctuation_in_full_replacement_keeps_all_digits():
     memory = caller_readback.CallerReferenceMemory()
     memory.handle("My reference is 123456.")

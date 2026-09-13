@@ -87,7 +87,7 @@ def numeric_reference(text: str) -> str | None:
     Sentence punctuation between whitespace-separated groups is allowed. A dot
     inside a numeric token is ambiguous and must be clarified, not erased.
     """
-    if len(text) > 200 or re.search(r"[0-9][.,][0-9]", text):
+    if len(text) > 200 or re.search(r"[A-Za-z0-9][.,;:!?][A-Za-z0-9]", text):
         return None
     tokens = re.sub(r"[.,!?;:]", " ", text.casefold()).split()
     if not tokens:
@@ -173,6 +173,16 @@ class CallerReferenceMemory:
             self.pending_change = None
             self.active_exchange = False
             return "I won't use that reference for the rest of this conversation."
+        if self.active_exchange and self.value is None and not self.delegated:
+            # A payload-free reference request asks the caller for its value.
+            # Accept a numeric answer to that question without requiring the
+            # caller (or STT's next item) to repeat the reference label.
+            supplied_value = numeric_reference(text)
+            if supplied_value is not None:
+                self.value = supplied_value
+                self.needs_clarification = False
+                self.pending_change = None
+                return self.spoken(confirm=True)
         occurrence = re.fullmatch(r"(?:the )?(first|last)(?: one| occurrence)?[.!?]*", text, re.I)
         if self.pending_change and self.value and occurrence:
             before, after = self.pending_change
@@ -209,7 +219,8 @@ class CallerReferenceMemory:
             return self.spoken(confirm=True)
         capture = _CAPTURE.fullmatch(text) or _REPLACE.fullmatch(text)
         if not capture:
-            if self.active_exchange and re.match(
+            reference_correction = self.active_exchange or bool(re.search(_LABEL, text, re.I))
+            if reference_correction and re.match(
                 r"^(?:no\b|actually\b|sorry\b|(?:please )?(?:change|correct|replace)\b)",
                 text,
                 re.I,
