@@ -1531,7 +1531,8 @@ def resolve_exact_fact(
     # A named service overview needs its descriptive source, not a list of all
     # business divisions merely containing the requested topic.
     if intent_tuple == (ExactFactType.SERVICES,) and re.search(
-        r"\b(?:tell me about|explain|describe|rundown|details|more about)\b", _normalized(query)
+        r"\b(?:tell me about|explain|describe|rundown|details|more about|what kind|what type)\b",
+        _normalized(query),
     ):
         subject_tokens = set().union(*(_tokens(fact.subject) for fact in index.facts))
         topic = _requested_tokens(query, intent_tuple) - subject_tokens

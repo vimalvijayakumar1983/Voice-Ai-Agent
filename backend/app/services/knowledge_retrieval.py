@@ -36,6 +36,13 @@ _TOKEN = re.compile(r"[^\W_]+", re.UNICODE)
 _SPLIT = re.compile(r"(?:\r?\n){2,}|(?<=[.!?।])\s+")
 _PARAGRAPH_SPLIT = re.compile(r"(?:\r?\n){2,}")
 MAX_CONTEXT_CHARS = 6000
+_RETRIEVAL_SCOPE_NOTE = (
+    "Retrieval scope: selected evidence excerpts, not a complete directory or catalogue. "
+    "Do not count these excerpts or claim they are all available entries. "
+    "For a multi-part question, answer only the supported parts and identify the "
+    "unsupported parts separately. A match for one service does not verify another "
+    "service, their combination, or a department relationship.\n\n"
+)
 MAX_SOURCE_CANDIDATES = 48
 MAX_RANKING_CORPUS_CHARS = 96_000
 MAX_RANKING_SOURCE_CHARS = 8_000
@@ -478,9 +485,12 @@ def _query_tokens(value: str) -> set[str]:
     # negation, dates and specialties untouched (no fuzzy content substitution).
     value = re.sub(r"\b(?:the )?names? of\b", " ", value, flags=re.I)
     value = re.sub(r"\b(?:i am|i'm|we are|we're)?\s*looking for\b", " ", value, flags=re.I)
+    value = re.sub(r"\byou\s+guys\b", "you", value, flags=re.I)
     tokens = {
         _singular(token) for token in _base_tokens(value) if token not in _QUERY_STOP_WORDS
     } - _QUERY_STOP_WORDS
+    if _is_department_description(value):
+        tokens.discard("department")
     if _is_service_capability_query(value):
         # These verbs express a request for a service, not an additional fact.
         # Preserve the service, price, negation, date and other constraints.
@@ -511,6 +521,47 @@ def _query_tokens(value: str) -> set[str]:
         # whether the word 'available' occurs next to every clinician's name.
         tokens.discard("available")
     return tokens
+
+
+def _is_department_description(value: str) -> bool:
+    # Only this request shape treats 'department' as framing. Never remove it
+    # from relationship questions such as 'is endoscopy under gastroenterology'.
+    return bool(
+        re.fullmatch(
+            r"\s*what\s+(?:kind|type)s?\s+of\s+[\w -]+\s+department"
+            r"(?:\s+(?:(?:do|are)\s+you\s+)?(?:have|having))?[?.!\s]*",
+            value,
+            re.I,
+        )
+    )
+
+
+def _capability_parts(query: str) -> tuple[str, ...]:
+    """Split a short explicit service list, retaining its owner and request.
+
+    Decline shared qualifiers, comparisons and relationships: splitting those
+    would silently change the question. This is not a semantic rewrite.
+    """
+    match = re.fullmatch(
+        r"(?P<prefix>.*?\b(?:do|does|can|could)\b.{0,80}?\b(?:provide|offer)\s+)"
+        r"(?P<items>[\w ,&-]+)[?.!\s]*",
+        query,
+        re.I,
+    )
+    if not match:
+        return ()
+    items = re.split(r"\s+and\s+|\s*&\s*|\s*,\s*", match["items"].strip())
+    if not 2 <= len(items) <= 3:
+        return ()
+    unsafe = re.compile(
+        r"\b(?:not|no|without|except|only|under|for|with|in|at|before|after|"
+        r"versus|vs|compare|comparison|difference|between|combined|combination|"
+        r"together|today|tomorrow|price|cost|same|both|services)\b|\d",
+        re.I,
+    )
+    if unsafe.search(query) or any(not 1 <= len(item.split()) <= 3 for item in items):
+        return ()
+    return tuple(match["prefix"] + item.strip() for item in items)
 
 
 def _is_phone_query(value: str, query_tokens: set[str]) -> bool:
@@ -1634,7 +1685,12 @@ def _rank_contextual_knowledge(
 ) -> list[KnowledgeMatch]:
     """Merge independently ranked alternatives without weakening match safety."""
     best_matches: dict[tuple[str, str], KnowledgeMatch] = {}
-    for query_index, query in enumerate(queries):
+    ranking_queries = tuple(
+        dict.fromkeys(
+            variant for query in queries for variant in (query, *_capability_parts(query))
+        )
+    )
+    for query_index, query in enumerate(ranking_queries):
         # Prefer a recovered/contextual query only when its evidence is at least
         # as strong as the literal transcript. The tiny penalty is deterministic
         # and keeps an exact raw-query result ahead on a tie.
@@ -2291,6 +2347,35 @@ async def _retrieve_serving_revision_context(
 ) -> str | None:
     """Search only an immutable release while a newer draft is being edited."""
 
+    from app.services.conversation_scope import same_company
+    from app.services.knowledge_directory import published_doctor_names, requests_doctor_count
+
+    owner = (getattr(revision, "manifest", None) or {}).get("owner_company")
+    if (
+        owner
+        and (company_subject is None or same_company(owner, company_subject))
+        and any(requests_doctor_count(variant, owner) for variant in query_plan.variants)
+    ):
+        # Counts must scan the pinned catalogue, never the top-k matches. Bound
+        # the scan and fail closed rather than counting a truncated result.
+        catalogue = (
+            await db.execute(
+                select(
+                    KnowledgeServingRevisionSource.name,
+                    KnowledgeServingRevisionSource.structured_content,
+                )
+                .where(
+                    KnowledgeServingRevisionSource.tenant_id == tenant_id,
+                    KnowledgeServingRevisionSource.serving_revision_id == revision.id,
+                )
+                .limit(257)
+            )
+        ).all()
+        if len(catalogue) <= 256:
+            directory = published_doctor_names(list(catalogue))
+            if directory and len(directory) <= max_context_chars:
+                return directory
+
     combined_query = " ".join(query_plan.variants)
     query_tokens = _query_tokens(combined_query)
     exact_terms = sorted(_tokens(combined_query) - _QUERY_STOP_WORDS)[:16]
@@ -2459,8 +2544,10 @@ async def _retrieve_serving_revision_context(
             + ". Verify the intended term against the evidence below; ask a brief "
             "clarifying question if it would materially change the answer.\n\n"
         )
-    context = interpretation + "\n\n".join(
-        f"Source: {match.source}\n{match.text}" for match in matches
+    context = (
+        interpretation
+        + _RETRIEVAL_SCOPE_NOTE
+        + "\n\n".join(f"Source: {match.source}\n{match.text}" for match in matches)
     )
     return context[:max_context_chars]
 
@@ -2640,7 +2727,9 @@ async def retrieve_knowledge_context(
             + ". Verify the intended term against the evidence below; ask a brief "
             "clarifying question if it would materially change the answer.\n\n"
         )
-    context = interpretation + "\n\n".join(
-        f"Source: {match.source}\n{match.text}" for match in matches
+    context = (
+        interpretation
+        + _RETRIEVAL_SCOPE_NOTE
+        + "\n\n".join(f"Source: {match.source}\n{match.text}" for match in matches)
     )
     return context[:max_context_chars]
