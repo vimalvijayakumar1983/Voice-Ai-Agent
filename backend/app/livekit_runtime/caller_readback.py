@@ -61,7 +61,7 @@ _CAPTURE = re.compile(
     re.I,
 )
 _REPLACE = re.compile(
-    rf"^(?:no[, ]+)?(?:please )?(?:replace|change) (?:that |the |my )?{_LABEL} "
+    rf"^(?:no[,. ]+)?(?:please )?(?:replace|change) (?:that |the |my )?{_LABEL} "
     r"(?:with|to)\s+(.*?)[.!?]*$",
     re.I,
 )
@@ -102,6 +102,37 @@ def numeric_reference(text: str) -> str | None:
             return None
     result = "".join(digits)
     return result if 1 <= len(result) <= 32 else None
+
+
+def reference_turn_text(messages) -> str:
+    """Recover an adjacent numeric continuation before any assistant reply.
+
+    The STT can commit two user items a fraction of a second apart. Only join
+    a strictly numeric suffix onto an explicit numeric-reference utterance,
+    within two seconds and with no intervening assistant/tool/message. No
+    transcript mutation, fuzzy rewriting, or general cross-turn concatenation.
+    """
+    items = list(messages)
+    if not items or items[-1].role != "user":
+        return ""
+    latest = items[-1]
+    text = latest.text_content or ""
+    if len(items) < 2 or numeric_reference(text) is None:
+        return text
+    previous = items[-2]
+    if previous.role != "user":
+        return text
+    elapsed = latest.created_at - previous.created_at
+    if not 0 <= elapsed <= 2.0:
+        return text
+    previous_text = " ".join((previous.text_content or "").split())
+    capture = _CAPTURE.fullmatch(previous_text) or _REPLACE.fullmatch(previous_text)
+    if capture and numeric_reference(capture.group(1)) is not None:
+        combined = f"{previous_text} {text}"
+        match = _CAPTURE.fullmatch(combined) or _REPLACE.fullmatch(combined)
+        if match and numeric_reference(match.group(1)) is not None:
+            return combined
+    return text
 
 
 @dataclass

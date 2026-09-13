@@ -103,3 +103,32 @@ This is a bounded opt-in fix, not a claim of 100% speech or conversational accur
 The branch includes the prior pause-safe candidate and is based on unmerged
 doctor-retrieval PR #56. Keep it in review; do not enable globally or merge that
 dependency implicitly as part of this test.
+# Follow-up release gate (13 September, 10:17 UTC)
+
+The broader synthetic call `282445ce-2b0e-5120-8632-8ee2049e067f`, on
+`fe2ddae`, **failed acceptance**. The previous successful A/B is not sufficient
+to enable the feature in production.
+
+- STT committed `Please remember my reference number: 4291.` and `54.` as two
+  adjacent user items 576 ms apart, before an assistant answer. The last-item
+  handler lost the suffix. Neither the 800 ms endpoint nor policy alone
+  guaranteed a complete reference.
+- `No. Replace that reference with 00739.` fell through to the model because
+  the correction parser accepted a comma after No but not a period. The model
+  acknowledged 00739, but the next deterministic recall returned the old value.
+- Doctor, department, payment-boundary and goodbye cases answered. Doctor and
+  department first received audio were 5,229 and 3,475 ms respectively.
+- The replay process exited normally (0) after explicitly unpublishing the
+  caller track, closing readers/source/room and DB resources, and collecting
+  callback cycles before event-loop shutdown. This fixes the observed test
+  cleanup abort in this run; not a claim about every SDK teardown.
+- QA agent/profile disabled and flags removed after the call. Production flags
+  remain off.
+
+Review fixes invalidate delegated natural corrections, expire bare correction
+context on a topic change, and preserve payload-free confirmation requests.
+The follow-up patch also accepts sentence punctuation after No and recovers
+an adjacent strictly numeric suffix before any assistant message, bounded to
+two seconds. It does not rewrite stored transcripts, wait on another model,
+join arbitrary questions, or resolve general speech-finalization failures.
+These changes require another voice replay before rollout.

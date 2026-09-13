@@ -3966,7 +3966,9 @@ class VAVInworldRealtimeAgent(VAVInworldAgent):
                 if previous is not None and previous[0] == message.id:
                     readback = previous[1]
                 else:
-                    readback = memory.handle(message.text_content or "")
+                    from app.livekit_runtime.caller_readback import reference_turn_text
+
+                    readback = memory.handle(reference_turn_text(chat_ctx.messages()))
                     self._caller_readback_last_message = (message.id, readback)
                     if readback is not None and self._telemetry is not None:
                         metrics = self._telemetry.runtime_metrics

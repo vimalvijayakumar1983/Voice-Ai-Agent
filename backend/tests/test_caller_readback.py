@@ -259,6 +259,57 @@ def test_payload_free_confirmation_without_a_value_asks_for_it():
     )
 
 
+def test_stt_sentence_punctuation_in_full_replacement_keeps_all_digits():
+    memory = caller_readback.CallerReferenceMemory()
+    memory.handle("My reference is 123456.")
+    assert memory.handle("No. Replace that reference with 00739.") == (
+        "You said zero zero seven three nine. Is that correct?"
+    )
+    assert memory.handle("Read back my reference") == "You said zero zero seven three nine."
+
+
+@pytest.mark.parametrize("delay,intervening", [(0.576, False), (3.0, False), (0.5, True)])
+def test_numeric_fragment_join_is_bounded_and_never_crosses_assistant(delay, intervening):
+    context = llm.ChatContext.empty()
+    first = context.add_message(role="user", content="Please remember my reference number: 4291.")
+    first.created_at = 100.0
+    if intervening:
+        context.add_message(role="assistant", content="You said four two nine one.")
+    last = context.add_message(role="user", content="54.")
+    last.created_at = 100.0 + delay
+    combined = caller_readback.reference_turn_text(context.messages())
+    assert combined == (
+        "54." if delay > 2 or intervening else "Please remember my reference number: 4291. 54."
+    )
+    assert first.text_content == "Please remember my reference number: 4291."
+    assert last.text_content == "54."
+
+
+@pytest.mark.parametrize("text", ["No, 54", "54 dirhams", "my appointment is at four", "12.34"])
+def test_continuation_join_does_not_invent_reference_from_other_content(text):
+    context = llm.ChatContext.empty()
+    context.add_message(role="user", content="My reference is 4291.")
+    context.add_message(role="user", content=text)
+    assert caller_readback.reference_turn_text(context.messages()) == text
+
+
+@pytest.mark.asyncio
+async def test_actual_node_recovers_adjacent_fragment_after_cancelled_partial_reply():
+    config = model({caller_readback.CALLER_READBACK_FLAG: True})
+    config.voice_provider = "soniox"
+    agent = worker.VAVInworldRealtimeAgent(model=config)
+    context = llm.ChatContext.empty()
+    first = context.add_message(role="user", content="Please remember my reference number: 4291.")
+    first.created_at = 100.0
+    _ = [chunk async for chunk in agent.llm_node(context, [], {})]
+    suffix = context.add_message(role="user", content="54.")
+    suffix.created_at = 100.576
+    assert [chunk async for chunk in agent.llm_node(context, [], {})] == [
+        "You said four two nine one five four. Is that correct?"
+    ]
+    assert agent._caller_reference_memory.value == "429154"
+
+
 @pytest.mark.asyncio
 async def test_actual_soniox_node_says_exact_digits_without_llm_and_preserves_input():
     config = model({caller_readback.CALLER_READBACK_FLAG: True})
