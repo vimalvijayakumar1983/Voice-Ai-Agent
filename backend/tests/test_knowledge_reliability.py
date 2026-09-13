@@ -593,7 +593,9 @@ async def test_company_location_question_prefers_the_company_fact_over_item_phra
         company_subject=company,
     )
     assert context is not None
-    first_block = context.split("\n\n")[0]
+    from app.services.knowledge_search import _context_chunks
+
+    first_block = _context_chunks(context)[0][0].text
     assert "SUBJECT: Royal Medical Center" in first_block
     assert address in first_block
 
