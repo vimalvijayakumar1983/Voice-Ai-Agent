@@ -44,6 +44,10 @@ Server response-start latency P50 7592ms, P90/P95 8003ms (eight samples), greeti
 
 ## Verification
 
+- Full local suite before final caller-query/API-projection additions: 2195
+  passed, 33 skipped. Final retrieval/directory/disposition/metadata regressions:
+  129 passed. Complete provider test file after updating its optional
+  caller-query mock contract: 120 passed. Exact-head CI remains the merge gate.
 - Regression tests cover literal failed questions; GP list/count; model shortened
   owner wording with authoritative caller intent; generated expansions; foreign
   companies, dates, negation and other filters; pinned release vs newer draft;

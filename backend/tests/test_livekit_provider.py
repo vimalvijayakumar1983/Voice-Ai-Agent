@@ -2214,6 +2214,7 @@ async def test_native_realtime_tool_passes_semantic_terms_to_shared_retrieval(mo
     retrieval.assert_awaited_once_with(
         query="When was Al Zaabi Group formed?",
         query_variants=("What is the Al Zaabi Group inception year?",),
+        directory_query=None,
     )
 
 
