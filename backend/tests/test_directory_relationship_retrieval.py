@@ -2,6 +2,7 @@
 
 import pytest
 
+from app.services import knowledge_retrieval
 from app.services.knowledge_retrieval import _rank_contextual_knowledge, rank_knowledge
 
 DOCTORS = """VERIFIED STRUCTURED FACTS
@@ -112,3 +113,59 @@ SUBJECT: Dr Mira Anwar
     assert rank_knowledge(query, [("Our Doctors", parking)]) == []
     work = parking.replace("parking permit", "work permit")
     assert rank_knowledge(query, [("Our Doctors", work)])
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "Which doctor does not work in orthopedics?",
+        "Which doctor doesn't work in orthopedics?",
+        "Which doctor never works in orthopedics?",
+        "Doctors excluding the orthopedic department",
+    ],
+)
+@pytest.mark.parametrize("structured", [True, False])
+def test_negative_relationship_does_not_return_positive_evidence(query, structured):
+    content = DOCTORS if structured else "Dr Mira Anwar works in orthopedics."
+    assert rank_knowledge(query, [("Doctors", content)]) == []
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "Which department does doctor Lee work in?",
+        "In what department does Dr Lee work?",
+        "What is Dr Lee's department?",
+        "Give me the department of Dr Lee",
+    ],
+)
+def test_requested_department_requires_department_evidence(query):
+    content = "VERIFIED STRUCTURED FACTS\n\nSUBJECT: Dr Lee\n- specialty: Cardiology\n"
+    assert rank_knowledge(query, [("Doctors", content)]) == []
+    with_department = content + "- department: Cardiology department\n"
+    assert rank_knowledge(query, [("Doctors", with_department)])
+
+
+def test_bounded_excerpt_uses_same_relationship_tokens_as_final_rank(monkeypatch):
+    observed = []
+    original = knowledge_retrieval._query_aware_excerpt
+
+    def capture(content, query_tokens, *, limit):
+        observed.append(query_tokens.copy())
+        return original(content, query_tokens, limit=limit)
+
+    monkeypatch.setattr(knowledge_retrieval, "_query_aware_excerpt", capture)
+    monkeypatch.setattr(knowledge_retrieval, "MAX_RANKING_SOURCE_CHARS", 900)
+    content = (
+        "Doctors work in the department. "
+        + "Unrelated navigation. " * 300
+        + "Dr Mira Anwar is the orthopedic doctor. "
+        + "Unrelated footer. " * 300
+    )
+    matches = knowledge_retrieval._rank_bounded_knowledge(
+        "Which doctor works in the orthopedic department?", [("Doctors", content)]
+    )
+    assert observed and all(
+        "work" not in tokens and "department" not in tokens for tokens in observed
+    )
+    assert matches and "Dr Mira Anwar" in matches[0].text
