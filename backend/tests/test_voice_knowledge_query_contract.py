@@ -37,6 +37,7 @@ async def test_model_rewording_keeps_original_caller_query():
     agent._retrieve_approved_knowledge.assert_awaited_once_with(
         query="Who is the dentist at the center?",
         query_variants=(caller, "Which clinician provides dentistry?"),
+        directory_query=caller,
     )
 
 
@@ -66,7 +67,7 @@ async def test_tool_remains_usable_without_chat_history():
     agent = agent_with_history()
     await agent.search_approved_knowledge(query="What services are offered?")
     agent._retrieve_approved_knowledge.assert_awaited_once_with(
-        query="What services are offered?", query_variants=()
+        query="What services are offered?", query_variants=(), directory_query=None
     )
 
 
