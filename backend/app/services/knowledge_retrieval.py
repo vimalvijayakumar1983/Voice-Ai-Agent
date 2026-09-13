@@ -273,6 +273,14 @@ _REQUEST_FRAMING_TOKENS = frozenset({"handle", "handling", "treat", "treating"})
 # operating details remain constraints outside a contextualized directory query.
 _DIRECTORY_RELATION_TOKENS = frozenset({"department"})
 _DIRECTORY_WORK_RELATION = re.compile(r"\b(?:works?|working)\s+(?=(?:in|at|for)\b)", re.I)
+_NEGATED_DIRECTORY_RELATION = re.compile(
+    r"\b(?:not|never|except|excluding|outside)\b|n['’]t\b", re.I
+)
+_REQUESTED_DEPARTMENT = re.compile(
+    r"\b(?:which|what)\s+departments?\b|\bdepartment\s+(?:of|for)\b"
+    r"|['’]s\s+department\b",
+    re.I,
+)
 _QUERY_INTENT_TOKENS = (
     _BROAD_QUERY_TOKENS
     | _DIRECTORY_QUERY_TOKENS
@@ -1209,6 +1217,34 @@ def _chunks(
     return chunks
 
 
+def _ranking_query_tokens(query: str) -> set[str]:
+    """Use the same conservative relationship constraints before and after bounding."""
+    query_tokens = _query_tokens(query)
+    if not query_tokens & (_DIRECTORY_QUERY_TOKENS | {"dr"}):
+        return query_tokens
+    if _NEGATED_DIRECTORY_RELATION.search(query):
+        # A positive directory entry does not prove an inverse relationship.
+        # This ranker cannot evaluate exclusions safely; do not return positive
+        # evidence as an answer to a negative directory question.
+        return set()
+    relationship_tokens = _query_tokens(_DIRECTORY_WORK_RELATION.sub("", query))
+    substantive_tokens = (
+        relationship_tokens
+        - _QUERY_INTENT_TOKENS
+        - _REQUEST_FRAMING_TOKENS
+        - _DIRECTORY_RELATION_TOKENS
+    )
+    if not substantive_tokens:
+        return query_tokens
+    if _REQUESTED_DEPARTMENT.search(query):
+        # "Which department does Dr Lee work in?" needs a department fact,
+        # not merely any fact about Lee (or an inferred specialty assignment).
+        if re.search(r"\b(?:work|works|working)\s*[?.!]*$", query, re.I):
+            relationship_tokens.discard("work")
+        return relationship_tokens
+    return relationship_tokens - _DIRECTORY_RELATION_TOKENS
+
+
 def rank_knowledge(
     query: str,
     documents: list[tuple[str, str]],
@@ -1224,22 +1260,7 @@ def rank_knowledge(
     topic word, so a company-level question is answered by the company's own
     fact rather than a doctor's "where"/"location" search phrase.
     """
-    query_tokens = _query_tokens(query)
-    if query_tokens & _DIRECTORY_QUERY_TOKENS:
-        # Strip only the relational verb phrase, not the modifier in e.g.
-        # "work permit" or "work experience" (even if both occur in a query).
-        relationship_tokens = _query_tokens(_DIRECTORY_WORK_RELATION.sub("", query))
-        substantive_tokens = (
-            relationship_tokens
-            - _QUERY_INTENT_TOKENS
-            - _REQUEST_FRAMING_TOKENS
-            - _DIRECTORY_RELATION_TOKENS
-        )
-        if substantive_tokens:
-            # The specialty/person must survive normalization. A bare follow-up
-            # ("which doctor works in that department?") still needs a resolved
-            # contextual variant, rather than broadening to every doctor.
-            query_tokens = relationship_tokens - _DIRECTORY_RELATION_TOKENS
+    query_tokens = _ranking_query_tokens(query)
     phone_query = _is_phone_query(query, query_tokens)
     if phone_query:
         # ``phone number`` and ``telephone number`` describe one contact
@@ -1521,7 +1542,7 @@ def _bounded_ranking_documents(
     query: str,
     documents: list[tuple[str, str]],
 ) -> list[tuple[str, str]]:
-    query_tokens = _query_tokens(query)
+    query_tokens = _ranking_query_tokens(query)
     phone_query = _is_phone_query(query, query_tokens)
     if phone_query:
         query_tokens.discard("number")
