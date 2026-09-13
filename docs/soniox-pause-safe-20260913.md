@@ -103,6 +103,11 @@ itself fix that response behavior, and a generic recall refusal is not a pass.
 Repeated evaluation of complete identifier readback/confirmation is required;
 do not insert a one-off rule for this particular number or doctor.
 
+Follow-up: the separately flagged caller-reference handler passed the targeted
+readback comparison described in [caller-reference-readback-20260913.md](caller-reference-readback-20260913.md).
+This does not retroactively change the failed result of the timing-only test above
+or authorize global rollout.
+
 ## Cleanup and rollout state
 
 Both calls completed. The QA clone/profile were disabled and the test flag removed.
