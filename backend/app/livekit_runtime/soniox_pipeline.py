@@ -5,6 +5,45 @@ from livekit.plugins import silero, soniox
 from app.providers.soniox import SONIOX_STT_MODEL, SONIOX_TTS_MODEL
 from app.services.realtime_speech_config import resolve_inworld_stt_language
 
+PAUSE_SAFE_FLAG = "soniox_pause_safe_v1"
+
+
+def pause_safe_enabled(profile) -> bool:
+    """Explicit opt-in only; never interpret strings or cross-provider flags."""
+    raw = getattr(profile, "runtime_config", None)
+    config = raw if isinstance(raw, dict) else {}
+    return (
+        config.get(PAUSE_SAFE_FLAG) is True
+        and getattr(profile, "primary_speech_provider", None) == "soniox"
+        and str(config.get("voice_runtime") or "pipeline") == "pipeline"
+    )
+
+
+def input_sample_rate(profile) -> int:
+    return 48000 if pause_safe_enabled(profile) else 16000
+
+
+def endpointing(profile) -> dict:
+    # Native SDK delay, not a second turn model or a transcript rewrite. Allow
+    # short in-sentence pauses without the previous audio model's 2.5 s tail.
+    return {
+        "mode": "fixed",
+        "min_delay": 0.8 if pause_safe_enabled(profile) else 0.3,
+        "max_delay": 0.8,
+    }
+
+
+def input_diagnostics(profile) -> dict:
+    return {
+        "soniox_pause_safe_enabled": pause_safe_enabled(profile),
+        "soniox_turn_completion_mode": "stt_pause_safe_v1"
+        if pause_safe_enabled(profile)
+        else "stt_standard",
+        "stt_sample_rate_configured": input_sample_rate(profile),
+        "stt_max_endpoint_delay_ms_configured": 1000,
+        "turn_endpointing_configured": endpointing(profile),
+    }
+
 
 def speech_language(model) -> str:
     return str(model.language or "en").split("-")[0].lower()
@@ -34,6 +73,7 @@ def build_stt(model, profile, api_key: str, terminology=()):
         api_key=api_key,
         params=soniox.STTOptions(
             model=SONIOX_STT_MODEL,
+            sample_rate=input_sample_rate(profile),
             language_hints=language_hints(model, profile),
             language_hints_strict=True,
             context=soniox.ContextObject(terms=list(terminology)[:100]),

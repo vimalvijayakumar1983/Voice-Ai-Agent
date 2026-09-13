@@ -1208,10 +1208,13 @@ def test_inworld_agent_requires_context_resolved_knowledge_searches():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("speech_provider", ["inworld", "soniox"])
+@pytest.mark.parametrize(
+    "speech_provider,pause_safe", [("inworld", False), ("soniox", False), ("soniox", True)]
+)
 async def test_worker_browser_branch_uses_signed_identity_not_participant_metadata(
     monkeypatch,
     speech_provider,
+    pause_safe,
 ):
     _configure_platform(monkeypatch)
     tenant_id = uuid4()
@@ -1249,7 +1252,11 @@ async def test_worker_browser_branch_uses_signed_identity_not_participant_metada
         profile.primary_speech_provider = "soniox"
         profile.llm_provider = "openai"
         profile.llm_model = "gpt-4o-mini"
-        profile.runtime_config = {"voice_runtime": "pipeline", "stt_model": "stt-rt-v5"}
+        profile.runtime_config = {
+            "voice_runtime": "pipeline",
+            "stt_model": "stt-rt-v5",
+            "soniox_pause_safe_v1": pause_safe,
+        }
         from app.livekit_runtime import mcp_tools
 
         monkeypatch.setattr(mcp_tools, "load_mcp_tools", AsyncMock(return_value=[]))
@@ -1298,6 +1305,7 @@ async def test_worker_browser_branch_uses_signed_identity_not_participant_metada
     open_browser = AsyncMock(return_value=call_id)
     open_sip = AsyncMock()
     start_options = {}
+    session_options = {}
     expected_room_options = object()
 
     async def hang_cleanup(*_args, **_kwargs):
@@ -1332,7 +1340,12 @@ async def test_worker_browser_branch_uses_signed_identity_not_participant_metada
         "store_shared_greeting_audio",
         AsyncMock(side_effect=RuntimeError("shared cache unavailable")),
     )
-    monkeypatch.setattr(livekit_worker, "AgentSession", lambda **_kwargs: FailingStartSession())
+
+    def make_session(**kwargs):
+        session_options.update(kwargs)
+        return FailingStartSession()
+
+    monkeypatch.setattr(livekit_worker, "AgentSession", make_session)
     monkeypatch.setattr(
         livekit_worker,
         "production_room_options",
@@ -1354,6 +1367,16 @@ async def test_worker_browser_branch_uses_signed_identity_not_participant_metada
     assert start_options["room_options"] is expected_room_options
     assert finalize.await_count == 1
     finalized_usage = finalize.await_args.args[2]
+    if speech_provider == "soniox":
+        assert session_options["turn_handling"]["turn_detection"] == "stt"
+        assert session_options["turn_handling"]["endpointing"] == {
+            "mode": "fixed",
+            "min_delay": 0.8 if pause_safe else 0.3,
+            "max_delay": 0.8,
+        }
+        assert session_options["turn_handling"]["preemptive_generation"]["enabled"] is False
+        assert finalized_usage["soniox_pause_safe_enabled"] is pause_safe
+        assert finalized_usage["stt_sample_rate_configured"] == (48000 if pause_safe else 16000)
     assert finalized_usage["greeting_provider_tts_request_count"] == 1
     assert finalized_usage["greeting_tts_charge_expected"] is True
     assert finalized_usage["greeting_tts_warmup_attempted"] is True

@@ -2424,8 +2424,19 @@ Knowledge policy:
   numbered lists or headings. Name several items in one sentence separated by
   commas.
 """
+        from app.livekit_runtime import caller_readback
         from app.livekit_runtime.reporting import FINANCIAL_SPEECH_INSTRUCTIONS
 
+        if caller_readback.enabled(model):
+            instructions += caller_readback.CALLER_READBACK_INSTRUCTIONS
+        self._caller_reference_memory = (
+            caller_readback.CallerReferenceMemory()
+            if caller_readback.enabled(model) and getattr(model, "voice_provider", None) == "soniox"
+            else None
+        )
+        self._caller_readback_last_message: tuple[str, str | None] | None = None
+        if telemetry is not None:
+            telemetry.runtime_metrics["caller_readback_enabled"] = caller_readback.enabled(model)
         super().__init__(instructions=FINANCIAL_SPEECH_INSTRUCTIONS + instructions)
 
     @property
@@ -3942,11 +3953,38 @@ class VAVInworldRealtimeAgent(VAVInworldAgent):
     """Native agent for the grounded tool-loop and explicit single-pass policies."""
 
     def llm_node(self, chat_ctx, tools, model_settings):
+        # Keep the SDK's normal turn lifecycle, transcript history, EOU metrics
+        # and cancellable TTS. Only replace the text-generation step for a
+        # narrowly recognized caller-reference readback, not the entire turn.
+        memory = self._caller_reference_memory
+        if memory is not None and getattr(self, "_mcp_checked_output_metrics", None) is None:
+            message = next(
+                (item for item in reversed(chat_ctx.messages()) if item.role == "user"), None
+            )
+            if message is not None:
+                previous = self._caller_readback_last_message
+                if previous is not None and previous[0] == message.id:
+                    readback = previous[1]
+                else:
+                    from app.livekit_runtime.caller_readback import reference_turn_text
+
+                    readback = memory.handle(reference_turn_text(chat_ctx.messages()))
+                    self._caller_readback_last_message = (message.id, readback)
+                    if readback is not None and self._telemetry is not None:
+                        metrics = self._telemetry.runtime_metrics
+                        metrics["caller_reference_readbacks"] = (
+                            metrics.get("caller_reference_readbacks", 0) + 1
+                        )
+                if readback is not None:
+                    return self._caller_reference_text(readback)
         chunks = super().llm_node(chat_ctx, tools, model_settings)
         metrics = getattr(self, "_mcp_checked_output_metrics", None)
         if metrics is not None:
             return soniox_pipeline.gate_unchecked_text(chunks, metrics)
         return chunks
+
+    async def _caller_reference_text(self, text: str):
+        yield text
 
     def realtime_audio_output_node(self, audio, model_settings):
         metrics = getattr(self, "_mcp_checked_output_metrics", None)
@@ -6118,8 +6156,11 @@ async def vav_inworld_session(ctx: JobContext) -> None:
         if soniox_active:
             usage_totals["stt_language_hints"] = soniox_pipeline.language_hints(model, profile)
             usage_totals["stt_language_hints_strict"] = True
+            usage_totals.update(soniox_pipeline.input_diagnostics(profile))
         normal_endpointing = (
-            ASSEMBLYAI_ENDPOINTING
+            soniox_pipeline.endpointing(profile)
+            if soniox_active
+            else ASSEMBLYAI_ENDPOINTING
             if resolved_stt_model == INWORLD_STT_FAST_ACCURATE
             else DEFAULT_ENDPOINTING
         )
