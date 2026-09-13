@@ -290,6 +290,15 @@ def test_explicit_natural_reference_correction_invalidates_value_after_topic_cha
     assert memory.handle("Read back my reference") is None
 
 
+@pytest.mark.parametrize("choice", ["The first one:.", "The first one;", "The first one?!"])
+def test_stt_trailing_punctuation_does_not_delegate_a_valid_occurrence_choice(choice):
+    memory = caller_readback.CallerReferenceMemory()
+    memory.handle("My reference is 429154.")
+    memory.handle("Change four to seven.")
+    assert memory.handle(choice) == "You said seven two nine one five four. Is that correct?"
+    assert memory.handle("Read back my reference.") == "You said seven two nine one five four."
+
+
 def test_stt_sentence_punctuation_in_full_replacement_keeps_all_digits():
     memory = caller_readback.CallerReferenceMemory()
     memory.handle("My reference is 123456.")

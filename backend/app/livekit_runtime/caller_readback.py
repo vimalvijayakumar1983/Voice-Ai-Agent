@@ -159,7 +159,10 @@ class CallerReferenceMemory:
         return f"You said {digits}." + (" Is that correct?" if confirm else "")
 
     def handle(self, text: str) -> str | None:
-        text = " ".join(text.split()).strip()
+        # STT may emit sentence-final punctuation stacks such as "one:.".
+        # Remove only trailing marks; embedded numeric separators remain
+        # subject to numeric_reference's ambiguity checks.
+        text = " ".join(text.split()).strip().rstrip(".,!?;:").rstrip()
         if not text or len(text) > 500 or _SECRET.search(text):
             self.active_exchange = False
             self.pending_change = None
