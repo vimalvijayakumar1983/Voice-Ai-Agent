@@ -6118,8 +6118,11 @@ async def vav_inworld_session(ctx: JobContext) -> None:
         if soniox_active:
             usage_totals["stt_language_hints"] = soniox_pipeline.language_hints(model, profile)
             usage_totals["stt_language_hints_strict"] = True
+            usage_totals.update(soniox_pipeline.input_diagnostics(profile))
         normal_endpointing = (
-            ASSEMBLYAI_ENDPOINTING
+            soniox_pipeline.endpointing(profile)
+            if soniox_active
+            else ASSEMBLYAI_ENDPOINTING
             if resolved_stt_model == INWORLD_STT_FAST_ACCURATE
             else DEFAULT_ENDPOINTING
         )
