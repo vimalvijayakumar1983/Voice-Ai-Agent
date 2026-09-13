@@ -158,3 +158,97 @@ async def test_real_native_tool_rewrite_retrieves_caller_fact(db, tenant, monkey
         query="Who is the dental doctor at Different Medical Center?",
     )
     assert result == "NO_VERIFIED_KNOWLEDGE_MATCH"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("company", ["Harbour Medical Center", "Meadow Medical Center"])
+async def test_directory_followups_use_owned_published_facts(db, tenant, monkeypatch, company):
+    kb = KnowledgeBase(
+        tenant_id=tenant.id,
+        name=company,
+        owner_company=company,
+        sync_status="ready",
+        approval_status="draft",
+        source_count=2,
+        indexed_source_count=2,
+    )
+    kb.sources.extend(
+        [
+            KnowledgeSource(
+                tenant_id=tenant.id,
+                source_type="text",
+                name="Our Doctors",
+                status="indexed",
+                content="Dr Mira Anwar, orthopedic doctor. Dr Kareem Nasser, urology doctor.",
+                structured_content={
+                    "facts": [
+                        {
+                            "subject": name,
+                            "predicate": "specialty",
+                            "value": specialty + " doctor",
+                            "evidence": f"{name}, {specialty} doctor.",
+                            "search_phrases": [specialty + " doctor"],
+                        }
+                        for name, specialty in [
+                            ("Dr Mira Anwar", "orthopedic"),
+                            ("Dr Kareem Nasser", "urology"),
+                        ]
+                    ]
+                },
+            ),
+            KnowledgeSource(
+                tenant_id=tenant.id,
+                source_type="text",
+                name="Departments",
+                status="indexed",
+                content="Orthopedic Department. Urology Department.",
+            ),
+        ]
+    )
+    db.add(kb)
+    await db.flush()
+    lexicon = await publish_speech_lexicon(
+        db, tenant_id=tenant.id, knowledge_base=kb, allow_draft_for_approval=True
+    )
+    revision = await publish_serving_revision(
+        db,
+        tenant_id=tenant.id,
+        knowledge_base=kb,
+        speech_lexicon=lexicon,
+        allow_draft_for_approval=True,
+    )
+
+    @asynccontextmanager
+    async def session():
+        yield db
+
+    monkeypatch.setattr(worker, "async_session_factory", session)
+    agent = VAVInworldRealtimeAgent(
+        model=SimpleNamespace(
+            id=uuid4(), tenant_id=tenant.id, name=company, system_prompt="Use approved knowledge."
+        ),
+        knowledge_serving_revision_id=revision.id,
+        knowledge_base_id=kb.id,
+    )
+    agent._chat_ctx = llm.ChatContext()
+    for specialty, caller, expected in [
+        ("orthopedic", "Which doctor works in that department?", "Dr Mira Anwar"),
+        ("urology", "Which doctor works in urology?", "Dr Kareem Nasser"),
+        ("orthopedic", "Going back to orthopedics, tell me the doctor again.", "Dr Mira Anwar"),
+    ]:
+        agent._chat_ctx.add_message(role="user", content=caller)
+        result = await agent.search_approved_knowledge(
+            query=f"{company} {specialty} department doctors",
+            semantic_query=(
+                f"Which doctors are available in the {specialty} department at {company}?"
+            ),
+        )
+        assert expected in result
+
+    agent._chat_ctx.add_message(
+        role="user", content="Which doctor works in urology at Different Medical Center?"
+    )
+    result = await agent.search_approved_knowledge(
+        query="Different Medical Center urology department doctors"
+    )
+    assert result == "NO_VERIFIED_KNOWLEDGE_MATCH"
