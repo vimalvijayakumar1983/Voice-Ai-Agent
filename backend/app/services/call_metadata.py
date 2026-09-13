@@ -171,6 +171,10 @@ def public_call_metadata(value: Any) -> dict[str, Any] | None:
             "knowledge_error_count",
             "unsupported_knowledge_response_count",
             "last_knowledge_tool_ms",
+            "last_knowledge_query_plan_ms",
+            "last_knowledge_source_query_ms",
+            "last_knowledge_document_prepare_ms",
+            "last_knowledge_rank_ms",
             "session_connection_ms",
             "call_open_to_greeting_ms",
             "session_start_to_greeting_ms",
@@ -328,6 +332,10 @@ def public_call_metadata(value: Any) -> dict[str, Any] | None:
                 "transcription_delay_ms",
                 "knowledge_hook_ms",
                 "knowledge_tool_ms",
+                "knowledge_query_plan_ms",
+                "knowledge_source_query_ms",
+                "knowledge_document_prepare_ms",
+                "knowledge_rank_ms",
                 "knowledge_evidence_chars",
                 "knowledge_query_variant_count",
                 "interruption_detection_ms",
@@ -382,6 +390,7 @@ def public_call_metadata(value: Any) -> dict[str, Any] | None:
                     "exact_fact_cache_hit",
                     "entity_resolution_applied_to_search",
                     "unexpected_script",
+                    "reported_missing_information",
                 ):
                     if isinstance(trace.get(field), bool):
                         safe_trace[field] = trace[field]
@@ -408,8 +417,16 @@ def public_call_metadata(value: Any) -> dict[str, Any] | None:
                     "answered_without_verified_evidence",
                     "knowledge_error_response",
                     "asked_transcription_clarification",
+                    "reported_missing_information",
                 }:
                     safe_trace["response_action"] = trace["response_action"]
+                if trace.get("grounding_response_observation") in {
+                    "assistant_item_interrupted",
+                    "assistant_item_completed",
+                }:
+                    safe_trace["grounding_response_observation"] = trace[
+                        "grounding_response_observation"
+                    ]
                 for field in (
                     "knowledge_retrieval_path",
                     "knowledge_interpretation_status",
