@@ -268,6 +268,10 @@ _CONTACT_QUERY_TOKENS = {
 # framing, not a fact the card must state. Only a directory question drops
 # these words: "What is the handling fee?" keeps "handling" as its topic.
 _REQUEST_FRAMING_TOKENS = frozenset({"handle", "handling", "treat", "treating"})
+# Relationship wording is not a property every doctor's card must contain.
+# These are deliberately NOT global stopwords: work permits, departments and
+# operating details remain constraints outside a contextualized directory query.
+_DIRECTORY_RELATION_TOKENS = frozenset({"department", "work", "working"})
 _QUERY_INTENT_TOKENS = (
     _BROAD_QUERY_TOKENS
     | _DIRECTORY_QUERY_TOKENS
@@ -1220,6 +1224,18 @@ def rank_knowledge(
     fact rather than a doctor's "where"/"location" search phrase.
     """
     query_tokens = _query_tokens(query)
+    if query_tokens & _DIRECTORY_QUERY_TOKENS:
+        substantive_tokens = (
+            query_tokens
+            - _QUERY_INTENT_TOKENS
+            - _REQUEST_FRAMING_TOKENS
+            - _DIRECTORY_RELATION_TOKENS
+        )
+        if substantive_tokens:
+            # The specialty/person must survive normalization. A bare follow-up
+            # ("which doctor works in that department?") still needs a resolved
+            # contextual variant, rather than broadening to every doctor.
+            query_tokens -= _DIRECTORY_RELATION_TOKENS
     phone_query = _is_phone_query(query, query_tokens)
     if phone_query:
         # ``phone number`` and ``telephone number`` describe one contact
