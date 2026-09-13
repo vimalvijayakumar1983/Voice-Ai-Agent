@@ -271,7 +271,8 @@ _REQUEST_FRAMING_TOKENS = frozenset({"handle", "handling", "treat", "treating"})
 # Relationship wording is not a property every doctor's card must contain.
 # These are deliberately NOT global stopwords: work permits, departments and
 # operating details remain constraints outside a contextualized directory query.
-_DIRECTORY_RELATION_TOKENS = frozenset({"department", "work", "working"})
+_DIRECTORY_RELATION_TOKENS = frozenset({"department"})
+_DIRECTORY_WORK_RELATION = re.compile(r"\b(?:works?|working)\s+(?=(?:in|at|for)\b)", re.I)
 _QUERY_INTENT_TOKENS = (
     _BROAD_QUERY_TOKENS
     | _DIRECTORY_QUERY_TOKENS
@@ -1225,8 +1226,11 @@ def rank_knowledge(
     """
     query_tokens = _query_tokens(query)
     if query_tokens & _DIRECTORY_QUERY_TOKENS:
+        # Strip only the relational verb phrase, not the modifier in e.g.
+        # "work permit" or "work experience" (even if both occur in a query).
+        relationship_tokens = _query_tokens(_DIRECTORY_WORK_RELATION.sub("", query))
         substantive_tokens = (
-            query_tokens
+            relationship_tokens
             - _QUERY_INTENT_TOKENS
             - _REQUEST_FRAMING_TOKENS
             - _DIRECTORY_RELATION_TOKENS
@@ -1235,7 +1239,7 @@ def rank_knowledge(
             # The specialty/person must survive normalization. A bare follow-up
             # ("which doctor works in that department?") still needs a resolved
             # contextual variant, rather than broadening to every doctor.
-            query_tokens -= _DIRECTORY_RELATION_TOKENS
+            query_tokens = relationship_tokens - _DIRECTORY_RELATION_TOKENS
     phone_query = _is_phone_query(query, query_tokens)
     if phone_query:
         # ``phone number`` and ``telephone number`` describe one contact

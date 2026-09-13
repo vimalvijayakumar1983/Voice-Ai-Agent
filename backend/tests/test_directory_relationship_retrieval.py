@@ -94,3 +94,21 @@ def test_raw_directory_text_supports_the_same_relationship():
     )
     assert matches
     assert "Dr Kareem Nasser" in matches[0].text
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "Which orthopedic doctor has a work permit?",
+        "Which doctor works in orthopedics and has a work permit?",
+    ],
+)
+def test_work_modifier_is_not_discarded_with_the_relationship(query):
+    parking = """VERIFIED STRUCTURED FACTS
+SUBJECT: Dr Mira Anwar
+- role: orthopedic doctor
+- permit: parking permit
+"""
+    assert rank_knowledge(query, [("Our Doctors", parking)]) == []
+    work = parking.replace("parking permit", "work permit")
+    assert rank_knowledge(query, [("Our Doctors", work)])
