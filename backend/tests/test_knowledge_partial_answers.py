@@ -52,13 +52,27 @@ def test_filler_specific_offer_is_not_expanded_to_generic_treatment():
     assert matches and matches[0].text == evidence
 
 
-def test_descriptive_department_query_retrieves_procedures_not_just_label():
+@pytest.mark.parametrize("wording", ["kind", "type", "types"])
+def test_descriptive_department_query_retrieves_procedures_not_just_label(wording):
     matches = retrieval._rank_contextual_knowledge(
-        ("What kind of laser department are you having?",),
+        (f"What {wording} of laser department are you having?",),
         [("Home", "Laser services include skin renewal, hair removal and scar correction.")],
         6,
     )
     assert matches and "hair removal" in matches[0].text
+
+
+def test_description_survives_runtime_four_match_budget():
+    sources = [(f"Departments {index}", "Laser Department") for index in range(5)]
+    sources.append(
+        ("Homepage", "Laser services include skin renewal, hair removal and scar correction.")
+    )
+    matches = retrieval._rank_contextual_knowledge(
+        ("What kind of laser department are you having?",),
+        sources,
+        4,
+    )
+    assert "hair removal" in matches[0].text
 
 
 def test_department_relationship_is_not_inferred_from_separate_lists():

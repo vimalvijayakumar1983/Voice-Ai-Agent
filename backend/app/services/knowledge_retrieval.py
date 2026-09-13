@@ -490,7 +490,7 @@ def _query_tokens(value: str) -> set[str]:
         _singular(token) for token in _base_tokens(value) if token not in _QUERY_STOP_WORDS
     } - _QUERY_STOP_WORDS
     if _is_department_description(value):
-        tokens.discard("department")
+        tokens.difference_update({"department", "type"})
     if _is_service_capability_query(value):
         # These verbs express a request for a service, not an additional fact.
         # Preserve the service, price, negation, date and other constraints.
@@ -1327,6 +1327,7 @@ def rank_knowledge(
     ubiquitous_source_terms = _ubiquitous_source_terms(documents)
     broad_query = _is_broad_query(query, query_tokens)
     service_capability_query = _is_service_capability_query(query)
+    descriptive_query = _is_department_description(query)
     directory_query = bool(query_tokens & _DIRECTORY_QUERY_TOKENS)
     # A directory question ("which doctor treats children") may leave its
     # framing verb off the card; any other question keeps every word.
@@ -1453,6 +1454,17 @@ def rank_knowledge(
                     topic_bonus = 0.12
             if directory_query and source_terms & _DIRECTORY_SOURCE_TOKENS:
                 topic_bonus = max(topic_bonus, 0.18)
+            if descriptive_query:
+                # Prefer topic explanations over labels, prices and calls to
+                # action. Search phrases themselves are not descriptive prose.
+                core = re.sub(r"(?m)^\s*Search phrases:.*$", "", _structured_core(chunk))
+                if any(
+                    query_tokens <= _token_forms(_base_tokens(sentence))
+                    and 8 <= len(_base_tokens(sentence)) <= 80
+                    and re.search(r"[.!?]", sentence)
+                    for sentence in _SPLIT.split(core)
+                ):
+                    topic_bonus = max(topic_bonus, 0.45)
             authority_bonus = 0.14 if structured_facts else 0.0
             if requested_subject_tokens and requested_subject_tokens <= structured_subject_tokens:
                 authority_bonus += 0.18
@@ -2354,7 +2366,7 @@ async def _retrieve_serving_revision_context(
     if (
         owner
         and (company_subject is None or same_company(owner, company_subject))
-        and any(requests_doctor_count(variant, owner) for variant in query_plan.variants)
+        and all(requests_doctor_count(variant, owner) for variant in query_plan.variants)
     ):
         # Counts must scan the pinned catalogue, never the top-k matches. Bound
         # the scan and fail closed rather than counting a truncated result.
@@ -2372,7 +2384,7 @@ async def _retrieve_serving_revision_context(
             )
         ).all()
         if len(catalogue) <= 256:
-            directory = published_doctor_names(list(catalogue))
+            directory = published_doctor_names(list(catalogue), max_chars=max_context_chars)
             if directory and len(directory) <= max_context_chars:
                 return directory
 

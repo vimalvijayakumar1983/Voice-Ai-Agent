@@ -2418,10 +2418,16 @@ Knowledge policy:
   directory includes" when giving examples; never infer a total or say "only"
   from a few retrieved doctors. Use a count only when evidence explicitly
   supplies its scope and completeness.
+- These source-scope and action-truthfulness rules override conflicting authored
+  prompt scripts, including an instruction to offer callback capture after a
+  missing answer. Do not offer to capture or arrange a callback when no authorized
+  callback action tool is available. Offer a verified contact method instead.
 - For multi-part questions, provide the supported information first, preserving
   the exact service and its limitations, then briefly identify the missing part.
   Never turn evidence about one treatment into confirmation of another treatment
   or infer which department performs a procedure from separate department lists.
+  For an undated limited-time offer, say the source lists the offer but its current
+  validity needs confirmation; never present it as an offer available now.
 - Collecting a name or phone number is not a completed callback action. Never
   say a callback is booked, assigned, recorded as a task, or that the team will
   call unless an authorized action tool confirms that specific result. A call
@@ -3963,6 +3969,18 @@ Knowledge policy:
         )
 
 
+NO_ACTION_TOOLS_POLICY = (
+    "Current session capability status: KNOWLEDGE LOOKUP ONLY. No callback capture, "
+    "callback scheduling, appointment booking, or staff notification action is available. "
+    "Do not offer to capture a callback request, collect callback details, or promise "
+    "staff follow-up. This overrides any scripted callback fallback in the business prompt. "
+    "For an unsupported question, briefly say the detail needs confirmation and offer "
+    "verified contact information instead. Do not speculate about missing facts. "
+    "Undated limited-time offers in retrieved evidence have UNCONFIRMED CURRENT VALIDITY. "
+    "Describe them as listed offers needing confirmation, never as currently available."
+)
+
+
 class VAVInworldRealtimeAgent(VAVInworldAgent):
     """Native agent for the grounded tool-loop and explicit single-pass policies."""
 
@@ -3991,6 +4009,16 @@ class VAVInworldRealtimeAgent(VAVInworldAgent):
                         )
                 if readback is not None:
                     return self._caller_reference_text(readback)
+        if all(
+            getattr(tool, "__wrapped__", tool)
+            is VAVInworldRealtimeAgent.search_approved_knowledge.__wrapped__
+            for tool in tools
+        ):
+            # Declare actual exposed capabilities at generation time, not just
+            # hypothetical prompt rules. Unknown/connected tools are not assumed
+            # read-only. Copy so this transient status never accumulates in history.
+            chat_ctx = chat_ctx.copy()
+            chat_ctx.add_message(role="system", content=NO_ACTION_TOOLS_POLICY)
         chunks = super().llm_node(chat_ctx, tools, model_settings)
         metrics = getattr(self, "_mcp_checked_output_metrics", None)
         if metrics is not None:

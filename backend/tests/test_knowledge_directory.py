@@ -64,6 +64,15 @@ def test_no_names_is_not_zero_doctors():
     assert published_doctor_names([("Empty", {"entities": []})]) is None
 
 
+def test_large_count_fits_voice_budget_without_counting_only_displayed_entries():
+    source = {"entities": [person(f"Dr Person Number {i}") for i in range(350)]}
+    encoded = published_doctor_names([("A long directory title " * 20, source)], max_chars=1200)
+    assert len(encoded) <= 1200
+    data = json.loads(encoded)
+    assert data["published_name_count"] == 350
+    assert data["entries_omitted"] == 350 - len(data["entries"])
+
+
 @pytest.mark.asyncio
 async def test_count_uses_pinned_release_not_draft_and_honours_tenant(db, tenant):
     agent = Agent(tenant_id=tenant.id, name="Example receptionist", system_prompt="Use knowledge.")
@@ -88,6 +97,13 @@ async def test_count_uses_pinned_release_not_draft_and_honours_tenant(db, tenant
     result = await retrieve_knowledge_context(db, tenant_id=tenant.id, **args)
     assert json.loads(result)["published_name_count"] == 2
     assert "Draft Only" not in result
+    filtered = await retrieve_knowledge_context(
+        db,
+        tenant_id=tenant.id,
+        query_variants=("How many doctors in Dubai?",),
+        **args,
+    )
+    assert not filtered or "published_name_count" not in filtered
     assert await retrieve_knowledge_context(db, tenant_id=uuid4(), **args) is None
     assert (
         await retrieve_knowledge_context(

@@ -23,7 +23,7 @@ def requests_doctor_count(query: str, owner: str) -> bool:
     return bool(words & {"doctor", "doctors"}) and not (words - framing)
 
 
-def published_doctor_names(sources: list[tuple[str, dict]]) -> str | None:
+def published_doctor_names(sources: list[tuple[str, dict]], *, max_chars: int = 3600) -> str | None:
     """Count explicitly titled, evidence-backed names, not inferred professions.
 
     No clinical synonym inference, fuzzy name merging or 'current staff' claim.
@@ -53,17 +53,22 @@ def published_doctor_names(sources: list[tuple[str, dict]]) -> str | None:
             entry = names.setdefault(identity, {"name": name, "sources": []})
             if source not in entry["sources"]:
                 entry["sources"].append(source)
-    if not names or len(names) > 200:
+    if not names or len(names) > 20_000:
         return None
-    return json.dumps(
-        {
-            "directory_scope": "Distinct explicitly doctor-titled names in the approved sources",
-            "published_name_count": len(names),
-            "complete_current_staff_count_verified": False,
-            "qualification": "This counts published names, not a confirmed current staff total. "
-            "The sources may omit doctors or contain name variants. "
-            "State the published-name count with this limitation.",
-            "entries": [names[key] for key in sorted(names)],
-        },
-        ensure_ascii=False,
-    )
+    summary = {
+        "directory_scope": "Distinct explicitly doctor-titled names in the approved sources",
+        "published_name_count": len(names),
+        "complete_current_staff_count_verified": False,
+        "qualification": "This counts published names, not a confirmed current staff total. "
+        "The sources may omit doctors or contain name variants. "
+        "State the published-name count with this limitation.",
+        "entries": [names[key] for key in sorted(names)[:5]],
+    }
+    while True:
+        summary["entries_omitted"] = len(names) - len(summary["entries"])
+        encoded = json.dumps(summary, ensure_ascii=False)
+        if len(encoded) <= max_chars:
+            return encoded
+        if not summary["entries"]:
+            return None
+        summary["entries"].pop()

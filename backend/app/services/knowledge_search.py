@@ -10,6 +10,7 @@ approved release when one exists and otherwise against the draft sources.
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import uuid
 from dataclasses import dataclass, field
@@ -20,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.agent import KnowledgeBase
 from app.services.knowledge_retrieval import (
     _QUERY_STOP_WORDS,
+    _RETRIEVAL_SCOPE_NOTE,
     _rank_contextual_knowledge,
     _singular,
     _source_retrieval_documents,
@@ -203,6 +205,23 @@ def _context_chunks(context: str | None) -> tuple[list[RetrievalChunk], str | No
     if body.startswith(marker):
         head, _, body = body.partition("\n\n")
         note = head
+    if body.startswith(_RETRIEVAL_SCOPE_NOTE):
+        body = body.removeprefix(_RETRIEVAL_SCOPE_NOTE)
+        note = "\n".join(value for value in (note, _RETRIEVAL_SCOPE_NOTE.strip()) if value)
+    if body.startswith("{"):
+        try:
+            summary = json.loads(body)
+        except ValueError:
+            summary = None
+        if isinstance(summary, dict) and "published_name_count" in summary:
+            note = summary.get("qualification")
+            return [
+                RetrievalChunk(
+                    source="Approved directory aggregate",
+                    text=f"{summary['published_name_count']} published doctor-titled names. "
+                    + str(note or ""),
+                )
+            ], note
     chunks: list[RetrievalChunk] = []
     for part in body.split("\n\nSource: "):
         part = part.removeprefix("Source: ").strip()
