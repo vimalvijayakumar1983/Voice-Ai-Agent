@@ -451,7 +451,11 @@ def _specialty_forms(token: str) -> set[str]:
 
 def _token_forms(base_tokens: list[str]) -> set[str]:
     tokens: set[str] = set()
-    for token in base_tokens:
+    # This is a set-valued expansion: repeated words cannot contribute new
+    # forms. Overlapping page excerpts otherwise repeat the suffix scan tens
+    # of thousands of times per query. Keep multiplicity-sensitive ranking
+    # outside this helper unchanged; no source/answer cache is introduced.
+    for token in set(base_tokens):
         tokens.add(token)
         tokens.add(_singular(token))
         tokens.update(_specialty_forms(token))
