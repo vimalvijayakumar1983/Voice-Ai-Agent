@@ -117,6 +117,7 @@ class CallerReferenceMemory:
     needs_clarification: bool = False
     delegated: bool = False
     pending_change: tuple[str, str] | None = None
+    active_exchange: bool = False
 
     def spoken(self, *, confirm: bool = False) -> str:
         if self.needs_clarification:
@@ -129,6 +130,8 @@ class CallerReferenceMemory:
     def handle(self, text: str) -> str | None:
         text = " ".join(text.split()).strip()
         if not text or len(text) > 500 or _SECRET.search(text):
+            self.active_exchange = False
+            self.pending_change = None
             return None
         if re.fullmatch(
             r"(?:please )?forget (?:my|the|that) reference(?: number)?[.!?]*", text, re.I
@@ -137,6 +140,7 @@ class CallerReferenceMemory:
             self.needs_clarification = False
             self.delegated = False
             self.pending_change = None
+            self.active_exchange = False
             return "I won't use that reference for the rest of this conversation."
         occurrence = re.fullmatch(r"(?:the )?(first|last)(?: one| occurrence)?[.!?]*", text, re.I)
         if self.pending_change and self.value and occurrence:
@@ -144,9 +148,10 @@ class CallerReferenceMemory:
             position = occurrence.group(1)
             text = f"Change the {position} {before} to {after}."
         if _RECALL.fullmatch(text):
+            self.active_exchange = not self.delegated
             return None if self.delegated else self.spoken()
         replacement = _CORRECT_DIGIT.fullmatch(text)
-        if replacement and self.value:
+        if replacement and self.value and (self.active_exchange or "reference" in text.lower()):
             position, before, after = replacement.groups()
             before = _DIGITS.get(before.casefold(), before)
             after = _DIGITS.get(after.casefold(), after)
@@ -173,10 +178,25 @@ class CallerReferenceMemory:
             return self.spoken(confirm=True)
         capture = _CAPTURE.fullmatch(text) or _REPLACE.fullmatch(text)
         if not capture:
+            if self.active_exchange and re.match(
+                r"^(?:no\b|actually\b|sorry\b|(?:please )?(?:change|correct|replace)\b)",
+                text,
+                re.I,
+            ):
+                # A natural correction may go to the LLM. Do not later
+                # override its response with a stale deterministic value.
+                self.value = None
+                self.needs_clarification = False
+                self.delegated = True
+            self.active_exchange = False
             if not _RECALL.fullmatch(text):
                 self.pending_change = None  # Don't interpret later unrelated 'first' as consent.
             return None
+        if not capture.group(1).strip():
+            self.active_exchange = not self.delegated
+            return None if self.delegated else self.spoken(confirm=True)
         self.pending_change = None
+        self.active_exchange = True
         value = numeric_reference(capture.group(1))
         if value is None:
             # No partial value may replace the previous complete reference.
@@ -185,6 +205,7 @@ class CallerReferenceMemory:
                 return "Please say the full reference digit by digit, including any separator."
             self.value = None
             self.delegated = True
+            self.active_exchange = False
             return None
         self.value = value
         self.needs_clarification = False

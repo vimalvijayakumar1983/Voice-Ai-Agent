@@ -221,6 +221,44 @@ def test_occurrence_choice_expires_on_topic_change():
     assert memory.value == "442"
 
 
+@pytest.mark.parametrize(
+    "correction", ["No, it is 456", "Actually, I meant 456", "Correct it to 456"]
+)
+def test_delegated_natural_correction_invalidates_old_reference(correction):
+    memory = caller_readback.CallerReferenceMemory()
+    memory.handle("My reference is 123.")
+    assert memory.handle(correction) is None
+    assert memory.value is None and memory.delegated
+    assert memory.handle("Read back my reference") is None
+
+
+def test_bare_digit_correction_does_not_cross_topic_boundary():
+    memory = caller_readback.CallerReferenceMemory()
+    memory.handle("My reference is 429.")
+    memory.handle("Can I book an appointment at four?")
+    assert memory.handle("Change four to seven") is None
+    assert memory.value == "429"
+    assert memory.handle("Read back my reference") == "You said four two nine."
+    assert memory.handle("Change four to seven") == "You said seven two nine. Is that correct?"
+
+
+@pytest.mark.parametrize(
+    "utterance", ["Please confirm my reference number", "Read back my reference number"]
+)
+def test_payload_free_confirmation_preserves_stored_reference(utterance):
+    memory = caller_readback.CallerReferenceMemory()
+    memory.handle("My reference is 00739.")
+    assert "zero zero seven three nine" in memory.handle(utterance)
+    assert memory.value == "00739" and not memory.delegated
+
+
+def test_payload_free_confirmation_without_a_value_asks_for_it():
+    memory = caller_readback.CallerReferenceMemory()
+    assert memory.handle("Please confirm my reference number") == (
+        "Please tell me the reference number you want me to read back."
+    )
+
+
 @pytest.mark.asyncio
 async def test_actual_soniox_node_says_exact_digits_without_llm_and_preserves_input():
     config = model({caller_readback.CALLER_READBACK_FLAG: True})
